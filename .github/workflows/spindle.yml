@@ -1,8 +1,11 @@
 name: Spindle checks
 
 on:
+  # The website (site/, published by pages.yml) changes no code.
   push:
+    paths-ignore: ["site/**", ".github/workflows/pages.yml"]
   pull_request:
+    paths-ignore: ["site/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:

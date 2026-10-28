@@ -9,6 +9,9 @@ Spindle runs as a native command (`spindle`), as a browser host for phones and d
 (`spindle serve`), behind a JSON-RPC or HTTP API for your own programs, as a WebAssembly
 package inside a JavaScript app, and as a Chrome extension that needs no server at all.
 
+Website: [siliconstate.github.io/Spindle](https://siliconstate.github.io/Spindle/), with a page
+for [Spindle for Chrome](https://siliconstate.github.io/Spindle/chrome/).
+
 > **Status:** experimental, single-operator software. Read [SECURITY.md](SECURITY.md)
 > before giving it real work.
 

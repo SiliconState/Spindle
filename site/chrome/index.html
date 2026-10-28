@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spindle for Chrome: an agent that lives in your Chrome</title>
+<meta name="description" content="Spindle for Chrome is a side-panel agent that writes and runs code in a Linux inside your browser, reads and works your tabs when you switch it on, and keeps going with the panel closed. Built on Spindle and the Dext engine: every step durable. Open source, MIT.">
+<meta property="og:title" content="Spindle for Chrome: an agent that lives in your Chrome">
+<meta property="og:description" content="A durable agent in Chrome's side panel, with a Linux inside the browser. Open source, MIT.">
+<meta property="og:type" content="website">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="wrap">
+    <a class="mark" href="../" aria-label="Spindle home"><span class="glyph" aria-hidden="true">s</span>Spindle <span class="crumb">/ for Chrome</span></a>
+    <nav aria-label="Product">
+      <a href="#what">Features</a>
+      <a href="#durable">Durable</a>
+      <a href="#control">Safety</a>
+      <a href="#install">Install</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://github.com/SiliconState/Spindle">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <section class="hero">
+    <div class="wrap split">
+      <div>
+        <p class="eyebrow">Spindle for Chrome · built on Spindle and the Dext engine</p>
+        <h1>An agent that lives in your Chrome.</h1>
+        <p class="lead">A side panel that writes and runs code in <strong>a Linux inside your browser</strong>,
+          reads and works your tabs when you switch that on, and keeps going after you close it.
+          Threads, files and keys stay in Chrome. No server, no account with us, and every step durable,
+          because it is Spindle underneath.</p>
+        <div class="actions">
+          <a class="button primary" href="#install">Install from source</a>
+          <a class="button" href="https://github.com/SiliconState/Spindle/blob/main/docs/chrome.md">How it is built</a>
+        </div>
+        <p class="note" style="margin-top:16px">Chrome 116 or later on desktop. Not in the Chrome Web Store yet.</p>
+      </div>
+      <div class="panel" role="img" aria-label="A sketch of the Spindle side panel: a request, three steps, a folded workspace card, then the answer.">
+        <div class="bar-top">
+          <span class="mark" aria-hidden="true"><span class="glyph">s</span></span>
+          <div><b>Spindle</b><small>DeepSeek · commands in this browser</small></div>
+        </div>
+        <div class="body">
+          <div class="you"><span class="role">YOU</span>Compare the prices on these three tabs and chart them.</div>
+          <div class="step"><span>Read 3 tabs</span><span>page reading</span></div>
+          <div class="step"><span>bash · python3 chart.py</span><span>exit 0</span></div>
+          <div class="step"><span>Wrote prices.csv, chart.svg</span><span>2 files</span></div>
+          <div class="ws">Workspace · 3 files · 2 new</div>
+          <div class="ans"><span class="role">SPINDLE</span><p>The second shop is cheapest on four of five items.
+            <code>prices.csv</code> and <code>chart.svg</code> are in the workspace.</p></div>
+        </div>
+        <div class="box"><span>Message Spindle&hellip;</span><span>Send</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="what" aria-labelledby="what-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">01 &mdash; WHAT IT DOES</span>
+        <h2 id="what-h">A whole agent, carried into the browser.</h2>
+        <p>Not a chat box that talks to someone's server: the Spindle engine itself, compiled to
+          WebAssembly and running in Chrome, with a Linux beside it.</p>
+      </div>
+      <div class="grid three">
+        <div class="card"><span class="tag">Background</span><h3>Keeps going with the panel closed.</h3>
+          <p>Threads run in an offscreen worker, not in the panel. Close it, switch tabs, and come back to
+            the answer.</p></div>
+        <div class="card"><span class="tag">Linux</span><h3>A real shell, inside Chrome.</h3>
+          <p>bash, coreutils, Python 3 with pip, Node with npm, git, curl, jq and ripgrep in Alpine Linux.
+            Each command runs in namespaces of its own, over a copy of the thread's workspace.</p></div>
+        <div class="card"><span class="tag">Tabs</span><h3>Reads and works your pages.</h3>
+          <p>With page reading on: list, read and outline tabs. With page actions on: click, type, select,
+            scroll, navigate, answer dialogs and record a tab's network.</p></div>
+        <div class="card"><span class="tag">Code mode</span><h3>Scripts that call the agent.</h3>
+          <p>From a command, <code>spindle model</code>, <code>spindle tool</code> and <code>spindle http</code>;
+            from Python <code>import spindle</code>; from Node <code>require('spindle')</code>. Every call is
+            journaled like any other step.</p></div>
+        <div class="card"><span class="tag">Files</span><h3>Files in, files out.</h3>
+          <p>Drop files on the panel or picture a tab. Get files back as cards, HTML as a sandboxed preview
+            shut off from the web until you allow it, and everything as one <code>.zip</code>.</p></div>
+        <div class="card"><span class="tag">Keys</span><h3>Sealed, never sent elsewhere.</h3>
+          <p>Keys and sign-ins are sealed with AES-GCM in the extension's storage, under an optional passphrase,
+            and go only to the provider they were saved for. Or sign in with ChatGPT.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="durable" aria-labelledby="durable-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">02 &mdash; DURABLE, BECAUSE IT IS SPINDLE</span>
+        <h2 id="durable-h">Interrupt it. It keeps its word.</h2>
+        <p>A browser is a hard place for long work: tabs close, workers rest, Chrome quits. Every thread here is
+          a Spindle session, so each step is committed before the next begins.</p>
+      </div>
+      <ol class="principles four">
+        <li><h3>Chrome closes mid-turn.</h3><p>When it starts again, the thread is there, marked interrupted, with
+          every committed step kept. Continue takes it on from there.</p></li>
+        <li><h3>Nothing is sent twice by itself.</h3><p>A model request whose fate is unknown is shown as unknown.
+          Continue never resends it; Retry sends it once more, on your word.</p></li>
+        <li><h3>Go back to before a message.</h3><p>The conversation and the workspace's files return together,
+          so nothing from the undone future is left behind.</p></li>
+        <li><h3>Take a thread with you.</h3><p>Move it to a <code>.spindle</code> file and go on with native
+          Spindle on your machine, in its sandbox with its full tools. Then bring it back.</p></li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="speed-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">03 &mdash; SPEED</span>
+        <h2 id="speed-h">A Linux that answers in half a second.</h2>
+        <p>Built with its optional wasm Linux, the extension runs the commands it can at the machine's own
+          speed, with no emulator in between. Plain <code>sh</code> commands run 2.2 to 8.6 times faster; what the
+          wasm Linux cannot run (bash itself, Node, git, the network) stays on the emulated Linux.</p>
+      </div>
+      <figure class="diagram">
+        <p class="bar-key"><span class="key-track"></span>v86 Linux, the whole bar <span class="key-fill"></span>wasm Linux</p>
+        <ul class="bars" aria-label="Time on the wasm Linux as a share of the time on the v86 Linux">
+          <li class="bar"><span>First command after install<br><small>21 s &rarr; 0.54 s</small></span>
+            <span class="track" title="v86 21 s, wasm 0.54 s"><span class="fill" style="width:2.6%"></span></span><b>39x</b></li>
+          <li class="bar"><span>Python summing 3 million squares<br><small>8,353 &rarr; 326 ms</small></span>
+            <span class="track" title="v86 8,353 ms, wasm 326 ms"><span class="fill" style="width:3.9%"></span></span><b>25.6x</b></li>
+          <li class="bar"><span>Python importing six modules<br><small>1,299 &rarr; 171 ms</small></span>
+            <span class="track" title="v86 1,299 ms, wasm 171 ms"><span class="fill" style="width:13.2%"></span></span><b>7.6x</b></li>
+          <li class="bar"><span><code>python3 -c pass</code><br><small>418 &rarr; 102 ms</small></span>
+            <span class="track" title="v86 418 ms, wasm 102 ms"><span class="fill" style="width:24.4%"></span></span><b>4.1x</b></li>
+          <li class="bar"><span>Python writing 200 files<br><small>894 &rarr; 300 ms</small></span>
+            <span class="track" title="v86 894 ms, wasm 300 ms"><span class="fill" style="width:33.6%"></span></span><b>3.0x</b></li>
+        </ul>
+        <figcaption>Median of five runs in headless Chrome 153, the same commands on both Linuxes
+          (<a href="https://github.com/SiliconState/Spindle/blob/main/docs/browser-linux.md#measured-speed">the full table</a>).
+          The first command is a one-time cost: v86 resumes its saved state on later starts.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="uses-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">04 &mdash; USE IT FOR</span>
+        <h2 id="uses-h">Work that starts on a web page.</h2>
+      </div>
+      <div class="grid three">
+        <div class="card"><h3>Pull data out of pages.</h3><p>Read several tabs, gather what they say into a CSV,
+          and chart it with Python, without copying a cell by hand.</p></div>
+        <div class="card"><h3>Do the clicking for you.</h3><p>Fill in a long form or walk a settings page, one action
+          at a time, on the page you are looking at.</p></div>
+        <div class="card"><h3>Build a small app and see it.</h3><p>Write HTML and JavaScript, open it in a preview,
+          change it, and download the folder when it works.</p></div>
+        <div class="card"><h3>Make sense of a file.</h3><p>Drop in a log, a spreadsheet export or a JSON dump and ask
+          what is in it. Python does the counting; you get the answer and the script.</p></div>
+        <div class="card"><h3>See what a page loads.</h3><p>Record a tab's requests and read the responses, to find
+          the call behind a broken button.</p></div>
+        <div class="card"><h3>Research across tabs.</h3><p>Compare what several pages say and keep a written summary
+          in the workspace, with where each claim came from.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="which-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">05 &mdash; WHICH SPINDLE</span>
+        <h2 id="which-h">In your Chrome, or wherever you work.</h2>
+        <p>The same sessions run in both. Start in the browser, move the thread to your machine for the heavy
+          part, and bring it back.</p>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th scope="col"></th><th scope="col">Spindle for Chrome</th><th scope="col">Spindle on your machine</th></tr></thead>
+          <tbody>
+            <tr><td>Runs</td><td>In Chrome: a side panel and a worker that outlives it</td><td>A native binary: your terminal, <code>spindle serve</code> for your phone, or inside your app</td></tr>
+            <tr><td>Commands</td><td>A Linux inside the browser, or a Spindle host you connect</td><td>A bubblewrap sandbox on Linux, with your Rust toolchain read-only if you ask</td></tr>
+            <tr><td>Your tabs</td><td>Reads and acts on them, once you switch that on</td><td>No</td></tr>
+            <tr><td>Spending limit</td><td>None in Chrome</td><td><code>--max-usd</code> per thread</td></tr>
+            <tr><td>Setup</td><td>Load the extension, add a key or sign in</td><td>Build one binary, <code>spindle login</code></td></tr>
+            <tr><td>Best for</td><td>Work that starts on a page, or a machine with nothing installed</td><td>Real repositories, long builds, servers</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note" style="margin-top:14px">Spindle on your machine: see <a href="../">the Spindle home page</a>.</p>
+    </div>
+  </section>
+
+  <section class="block" id="control" aria-labelledby="control-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">06 &mdash; STAY IN CONTROL</span>
+        <h2 id="control-h">It acts when you say, where you can see.</h2>
+      </div>
+      <div class="grid two">
+        <div class="card"><span class="tag">Off until you turn it on</span><h3>Your tabs are yours.</h3>
+          <p>A new install reads no page and acts on none. Page actions need page reading, and both need Chrome's
+            site access, which you can take back in one click.</p></div>
+        <div class="card"><span class="tag">Visible</span><h3>Chrome shows when it acts.</h3>
+          <p>Chrome's debugging bar is up while Spindle acts on a tab. Close the bar and Spindle leaves that tab
+            alone until you turn page actions off and on.</p></div>
+        <div class="card"><span class="tag">Precise</span><h3>Clicks land where they aim.</h3>
+          <p>If something covers the target, such as a banner or a dialog, nothing is clicked or typed, and the
+            agent is told what is in the way. Two threads never type into one tab at once.</p></div>
+        <div class="card"><span class="tag">Never by itself</span><h3>No repeat clicks.</h3>
+          <p>Spindle never repeats a click, a keystroke or a navigation on its own after an interruption. Reading
+            tools may rerun; acting tools never do.</p></div>
+        <div class="card"><span class="tag">Contained</span><h3>Commands stay in their Linux.</h3>
+          <p>Network for commands is off for each thread until you turn it on. Through Chrome, it reaches public
+            sites only: local and private addresses are refused, and requests carry no cookies.</p></div>
+        <div class="card"><span class="tag">Sealed</span><h3>Keys never sit as text.</h3>
+          <p>Every key is sealed. Add a passphrase and a copy of your whole Chrome profile holds nothing usable
+            without it.</p></div>
+      </div>
+      <div class="callout warn">
+        <strong>What it cannot promise.</strong>
+        <ul>
+          <li>A page can carry text written to steer an agent. Turn on page reading for sites you trust, and
+            read what the agent proposes before it acts on anything that matters.</li>
+          <li>A click, a submitted form or a sent request cannot be taken back. Spindle tells you when one may
+            have happened; it cannot undo it.</li>
+          <li>Through Chrome, local addresses are refused by name and number, but Chrome resolves names, so a
+            public name that points into your own network is not caught. A relay you set up reaches whatever it
+            can reach.</li>
+          <li>Without a passphrase, the key that seals your keys lives in the same Chrome profile.</li>
+        </ul>
+        <a href="https://github.com/SiliconState/Spindle/blob/main/SECURITY.md">Security notes</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="providers-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">07 &mdash; YOUR MODEL</span>
+        <h2 id="providers-h">Bring the model you already pay for.</h2>
+        <p>Requests go from your browser straight to the provider. No Spindle server sits in between.</p>
+      </div>
+      <ul class="chips" aria-label="Built-in providers">
+        <li>DeepSeek <small>key</small></li>
+        <li>ZAI GLM <small>key</small></li>
+        <li>Kimi Code <small>key</small></li>
+        <li>OpenAI API <small>key</small></li>
+        <li>Anthropic <small>key</small></li>
+        <li>ChatGPT <small>sign in</small></li>
+        <li>Local llama.cpp <small>no key</small></li>
+        <li>Your own <small>providers.json</small></li>
+      </ul>
+      <p class="note" style="margin-top:16px">Sign in with ChatGPT uses your ChatGPT plan. Anthropic models take an
+        API key; a Claude subscription sign-in is not offered. Any OpenAI-compatible endpoint can be added with a
+        <code>providers.json</code>.</p>
+    </div>
+  </section>
+
+  <section class="block" id="install" aria-labelledby="install-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">08 &mdash; INSTALL</span>
+        <h2 id="install-h">Build it, load it, sign in.</h2>
+        <p>Spindle for Chrome is not in the Chrome Web Store yet. It builds from source on Linux (WSL works)
+          and loads into any desktop Chrome, 116 or later.</p>
+      </div>
+      <ol class="steps">
+        <li><div><h3>Get the tools.</h3>
+          <p>Rust, curl, npm, python3 and user namespaces (<code>unshare -r</code>), plus two Rust targets and the
+            pinned wasm-bindgen:</p>
+<pre><code>rustup target add wasm32-unknown-unknown i686-unknown-linux-musl
+cargo install wasm-bindgen-cli --version 0.2.129 --locked</code></pre></div></li>
+        <li><div><h3>Build the Linux, then the extension.</h3>
+<pre><code>git clone https://github.com/SiliconState/Spindle.git
+cd Spindle/spindle
+chrome/linux/build.sh   <span class="c"># the browser Linux, into chrome/linux/dist</span>
+chrome/build.sh         <span class="c"># the extension, into chrome/dist</span></code></pre>
+          <p>For the faster wasm Linux, build it and pass <code>SPINDLE_WASM_LINUX</code>
+            (<a href="https://github.com/SiliconState/Spindle/blob/main/docs/browser-linux.md#building-the-images">how</a>).</p></div></li>
+        <li><div><h3>Load it into Chrome.</h3>
+          <p>Open <code>chrome://extensions</code>, turn on <strong>Developer mode</strong>, click <strong>Load
+            unpacked</strong> and choose <code>spindle/chrome/dist</code>. Pin Spindle to the toolbar.</p></div></li>
+        <li><div><h3>Open the panel and connect a model.</h3>
+          <p>Click the toolbar button, open <strong>Settings</strong>, and add a key or <strong>Sign in</strong>.
+            Chrome asks for access to that provider's site. Your threads live in the extension's storage, so
+            rebuilding never touches them.</p></div></li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="block" id="faq" aria-labelledby="faq-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">09 &mdash; QUESTIONS</span>
+        <h2 id="faq-h">Asked before installing.</h2>
+      </div>
+      <details class="qa"><summary>Do I need a server or an account?</summary>
+        <div><p>No. Everything runs in Chrome. You need a key or sign-in for a model provider. Connecting a native
+          Spindle host is optional and only adds a second place for commands to run.</p></div></details>
+      <details class="qa"><summary>Where do my keys go?</summary>
+        <div><p>They are sealed in the extension's IndexedDB and opened only by its engine, for a request to the
+          provider they were saved for. If a provider list later points that provider at another address, the
+          request is refused. Exported threads carry no keys.</p></div></details>
+      <details class="qa"><summary>Can it see my other tabs?</summary>
+        <div><p>Only with page reading on, which a new install has off. Page actions are a second switch on top
+          of that. Take Chrome's site access back and both go off.</p></div></details>
+      <details class="qa"><summary>What happens if Chrome closes in the middle of a turn?</summary>
+        <div><p>When Chrome starts again, the thread says it was interrupted, with every committed step kept.
+          Continue goes on and never resends a request whose fate is unknown; Retry sends it once more if you
+          choose.</p></div></details>
+      <details class="qa"><summary>What does it cost?</summary>
+        <div><p>Spindle is free and open source (MIT). Your provider bills model use to your key or plan. Threads
+          in Chrome have no spending limit of their own; native Spindle has <code>--max-usd</code>.</p></div></details>
+      <details class="qa"><summary>Can I use my ChatGPT or Claude subscription?</summary>
+        <div><p>ChatGPT, yes: <strong>Sign in</strong> in Settings. Claude, through an Anthropic API key; signing in
+          with a Claude subscription is not offered.</p></div></details>
+      <details class="qa"><summary>Where are my threads kept?</summary>
+        <div><p>In the extension's own storage on this computer. Removing the extension removes them; move a thread
+          to a <code>.spindle</code> file first to keep it.</p></div></details>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Spindle for Chrome · MIT · &copy; SiliconState</span>
+    <nav aria-label="Footer">
+      <a href="../">Spindle</a>
+      <a href="https://github.com/SiliconState/Spindle/blob/main/docs/chrome.md">Documentation</a>
+      <a href="https://github.com/SiliconState/Spindle/blob/main/SECURITY.md">Security</a>
+      <a href="https://github.com/SiliconState/Spindle">GitHub</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

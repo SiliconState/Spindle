@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spindle: an agent that lives wherever you work</title>
+<meta name="description" content="Spindle is an open-source, durable coding agent. Every step is a committed revision of the conversation, the files and the app state; a model request is never sent twice by accident; and the same engine runs in a terminal, on your server, inside your app or in your browser.">
+<meta property="og:title" content="Spindle: an agent that lives wherever you work">
+<meta property="og:description" content="A durable, embeddable coding agent. Open source, MIT.">
+<meta property="og:type" content="website">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="wrap">
+    <a class="mark" href="./" aria-label="Spindle home"><span class="glyph" aria-hidden="true">s</span>Spindle</a>
+    <nav aria-label="Site">
+      <a href="#principles">Principles</a>
+      <a href="#everywhere">Everywhere</a>
+      <a href="chrome/">Spindle for Chrome</a>
+      <a href="https://github.com/SiliconState/Spindle/tree/main/docs">Docs</a>
+      <a href="https://github.com/SiliconState/Spindle">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Open source · MIT · Spindle everywhere</p>
+      <h1>An agent that lives wherever you work.</h1>
+      <p class="lead">Spindle is a durable coding agent. <strong>Every step is a committed revision</strong> of
+        the conversation, the files and the app state, so a run that is killed resumes where it stopped,
+        a model request is never sent twice by accident, and going back restores all three at once.
+        The same engine runs in your terminal, on your server, inside your app, and in your browser.</p>
+      <div class="actions">
+        <a class="button primary" href="https://github.com/SiliconState/Spindle/blob/main/docs/getting-started.md">Get started</a>
+        <a class="button" href="chrome/">Spindle for Chrome &rarr;</a>
+        <a class="button" href="https://github.com/SiliconState/Spindle">View on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="thread-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">THE THREAD</span>
+        <h2 id="thread-h">Work is a thread of knots that stay tied.</h2>
+        <p>A spindle spins thread. Spindle spins work into revisions: each one commits what the
+          conversation said, what the workspace holds and what the app's state is, in one
+          transaction. Nothing committed is ever edited after.</p>
+      </div>
+      <figure class="diagram">
+        <svg viewBox="0 0 960 226" role="img" aria-labelledby="thread-t thread-d">
+          <title id="thread-t">A session as a thread of revisions</title>
+          <desc id="thread-d">Five revisions in a row: a prompt admitted, a model request reserved and sent once, its reply recorded, the files a command changed committed, and the answer. A rewind adds a sixth revision equal to the third, with fresh identities.</desc>
+          <path class="ink" d="M30 64 H870" stroke-width="2.5" fill="none"/>
+          <g>
+            <circle class="bg ink" cx="80" cy="64" r="13" stroke-width="2.5"/><text class="label" x="80" y="34" text-anchor="middle">r1</text>
+            <text class="small" x="80" y="102" text-anchor="middle">prompt</text><text class="small" x="80" y="118" text-anchor="middle">admitted</text>
+          </g>
+          <g>
+            <circle class="bg ink" cx="250" cy="64" r="13" stroke-width="2.5"/><text class="label" x="250" y="34" text-anchor="middle">r2</text>
+            <text class="small" x="250" y="102" text-anchor="middle">request reserved,</text><text class="small" x="250" y="118" text-anchor="middle">then sent once</text>
+          </g>
+          <g>
+            <circle class="bg ink" cx="420" cy="64" r="13" stroke-width="2.5"/><text class="label" x="420" y="34" text-anchor="middle">r3</text>
+            <text class="small" x="420" y="102" text-anchor="middle">reply recorded</text><text class="small" x="420" y="118" text-anchor="middle">before it is used</text>
+          </g>
+          <g>
+            <circle class="bg ink" cx="590" cy="64" r="13" stroke-width="2.5"/><text class="label" x="590" y="34" text-anchor="middle">r4</text>
+            <text class="small" x="590" y="102" text-anchor="middle">a command's files</text><text class="small" x="590" y="118" text-anchor="middle">committed with it</text>
+          </g>
+          <g>
+            <circle class="accf acc" cx="760" cy="64" r="13" stroke-width="2.5"/><text class="label" x="760" y="34" text-anchor="middle">r5</text>
+            <text class="small" x="760" y="102" text-anchor="middle">the answer</text>
+          </g>
+          <path class="acc" d="M760 132 C 760 196, 420 196, 420 134" stroke-width="2" stroke-dasharray="6 6" fill="none"/>
+          <path class="acc" d="M413 143 L420 131 L427 143" stroke-width="2" fill="none"/>
+          <text class="small" x="590" y="214" text-anchor="middle">rewind to r3: conversation, files and state together, as a new revision</text>
+          <text class="small" x="900" y="68">&hellip;</text>
+        </svg>
+        <figcaption>Each knot holds the conversation, a content-addressed tree of the workspace and the app's
+          JSON state. A request is reserved before it leaves and its reply recorded before it is used, so a
+          restart always knows whether something happened, did not, or cannot be known.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="block" id="principles" aria-labelledby="principles-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">01 &mdash; PRINCIPLES</span>
+        <h2 id="principles-h">Five rules, enforced by the store, not by convention.</h2>
+      </div>
+      <ol class="principles">
+        <li><h3>One revision holds everything.</h3><p>Conversation, workspace and app state commit together.
+          Go back, and all three come back: no files left over from a future that was undone.</p></li>
+        <li><h3>Sent at most once.</h3><p>Every model request is reserved before it leaves. A crash, a kill or
+          a dropped connection never quietly sends it again, and never quietly bills you twice.</p></li>
+        <li><h3>Unknown is said, not guessed.</h3><p>When a request's fate cannot be known, Spindle tells you
+          so. Continue never resends it; Retry sends it once more, on your word.</p></li>
+        <li><h3>The store decides; hosts act.</h3><p>A portable decision driver, with no network and no
+          clock, says what a turn needs next. Whatever hosts it performs the effect and hands the answer back.</p></li>
+        <li><h3>Sessions move.</h3><p>A session is a directory, or one file. Export it from one host and go
+          on in another: from your terminal to your browser and back, history and unknowns included.</p></li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="is-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">02 &mdash; WHAT IT IS</span>
+        <h2 id="is-h">An engine you can trust with an interruption.</h2>
+      </div>
+      <div class="contrast">
+        <div><b class="yes">Is: durable</b><p>Kill it mid-turn. Every committed step is still there, and the
+          turn resumes where it stopped.</p></div>
+        <div><b class="yes">Is: embeddable</b><p>A Rust crate, a JSON-RPC process, an HTTP host, or
+          WebAssembly inside your JavaScript app. Same rules in each.</p></div>
+        <div><b class="yes">Is: yours</b><p>Runs on your machine with your provider keys. Keys are read per
+          request and never written into a session.</p></div>
+        <div><b class="no">Is not: a hosted service</b><p>There is no Spindle cloud. Requests go from your
+          host to the provider you chose.</p></div>
+        <div><b class="no">Is not: magic exactly-once</b><p>It cannot unsend a request or refund a charge. It
+          tells you when one may have happened.</p></div>
+        <div><b class="no">Is not: a sandbox beyond its word</b><p>Commands run in a bubblewrap sandbox where
+          Linux allows; otherwise Spindle says so, or refuses if you required it.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="everywhere" aria-labelledby="everywhere-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">03 &mdash; SPINDLE EVERYWHERE</span>
+        <h2 id="everywhere-h">One core. Any host.</h2>
+        <p>Native or embedded, every host runs the same driver over the same store. They differ only in who
+          performs the effects: the native binary does it itself; an app (or the Chrome extension) does it for
+          the WebAssembly package.</p>
+      </div>
+      <figure class="diagram">
+        <svg viewBox="0 0 960 320" role="img" aria-labelledby="hosts-t hosts-d">
+          <title id="hosts-t">Spindle's hosts around one core</title>
+          <desc id="hosts-d">Four hosts at the top: your terminal, your server, your app and your browser. Each connects to the same core, the decision driver and the store, which hands effects to the host that runs it: model providers and command runners.</desc>
+          <g>
+            <rect class="bg ink" x="10" y="20" width="220" height="78" stroke-width="2"/>
+            <text class="title" x="28" y="52">Your terminal</text><text class="small" x="28" y="76">spindle new, say, continue</text>
+            <rect class="bg ink" x="250" y="20" width="220" height="78" stroke-width="2"/>
+            <text class="title" x="268" y="52">Your server</text><text class="small" x="268" y="76">spindle serve · phone · /v1</text>
+            <rect class="bg ink" x="490" y="20" width="220" height="78" stroke-width="2"/>
+            <text class="title" x="508" y="52">Your app</text><text class="small" x="508" y="76">JSON-RPC · HTTP · wasm</text>
+            <rect class="bg acc" x="730" y="20" width="220" height="78" stroke-width="2.5"/>
+            <text class="title" x="748" y="52">Your browser</text><text class="small" x="748" y="76">Spindle for Chrome</text>
+          </g>
+          <g class="line" stroke-width="1.5" fill="none">
+            <path d="M120 98 V138 H840 V98"/><path d="M360 98 V138"/><path d="M600 98 V138"/>
+            <path d="M480 138 V168"/>
+          </g>
+          <rect class="soft ink" x="250" y="168" width="460" height="86" stroke-width="2.5"/>
+          <text class="title" x="480" y="202" text-anchor="middle">Decision driver + store</text>
+          <text class="small" x="480" y="228" text-anchor="middle">revisions · objects · attempts · receipts · rewind</text>
+          <g class="line" stroke-width="1.5" fill="none"><path d="M480 254 V284"/></g>
+          <text class="label" x="480" y="310" text-anchor="middle">effects, performed by the host: model providers · command runners · app tools · tasks</text>
+        </svg>
+        <figcaption>The decision layer builds without native code: it compiles to WebAssembly, which is how the
+          Chrome extension carries Spindle whole.</figcaption>
+      </figure>
+      <div class="grid three" style="margin-top:16px">
+        <div class="card"><span class="tag">Terminal</span><h3>A CLI that survives you.</h3><p><code>spindle new</code>,
+          <code>say</code>, <code>continue</code>, <code>retry</code>, <code>rewind</code>. Sessions are directories
+          you can inspect, export and move.</p></div>
+        <div class="card"><span class="tag">Server</span><h3>Your agent, on your phone.</h3><p><code>spindle serve</code>
+          runs a mobile web UI and an HTTP API on loopback, paired per device, behind your own HTTPS proxy.</p></div>
+        <div class="card"><span class="tag">App</span><h3>Durability as a library.</h3><p>Drive sessions over
+          JSON-RPC or HTTP, or run the WebAssembly package in Node or a browser worker, with app tools whose calls
+          keep stable ids across crashes.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="products-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">04 &mdash; BUILT ON SPINDLE</span>
+        <h2 id="products-h">The first product: Spindle for Chrome.</h2>
+        <p>Spindle's durability and embeddability, carried whole into the browser. No server, no host
+          required: threads, a Linux, your keys and your files, all inside Chrome.</p>
+      </div>
+      <a class="card link" href="chrome/">
+        <span class="tag">Spindle for Chrome</span>
+        <h3>An agent that lives in your Chrome.</h3>
+        <p>Threads that keep going with the panel closed. bash, Python and Node in a Linux that runs inside the
+          browser. Page tools you switch on. Keys sealed on your machine, or sign in with ChatGPT. And every step
+          durable, because it is Spindle underneath.</p>
+        <span class="more">See Spindle for Chrome &rarr;</span>
+      </a>
+    </div>
+  </section>
+
+  <section class="block" id="start" aria-labelledby="start-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">05 &mdash; GET STARTED</span>
+        <h2 id="start-h">From source, in a minute of typing.</h2>
+        <p>Rust 1.89 or newer and a C compiler; on Linux, <code>bubblewrap</code> for sandboxed commands.</p>
+      </div>
+<pre><code>git clone https://github.com/SiliconState/Spindle.git
+cd Spindle/spindle
+cargo build --release --locked -p spindle-store --features cli --bin spindle
+
+./target/release/spindle login deepseek          <span class="c"># or any provider: spindle providers</span>
+./target/release/spindle --dir ../demo new --provider deepseek --isolation required \
+  "Create a small command-line calculator with tests"
+./target/release/spindle --dir ../demo continue  <span class="c"># after any interruption</span></code></pre>
+      <div class="actions">
+        <a class="button" href="https://github.com/SiliconState/Spindle/blob/main/docs/getting-started.md">Getting started</a>
+        <a class="button" href="https://github.com/SiliconState/Spindle/blob/main/docs/architecture.md">Architecture</a>
+        <a class="button" href="https://github.com/SiliconState/Spindle/blob/main/docs/API.md">API</a>
+      </div>
+      <p class="callout warn"><strong>Experimental, single-operator software.</strong> Spindle cannot unsend a
+        request, refund a charge, or undo what a command did outside its workspace. Read
+        <a href="https://github.com/SiliconState/Spindle/blob/main/SECURITY.md">the security notes</a> before giving it
+        real work.</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Spindle · MIT · &copy; SiliconState</span>
+    <nav aria-label="Footer">
+      <a href="chrome/">Spindle for Chrome</a>
+      <a href="https://github.com/SiliconState/Spindle/tree/main/docs">Documentation</a>
+      <a href="https://github.com/SiliconState/Spindle/blob/main/SECURITY.md">Security</a>
+      <a href="https://github.com/SiliconState/Spindle">GitHub</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>
