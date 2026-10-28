@@ -7,10 +7,11 @@ restores all three at once.
 
 Spindle runs as a native command (`spindle`), as a browser host for phones and desktops
 (`spindle serve`), behind a JSON-RPC or HTTP API for your own programs, as a WebAssembly
-package inside a JavaScript app, and as a Chrome extension that needs no server at all.
+package inside a JavaScript app, and as a browser extension for Chrome and Edge that needs no
+server at all.
 
 Website: [siliconstate.github.io/Spindle](https://siliconstate.github.io/Spindle/), with a page
-for [Spindle for Chrome](https://siliconstate.github.io/Spindle/chrome/).
+for [Spindle for Browser](https://siliconstate.github.io/Spindle/browser/).
 
 > **Status:** experimental, single-operator software. Read [SECURITY.md](SECURITY.md)
 > before giving it real work.
@@ -26,7 +27,7 @@ for [Spindle for Chrome](https://siliconstate.github.io/Spindle/chrome/).
   revision; a call made again after a rewind gets a fresh id.
 - **The store decides, hosts act.** A portable decision driver (no network, no clocks,
   builds for wasm) tells a host what the turn needs next. The native host, the embedded
-  package and the Chrome extension all run the same driver.
+  package and the browser extension all run the same driver.
 - **Sessions move.** Export a session to a single-file bundle and continue it in another
   host: terminal to browser and back.
 
@@ -52,6 +53,11 @@ Interrupted? `spindle --dir ../demo continue`. Browser UI:
 `spindle --dir ../host serve --port 8790`, then pair with the key in
 `../host/pairing.key`. Full walkthrough: [docs/getting-started.md](docs/getting-started.md).
 
+Spindle for Browser (Chrome and Edge) needs no build: download `spindle-browser-VERSION.zip`
+from the [latest release](https://github.com/SiliconState/Spindle/releases/latest), unzip it,
+and load the folder with **Load unpacked**
+([docs/chrome.md](docs/chrome.md#install-a-release)).
+
 ## Architecture
 
 ```mermaid
@@ -60,7 +66,7 @@ flowchart LR
     Stdio["spindle api<br/>JSON-RPC"] --> Native
     Serve["spindle serve<br/>web UI + HTTP /v1"] --> Native
     App["JS app"] --> Embedded
-    Chrome["Chrome extension"] --> Embedded
+    Chrome["Browser extension"] --> Embedded
 
     Native["Native host<br/>performs effects"] --> Driver
     Embedded["Embedded host, wasm<br/>app performs effects"] --> Driver
@@ -83,7 +89,7 @@ More diagrams and the full picture: [docs/architecture.md](docs/architecture.md)
 | [Architecture](docs/architecture.md) | [Clients](docs/clients.md) | [Tools and execution](docs/tools.md) |
 | [Security](SECURITY.md) | [Testing](docs/testing.md) | [Browser host](docs/host.md) |
 | | | [Embedded package](docs/embedded.md) |
-| | | [Chrome extension](docs/chrome.md) |
+| | | [Browser extension](docs/chrome.md) |
 | | | [Browser Linux](docs/browser-linux.md) |
 | | | [Engine crates](docs/engine.md) |
 
@@ -97,7 +103,7 @@ All of it is indexed in [docs/README.md](docs/README.md).
 | [`spindle/store/ui`](spindle/store/ui) | The web UI, embedded into the binary (no frontend build step) |
 | [`spindle/embed`](spindle/embed) | `spindle-embed`: the WebAssembly package with Node and browser storage |
 | [`spindle/clients`](spindle/clients) | Dependency-free Node.js and Python clients |
-| [`spindle/chrome`](spindle/chrome) | Spindle for Chrome and the Linuxes it runs commands in |
+| [`spindle/chrome`](spindle/chrome) | Spindle for Browser and the Linuxes it runs commands in |
 | [`spindle/src`](spindle/src) | `spindle-reference`: an in-memory reference model of the store's rules |
 | [`dext-engine`](dext-engine) | Engine crates: model and turn types, transcripts, provider catalog and wire formats, the strict runner |
 | [`docs`](docs) | Documentation |

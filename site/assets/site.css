@@ -96,6 +96,9 @@ pre .c { color: var(--muted); }
 .button.primary { background: var(--ink); color: var(--page); }
 .button.primary:hover { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .note { font-size: 14px; color: var(--muted); }
+.trust { font: 500 13px/1.5 var(--mono); letter-spacing: .04em; color: var(--ink); margin: 22px 0 6px; }
+.hero .note { margin: 0; }
+.subhead { margin: 40px 0 8px; }
 
 /* ---- Sections -------------------------------------------------------------------- */
 .hero { padding: clamp(56px, 9vw, 112px) 0 clamp(40px, 6vw, 72px); }
