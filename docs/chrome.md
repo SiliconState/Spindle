@@ -406,8 +406,9 @@ of the workspace. The message gets a trailing line `[Attached, in the workspace:
 files back from the workspace so they can be sent again.
 
 **Out.** The panel shows what a turn's file tools wrote as cards under the step that wrote it, and
-lists the whole workspace once, by folder, just above the last turn's final answer (at the end
-when the turn ended without one), marking files as new or edited (`turnFiles` compares digests
+lists the whole workspace once, by folder, in a card folded until the user opens it, just above
+the last turn's final answer (at the end when the turn ended without one), marking files as new
+or edited (`turnFiles` compares digests
 with the workspace before the turn), whether a file tool or a command made them. Scratch files (`isScratch`:
 `.txt`, `.py`, `.pyc`, `.log`, `.tmp`, and anything under `test/`, `tests/`, `__pycache__/` or
 `.cache/`) are hidden until shown. The workspace also has a page of its own in the panel, and

@@ -351,6 +351,10 @@ for (const theme of THEMES) {
   await shot(`${name}-7-step-open`);
   // The workspace page: the list (scratch hidden), then a file open.
   say(`${name}: the workspace page`);
+  // The card is folded until opened, as the user opens it.
+  const closed = await panel.eval(`!document.querySelector('#history .workspace-card').open`);
+  if (!closed) throw new Error('the workspace card opened by itself');
+  await panel.click('#history .workspace-card > summary');
   await panel.click('#history .workspace-card .ws-tools .link-like');
   await panel.until(`document.body.dataset.view === 'workspace' && document.querySelector('#file-list .file-row') || null`, { what: 'the workspace page' });
   const page1 = await panel.eval(`({ rows: [...document.querySelectorAll('#file-list .file-row')].filter((r) => !r.hidden).map((r) => r.dataset.path), hiddenNote: document.querySelector('#file-list .ws-hidden')?.textContent ?? null, heading: document.querySelector('#ws-heading').textContent, back: document.querySelector('#home').getAttribute('aria-label') })`);

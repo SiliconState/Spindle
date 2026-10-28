@@ -910,13 +910,14 @@ try {
   const notesListed = await panel.until(`document.querySelector('#history .workspace-card .file-row[data-path="notes.md"]') && true`, { what: 'the command\'s notes.md in the workspace card' }).catch((error) => error.message);
   const commandLists = await panel.eval(`document.querySelectorAll('#history .file-group').length`);
   const cardAboveAnswer = await panel.eval(`(() => { const card = document.querySelector('#history .workspace-card'); const answers = [...document.querySelectorAll('#history article.message-wrap.assistant')]; return Boolean(card) && card.nextElementSibling === answers.at(-1); })()`);
+  const cardFolded = await panel.eval(`!document.querySelector('#history .workspace-card').open`);
   // Its summary counts the files once they are listed.
   const workspaceListed = await panel.until(`(() => { const text = document.querySelector('#history .workspace-card summary')?.textContent ?? ''; return /\\d+ files?/.test(text) && text; })()`, { what: 'the workspace card' }).catch((error) => error.message);
   const tabsAfter = await reportTabs();
   for (const tab of tabsAfter) await browser.send('Target.closeTarget', { targetId: tab.targetId }).catch(() => {});
   const saved = fs.readFileSync(await downloadBy(panel, '#history .file-card[data-path="report.html"] button[title="Download report.html"]', /^report\.html$/)).toString();
   await panel.screenshot(join(shots, '03h-files-in-conversation.png'));
-  check('what a thread makes shows in the conversation: a report (written to /workspace/report.html) as a page running shut off from the network, the web on a click, Download, opened in a tab by navigate; what its commands made in the one workspace card, just above the final answer', () => {
+  check('what a thread makes shows in the conversation: a report (written to /workspace/report.html) as a page running shut off from the network, the web on a click, Download, opened in a tab by navigate; what its commands made in the one workspace card, folded, just above the final answer', () => {
     assert.equal(conversed, 'idle', `state ${conversed}`);
     assert.equal(reportCard, true, `the report's card shows its page: ${reportCard}`);
     assert.ok(ran, `the page's script ran in the card (its frames said: ${JSON.stringify(cardSaid())})`);
@@ -928,6 +929,7 @@ try {
     assert.equal(notesListed, true, `the command's notes.md is in the workspace card: ${notesListed}`);
     assert.equal(commandLists, 0, 'no separate list of what the commands made');
     assert.equal(cardAboveAnswer, true, 'the workspace card is just above the final answer');
+    assert.equal(cardFolded, true, 'the workspace card stays folded until opened');
     assert.match(String(workspaceListed), /Workspace · \d+ files/, `the workspace card: ${workspaceListed}`);
     assert.equal(saved.trim(), report.trim(), 'Download saves the report as written');
   });

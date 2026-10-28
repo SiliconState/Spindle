@@ -1217,8 +1217,9 @@ function workspaceCard(id) {
       return;
     }
     const fresh = files.filter((file) => changes.has(file.path)).length;
+    // Folded until the user opens it: its summary says what is there, and an open list
+    // would stand between the steps and the final answer.
     summary.textContent = `Workspace · ${files.length} file${files.length === 1 ? '' : 's'}${fresh ? ` · ${fresh} new or edited` : ''}`;
-    card.open = files.length <= 8 || fresh > 0;
     const tree = el('div', 'ws-tree');
     const toggle = scratchSwitch(() => drawTree(tree, files, changes, { onOpen: (path) => openWorkspace(id, path) }));
     const tools = el('div', 'ws-tools');
