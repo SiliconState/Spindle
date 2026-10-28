@@ -1,0 +1,32 @@
+{"error":{"code":-32700,"data":{"code":"parse_error"},"message":"not JSON: key must be a string at line 1 column 2"},"id":null,"jsonrpc":"2.0"}
+{"error":{"code":-32600,"data":{"code":"invalid_request"},"message":"batches are not supported; send one request per line"},"id":null,"jsonrpc":"2.0"}
+{"error":{"code":-32600,"data":{"code":"invalid_request"},"message":"a request is a JSON object"},"id":null,"jsonrpc":"2.0"}
+{"error":{"code":-32600,"data":{"code":"invalid_request"},"message":"`id` must be a string, a number or null"},"id":null,"jsonrpc":"2.0"}
+{"error":{"code":-32600,"data":{"code":"invalid_request"},"message":"`jsonrpc` must be \"2.0\""},"id":1,"jsonrpc":"2.0"}
+{"error":{"code":-32600,"data":{"code":"invalid_request"},"message":"`method` must be a string"},"id":2,"jsonrpc":"2.0"}
+{"error":{"code":-32601,"data":{"code":"method_not_found"},"message":"no method `nope`"},"id":3,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`params` must be an object"},"id":4,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"unknown parameter `x`"},"id":5,"jsonrpc":"2.0"}
+{"error":{"code":-32004,"data":{"code":"not_found"},"message":"no session in /nonexistent-spindle-golden/x; create one first"},"id":"six","jsonrpc":"2.0"}
+{"error":{"code":-32002,"data":{"code":"not_running"},"message":"this session is not open in this process"},"id":7,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`text` must be 1 byte to 4 MiB and not blank"},"id":8,"jsonrpc":"2.0"}
+{"id":9,"jsonrpc":"2.0","result":{"sessions":[]}}
+{"error":{"code":-32004,"data":{"code":"not_found"},"message":"no session in /nonexistent-spindle-golden/x; create one first"},"id":10,"jsonrpc":"2.0"}
+{"id":11,"jsonrpc":"2.0","result":{"closed":false,"session":"/nonexistent-spindle-golden/x"}}
+{"error":{"code":-32002,"data":{"code":"not_running"},"message":"this session is not open in this process"},"id":12,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`text` must be 1 to 65536 bytes and not blank"},"id":13,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`patch` is a JSON merge patch: an object"},"id":14,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`call` names the app tool call answered"},"id":15,"jsonrpc":"2.0"}
+{"error":{"code":-32002,"data":{"code":"not_running"},"message":"this session is not open in this process"},"id":16,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"unknown parameter `colour`"},"id":17,"jsonrpc":"2.0"}
+{"error":{"code":-32004,"data":{"code":"not_found"},"message":"no session in /nonexistent-spindle-golden/x"},"id":18,"jsonrpc":"2.0"}
+{"error":{"code":-32004,"data":{"code":"not_found"},"message":"no session in /nonexistent-spindle-golden/x"},"id":19,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`provider` is required"},"id":20,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`../a` is not a workspace path (relative, without empty, `.` or `..` parts)"},"id":21,"jsonrpc":"2.0"}
+{"error":{"code":-32004,"data":{"code":"not_found"},"message":"no session in /nonexistent-spindle-golden/x"},"id":22,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`until` is unknown"},"id":23,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`revision` is required (see `targets`)"},"id":24,"jsonrpc":"2.0"}
+{"error":{"code":-32004,"data":{"code":"not_found"},"message":"no session in /nonexistent-spindle-golden/x"},"id":25,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`dir` is required"},"id":26,"jsonrpc":"2.0"}
+{"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`dir` is required"},"id":27,"jsonrpc":"2.0"}
+{"id":28,"jsonrpc":"2.0","result":{"api_version":1,"build":"BUILD","engine":"dext-turn-v1","features":["events","expected_head","steering","attachments","import","revisions","export","doctor","usage","display","steer_now","app_tools","state","recover","tasks","session_transfer"],"schema":19,"transport":"stdio","version":"0.1.0"}}

@@ -1,0 +1,114 @@
+diff -ruN a/core/src/ffi/primitives.rs b/core/src/ffi/primitives.rs
+--- a/core/src/ffi/primitives.rs
++++ b/core/src/ffi/primitives.rs
+@@ -139,8 +139,8 @@
+     crate::cfg_select! {
+         any(
+             all(target_pointer_width = "64", not(windows)),
+-            // wasm32 Linux ABI uses 64-bit long
+-            all(target_arch = "wasm32", target_os = "linux")
++            // wasm32 Linux ABI (WALI) uses 64-bit long; Spindle's (arch/wasm) does not
++            all(target_arch = "wasm32", target_os = "linux", not(target_vendor = "spindle"))
+         ) => {
+             pub(super) type c_long = i64;
+             pub(super) type c_ulong = u64;
+diff -ruN a/std/src/os/linux/raw.rs b/std/src/os/linux/raw.rs
+--- a/std/src/os/linux/raw.rs
++++ b/std/src/os/linux/raw.rs
+@@ -237,7 +237,9 @@
+     target_arch = "s390x",
+     target_arch = "sparc64",
+     target_arch = "riscv64",
+-    target_arch = "riscv32"
++    target_arch = "riscv32",
++    // Spindle's wasm32 Linux (arch/wasm, musl): libc's own definitions
++    all(target_arch = "wasm32", target_vendor = "spindle")
+ ))]
+ mod arch {
+     #[stable(feature = "raw_ext", since = "1.1.0")]
+@@ -312,7 +314,7 @@
+ 
+ #[cfg(any(target_arch = "x86_64", target_arch = "powerpc64",
+     // `wasm32-wali-linux-musl` uses ABI similar to x86_64
+-    target_arch = "wasm32"))]
++    all(target_arch = "wasm32", not(target_vendor = "spindle"))))]
+ mod arch {
+     use crate::os::raw::{c_int, c_long};
+ 
+diff -ruN a/std/src/sys/args/mod.rs b/std/src/sys/args/mod.rs
+--- a/std/src/sys/args/mod.rs
++++ b/std/src/sys/args/mod.rs
+@@ -15,7 +15,7 @@
+ 
+ cfg_select! {
+     any(
+-        all(target_family = "unix", not(any(all(target_family = "wasm", target_os = "linux"), target_os = "espidf", target_os = "vita"))),
++        all(target_family = "unix", not(any(all(target_family = "wasm", target_os = "linux", not(target_vendor = "spindle")), target_os = "espidf", target_os = "vita"))),
+         target_os = "hermit",
+     ) => {
+         mod unix;
+@@ -45,7 +45,7 @@
+         mod wasi;
+         pub use wasi::*;
+     }
+-    all(target_family = "wasm", target_os = "linux") => {
++    all(target_family = "wasm", target_os = "linux", not(target_vendor = "spindle")) => {
+         mod wali;
+         pub use wali::*;
+     }
+diff -ruN a/std/src/sys/pal/unix/stack_overflow.rs b/std/src/sys/pal/unix/stack_overflow.rs
+--- a/std/src/sys/pal/unix/stack_overflow.rs
++++ b/std/src/sys/pal/unix/stack_overflow.rs
+@@ -27,6 +27,8 @@
+ 
+ #[cfg(all(
+     not(miri),
++    // Spindle's wasm Linux has no MMU, so no guard pages to catch an overflow with
++    not(all(target_family = "wasm", target_vendor = "spindle")),
+     any(
+         target_os = "linux",
+         target_os = "freebsd",
+@@ -45,6 +47,8 @@
+ // hence we disable it on miri.
+ #[cfg(all(
+     not(miri),
++    // Spindle's wasm Linux has no MMU, so no guard pages to catch an overflow with
++    not(all(target_family = "wasm", target_vendor = "spindle")),
+     any(
+         target_os = "linux",
+         target_os = "freebsd",
+@@ -636,6 +640,7 @@
+ // <https://github.com/apple/swift/blob/swift-5.10-RELEASE/stdlib/public/runtime/CrashHandlerMacOS.cpp>
+ #[cfg(any(
+     miri,
++    all(target_family = "wasm", target_vendor = "spindle"),
+     not(any(
+         target_os = "linux",
+         target_os = "freebsd",
+diff -ruN a/std/src/sys/process/unix/unix.rs b/std/src/sys/process/unix/unix.rs
+--- a/std/src/sys/process/unix/unix.rs
++++ b/std/src/sys/process/unix/unix.rs
+@@ -187,12 +187,22 @@
+         target_os = "watchos",
+         target_os = "tvos",
+         target_os = "nto",
+-        target_os = "qnx"
++        target_os = "qnx",
++        all(target_os = "linux", target_vendor = "spindle"),
+     )))]
+     unsafe fn do_fork(&mut self) -> Result<pid_t, io::Error> {
+         cvt(libc::fork())
+     }
+ 
++    // Spindle's wasm Linux has no MMU and so no `fork`: only the `posix_spawn` path spawns.
++    #[cfg(all(target_os = "linux", target_vendor = "spindle"))]
++    unsafe fn do_fork(&mut self) -> Result<pid_t, io::Error> {
++        Err(io::const_error!(
++            ErrorKind::Unsupported,
++            "this spawn needs `fork`, which Spindle's wasm Linux does not have",
++        ))
++    }
++
+     // On QNX SDP, fork can fail with EBADF in case "another thread might have opened
+     // or closed a file descriptor while the fork() was occurring".
+     // Documentation says "... or try calling fork() again". This is what we do here.

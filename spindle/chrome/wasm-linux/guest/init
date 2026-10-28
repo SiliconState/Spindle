@@ -1,0 +1,14 @@
+#!/bin/sh
+# The wasm Linux's first process (/sbin/init in its image): the mounts every command's
+# sandbox builds on, then the runner agent (src/agent.rs), which is init from then on.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+mount -t proc proc /proc
+mount -t devtmpfs dev /dev
+mkdir -p /dev/pts /dev/shm
+mount -t tmpfs run /run
+# Each CPU keeps its own timers: an idle one would hand them to a busy one, and one a
+# runaway holds (a task that never calls the kernel) takes no timer interrupt, so the
+# agent's own waits and the console's would never end.
+echo 0 > /proc/sys/kernel/timer_migration
+hostname spindle
+exec /usr/local/bin/spindle-agent

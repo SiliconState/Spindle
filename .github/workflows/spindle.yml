@@ -1,0 +1,182 @@
+name: Spindle checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install sandbox fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap python3 nodejs
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Formatting and all-feature lint
+        working-directory: spindle
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked -p spindle-store --all-targets --all-features --no-deps -- -D warnings
+      - name: Native debug and release regressions
+        working-directory: spindle
+        run: |
+          cargo test --locked --workspace --all-features
+          cargo build --locked --workspace --all-features --release
+          cargo test --locked --workspace --all-features --release
+      - name: Native engine libraries
+        working-directory: dext-engine
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked -p dext-native --all-targets --all-features --no-deps -- -D warnings
+          cargo test --locked -p dext-core -p dext-transcript -p dext-native -p dext-provider --all-features
+      - name: Clients and UI
+        working-directory: spindle
+        run: |
+          SPINDLE_BIN="$PWD/target/release/spindle" node clients/js/smoke_test.mjs
+          SPINDLE_BIN="$PWD/target/release/spindle" python3 clients/python/smoke_test.py
+          node --test store/tests/ui.mjs store/tests/ui_app.mjs
+      - name: Audit tooling
+        run: |
+          cargo install cargo-audit --version 0.22.0 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+      - name: Dependency and license gates
+        run: |
+          (cd spindle && cargo audit --deny warnings && cargo deny --workspace --all-features check licenses)
+          (cd dext-engine && cargo audit --deny warnings && cargo deny --workspace --all-features check licenses)
+  portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ['', dext-turn, dext-image-continuation, driver, workspace-tools, shape, embedded]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Portable feature gates
+        working-directory: spindle
+        env:
+          FEATURES: ${{ matrix.features }}
+        shell: bash
+        run: |
+          args=(--no-default-features)
+          if [ -n "$FEATURES" ]; then args+=(--features "$FEATURES"); fi
+          cargo clippy --locked -p spindle-store --all-targets --no-deps "${args[@]}" -- -D warnings
+          cargo test --locked -p spindle-store "${args[@]}"
+      - name: Native-free driver dependencies
+        if: matrix.features == 'driver'
+        working-directory: spindle
+        shell: bash
+        run: |
+          cargo tree --locked -p spindle-store --no-default-features --features driver -e normal --prefix none > driver-tree.txt
+          if grep -E '^(dext-native|dext-provider|reqwest|tokio) ' driver-tree.txt; then exit 1; fi
+      - name: Native-free embedded host dependencies
+        if: matrix.features == 'embedded'
+        working-directory: spindle
+        shell: bash
+        run: |
+          # The embedded host shapes requests and parses streams; it never sends one.
+          cargo tree --locked -p spindle-store --no-default-features --features embedded -e normal --prefix none --target wasm32-unknown-unknown > embedded-tree.txt
+          if grep -E '^(reqwest|tokio|image|ring|rustls) ' embedded-tree.txt; then exit 1; fi
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Portable targets and private WASI sysroot
+        run: |
+          rustup target add wasm32-unknown-unknown wasm32-wasip1 i686-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y clang
+          # Extracted, not installed: the probe's C sysroot must not include host headers.
+          cd "$RUNNER_TEMP"
+          apt-get download wasi-libc
+          dpkg-deb -x wasi-libc_*.deb wasi-root
+      - name: Pure provider and wire regressions
+        working-directory: dext-engine
+        run: |
+          cargo test --locked -p dext-provider --no-default-features
+          cargo test --locked -p dext-native --no-default-features --features wire
+          cargo clippy --locked -p dext-provider --no-default-features --all-targets --no-deps -- -D warnings
+          cargo clippy --locked -p dext-native --no-default-features --features wire --all-targets --no-deps -- -D warnings
+          cargo check --locked -p dext-provider --no-default-features --target wasm32-unknown-unknown
+          cargo check --locked -p dext-native --no-default-features --features wire --target wasm32-unknown-unknown
+          # Dependency guards read the browser target's graph, not the Linux host's.
+          cargo tree --locked -p dext-provider --no-default-features -e normal --prefix none --target wasm32-unknown-unknown > provider-tree.txt
+          cargo tree --locked -p dext-native --no-default-features --features wire -e normal --prefix none --target wasm32-unknown-unknown > wire-tree.txt
+          if grep -E '^(reqwest|tokio|image|libc|getrandom|wasm-bindgen|js-sys) ' provider-tree.txt wire-tree.txt; then exit 1; fi
+      - name: Browser-target store compile
+        working-directory: spindle
+        run: |
+          cargo clippy --locked -p spindle-store --no-default-features --features driver --lib --target wasm32-unknown-unknown --no-deps -- -D warnings
+          cargo clippy --locked -p spindle-store --no-default-features --features embedded --lib --target wasm32-unknown-unknown --no-deps -- -D warnings
+      - name: WASI authority probe
+        working-directory: spindle
+        shell: bash
+        run: store/tests/wasi_probe.sh "$RUNNER_TEMP/wasi-root"
+      - name: Embedded package (Node and headless Chrome)
+        working-directory: spindle
+        shell: bash
+        run: |
+          cargo clippy --locked -p spindle-embed --all-targets --no-deps -- -D warnings
+          cargo clippy --locked -p spindle-embed --lib --target wasm32-unknown-unknown --no-deps -- -D warnings
+          version=$(sed -n 's/^wasm-bindgen = "=\(.*\)"$/\1/p' embed/Cargo.toml)
+          cargo install wasm-bindgen-cli --version "$version" --locked --root "$RUNNER_TEMP/wasm-bindgen"
+          # The native host the package's cross-host cases need (the remote runner on
+          # `spindle serve`, sessions moving in place).
+          cargo build --locked -p spindle-store --features cli --bin spindle
+          # A headless Node test of the package against a scripted model, then OPFS
+          # sessions behind Web Locks in the runner image's Chrome.
+          SPINDLE_BIN="$PWD/target/debug/spindle" \
+          SPINDLE_BROWSER="$(command -v google-chrome || command -v chromium || true)" \
+            embed/tests/package.sh "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen"
+          # The Linux its threads run bash in (pinned downloads, no root; its boot image
+          # is made in a user namespace, which this runner's AppArmor blocks by default),
+          # checked booted in Node: commands, files, timeouts, the code-mode bridge, and
+          # its network (real websites through the gateway, a WISP relay in the test).
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          # Its `spindle` command (Rust, built into the image by build.sh) checked first.
+          (cd chrome/linux/command && cargo fmt -- --check \
+            && cargo clippy --locked --release --target i686-unknown-linux-musl -- -D warnings)
+          chrome/linux/build.sh
+          node chrome/tests/linux_node.mjs chrome/linux/dist
+          # Spindle for Chrome, built and driven through its panel in the runner's
+          # Chrome against a scripted provider (no account).
+          chrome/build.sh "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen"
+          SPINDLE_BIN="$PWD/target/debug/spindle" SPINDLE_BROWSER="$(command -v google-chrome)" \
+            node chrome/tests/extension_real.mjs chrome/dist --scripted
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Native store and CLI
+        working-directory: spindle
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked -p spindle-store --all-targets --all-features --no-deps -- -D warnings
+          cargo build --locked --workspace --all-features --release
+          cargo test --locked --workspace --all-features --release
+      - name: Native engine and host runner
+        working-directory: dext-engine
+        shell: bash
+        run: |
+          cargo clippy --locked -p dext-core -p dext-transcript -p dext-native -p dext-provider --all-targets --all-features --no-deps -- -D warnings
+          cargo test --locked -p dext-core -p dext-transcript -p dext-native -p dext-provider --all-features --release

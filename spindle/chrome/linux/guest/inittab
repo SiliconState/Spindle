@@ -1,0 +1,7 @@
+# Spindle's browser Linux: no logins. The startup script mounts what commands need and
+# sets up the network card; the agent takes commands from the serial line, and the web
+# proxy carries commands' HTTP and HTTPS to Chrome; each is restarted if it ever stops.
+::sysinit:/etc/spindle/sysinit
+::respawn:/usr/bin/python3 -I /opt/spindle/agent.py
+::respawn:/usr/bin/python3 -I /opt/spindle/proxy.py
+::shutdown:/bin/umount -a -r

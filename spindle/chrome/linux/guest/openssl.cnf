@@ -1,0 +1,19 @@
+# The certificates the browser Linux makes for itself (sysinit, proxy.py): its own
+# authority, and one for each site a command opens over HTTPS through Chrome.
+[req]
+distinguished_name = dn
+prompt = no
+
+[dn]
+
+[ca]
+basicConstraints = critical, CA:true, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+
+[site]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid

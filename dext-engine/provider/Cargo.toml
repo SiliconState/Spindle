@@ -1,0 +1,32 @@
+[package]
+name = "dext-provider"
+version = "0.2.1"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[features]
+default = ["native"]
+native = ["dep:reqwest", "dep:libc", "dep:getrandom"]
+test-support = ["native"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+dext-core = { path = "../core" }
+dext-transcript = { path = "../transcript" }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+getrandom = { version = "0.4", optional = true }
+http = "1"
+url = "2"
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls", "stream", "blocking", "gzip", "brotli", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "process", "io-util"] }

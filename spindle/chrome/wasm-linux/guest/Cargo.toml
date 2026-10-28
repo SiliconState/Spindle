@@ -1,0 +1,34 @@
+# The programs of Spindle's wasm Linux that are Spindle's own: its runner agent (with the
+# sandbox it puts each command in) and the `spindle` command (the browser Linux's, from
+# chrome/linux/command, unchanged). Built for wasm32-spindle-linux-musl by
+# chrome/wasm-linux/build-image.sh (with build-rust.sh's cargo-wasm-linux).
+[package]
+name = "spindle-wasm-guest"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "spindle-agent"
+path = "src/agent.rs"
+
+[[bin]]
+name = "spindle"
+path = "../../linux/command/src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+libc = "0.2.189"
+# Objects keep their order, as the replies come.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+# Its own build, not one of the workspace's crates.
+[workspace]

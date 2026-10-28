@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f6f2e9">
+<title>Spindle · file</title>
+<link rel="stylesheet" href="panel.css">
+<script src="theme.js"></script>
+<style>
+  body { height: 100vh; display: flex; flex-direction: column; }
+  #view-bar { display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-bottom: 1px solid var(--rule); background: var(--page); font-size: 12px; }
+  #view-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  #view-bar button { min-height: 0; padding: 3px 10px; font-size: 11px; }
+  #view { flex: 1; min-height: 0; border: 0; width: 100%; overflow: auto; }
+  iframe#view { background: #fff; }
+  #view.view-picture { display: flex; align-items: flex-start; justify-content: center; padding: 16px; }
+  #view.view-picture img { max-width: 100%; }
+  #view.view-markdown, #view.view-text, #view.view-bytes { padding: 16px 20px; max-width: 860px; margin: 0 auto; width: 100%; box-sizing: border-box; }
+  #view pre.code { white-space: pre-wrap; overflow-wrap: anywhere; }
+  #view-note { margin: 6px 12px; }
+</style>
+</head>
+<body>
+<div id="view-bar"><strong>Spindle</strong><span id="view-path"></span><button id="view-web" type="button" hidden title="Let this page load from the web over HTTPS (it still cannot reach Spindle)">Load from the web</button><button id="view-reload" type="button">Reload</button><button id="view-download" type="button">Download</button></div>
+<p id="view-note" class="note" hidden></p>
+<script type="module" src="view.mjs"></script>
+</body>
+</html>

@@ -1,0 +1,389 @@
+{
+  "events": [
+    {
+      "text": "[t:files] write and read a file",
+      "type": "prompt"
+    },
+    {
+      "model": "fake-model",
+      "provider": "fake",
+      "step": 1,
+      "type": "model_step"
+    },
+    {
+      "input": 1000,
+      "output": 100,
+      "type": "usage"
+    },
+    {
+      "billing": "unpriced",
+      "total": 0.0,
+      "turn": 0.0,
+      "type": "cost",
+      "usd": 0.0
+    },
+    {
+      "id": "call_1",
+      "input": {
+        "content": "hi\n",
+        "path": "a.txt"
+      },
+      "name": "write_file",
+      "type": "tool_call"
+    },
+    {
+      "type": "output_end"
+    },
+    {
+      "content": "Created a.txt (3 bytes)",
+      "failed": false,
+      "type": "tool_result"
+    },
+    {
+      "model": "fake-model",
+      "provider": "fake",
+      "step": 2,
+      "type": "model_step"
+    },
+    {
+      "input": 1000,
+      "output": 100,
+      "type": "usage"
+    },
+    {
+      "billing": "unpriced",
+      "total": 0.0,
+      "turn": 0.0,
+      "type": "cost",
+      "usd": 0.0
+    },
+    {
+      "id": "call_2",
+      "input": {
+        "path": "a.txt"
+      },
+      "name": "read_file",
+      "type": "tool_call"
+    },
+    {
+      "type": "output_end"
+    },
+    {
+      "content": "     1\thi\n",
+      "failed": false,
+      "type": "tool_result"
+    },
+    {
+      "model": "fake-model",
+      "provider": "fake",
+      "step": 3,
+      "type": "model_step"
+    },
+    {
+      "text": "done",
+      "type": "model_delta"
+    },
+    {
+      "text": "",
+      "type": "model_text"
+    },
+    {
+      "input": 1000,
+      "output": 100,
+      "type": "usage"
+    },
+    {
+      "billing": "unpriced",
+      "total": 0.0,
+      "turn": 0.0,
+      "type": "cost",
+      "usd": 0.0
+    },
+    {
+      "complete": true,
+      "files": 1,
+      "reason": "done",
+      "revision": 9,
+      "steps": 3,
+      "type": "stopped"
+    }
+  ],
+  "outcome": "ok",
+  "requests": [
+    "{\"max_tokens\":4096,\"messages\":[{\"content\":\"You are a coding agent. You work in a workspace with the bash, run_code, read_file, read_output, write_file, edit_file, start_job, read_job and stop_job tools (show puts files in the chat, settings changes this thread's model and options); commands start in the workspace directory, so refer to files by relative paths. Prefer one run_code script over many small tool calls when work spans several files or steps. Commands have no internet access, but local sockets work (loopback servers, IPC). Workspace files persist between calls; use $TMPDIR for scratch files, which are not kept. Workspace paths are relative (any UTF-8 name; .git, symbolic links and empty directories are kept), up to 50,000 entries, 64 MiB per file and 2 GiB in all. A bash or run_code command ends with its call; for servers, watchers and long builds or test runs use start_job, which keeps a command running in the background over a snapshot of the workspace (its file changes are not saved) while you continue: read_job shows its output (and can wait for more), stop_job ends it. Prefer edit_file for small changes to existing files. You may issue several tool calls at once; they run in order, each on the workspace the previous one left. Check results and keep going until the task is done. Then reply with a short plain-text summary of what you did.\",\"role\":\"system\"},{\"content\":\"[t:files] write and read a file\",\"role\":\"user\"}],\"model\":\"fake-model\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Run a bash command in the workspace directory. Do not use the network. Output defaults to an 8 KiB window; max_output selects 4096–32768 bytes. Larger output is retained as an artifact for read_output. timeout is in seconds (default 30, max 1800).\",\"name\":\"bash\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"command\":{\"description\":\"The bash command to run.\",\"type\":\"string\"},\"max_output\":{\"maximum\":32768,\"minimum\":4096,\"type\":\"integer\"},\"timeout\":{\"maximum\":1800,\"minimum\":1,\"type\":\"integer\"}},\"required\":[\"command\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Run a Python, JavaScript or TypeScript script in the workspace directory as ONE step. Use it instead of many separate tool calls when a task needs several reads, edits, searches or commands: loop, filter and aggregate inside the script and print only what you need to see. Only printed output (8 KiB by default, max_output selects 4096–32768 bytes; larger output is retained for read_output) returns to you. Built-in helpers: read(path) -> text; write(path, text); edit(path, old, new, count=1) (count=0 replaces all; raises if not found or ambiguous); ls(pattern='**/*') -> file list; sh(command, check=True) -> combined output (raises on failure). JavaScript runs as an async function body (await works; require is available). The script's workspace changes are all-or-nothing: if it fails they are discarded. External model/tool calls are NOT rolled back. model(prompt,options) returns {text,usage,provider,model}; Python uses keyword options. model options: provider, model, max_tokens (default 4096), system, effort (off|low|medium|high|xhigh|max), images (a list of image(path) values; PNG/JPEG/GIF/WebP; the model must accept images, the error lists those that do). Unknown options are refused. tools.search(query), tools.describe(name), tool(name,args) use host-reviewed bindings (Python also tools.call). http(url, {method, headers, body|json, timeout}) sends a request through an operator HTTP grant (the host adds credentials; refusals list the grants) and returns {status,headers,json|body,truncated} (JSON that parses as json, else body). batch([(method, input), ...]) (JS: batch([{method,input}])) reserves every call first, then runs them concurrently up to the operator's parallel limit and returns per-call {ok,data|error} in order; models(prompts, options) fans out model calls and returns texts/errors. Calls are durably reserved and never automatically retried after unknown outcomes. Per-script call/model/budget/parallel limits come from the operator's code policy (defaults 32 calls, 8 model calls, 32768 prompt-byte+output allowance, serial); limits() returns the effective values. Defaults: the session provider/model when granted, else the first granted provider, 4096 output tokens; only operator-granted routes/tools work. Reusable helpers: put modules in .spindle/helpers/ (or the workspace root) and import/require them; helper modules reach the built-ins via `import spindle` (Python) or globalThis.spindle (JS/TS). ui.skin(css) writes a host-UI skin proposal to .spindle/skin.css (CSS colours and layout only: no url(), @import, content, !important, quotes or escapes); the operator stages it from Settings, previews and applies it, so say what you changed. TS is transpiled (not typechecked), async function body; no top-level import/export. Do not use the network. timeout is in seconds (default 60, max 1800).\",\"name\":\"run_code\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"code\":{\"description\":\"The script (up to 64 KiB).\",\"type\":\"string\"},\"language\":{\"enum\":[\"python\",\"javascript\",\"typescript\"],\"type\":\"string\"},\"max_output\":{\"maximum\":32768,\"minimum\":4096,\"type\":\"integer\"},\"timeout\":{\"maximum\":1800,\"minimum\":1,\"type\":\"integer\"}},\"required\":[\"language\",\"code\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read a byte window of retained tool output without executing anything again. Use the artifact digest returned by the original result; offset is zero-based, limit defaults to 8192 bytes (max 262144). Tool output shares a 256 KiB turn budget; paging with read_output and read_file is not charged.\",\"name\":\"read_output\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"artifact\":{\"type\":\"string\"},\"limit\":{\"maximum\":262144,\"minimum\":1,\"type\":\"integer\"},\"offset\":{\"minimum\":0,\"type\":\"integer\"}},\"required\":[\"artifact\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read a UTF-8 text file from the workspace with line numbers. offset is the first line (1-based), limit the number of lines (default 2000); the window is 8 KiB by default (max_output up to 262144 bytes) with a note on how to continue.\",\"name\":\"read_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"limit\":{\"minimum\":1,\"type\":\"integer\"},\"max_output\":{\"maximum\":262144,\"minimum\":4096,\"type\":\"integer\"},\"offset\":{\"minimum\":1,\"type\":\"integer\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Create or overwrite a workspace file with the given content (up to 1 MiB; parent directories are implied).\",\"name\":\"write_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"content\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Replace exact text in a workspace file. old_string must occur exactly once unless replace_all is true.\",\"name\":\"edit_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"new_string\":{\"type\":\"string\"},\"old_string\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"},\"replace_all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"old_string\",\"new_string\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Start a bash command in the background (a server, watcher, long build or test run) and return at once with its job id and first output. It runs in its own sandbox over a snapshot of the workspace as it is now: files it changes are NOT saved to the workspace and later workspace changes are not visible to it (start a new job to pick them up). Each run has its own private network, so later bash calls cannot reach a server the job starts: exercise it inside the job's own command. It keeps running while you make other calls until it exits, stop_job ends it, its timeout passes (seconds, default 3600, max 86400), the session is rewound, or Spindle restarts.\",\"name\":\"start_job\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"command\":{\"description\":\"The bash command to run.\",\"type\":\"string\"},\"timeout\":{\"maximum\":86400,\"minimum\":1,\"type\":\"integer\"}},\"required\":[\"command\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read a background job's output and status. Without offset it returns the newest output (after waiting up to wait seconds for the job to end); with offset (from the previous result's next offset) it returns output from there, first waiting up to wait seconds (max 600) for some. limit is in bytes (default 8192, max 65536). Without job it lists the session's jobs. A job keeps its newest 4.0 MiB of output.\",\"name\":\"read_job\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"job\":{\"type\":\"string\"},\"limit\":{\"maximum\":65536,\"minimum\":1,\"type\":\"integer\"},\"offset\":{\"minimum\":0,\"type\":\"integer\"},\"wait\":{\"maximum\":600,\"minimum\":0,\"type\":\"integer\"}},\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Stop a background job and everything it started; returns its final status and newest output.\",\"name\":\"stop_job\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"job\":{\"type\":\"string\"}},\"required\":[\"job\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Show workspace files to the user in the chat as cards they can open: web pages (rendered in a sandboxed preview with their CSS, scripts and images), images, SVG, Markdown, PDF and text. Use it whenever the user asks to see, display, preview or open something, and after you build something visual (a page, chart, image or document) so they can look at it without leaving the chat. paths: 1-8 workspace files (a directory shows its index.html); title: an optional caption. The files are shown as they are at this step.\",\"name\":\"show\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"paths\":{\"items\":{\"type\":\"string\"},\"maxItems\":8,\"minItems\":1,\"type\":\"array\"},\"title\":{\"type\":\"string\"}},\"required\":[\"paths\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read or change this thread's settings when the user asks (\\\"use a cheaper model\\\", \\\"think harder\\\", \\\"turn on internet\\\", \\\"what models can I use?\\\"). Without arguments it returns the current settings and the available providers, models and efforts. A change (provider, model, effort, network, toolchain, compaction, max_usd as dollars or null for no budget, name for the thread) is checked, queued and applied when this turn ends, never in the middle of it; unknown values are refused with the valid choices.\",\"name\":\"settings\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"compaction\":{\"enum\":[\"model\",\"digest\"],\"type\":\"string\"},\"effort\":{\"enum\":[\"default\",\"off\",\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],\"type\":\"string\"},\"max_usd\":{\"type\":[\"number\",\"null\"]},\"model\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"network\":{\"type\":\"boolean\"},\"provider\":{\"type\":\"string\"},\"toolchain\":{\"type\":\"boolean\"}},\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Spindle's own source (the app serving this chat), when the host offers it. checkout copies the host's current source into spindle/ and enables what building it needs (Rust toolchain, the dext-engine sources) from your next command; edit and test it there. update merges the host's newer source into spindle/, writing conflict markers where both changed the same lines for you to resolve.\",\"name\":\"spindle_source\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"action\":{\"enum\":[\"checkout\",\"update\"],\"type\":\"string\"}},\"required\":[\"action\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Ask to install your changes to Spindle's source (spindle/) into the running host. This does not install: it records the request and raises the Spindle change card in the chat, whose Install the user taps (or types /install); the host then merges your changes with its current source, runs fmt, clippy, tests and a release build, installs and restarts. summary: what the change does, for the user.\",\"name\":\"spindle_install\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+    "{\"max_tokens\":4096,\"messages\":[{\"content\":\"You are a coding agent. You work in a workspace with the bash, run_code, read_file, read_output, write_file, edit_file, start_job, read_job and stop_job tools (show puts files in the chat, settings changes this thread's model and options); commands start in the workspace directory, so refer to files by relative paths. Prefer one run_code script over many small tool calls when work spans several files or steps. Commands have no internet access, but local sockets work (loopback servers, IPC). Workspace files persist between calls; use $TMPDIR for scratch files, which are not kept. Workspace paths are relative (any UTF-8 name; .git, symbolic links and empty directories are kept), up to 50,000 entries, 64 MiB per file and 2 GiB in all. A bash or run_code command ends with its call; for servers, watchers and long builds or test runs use start_job, which keeps a command running in the background over a snapshot of the workspace (its file changes are not saved) while you continue: read_job shows its output (and can wait for more), stop_job ends it. Prefer edit_file for small changes to existing files. You may issue several tool calls at once; they run in order, each on the workspace the previous one left. Check results and keep going until the task is done. Then reply with a short plain-text summary of what you did.\",\"role\":\"system\"},{\"content\":\"[t:files] write and read a file\",\"role\":\"user\"},{\"content\":null,\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"content\\\":\\\"hi\\\\n\\\",\\\"path\\\":\\\"a.txt\\\"}\",\"name\":\"write_file\"},\"id\":\"call_1\",\"type\":\"function\"}]},{\"content\":\"Created a.txt (3 bytes)\",\"role\":\"tool\",\"tool_call_id\":\"call_1\"}],\"model\":\"fake-model\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Run a bash command in the workspace directory. Do not use the network. Output defaults to an 8 KiB window; max_output selects 4096–32768 bytes. Larger output is retained as an artifact for read_output. timeout is in seconds (default 30, max 1800).\",\"name\":\"bash\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"command\":{\"description\":\"The bash command to run.\",\"type\":\"string\"},\"max_output\":{\"maximum\":32768,\"minimum\":4096,\"type\":\"integer\"},\"timeout\":{\"maximum\":1800,\"minimum\":1,\"type\":\"integer\"}},\"required\":[\"command\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Run a Python, JavaScript or TypeScript script in the workspace directory as ONE step. Use it instead of many separate tool calls when a task needs several reads, edits, searches or commands: loop, filter and aggregate inside the script and print only what you need to see. Only printed output (8 KiB by default, max_output selects 4096–32768 bytes; larger output is retained for read_output) returns to you. Built-in helpers: read(path) -> text; write(path, text); edit(path, old, new, count=1) (count=0 replaces all; raises if not found or ambiguous); ls(pattern='**/*') -> file list; sh(command, check=True) -> combined output (raises on failure). JavaScript runs as an async function body (await works; require is available). The script's workspace changes are all-or-nothing: if it fails they are discarded. External model/tool calls are NOT rolled back. model(prompt,options) returns {text,usage,provider,model}; Python uses keyword options. model options: provider, model, max_tokens (default 4096), system, effort (off|low|medium|high|xhigh|max), images (a list of image(path) values; PNG/JPEG/GIF/WebP; the model must accept images, the error lists those that do). Unknown options are refused. tools.search(query), tools.describe(name), tool(name,args) use host-reviewed bindings (Python also tools.call). http(url, {method, headers, body|json, timeout}) sends a request through an operator HTTP grant (the host adds credentials; refusals list the grants) and returns {status,headers,json|body,truncated} (JSON that parses as json, else body). batch([(method, input), ...]) (JS: batch([{method,input}])) reserves every call first, then runs them concurrently up to the operator's parallel limit and returns per-call {ok,data|error} in order; models(prompts, options) fans out model calls and returns texts/errors. Calls are durably reserved and never automatically retried after unknown outcomes. Per-script call/model/budget/parallel limits come from the operator's code policy (defaults 32 calls, 8 model calls, 32768 prompt-byte+output allowance, serial); limits() returns the effective values. Defaults: the session provider/model when granted, else the first granted provider, 4096 output tokens; only operator-granted routes/tools work. Reusable helpers: put modules in .spindle/helpers/ (or the workspace root) and import/require them; helper modules reach the built-ins via `import spindle` (Python) or globalThis.spindle (JS/TS). ui.skin(css) writes a host-UI skin proposal to .spindle/skin.css (CSS colours and layout only: no url(), @import, content, !important, quotes or escapes); the operator stages it from Settings, previews and applies it, so say what you changed. TS is transpiled (not typechecked), async function body; no top-level import/export. Do not use the network. timeout is in seconds (default 60, max 1800).\",\"name\":\"run_code\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"code\":{\"description\":\"The script (up to 64 KiB).\",\"type\":\"string\"},\"language\":{\"enum\":[\"python\",\"javascript\",\"typescript\"],\"type\":\"string\"},\"max_output\":{\"maximum\":32768,\"minimum\":4096,\"type\":\"integer\"},\"timeout\":{\"maximum\":1800,\"minimum\":1,\"type\":\"integer\"}},\"required\":[\"language\",\"code\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read a byte window of retained tool output without executing anything again. Use the artifact digest returned by the original result; offset is zero-based, limit defaults to 8192 bytes (max 262144). Tool output shares a 256 KiB turn budget; paging with read_output and read_file is not charged.\",\"name\":\"read_output\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"artifact\":{\"type\":\"string\"},\"limit\":{\"maximum\":262144,\"minimum\":1,\"type\":\"integer\"},\"offset\":{\"minimum\":0,\"type\":\"integer\"}},\"required\":[\"artifact\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read a UTF-8 text file from the workspace with line numbers. offset is the first line (1-based), limit the number of lines (default 2000); the window is 8 KiB by default (max_output up to 262144 bytes) with a note on how to continue.\",\"name\":\"read_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"limit\":{\"minimum\":1,\"type\":\"integer\"},\"max_output\":{\"maximum\":262144,\"minimum\":4096,\"type\":\"integer\"},\"offset\":{\"minimum\":1,\"type\":\"integer\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Create or overwrite a workspace file with the given content (up to 1 MiB; parent directories are implied).\",\"name\":\"write_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"content\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Replace exact text in a workspace file. old_string must occur exactly once unless replace_all is true.\",\"name\":\"edit_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"new_string\":{\"type\":\"string\"},\"old_string\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"},\"replace_all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"old_string\",\"new_string\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Start a bash command in the background (a server, watcher, long build or test run) and return at once with its job id and first output. It runs in its own sandbox over a snapshot of the workspace as it is now: files it changes are NOT saved to the workspace and later workspace changes are not visible to it (start a new job to pick them up). Each run has its own private network, so later bash calls cannot reach a server the job starts: exercise it inside the job's own command. It keeps running while you make other calls until it exits, stop_job ends it, its timeout passes (seconds, default 3600, max 86400), the session is rewound, or Spindle restarts.\",\"name\":\"start_job\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"command\":{\"description\":\"The bash command to run.\",\"type\":\"string\"},\"timeout\":{\"maximum\":86400,\"minimum\":1,\"type\":\"integer\"}},\"required\":[\"command\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read a background job's output and status. Without offset it returns the newest output (after waiting up to wait seconds for the job to end); with offset (from the previous result's next offset) it returns output from there, first waiting up to wait seconds (max 600) for some. limit is in bytes (default 8192, max 65536). Without job it lists the session's jobs. A job keeps its newest 4.0 MiB of output.\",\"name\":\"read_job\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"job\":{\"type\":\"string\"},\"limit\":{\"maximum\":65536,\"minimum\":1,\"type\":\"integer\"},\"offset\":{\"minimum\":0,\"type\":\"integer\"},\"wait\":{\"maximum\":600,\"minimum\":0,\"type\":\"integer\"}},\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Stop a background job and everything it started; returns its final status and newest output.\",\"name\":\"stop_job\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"job\":{\"type\":\"string\"}},\"required\":[\"job\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Show workspace files to the user in the chat as cards they can open: web pages (rendered in a sandboxed preview with their CSS, scripts and images), images, SVG, Markdown, PDF and text. Use it whenever the user asks to see, display, preview or open something, and after you build something visual (a page, chart, image or document) so they can look at it without leaving the chat. paths: 1-8 workspace files (a directory shows its index.html); title: an optional caption. The files are shown as they are at this step.\",\"name\":\"show\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"paths\":{\"items\":{\"type\":\"string\"},\"maxItems\":8,\"minItems\":1,\"type\":\"array\"},\"title\":{\"type\":\"string\"}},\"required\":[\"paths\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read or change this thread's settings when the user asks (\\\"use a cheaper model\\\", \\\"think harder\\\", \\\"turn on internet\\\", \\\"what models can I use?\\\"). Without arguments it returns the current settings and the available providers, models and efforts. A change (provider, model, effort, network, toolchain, compaction, max_usd as dollars or null for no budget, name for the thread) is checked, queued and applied when this turn ends, never in the middle of it; unknown values are refused with the valid choices.\",\"name\":\"settings\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"compaction\":{\"enum\":[\"model\",\"digest\"],\"type\":\"string\"},\"effort\":{\"enum\":[\"default\",\"off\",\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],\"type\":\"string\"},\"max_usd\":{\"type\":[\"number\",\"null\"]},\"model\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"network\":{\"type\":\"boolean\"},\"provider\":{\"type\":\"string\"},\"toolchain\":{\"type\":\"boolean\"}},\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Spindle's own source (the app serving this chat), when the host offers it. checkout copies the host's current source into spindle/ and enables what building it needs (Rust toolchain, the dext-engine sources) from your next command; edit and test it there. update merges the host's newer source into spindle/, writing conflict markers where both changed the same lines for you to resolve.\",\"name\":\"spindle_source\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"action\":{\"enum\":[\"checkout\",\"update\"],\"type\":\"string\"}},\"required\":[\"action\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Ask to install your changes to Spindle's source (spindle/) into the running host. This does not install: it records the request and raises the Spindle change card in the chat, whose Install the user taps (or types /install); the host then merges your changes with its current source, runs fmt, clippy, tests and a release build, installs and restarts. summary: what the change does, for the user.\",\"name\":\"spindle_install\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+    "{\"max_tokens\":4096,\"messages\":[{\"content\":\"You are a coding agent. You work in a workspace with the bash, run_code, read_file, read_output, write_file, edit_file, start_job, read_job and stop_job tools (show puts files in the chat, settings changes this thread's model and options); commands start in the workspace directory, so refer to files by relative paths. Prefer one run_code script over many small tool calls when work spans several files or steps. Commands have no internet access, but local sockets work (loopback servers, IPC). Workspace files persist between calls; use $TMPDIR for scratch files, which are not kept. Workspace paths are relative (any UTF-8 name; .git, symbolic links and empty directories are kept), up to 50,000 entries, 64 MiB per file and 2 GiB in all. A bash or run_code command ends with its call; for servers, watchers and long builds or test runs use start_job, which keeps a command running in the background over a snapshot of the workspace (its file changes are not saved) while you continue: read_job shows its output (and can wait for more), stop_job ends it. Prefer edit_file for small changes to existing files. You may issue several tool calls at once; they run in order, each on the workspace the previous one left. Check results and keep going until the task is done. Then reply with a short plain-text summary of what you did.\",\"role\":\"system\"},{\"content\":\"[t:files] write and read a file\",\"role\":\"user\"},{\"content\":null,\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"content\\\":\\\"hi\\\\n\\\",\\\"path\\\":\\\"a.txt\\\"}\",\"name\":\"write_file\"},\"id\":\"call_1\",\"type\":\"function\"}]},{\"content\":\"Created a.txt (3 bytes)\",\"role\":\"tool\",\"tool_call_id\":\"call_1\"},{\"content\":null,\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\",\"name\":\"read_file\"},\"id\":\"call_2\",\"type\":\"function\"}]},{\"content\":\"     1\\thi\\n\",\"role\":\"tool\",\"tool_call_id\":\"call_2\"}],\"model\":\"fake-model\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Run a bash command in the workspace directory. Do not use the network. Output defaults to an 8 KiB window; max_output selects 4096–32768 bytes. Larger output is retained as an artifact for read_output. timeout is in seconds (default 30, max 1800).\",\"name\":\"bash\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"command\":{\"description\":\"The bash command to run.\",\"type\":\"string\"},\"max_output\":{\"maximum\":32768,\"minimum\":4096,\"type\":\"integer\"},\"timeout\":{\"maximum\":1800,\"minimum\":1,\"type\":\"integer\"}},\"required\":[\"command\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Run a Python, JavaScript or TypeScript script in the workspace directory as ONE step. Use it instead of many separate tool calls when a task needs several reads, edits, searches or commands: loop, filter and aggregate inside the script and print only what you need to see. Only printed output (8 KiB by default, max_output selects 4096–32768 bytes; larger output is retained for read_output) returns to you. Built-in helpers: read(path) -> text; write(path, text); edit(path, old, new, count=1) (count=0 replaces all; raises if not found or ambiguous); ls(pattern='**/*') -> file list; sh(command, check=True) -> combined output (raises on failure). JavaScript runs as an async function body (await works; require is available). The script's workspace changes are all-or-nothing: if it fails they are discarded. External model/tool calls are NOT rolled back. model(prompt,options) returns {text,usage,provider,model}; Python uses keyword options. model options: provider, model, max_tokens (default 4096), system, effort (off|low|medium|high|xhigh|max), images (a list of image(path) values; PNG/JPEG/GIF/WebP; the model must accept images, the error lists those that do). Unknown options are refused. tools.search(query), tools.describe(name), tool(name,args) use host-reviewed bindings (Python also tools.call). http(url, {method, headers, body|json, timeout}) sends a request through an operator HTTP grant (the host adds credentials; refusals list the grants) and returns {status,headers,json|body,truncated} (JSON that parses as json, else body). batch([(method, input), ...]) (JS: batch([{method,input}])) reserves every call first, then runs them concurrently up to the operator's parallel limit and returns per-call {ok,data|error} in order; models(prompts, options) fans out model calls and returns texts/errors. Calls are durably reserved and never automatically retried after unknown outcomes. Per-script call/model/budget/parallel limits come from the operator's code policy (defaults 32 calls, 8 model calls, 32768 prompt-byte+output allowance, serial); limits() returns the effective values. Defaults: the session provider/model when granted, else the first granted provider, 4096 output tokens; only operator-granted routes/tools work. Reusable helpers: put modules in .spindle/helpers/ (or the workspace root) and import/require them; helper modules reach the built-ins via `import spindle` (Python) or globalThis.spindle (JS/TS). ui.skin(css) writes a host-UI skin proposal to .spindle/skin.css (CSS colours and layout only: no url(), @import, content, !important, quotes or escapes); the operator stages it from Settings, previews and applies it, so say what you changed. TS is transpiled (not typechecked), async function body; no top-level import/export. Do not use the network. timeout is in seconds (default 60, max 1800).\",\"name\":\"run_code\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"code\":{\"description\":\"The script (up to 64 KiB).\",\"type\":\"string\"},\"language\":{\"enum\":[\"python\",\"javascript\",\"typescript\"],\"type\":\"string\"},\"max_output\":{\"maximum\":32768,\"minimum\":4096,\"type\":\"integer\"},\"timeout\":{\"maximum\":1800,\"minimum\":1,\"type\":\"integer\"}},\"required\":[\"language\",\"code\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read a byte window of retained tool output without executing anything again. Use the artifact digest returned by the original result; offset is zero-based, limit defaults to 8192 bytes (max 262144). Tool output shares a 256 KiB turn budget; paging with read_output and read_file is not charged.\",\"name\":\"read_output\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"artifact\":{\"type\":\"string\"},\"limit\":{\"maximum\":262144,\"minimum\":1,\"type\":\"integer\"},\"offset\":{\"minimum\":0,\"type\":\"integer\"}},\"required\":[\"artifact\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read a UTF-8 text file from the workspace with line numbers. offset is the first line (1-based), limit the number of lines (default 2000); the window is 8 KiB by default (max_output up to 262144 bytes) with a note on how to continue.\",\"name\":\"read_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"limit\":{\"minimum\":1,\"type\":\"integer\"},\"max_output\":{\"maximum\":262144,\"minimum\":4096,\"type\":\"integer\"},\"offset\":{\"minimum\":1,\"type\":\"integer\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Create or overwrite a workspace file with the given content (up to 1 MiB; parent directories are implied).\",\"name\":\"write_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"content\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Replace exact text in a workspace file. old_string must occur exactly once unless replace_all is true.\",\"name\":\"edit_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"new_string\":{\"type\":\"string\"},\"old_string\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"},\"replace_all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"old_string\",\"new_string\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Start a bash command in the background (a server, watcher, long build or test run) and return at once with its job id and first output. It runs in its own sandbox over a snapshot of the workspace as it is now: files it changes are NOT saved to the workspace and later workspace changes are not visible to it (start a new job to pick them up). Each run has its own private network, so later bash calls cannot reach a server the job starts: exercise it inside the job's own command. It keeps running while you make other calls until it exits, stop_job ends it, its timeout passes (seconds, default 3600, max 86400), the session is rewound, or Spindle restarts.\",\"name\":\"start_job\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"command\":{\"description\":\"The bash command to run.\",\"type\":\"string\"},\"timeout\":{\"maximum\":86400,\"minimum\":1,\"type\":\"integer\"}},\"required\":[\"command\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read a background job's output and status. Without offset it returns the newest output (after waiting up to wait seconds for the job to end); with offset (from the previous result's next offset) it returns output from there, first waiting up to wait seconds (max 600) for some. limit is in bytes (default 8192, max 65536). Without job it lists the session's jobs. A job keeps its newest 4.0 MiB of output.\",\"name\":\"read_job\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"job\":{\"type\":\"string\"},\"limit\":{\"maximum\":65536,\"minimum\":1,\"type\":\"integer\"},\"offset\":{\"minimum\":0,\"type\":\"integer\"},\"wait\":{\"maximum\":600,\"minimum\":0,\"type\":\"integer\"}},\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Stop a background job and everything it started; returns its final status and newest output.\",\"name\":\"stop_job\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"job\":{\"type\":\"string\"}},\"required\":[\"job\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Show workspace files to the user in the chat as cards they can open: web pages (rendered in a sandboxed preview with their CSS, scripts and images), images, SVG, Markdown, PDF and text. Use it whenever the user asks to see, display, preview or open something, and after you build something visual (a page, chart, image or document) so they can look at it without leaving the chat. paths: 1-8 workspace files (a directory shows its index.html); title: an optional caption. The files are shown as they are at this step.\",\"name\":\"show\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"paths\":{\"items\":{\"type\":\"string\"},\"maxItems\":8,\"minItems\":1,\"type\":\"array\"},\"title\":{\"type\":\"string\"}},\"required\":[\"paths\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Read or change this thread's settings when the user asks (\\\"use a cheaper model\\\", \\\"think harder\\\", \\\"turn on internet\\\", \\\"what models can I use?\\\"). Without arguments it returns the current settings and the available providers, models and efforts. A change (provider, model, effort, network, toolchain, compaction, max_usd as dollars or null for no budget, name for the thread) is checked, queued and applied when this turn ends, never in the middle of it; unknown values are refused with the valid choices.\",\"name\":\"settings\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"compaction\":{\"enum\":[\"model\",\"digest\"],\"type\":\"string\"},\"effort\":{\"enum\":[\"default\",\"off\",\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],\"type\":\"string\"},\"max_usd\":{\"type\":[\"number\",\"null\"]},\"model\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"network\":{\"type\":\"boolean\"},\"provider\":{\"type\":\"string\"},\"toolchain\":{\"type\":\"boolean\"}},\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Spindle's own source (the app serving this chat), when the host offers it. checkout copies the host's current source into spindle/ and enables what building it needs (Rust toolchain, the dext-engine sources) from your next command; edit and test it there. update merges the host's newer source into spindle/, writing conflict markers where both changed the same lines for you to resolve.\",\"name\":\"spindle_source\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"action\":{\"enum\":[\"checkout\",\"update\"],\"type\":\"string\"}},\"required\":[\"action\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Ask to install your changes to Spindle's source (spindle/) into the running host. This does not install: it records the request and raises the Spindle change card in the chat, whose Install the user taps (or types /install); the host then merges your changes with its current source, runs fmt, clippy, tests and a release build, installs and restarts. summary: what the change does, for the user.\",\"name\":\"spindle_install\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"type\":\"object\"}},\"type\":\"function\"}]}"
+  ],
+  "store": {
+    "admissions": [
+      {
+        "command_id": "start",
+        "kind": "dext-turn-v1",
+        "payload": "07c8e1d1059d23f34a2c4586",
+        "scope": "operator",
+        "sequence": 1
+      },
+      {
+        "command_id": "prepare-r3",
+        "kind": "dext-turn-v1",
+        "payload": "e91b24bbee501b85b75a1808",
+        "scope": "operator",
+        "sequence": 2
+      },
+      {
+        "command_id": "prepare-r6",
+        "kind": "dext-turn-v1",
+        "payload": "9be33a76b3129a57e233e061",
+        "scope": "operator",
+        "sequence": 3
+      },
+      {
+        "command_id": "finish-r8",
+        "kind": "dext-turn-v1",
+        "payload": "16fdfde5a3c26d8e2f057d90",
+        "scope": "operator",
+        "sequence": 4
+      }
+    ],
+    "app_state": [],
+    "attempt_failures": [],
+    "attempts": [
+      {
+        "effect": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/1",
+        "grant_reference": "dext-login",
+        "id": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/1",
+        "implementation": "dext-provider-v1",
+        "owner_epoch": 1
+      },
+      {
+        "effect": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/1/t/0",
+        "grant_reference": "spindle-cli-host-unisolated",
+        "id": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/1/t/0",
+        "implementation": "dext-host-bash-v1-c142585cbd4deca67153991f869731a4b61f672d172992b2362e28c83c9831cc",
+        "owner_epoch": 1
+      },
+      {
+        "effect": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/2",
+        "grant_reference": "dext-login",
+        "id": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/2",
+        "implementation": "dext-provider-v1",
+        "owner_epoch": 1
+      },
+      {
+        "effect": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/2/t/0",
+        "grant_reference": "spindle-cli-host-unisolated",
+        "id": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/2/t/0",
+        "implementation": "dext-host-bash-v1-c142585cbd4deca67153991f869731a4b61f672d172992b2362e28c83c9831cc",
+        "owner_epoch": 1
+      },
+      {
+        "effect": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/3",
+        "grant_reference": "dext-login",
+        "id": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/3",
+        "implementation": "dext-provider-v1",
+        "owner_epoch": 1
+      }
+    ],
+    "consumed": [
+      {
+        "admission": 1,
+        "revision": 1
+      },
+      {
+        "admission": 2,
+        "revision": 4
+      },
+      {
+        "admission": 3,
+        "revision": 7
+      },
+      {
+        "admission": 4,
+        "revision": 9
+      }
+    ],
+    "intents": [
+      {
+        "adapter": "dext-model-v1",
+        "id": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/1",
+        "input": "9a7c787f37259cfca7421802",
+        "position": 0,
+        "revision": 1
+      },
+      {
+        "adapter": "write_file",
+        "id": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/1/t/0",
+        "input": "7103aec0565c0663a37f6828",
+        "position": 0,
+        "revision": 2
+      },
+      {
+        "adapter": "dext-model-v1",
+        "id": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/2",
+        "input": "d936b93292f05dcf3e2c3f6b",
+        "position": 0,
+        "revision": 4
+      },
+      {
+        "adapter": "read_file",
+        "id": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/2/t/0",
+        "input": "5aff422311aaf6f4983b3d9a",
+        "position": 0,
+        "revision": 5
+      },
+      {
+        "adapter": "dext-model-v1",
+        "id": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/3",
+        "input": "50695f8ebd0d351f85b62f21",
+        "position": 0,
+        "revision": 7
+      }
+    ],
+    "proposals": [
+      {
+        "canonical": "9a4037205e7d9de60a5d9130",
+        "id": "commit-start",
+        "revision": 1
+      },
+      {
+        "canonical": "2a3d2bb405149b01b4a9c363",
+        "id": "adopt-r1",
+        "revision": 2
+      },
+      {
+        "canonical": "e8b288829d110e5501c75e40",
+        "id": "adopt-r2",
+        "revision": 3
+      },
+      {
+        "canonical": "5005df82357e522c802b5979",
+        "id": "commit-prepare-r3",
+        "revision": 4
+      },
+      {
+        "canonical": "1e121e1ac1f783c9dac13683",
+        "id": "adopt-r4",
+        "revision": 5
+      },
+      {
+        "canonical": "81853db0a4ef61b284bc0291",
+        "id": "adopt-r5",
+        "revision": 6
+      },
+      {
+        "canonical": "3d43df5b2fbea70ea731d6ea",
+        "id": "commit-prepare-r6",
+        "revision": 7
+      },
+      {
+        "canonical": "e585d9d5e84cd7823cbfa813",
+        "id": "adopt-r7",
+        "revision": 8
+      },
+      {
+        "canonical": "6bf60302e5303d68f891872e",
+        "id": "commit-finish-r8",
+        "revision": 9
+      }
+    ],
+    "receipts": [
+      {
+        "attempt": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/1",
+        "result": "1f70abc8c75a25a5878ce737",
+        "workspace": null
+      },
+      {
+        "attempt": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/1/t/0",
+        "result": "4cca102c2dd3e1540e2ed969",
+        "workspace": "602f1ea1c1461318e5229594d73796a613d6de7cd400f20bca7104538c9d785f"
+      },
+      {
+        "attempt": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/2",
+        "result": "ee2efeadc20d3f2ad0154b9a",
+        "workspace": null
+      },
+      {
+        "attempt": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/2/t/0",
+        "result": "d71adb68f18f2197d0137591",
+        "workspace": "602f1ea1c1461318e5229594d73796a613d6de7cd400f20bca7104538c9d785f"
+      },
+      {
+        "attempt": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/3",
+        "result": "30b7014fa776ed7a596af1d9",
+        "workspace": null
+      }
+    ],
+    "revisions": [
+      {
+        "continuation": "e3b0c44298fc1c149afbf4c8",
+        "engine": "uninitialized",
+        "revision": 0,
+        "scope": "",
+        "workspace": null
+      },
+      {
+        "continuation": "322ab28614bb1c54709d1680",
+        "engine": "dext-turn-v1",
+        "revision": 1,
+        "scope": "operator",
+        "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
+      },
+      {
+        "continuation": "584db802c4af53a64ec30fdc",
+        "engine": "dext-turn-v1",
+        "revision": 2,
+        "scope": "operator",
+        "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
+      },
+      {
+        "continuation": "6627428361d9a0dbcf256096",
+        "engine": "dext-turn-v1",
+        "revision": 3,
+        "scope": "operator",
+        "workspace": "602f1ea1c1461318e5229594d73796a613d6de7cd400f20bca7104538c9d785f"
+      },
+      {
+        "continuation": "3ae30600d4b98dc0412fdc90",
+        "engine": "dext-turn-v1",
+        "revision": 4,
+        "scope": "operator",
+        "workspace": "602f1ea1c1461318e5229594d73796a613d6de7cd400f20bca7104538c9d785f"
+      },
+      {
+        "continuation": "6414bd67c132211446d6992a",
+        "engine": "dext-turn-v1",
+        "revision": 5,
+        "scope": "operator",
+        "workspace": "602f1ea1c1461318e5229594d73796a613d6de7cd400f20bca7104538c9d785f"
+      },
+      {
+        "continuation": "74064d26d377a63689f55c54",
+        "engine": "dext-turn-v1",
+        "revision": 6,
+        "scope": "operator",
+        "workspace": "602f1ea1c1461318e5229594d73796a613d6de7cd400f20bca7104538c9d785f"
+      },
+      {
+        "continuation": "1c50760437b89ffbffa0e596",
+        "engine": "dext-turn-v1",
+        "revision": 7,
+        "scope": "operator",
+        "workspace": "602f1ea1c1461318e5229594d73796a613d6de7cd400f20bca7104538c9d785f"
+      },
+      {
+        "continuation": "ff9d005feebd99415dd3ecf1",
+        "engine": "dext-turn-v1",
+        "revision": 8,
+        "scope": "operator",
+        "workspace": "602f1ea1c1461318e5229594d73796a613d6de7cd400f20bca7104538c9d785f"
+      },
+      {
+        "continuation": "f8ea2a7424fd811e8be0213d",
+        "engine": "dext-turn-v1",
+        "revision": 9,
+        "scope": "operator",
+        "workspace": "602f1ea1c1461318e5229594d73796a613d6de7cd400f20bca7104538c9d785f"
+      }
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+/target/
+__pycache__/
+embed/kit/
+chrome/dist/
+chrome/linux/dist/
+chrome/wasm-linux/dist/
+chrome/linux/command/target/

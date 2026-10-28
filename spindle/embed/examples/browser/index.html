@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spindle in a browser</title>
+<style>
+  body { font: 15px/1.45 system-ui, sans-serif; margin: 0 auto; max-width: 820px; padding: 16px; }
+  label { display: inline-block; margin: 0 12px 8px 0; }
+  input, textarea, button { font: inherit; }
+  textarea { width: 100%; box-sizing: border-box; }
+  button { margin: 6px 6px 6px 0; }
+  #log { background: #111; color: #ddd; padding: 12px; white-space: pre-wrap; min-height: 240px;
+    border-radius: 6px; overflow-wrap: anywhere; }
+  .tool { color: #8fd; } .note { color: #fc6; } .error { color: #f88; }
+</style>
+</head>
+<body>
+<h1>Spindle in a browser</h1>
+<p>The session lives in this browser's private storage (OPFS) and runs in a worker. Model
+requests go through the relay that served this page, which adds the key.</p>
+<label>Session <input id="dir" placeholder="/sessions/name" size="22"></label>
+<label>Provider <select id="provider"></select></label>
+<label>Model <input id="model" placeholder="default" size="16"></label>
+<textarea id="text" rows="3" placeholder="A prompt for the session"></textarea>
+<div>
+  <button id="send">Send</button>
+  <button id="stop">Stop</button>
+  <button id="status">Status</button>
+  <button id="export">Export (move) to a file</button>
+  <label>Import a bundle into Session <input id="import" type="file" accept=".spindle"></label>
+</div>
+<div id="log"></div>
+<script type="module" src="./page.mjs"></script>
+</body>
+</html>

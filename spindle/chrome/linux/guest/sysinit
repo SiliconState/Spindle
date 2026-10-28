@@ -1,0 +1,42 @@
+#!/bin/sh
+# Mounts for commands. The root is the browser's 9p share (mounted with caching: a
+# virtio 9p share mounts once); each command's workspace arrives in a directory of it
+# the guest has never seen, so nothing stale is cached, and goes back the same way.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs shm /dev/shm
+mount -t tmpfs tmp /tmp
+mount -t tmpfs -o mode=755 run /run
+# The 9p root comes up open to all: only root changes what is at the top.
+chmod 755 /
+# Without mdev, the kernel's nodes are root's only: commands (as spindle) need these.
+chmod 666 /dev/null /dev/zero /dev/full /dev/random /dev/urandom /dev/tty /dev/ptmx
+mkdir -p /workspace
+hostname spindle
+ip link set lo up 2>/dev/null
+# The network card ends in the browser, which is its router (192.168.86.1): what goes
+# through it reaches anything only while a command whose thread has network runs.
+ip addr add 192.168.86.100/24 dev eth0 2>/dev/null
+ip link set eth0 up 2>/dev/null
+ip route add default via 192.168.86.1 2>/dev/null
+echo 'nameserver 192.168.86.1' > /etc/resolv.conf
+# This Linux's own certificate authority, made at its first start (its key stays here):
+# the web proxy opens commands' HTTPS with certificates it signs, so commands trust it.
+# Made whole or not at all (a half-made one would be trusted and fail every site).
+if [ ! -s /etc/spindle/ca.crt ]; then
+    rm -f /etc/spindle/ca.key /etc/spindle/site.key /etc/spindle/ca.crt.new
+    if (umask 077
+        openssl ecparam -name prime256v1 -genkey -noout -out /etc/spindle/ca.key &&
+        openssl ecparam -name prime256v1 -genkey -noout -out /etc/spindle/site.key) &&
+       openssl req -x509 -new -key /etc/spindle/ca.key -subj '/CN=Spindle browser Linux' -days 3650 \
+           -config /etc/spindle/openssl.cnf -extensions ca -out /etc/spindle/ca.crt.new &&
+       openssl x509 -in /etc/spindle/ca.crt.new -noout; then
+        mv /etc/spindle/ca.crt.new /etc/spindle/ca.crt
+        cat /etc/spindle/ca.crt >> /etc/ssl/certs/ca-certificates.crt
+    else
+        rm -f /etc/spindle/ca.key /etc/spindle/site.key /etc/spindle/ca.crt.new
+    fi
+fi

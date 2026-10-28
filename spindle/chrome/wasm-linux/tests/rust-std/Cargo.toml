@@ -1,0 +1,15 @@
+# What Spindle's wasm Linux needs of Rust's std (built with -Zbuild-std for
+# wasm32-unknown-linux-musl): run as /init by chrome/tests/wasm_linux_rust.mjs.
+[package]
+name = "rust-std-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+
+# Its own build, not one of the workspaces above it.
+[workspace]

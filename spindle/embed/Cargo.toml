@@ -1,0 +1,23 @@
+[package]
+name = "spindle-embed"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Spindle inside a JS/TS app: the embedded host built for wasm, with Node and browser storage"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+spindle-store = { path = "../store", default-features = false, features = ["embedded"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+serde_json = "1"
+
+# Pinned to the wasm-bindgen CLI that generates the JS glue (embed/tests/package.sh).
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen = "=0.2.129"
+js-sys = "0.3.106"
+# The SQLite build rusqlite uses on wasm32-unknown-unknown (same version), for the VFS.
+sqlite-wasm-rs = "=0.5.5"
+getrandom = { version = "0.4", features = ["wasm_js"] }

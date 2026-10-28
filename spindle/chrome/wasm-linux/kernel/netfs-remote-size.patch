@@ -1,0 +1,25 @@
+diff --git a/fs/netfs/write_collect.c b/fs/netfs/write_collect.c
+index 24fc2bb2f..079df96ac 100644
+--- a/fs/netfs/write_collect.c
++++ b/fs/netfs/write_collect.c
+@@ -262,6 +262,20 @@ static void netfs_collect_write_results(struct netfs_io_request *wreq)
+ 				stream->transferred = stream->collected_to - wreq->start;
+ 				stream->transferred_valid = true;
+ 				notes |= MADE_PROGRESS;
++				/* What reached the server is the server's: once these
++				 * folios are let go, reads must ask it for this much
++				 * rather than take it to be zeros (the zero point is
++				 * capped at the remote size when a folio is released).
++				 */
++				if (stream->source == NETFS_UPLOAD_TO_SERVER) {
++					struct inode *inode = wreq->inode;
++					unsigned long long end = stream->collected_to;
++
++					spin_lock(&inode->i_lock);
++					if (end > netfs_inode(inode)->_remote_i_size)
++						netfs_write_remote_i_size(inode, end);
++					spin_unlock(&inode->i_lock);
++				}
+ 			}
+ 			if (test_bit(NETFS_SREQ_FAILED, &front->flags)) {
+ 				stream->failed = true;

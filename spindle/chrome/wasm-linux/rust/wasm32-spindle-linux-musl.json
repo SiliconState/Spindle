@@ -1,0 +1,41 @@
+{
+  "arch": "wasm32",
+  "crt-static-default": true,
+  "crt-static-respected": true,
+  "data-layout": "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20",
+  "dynamic-linking": false,
+  "eh-frame-header": false,
+  "emit-debug-gdb-scripts": false,
+  "entry-name": "__main_argc_argv",
+  "env": "musl",
+  "exe-suffix": "",
+  "executables": true,
+  "features": "+atomics,+bulk-memory,+mutable-globals,+sign-ext",
+  "generate-arange-section": false,
+  "has-thread-local": true,
+  "is-like-wasm": true,
+  "limit-rdylib-exports": false,
+  "linker": "@LINKER@",
+  "linker-flavor": "wasm-lld-cc",
+  "linker-is-gnu": false,
+  "lld-flavor": "wasm",
+  "llvm-target": "wasm32-unknown-linux-musl",
+  "main-needs-argc-argv": true,
+  "max-atomic-width": 64,
+  "metadata": {
+    "description": "WebAssembly Linux (arch/wasm) with musl: Spindle's wasm Linux",
+    "host_tools": false,
+    "std": true,
+    "tier": null
+  },
+  "os": "linux",
+  "panic-strategy": "abort",
+  "relocation-model": "static",
+  "target-family": [
+    "unix",
+    "wasm"
+  ],
+  "target-pointer-width": 32,
+  "tls-model": "local-exec",
+  "vendor": "spindle"
+}

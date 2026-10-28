@@ -1,0 +1,88 @@
+[package]
+name = "spindle-store"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[features]
+driver = ["dext-turn"]
+dext-turn = ["dep:dext-core", "dep:dext-transcript", "dep:serde_json"]
+dext-provider = ["dext-turn", "dep:dext-native", "dext-native/provider-http"]
+# The store's in-process workspace tools (file tools, output paging, recording
+# results), with no sandbox; portable to wasm. The sandbox runner builds on it.
+workspace-tools = ["driver", "dep:dext-native", "dext-native/tool-policy"]
+dext-strict-workspace = ["workspace-tools", "dext-native/strict"]
+dext-image = ["dep:dext-core"]
+dext-native-image = ["dext-image", "dep:dext-native", "dext-native/native", "dext-image-continuation"]
+dext-image-continuation = ["dext-image", "dep:dext-transcript", "dep:serde_json"]
+# Request shaping from Dext's provider catalog (pure; both hosts use it).
+shape = ["workspace-tools", "dep:dext-provider-catalog"]
+# The embedded host: sessions an app drives, with all I/O its own.
+embedded = ["shape", "dext-native/wire", "dep:url"]
+agent = ["driver", "shape", "dext-provider", "dext-strict-workspace", "dext-provider-catalog/native", "dep:tokio", "dep:reqwest", "dep:url"]
+cli = ["agent", "dep:ring"]
+
+[dependencies]
+dext-core = { path = "../../dext-engine/core", optional = true }
+dext-native = { path = "../../dext-engine/native", optional = true, default-features = false }
+dext-transcript = { path = "../../dext-engine/transcript", optional = true }
+dext-provider-catalog = { package = "dext-provider", path = "../../dext-engine/provider", optional = true, default-features = false }
+serde_json = { version = "1", optional = true }
+libc = "0.2"
+getrandom = { version = "0.4", features = ["wasm_js"] }
+rusqlite = { version = "=0.40.2", features = ["bundled", "backup", "serialize"] }
+sha2 = "=0.11.0"
+# Pure Rust, pinned: stored values are a pure function of their bytes (see codec.rs).
+miniz_oxide = { version = "=0.8.9", default-features = false, features = ["with-alloc"] }
+# blocking + rustls are what the provider crate already builds (Access key fetches).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+# Already in the build through rustls; verifies Cloudflare Access tokens (RS256).
+ring = { version = "=0.17.14", optional = true }
+tokio = { version = "1", features = ["rt", "time"], optional = true }
+# Code mode's HTTP grants match URLs with it (already in the build through the provider crate).
+url = { version = "2", optional = true }
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+rusqlite = { version = "=0.40.2", features = ["wasm32-wasi-vfs"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+libc = "0.2"
+
+[dev-dependencies]
+dext-core = { path = "../../dext-engine/core" }
+dext-transcript = { path = "../../dext-engine/transcript" }
+serde_json = "1"
+
+[[bin]]
+name = "spindle-image-worker"
+path = "src/image_worker.rs"
+required-features = ["dext-native-image"]
+
+[[bin]]
+name = "spindle"
+path = "src/cli.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "api"
+required-features = ["cli"]
+
+[[test]]
+name = "embedded"
+required-features = ["cli", "embedded"]
+
+[[test]]
+name = "self_edit"
+required-features = ["cli"]
+
+[[test]]
+name = "host_tools"
+required-features = ["cli"]
+
+[[test]]
+name = "worker_lifecycle"
+harness = false
+required-features = ["dext-turn", "dext-native-image"]

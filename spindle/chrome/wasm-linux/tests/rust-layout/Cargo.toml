@@ -1,0 +1,18 @@
+# The layouts and constants of Rust's libc crate (as build-rust.sh patches it) for
+# Spindle's wasm Linux; layout.c prints musl's own, and chrome/tests/wasm_linux_rust.mjs
+# compares the two on the machine.
+[package]
+name = "rust-layout-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "0.2.189"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+
+# Its own build, not one of the workspaces above it.
+[workspace]

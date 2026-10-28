@@ -1,0 +1,33 @@
+# The `spindle` command of the browser Linux: Spindle's calls from bash and Node scripts.
+# A static program (i686 musl), so a call does not start an interpreter first, which in
+# the emulated machine costs most of a second. Built by chrome/linux/build.sh.
+[package]
+name = "spindle-command"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "spindle"
+path = "src/main.rs"
+
+# Puts each command in namespaces of its own (the agent starts it, as root).
+[[bin]]
+name = "spindle-sandbox"
+path = "src/sandbox.rs"
+
+[dependencies]
+base64 = "0.22"
+# Objects keep their order, as the replies come.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+# Its own build, not one of the workspace's crates.
+[workspace]

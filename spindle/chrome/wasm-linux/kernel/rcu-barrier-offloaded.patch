@@ -1,0 +1,20 @@
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index 55df6d371..1c8e60719 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -3869,7 +3869,14 @@ void rcu_barrier(void)
+ 			rcu_barrier_trace(TPS("NQ"), cpu, rcu_state.barrier_sequence);
+ 			continue;
+ 		}
+-		if (!rcu_rdp_cpu_online(rdp)) {
++		/*
++		 * An offloaded CPU's callbacks are queued under its nocb lock, which
++		 * rcu_barrier_entrain() takes: entrain here rather than interrupt a
++		 * CPU that may not take the IPI (a task that never enters the
++		 * kernel on a full dynticks CPU of an architecture without
++		 * preemption holds it, and the IPI's sender would spin forever).
++		 */
++		if (!rcu_rdp_cpu_online(rdp) || rcu_rdp_is_offloaded(rdp)) {
+ 			rcu_barrier_entrain(rdp);
+ 			WARN_ON_ONCE(READ_ONCE(rdp->barrier_seq_snap) != gseq);
+ 			raw_spin_unlock_irqrestore(&rcu_state.barrier_lock, flags);

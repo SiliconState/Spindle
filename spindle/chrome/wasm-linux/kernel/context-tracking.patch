@@ -1,0 +1,67 @@
+diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
+index b6f1490a7..f8b05377b 100644
+--- a/arch/wasm/Kconfig
++++ b/arch/wasm/Kconfig
+@@ -21,6 +21,15 @@ config WASM
+ 	select OF_EARLY_FLATTREE
+ 	select OF_IRQ
+ 	select HAVE_PAGE_SIZE_64KB
++	# The generic entry code tracks the user boundary at every syscall, and task
++	# entry and signal delivery mark it too: with NO_HZ_FULL, a CPU running a task
++	# that never calls the kernel is quiescent to RCU instead of stalling every
++	# grace period (nothing preempts it, and it takes no interrupt).
++	select HAVE_CONTEXT_TRACKING_USER
++	# cputime_t is 64-bit there. The wasm threads spec lets a plain i64 access to
++	# shared memory tear, but on the 64-bit hosts browsers run it on, an aligned one
++	# is one access; a torn read would only misreport a task's time.
++	select HAVE_VIRT_CPU_ACCOUNTING_GEN
+ 	select SMP
+ 	select THREAD_INFO_IN_TASK
+ 
+diff --git a/arch/wasm/include/asm/irq_work.h b/arch/wasm/include/asm/irq_work.h
+new file mode 100644
+index 000000000..0c6f42ce4
+--- /dev/null
++++ b/arch/wasm/include/asm/irq_work.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_WASM_IRQ_WORK_H
++#define _ASM_WASM_IRQ_WORK_H
++
++/*
++ * arch_irq_work_raise() (smp.c) sends this CPU an IPI, taken as soon as its interrupts
++ * are on again, as any IPI here is: full dynticks may rely on it.
++ */
++static inline bool arch_irq_work_has_interrupt(void)
++{
++	return true;
++}
++
++#endif /* _ASM_WASM_IRQ_WORK_H */
+diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
+index 38e03e1f4..706a9a1b4 100644
+--- a/arch/wasm/kernel/process.c
++++ b/arch/wasm/kernel/process.c
+@@ -159,8 +159,22 @@ static void noinline_for_stack task_entry_inner(struct task_bootstrap_args *args
+ 	// callback returns when the kernel thread execs a process
+ 	fn_ret = fn(fn_arg);
+ 
++	/*
++	 * Into userspace as a syscall's return goes (context tracking: a CPU running
++	 * a task that never makes a syscall then counts as quiescent to RCU), and
++	 * back out of it when the task returns or traps.
++	 */
++	local_irq_disable();
++	current_pt_regs()->user_mode = 1;
++	exit_to_user_mode();
++	local_irq_enable();
++
+ 	wasm_user_call();
+ 
++	local_irq_disable();
++	enter_from_user_mode(current_pt_regs());
++	local_irq_enable();
++
+ 	// if we're here, either the thread returned from its entrypoint without exiting,
+ 	// or its entrypoint threw an error (likely either an `unreachable` instruction being
+ 	// executed, or an out of range memory access.)
