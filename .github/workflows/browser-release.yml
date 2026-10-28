@@ -44,7 +44,7 @@ jobs:
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
-          echo "ZIP=spindle-browser-$version.zip" >> "$GITHUB_ENV"
+          echo "ASSET=spindle-browser-$version.zip" >> "$GITHUB_ENV"
       - name: Tools
         run: |
           rustup target add wasm32-unknown-unknown i686-unknown-linux-musl
@@ -67,17 +67,17 @@ jobs:
             echo "build paths in the files above" >&2
             exit 1
           fi
-          (cd chrome/dist && zip -q -r -X "$RUNNER_TEMP/$ZIP" .)
-          (cd "$RUNNER_TEMP" && sha256sum "$ZIP" > "$ZIP.sha256")
+          (cd chrome/dist && zip -q -r -X "$RUNNER_TEMP/$ASSET" .)
+          (cd "$RUNNER_TEMP" && sha256sum "$ASSET" > "$ASSET.sha256")
       - name: Check the zip, unpacked, in Chrome
         working-directory: spindle
         run: |
-          unzip -q "$RUNNER_TEMP/$ZIP" -d "$RUNNER_TEMP/spindle-browser"
+          unzip -q "$RUNNER_TEMP/$ASSET" -d "$RUNNER_TEMP/spindle-browser"
           SPINDLE_BROWSER="$(command -v google-chrome)" \
             node chrome/tests/extension_real.mjs "$RUNNER_TEMP/spindle-browser" --scripted
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ runner.temp }}/${{ env.ZIP }}
+          subject-path: ${{ runner.temp }}/${{ env.ASSET }}
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -87,7 +87,7 @@ jobs:
 
           **Install** (Chrome or Edge, 116 or later, on desktop):
 
-          1. Download \`$ZIP\` and unzip it into a folder you will keep.
+          1. Download \`$ASSET\` and unzip it into a folder you will keep.
           2. Open \`chrome://extensions\` (in Edge, \`edge://extensions\`), turn on **Developer mode**, click **Load unpacked** and choose that folder.
           3. Pin Spindle, open its panel, and in **Settings** add a key or **Sign in**.
 
@@ -95,14 +95,14 @@ jobs:
 
           This build runs commands in the browser Linux on v86. The faster wasm Linux is in builds made from source with \`SPINDLE_WASM_LINUX\` (docs/browser-linux.md).
 
-          **Verify:** \`sha256sum -c $ZIP.sha256\`, or \`gh attestation verify $ZIP -R $GITHUB_REPOSITORY\`.
+          **Verify:** \`sha256sum -c $ASSET.sha256\`, or \`gh attestation verify $ASSET -R $GITHUB_REPOSITORY\`.
 
           The zip's THIRD-PARTY.md lists the other software it carries, with licenses and sources.
           EOF
           cd "$RUNNER_TEMP"
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$TAG" "$ZIP" "$ZIP.sha256" -R "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" -R "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$TAG" "$ZIP" "$ZIP.sha256" -R "$GITHUB_REPOSITORY" --verify-tag \
+            gh release create "$TAG" "$ASSET" "$ASSET.sha256" -R "$GITHUB_REPOSITORY" --verify-tag \
               --title "Spindle for Browser $VERSION" --notes-file notes.md
           fi
