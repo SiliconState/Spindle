@@ -490,6 +490,8 @@ function renderHistory({ thread, history, running, bundle }, { from = 0 } = {}) 
       box.append(earlierButton(thread, messages.slice(0, start)));
     }
   }
+  // One workspace card, for the workspace as it is now: an earlier one goes.
+  for (const card of box.querySelectorAll('.workspace-card')) card.remove();
   turnPaths = new Set();
   turnCards = [];
   const pictures = renderMessages(box, thread, messages.slice(start), from + start, { running, main: true });
@@ -502,8 +504,14 @@ function renderHistory({ thread, history, running, bundle }, { from = 0 } = {}) 
   // The last turn's pages, pictures and Markdown open (a few: each page is a frame).
   turnCards.filter((card) => card.preview && card.isConnected).slice(-3).forEach((card) => card.preview());
   pictures.slice(-4).forEach((card) => card.preview());
-  // Once no turn runs: the workspace, at the end of the conversation.
-  if (!running) box.append(workspaceCard(thread.id));
+  // Once no turn runs: the workspace, just above the turn's final answer (at the end when
+  // the turn ended without one). It marks what the turn made or changed.
+  if (!running) {
+    const card = workspaceCard(thread.id);
+    const last = [...box.children].reverse().find((node) => node.matches('article.message-wrap'));
+    if (last?.matches('.assistant:not(.steer)')) last.before(card);
+    else box.insertBefore(card, end);
+  }
   // What the running step has written so far stays on screen.
   if (live) box.append(live.node);
   scrollDown(from === 0);
@@ -1004,7 +1012,6 @@ async function onTurnEnd(id, unsent) {
   refreshWorkspace(id);
   if (id !== current) return;
   const paint = ++historyPaint;
-  const changed = turnStart?.id === id ? turnStart : null;
   endLive(live?.text);
   // Messages the turn ended before reading go back in the box, to send as the next one.
   if (unsent.length && !$('prompt').value.trim()) {
@@ -1024,49 +1031,11 @@ async function onTurnEnd(id, unsent) {
       renderHistory(data);
     }
     status = data.status;
-    await showChanged(id, changed, paint);
   } catch {}
   renderBar();
 }
 
 // ---- Files in the conversation ------------------------------------------------------
-
-/** The workspace as a turn began ({id, digests: path -> digest}), to show after it what
- * its commands changed (its file tools' files have their cards already). */
-let turnStart = null;
-
-async function noteTurnStart(id, attached = []) {
-  try {
-    const { files } = await ask('files', { id });
-    turnStart = { id, digests: new Map(files.map((file) => [file.path, file.digest])), attached: new Set(attached) };
-  } catch {
-    turnStart = null;
-  }
-}
-
-async function showChanged(id, start, paint) {
-  if (!start) return;
-  const { digests: before, attached } = start;
-  if (turnStart === start) turnStart = null;
-  const { files } = await ask('files', { id });
-  // What the user attached came with the message, not from its commands.
-  const changed = files.filter((file) => before.get(file.path) !== file.digest && !turnPaths.has(file.path) && !attached.has(file.path));
-  if (!changed.length || current !== id || historyPaint !== paint) return;
-  const group = el('section', 'file-group');
-  group.append(el('span', 'role-label', changed.length === 1 ? 'MADE OR CHANGED BY ITS COMMANDS' : `MADE OR CHANGED BY ITS COMMANDS · ${changed.length}`));
-  let shown = false;
-  for (const file of changed.slice(0, 12)) {
-    // The first page, picture or Markdown file opens; the rest wait to be asked.
-    const presentable = ['page', 'picture', 'markdown'].includes(kindOf(file.path));
-    group.append(fileCard(id, file.path, { size: file.size, preview: presentable && !shown }));
-    shown ||= presentable;
-  }
-  if (changed.length > 12) group.append(el('p', 'note', `…and ${changed.length - 12} more in the workspace below.`));
-  const workspace = $('history').querySelector('.workspace-card');
-  if (workspace) workspace.before(group);
-  else $('history').append(group);
-  scrollDown();
-}
 
 const readBytes = async (id, path) => (await ask('read', { id, path })).bytes;
 /** A file tool's path as the workspace names it (the tools take `name`, `./name` and
@@ -1672,10 +1641,7 @@ function send() {
     }
     try {
       if (thread) {
-        if (thread.state !== 'running') {
-          await noteTurnStart(thread.id, files.map((file) => file.path));
-          if (current === target) shown.turnFrom = shown.total;
-        }
+        if (thread.state !== 'running' && current === target) shown.turnFrom = shown.total;
         const answer = await ask('send', { id: thread.id, text, ...(files.length && { files }) });
         sending = null;
         if (answer.steered != null) toast('Sent to the running turn.');
@@ -1684,8 +1650,6 @@ function send() {
         sending = null;
         if (current === target) {
           carry(null);
-          // A new thread's workspace starts with its attachments only.
-          turnStart = from ? null : { id, digests: new Map(), attached: new Set(files.map((file) => file.path)) };
           await openThread(id);
         }
       }
@@ -1719,10 +1683,9 @@ $('prompt').addEventListener('input', () => {
   autosize();
   renderSend();
 });
-// The thread clicked, whichever is open by the time the files are listed.
 const again = (op) => () => {
   const id = current;
-  if (id) noteTurnStart(id).then(() => ask(op, { id })).catch((error) => toast(error.message));
+  if (id) ask(op, { id }).catch((error) => toast(error.message));
 };
 $('resume').onclick = again('resume');
 $('retry').onclick = again('retry');

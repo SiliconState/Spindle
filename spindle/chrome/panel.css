@@ -321,7 +321,6 @@ a.button-like { justify-content: center; text-decoration: none; margin-top: 10px
 .file-picture { display: block; max-width: 100%; margin: 0 auto; }
 .file-markdown { padding: 10px 12px; font-size: 13px; line-height: 1.6; max-height: 60vh; overflow: auto; }
 .file-text { margin: 0; border: 0; max-height: 50vh; overflow: auto; }
-.file-group { margin: 14px 0; }
 .workspace-card { border: 1px solid var(--rule); background: var(--soft); margin: 18px 0 8px; padding: 0 10px 10px; }
 .workspace-card > summary { cursor: pointer; padding: 10px 0 4px; font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
 .workspace-card .file-card { background: var(--surface); }

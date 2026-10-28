@@ -106,16 +106,15 @@ No server and no relay: the extension calls your provider directly with your key
   as real input; Chrome shows that Spindle is debugging a tab while it acts on it.
 - **Files in and out:** attach files to a message (the + beside the box, or drop them on
   the panel) and they land in the thread's workspace. What a thread makes shows in the
-  conversation as a card under the step that wrote it (and, for files its commands
-  changed, at the end of the turn): a web page runs in a preview (its scripts, styles,
+  conversation as a card under the step that wrote it: a web page runs in a preview (its scripts, styles,
   pictures and data files come from the workspace; it runs in a sandboxed page that
   cannot reach Spindle or your keys, and reaches nothing outside the workspace: no
   fetch, picture or script from the web, no form sent, until you press Load from the web
   on it, which lets that preview load over HTTPS), Markdown is drawn, pictures show,
   text and code show as they are; each card has icon buttons (show here, open in the
-  workspace, Download; their words in their tooltips). The workspace is listed at the end
-  of the conversation by folder, the files the last turn made or changed marked new or
-  edited, scratch files (`.txt`, `.py`, `tests/`) out of sight until you show them, with
+  workspace, Download; their words in their tooltips). The workspace is listed once, by
+  folder, just above the last turn's final answer, the files that turn made or changed
+  (by file tools or commands) marked new or edited, scratch files (`.txt`, `.py`, `tests/`) out of sight until you show them, with
   Download all (.zip); it has a page of its own in the panel (Workspace in the thread's
   menu, or a card's workspace button): its files to filter and open, one at a time with
   its preview, the files before and after it a click (or an arrow key) away, its path to

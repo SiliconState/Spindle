@@ -806,7 +806,9 @@ try {
   await panel.click('#settings-dialog [data-close]');
   const site = `http://127.0.0.1:${port}/api/notes.json`;
   const siteScript = `spindle http ${site} && (spindle http -X POST -d x ${site} || echo "post refused") && printf 'const n: number = 6 * 7;\\nconsole.log("ts", n);\\n' > t.ts && node t.ts`;
-  scripted.replies.push(call('bash', { command: siteScript }), text('Read the site; POST refused; ts 42.'));
+  // Node in the emulated Linux is slow on a small CI runner: the command says how long
+  // it may take, as a model does for a slow one.
+  scripted.replies.push(call('bash', { command: siteScript, timeout: 180 }), text('Read the site; POST refused; ts 42.'));
   await panel.click(`#threads .thread-row[data-id="${linuxThread}"]`);
   await panel.until(`spindlePanel.current === ${JSON.stringify(linuxThread)} && spindlePanel.status`, { what: 'the Linux thread to open' });
   await sendPrompt(panel, `Run exactly this command with bash, then reply with only its output: ${siteScript}`);
@@ -875,8 +877,8 @@ try {
   // with the page running in a preview that reaches nothing outside the workspace (its
   // script ran; its fetch out was refused; what it loads from the web waits for the
   // user's yes), Download saves it, navigate to /workspace/NAME opens it in a tab for
-  // the user; a file its command makes shows after the turn (Markdown drawn), and the
-  // workspace is listed at the end.
+  // the user; a file its command makes is in the one workspace card (marked), which
+  // sits just above the turn's final answer.
   step = 'files in the conversation';
   const report = `<!doctype html><title>Report</title><style>h1{color:#3f5b2f}</style><h1>Report</h1><script src="https://cdn.example.invalid/chart.js"></script><script>console.log('spindle-test ran'); fetch('http://127.0.0.1:${port}/rendered?word=leak').then(() => console.log('spindle-test reached'), () => console.log('spindle-test closed'))</script>`;
   const notesCommand = "printf '# Notes\\n\\n- first point\\n' > notes.md";
@@ -903,15 +905,18 @@ try {
   const webNote = await panel.until(`document.querySelector('#history .file-card[data-path="report.html"] .file-web')?.textContent`, { what: "the note of what the page would load from the web" }).catch((error) => error.message);
   await panel.click('#history .file-card[data-path="report.html"] .file-web button');
   const webAllowed = await panel.until(`!document.querySelector('#history .file-card[data-path="report.html"] .file-web') && document.querySelector('#history .file-card[data-path="report.html"] .file-frame') && true`, { what: 'the preview again, open to the web' }).catch((error) => error.message);
-  const notesCard = await panel.until(`document.querySelector('#history .file-group .file-card[data-path="notes.md"] .file-markdown :is(h1, h2, h3)')?.textContent`, { what: 'the notes card, drawn' }).catch((error) => error.message);
-  const reportTwice = await panel.eval(`document.querySelectorAll('#history .file-group .file-card[data-path="report.html"]').length`);
+  // What its commands made is in the workspace card (no list of its own), and that card
+  // sits just above the turn's final answer.
+  const notesListed = await panel.until(`document.querySelector('#history .workspace-card .file-row[data-path="notes.md"]') && true`, { what: 'the command\'s notes.md in the workspace card' }).catch((error) => error.message);
+  const commandLists = await panel.eval(`document.querySelectorAll('#history .file-group').length`);
+  const cardAboveAnswer = await panel.eval(`(() => { const card = document.querySelector('#history .workspace-card'); const answers = [...document.querySelectorAll('#history article.message-wrap.assistant')]; return Boolean(card) && card.nextElementSibling === answers.at(-1); })()`);
   // Its summary counts the files once they are listed.
   const workspaceListed = await panel.until(`(() => { const text = document.querySelector('#history .workspace-card summary')?.textContent ?? ''; return /\\d+ files?/.test(text) && text; })()`, { what: 'the workspace card' }).catch((error) => error.message);
   const tabsAfter = await reportTabs();
   for (const tab of tabsAfter) await browser.send('Target.closeTarget', { targetId: tab.targetId }).catch(() => {});
   const saved = fs.readFileSync(await downloadBy(panel, '#history .file-card[data-path="report.html"] button[title="Download report.html"]', /^report\.html$/)).toString();
   await panel.screenshot(join(shots, '03h-files-in-conversation.png'));
-  check('what a thread makes shows in the conversation: a report (written to /workspace/report.html) as a page running shut off from the network, the web on a click, Download, opened in a tab by navigate; a command\'s Markdown file drawn after the turn; the workspace listed', () => {
+  check('what a thread makes shows in the conversation: a report (written to /workspace/report.html) as a page running shut off from the network, the web on a click, Download, opened in a tab by navigate; what its commands made in the one workspace card, just above the final answer', () => {
     assert.equal(conversed, 'idle', `state ${conversed}`);
     assert.equal(reportCard, true, `the report's card shows its page: ${reportCard}`);
     assert.ok(ran, `the page's script ran in the card (its frames said: ${JSON.stringify(cardSaid())})`);
@@ -920,8 +925,9 @@ try {
     assert.match(String(webNote), /cdn\.example\.invalid/, `what it would load from the web is said: ${webNote}`);
     assert.equal(webAllowed, true, `Load from the web shows it again, open to the web: ${webAllowed}`);
     assert.equal(tabsAfter.length, tabsBefore + 1, 'navigate to /workspace/report.html opened it in a tab');
-    assert.equal(notesCard, 'Notes', `the command's notes.md is drawn as Markdown: ${notesCard}`);
-    assert.equal(reportTwice, 0, 'the report written by a file tool is not shown again as made by commands');
+    assert.equal(notesListed, true, `the command's notes.md is in the workspace card: ${notesListed}`);
+    assert.equal(commandLists, 0, 'no separate list of what the commands made');
+    assert.equal(cardAboveAnswer, true, 'the workspace card is just above the final answer');
     assert.match(String(workspaceListed), /Workspace · \d+ files/, `the workspace card: ${workspaceListed}`);
     assert.equal(saved.trim(), report.trim(), 'Download saves the report as written');
   });
