@@ -375,8 +375,9 @@ How the tools run ([`background.js`](../spindle/chrome/background.js)):
 - **Acting** attaches `chrome.debugger` (protocol 1.3) to the tab on demand and detaches after
   20 s without use (or when network recording stops). Chrome shows its debugging bar while
   attached. If the user closes that bar, Spindle does not act on that tab again until the user
-  turns page actions off and on (the veto is kept in Chrome's session storage, so a resting
-  service worker does not forget it; closing the tab drops it).
+  turns page actions off and on (the veto is kept in Chrome's session storage, one key per
+  tab, so a resting service worker does not forget it and vetoes written at once, as when
+  the bar ends several attachments together, all hold; closing the tab drops it).
 - **One action at a time per tab.** `click`, `type`, `select`, `press`, `scroll` and in-place
   `navigate` on one tab run one after another, so two threads never interleave focus and input
   on the same page. `dialog` is not queued: answering a dialog is what lets a waiting action on.

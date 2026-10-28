@@ -175,14 +175,14 @@ const pageContext = vm.createContext({
     storage: { session: (() => {
       const kept = {};
       return {
-        get: async (key) => (key in kept ? { [key]: kept[key] } : {}),
+        get: async (key) => (key === null ? { ...kept } : key in kept ? { [key]: kept[key] } : {}),
         set: async (values) => { Object.assign(kept, values); },
-        remove: async (key) => { delete kept[key]; },
+        remove: async (keys) => { for (const key of [keys].flat()) delete kept[key]; },
       };
     })() },
   },
 });
-vm.runInContext(`${background}\nglobalThis.test = { watched, attached, network, recordNetwork, cdp, calls, inPage, attach, veto, unveto, onTab };`, pageContext);
+vm.runInContext(`${background}\nglobalThis.test = { watched, attached, network, recordNetwork, cdp, calls, inPage, attach, veto, unveto, vetoed, onTab };`, pageContext);
 const bg = pageContext.test;
 bg.attached.set(7, null);
 bg.watched.set(7, new Map([['1234.56', { id: '1234.56' }]]));
@@ -208,11 +208,18 @@ vm.runInContext('for (const timer of attached.values()) clearTimeout(timer);', p
 // just the next one, until page actions go off and on (letGo clears the veto).
 await bg.veto(9);
 for (let n = 0; n < 2; n++) await assert.rejects(bg.attach(9), /closed Chrome's debugging bar/, `attempt ${n + 1} is refused`);
+// Closing the bar detaches every tab at once: vetoes written side by side all hold.
+await Promise.all([bg.veto(11), bg.veto(12), bg.veto(13)]);
+for (const tab of [9, 11, 12, 13]) assert.equal(await bg.vetoed(tab), true, `tab ${tab} stays vetoed`);
+await bg.unveto(12);
+assert.equal(await bg.vetoed(12), false, 'a closed tab drops its own veto');
+assert.equal(await bg.vetoed(13), true, 'and only its own');
 await bg.unveto();
+for (const tab of [9, 11, 13]) assert.equal(await bg.vetoed(tab), false, `page actions off and on clear tab ${tab}`);
 // Actions on one tab never interleave: a second waits until the first has finished.
 const order = [];
 const step = (name, ms) => () => new Promise((done) => { order.push(`${name} starts`); setTimeout(() => { order.push(`${name} ends`); done(); }, ms); });
 await Promise.all([bg.onTab(4, step('A', 30)), bg.onTab(4, step('B', 1)), bg.onTab(5, step('C', 1))]);
 assert.deepEqual(order.filter((line) => line[0] !== 'C'), ['A starts', 'A ends', 'B starts', 'B ends']);
 assert.ok(order.indexOf('C starts') < order.indexOf('A ends'), 'another tab does not wait');
-console.log('review-regressions passed: operation races, reset safety, early Stop, gateway bounds/redirects, IPv6, CDP body IDs, the debugging-bar veto kept, one action per tab');
+console.log('review-regressions passed: operation races, reset safety, early Stop, gateway bounds/redirects, IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too), one action per tab');

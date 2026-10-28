@@ -489,20 +489,22 @@ const attached = new Map();
 const attaching = new Map();
 /** Tabs where the user closed Chrome's debugging bar: Spindle does not act on them again
  * until the user turns page actions off and on (consent given anew). Kept in Chrome's
- * session storage, so a resting service worker does not forget them. */
-const VETOED = 'vetoed-tabs';
+ * session storage, so a resting service worker does not forget them, one key per tab:
+ * closing the bar detaches every tab at once, and their vetoes are written side by side,
+ * so none may rewrite a list another is writing. */
+const VETOED = 'vetoed-tab:';
 async function vetoed(tabId) {
-  const { [VETOED]: tabs = [] } = await chrome.storage.session.get(VETOED).catch(() => ({}));
-  return tabs.includes(tabId);
+  const key = `${VETOED}${tabId}`;
+  const { [key]: vetoedHere = false } = await chrome.storage.session.get(key).catch(() => ({}));
+  return vetoedHere;
 }
 async function veto(tabId) {
-  const { [VETOED]: tabs = [] } = await chrome.storage.session.get(VETOED).catch(() => ({}));
-  if (!tabs.includes(tabId)) await chrome.storage.session.set({ [VETOED]: [...tabs, tabId] });
+  await chrome.storage.session.set({ [`${VETOED}${tabId}`]: true });
 }
 async function unveto(tabId) {
-  const { [VETOED]: tabs = [] } = await chrome.storage.session.get(VETOED).catch(() => ({}));
-  if (tabId === undefined) await chrome.storage.session.remove(VETOED);
-  else if (tabs.includes(tabId)) await chrome.storage.session.set({ [VETOED]: tabs.filter((tab) => tab !== tabId) });
+  if (tabId !== undefined) return chrome.storage.session.remove(`${VETOED}${tabId}`);
+  const kept = await chrome.storage.session.get(null);
+  await chrome.storage.session.remove(Object.keys(kept).filter((key) => key.startsWith(VETOED)));
 }
 /** Actions on a tab, one at a time: a click or typing is never interleaved with another
  * thread's on the same tab (focus, then insert, stay together). */

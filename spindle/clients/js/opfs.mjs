@@ -17,6 +17,11 @@ const MAGIC = new TextEncoder().encode('spindle-opfs-slot-v1');
  * one is the file (`openOpfsPool` lets the older go). */
 const GENERATION = HEADER - 8;
 const MAX_PATH = GENERATION - MAGIC.length - 2;
+/** A directory moving: a slot named MOVE, then the old and new names (a path holds no
+ * NUL), written before its first file moves and let go of after its last. A pool opened
+ * with one finishes that move (`adoptSlots`), so a crash midway never leaves a directory
+ * split between its two names. */
+const MOVE = '\0move\0';
 /** The fd `openSync` gives a directory (synced by flushing its slots' headers). */
 const DIRECTORY = -2;
 
@@ -46,27 +51,48 @@ export async function openOpfsPool({ directory = 'spindle', slots = 48 } = {}) {
   return new OpfsFs(pool, dir, adoptSlots(pool));
 }
 
-/** Reads each slot's header into it (`path`, `generation`) and lets go of the older of
- * two slots one replacement left with the same path (a crash between its two steps):
- * the newest generation is the file. Returns the newest generation seen. */
+/** Reads each slot's header into it (`path`, `generation`), lets go of the older of
+ * two slots one replacement left with the same path (a crash between its two steps:
+ * the newest generation is the file), and finishes a directory move a crash cut short.
+ * Returns the newest generation given. */
 export function adoptSlots(pool) {
   let latest = 0;
   const named = new Map();
+  const moves = [];
   for (const slot of pool) {
     ({ path: slot.path, generation: slot.generation } = readHeader(slot.handle));
     latest = Math.max(latest, slot.generation);
     if (!slot.path) continue;
+    if (slot.path.startsWith(MOVE)) {
+      moves.push(slot);
+      continue;
+    }
     const other = named.get(slot.path);
     const [kept, gone] = !other || slot.generation > other.generation ? [slot, other] : [other, slot];
     named.set(slot.path, kept);
-    if (gone) {
-      writePath(gone.handle, '', 0);
-      gone.handle.truncate(HEADER);
-      gone.handle.flush();
-      gone.path = '';
+    if (gone) release(gone);
+  }
+  for (const move of moves) {
+    const [from, to] = move.path.slice(MOVE.length).split('\0');
+    for (const slot of pool) {
+      if (slot.path !== from && !slot.path.startsWith(`${from}/`)) continue;
+      latest += 1;
+      const path = to + slot.path.slice(from.length);
+      writePath(slot.handle, path, latest);
+      slot.path = path;
+      slot.generation = latest;
     }
+    release(move);
   }
   return latest;
+}
+
+/** Empties a slot: no path, no bytes. */
+function release(slot) {
+  writePath(slot.handle, '', 0);
+  slot.handle.truncate(HEADER);
+  slot.handle.flush();
+  slot.path = '';
 }
 
 /** Opens slots `from`..`to` (all or none: on a failure the ones opened are closed). */
@@ -184,11 +210,7 @@ export class OpfsFs {
   unlinkSync(path) {
     const at = this.#find(path);
     if (at < 0) throw failure('ENOENT', path);
-    const slot = this.#pool[at];
-    writePath(slot.handle, '', 0);
-    slot.handle.truncate(HEADER);
-    slot.handle.flush();
-    slot.path = '';
+    release(this.#pool[at]);
   }
   existsSync(path) { return this.#find(path) >= 0 || this.#inside(path); }
   /** Removes the file `path`, or with `recursive` everything under it too. */
@@ -204,23 +226,28 @@ export class OpfsFs {
     // A file replaces a file, as rename(2) does: it takes the name first, under a newer
     // generation, and the old slot is let go of after, so a crash between leaves the
     // new file under the name (the older slot goes when the pool is next opened), never
-    // no file. Directories never merge.
+    // no file. Directories never merge. A directory of several files moves under a record
+    // of the move (MOVE), so a crash midway is finished when the pool is next opened.
     const replaced = this.#find(to);
     const file = moving.length === 1 && moving[0].path === from;
     if (replaced >= 0 && !file) throw failure('EEXIST', to);
     if (replaced < 0 && this.existsSync(to)) throw failure('EEXIST', to);
     const old = replaced >= 0 ? this.#pool[replaced] : null;
+    let record = null;
+    if (moving.length > 1) {
+      record = this.#pool.find((slot) => !slot.path);
+      if (!record) throw failure('ENOSPC', 'the OPFS pool is full; open it with more slots');
+      record.handle.truncate(HEADER);
+      writePath(record.handle, `${MOVE}${from}\0${to}`, this.#next());
+      record.path = `${MOVE}${from}\0${to}`;
+    }
     for (const slot of moving) {
       const path = to + slot.path.slice(from.length);
       writePath(slot.handle, path, this.#next());
       slot.path = path;
     }
-    if (old) {
-      writePath(old.handle, '', 0);
-      old.handle.truncate(HEADER);
-      old.handle.flush();
-      old.path = '';
-    }
+    if (old) release(old);
+    if (record) release(record);
   }
   mkdirSync() {}
   /** The names directly inside `path` (directories are the paths' prefixes). */

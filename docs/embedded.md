@@ -423,7 +423,13 @@ runs over that pool.
 - Each slot holds one file. Its first 4096 bytes are a header with the magic
   `spindle-opfs-slot-v1` and the path the slot holds, and the file's data follows.
   Directories are path prefixes, `mkdirSync` does nothing, and a rename rewrites slot
-  headers. `fsyncSync` is the handle's `flush()`. When no slot is free, opening a new
+  headers. A file that replaces another takes the name first, under a newer generation
+  (the header's last 8 bytes), and the old slot is emptied after, so a crash between
+  leaves the new file under the name and the next open empties the older slot. A
+  directory of several files moves under a record of the move, kept in a free slot from
+  before its first file moves until after its last; the next open finishes a move a crash
+  cut short, so a directory is never split between its two names. `fsyncSync` is the
+  handle's `flush()`. When no slot is free, opening a new
   file fails with `ENOSPC`. `free` counts empty slots, and `grow(count)` adds slots
   between operations.
 - `lockSession(dir)` takes the exclusive Web Lock `spindle:<dir>` if it is available
