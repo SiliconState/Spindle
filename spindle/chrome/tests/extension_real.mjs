@@ -1,4 +1,4 @@
-// Spindle for Chrome, end to end in real Chrome: the built extension is loaded into a
+// Spindle for Browser, end to end in real Chrome: the built extension is loaded into a
 // fresh profile and driven through its own panel with real clicks and typing, against a
 // real provider (or, with --scripted, a scripted one served here). It checks:
 //

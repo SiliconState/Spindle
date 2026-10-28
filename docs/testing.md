@@ -87,7 +87,7 @@ parent crash tests invoke, not disabled coverage.
 | `embed/tests/package.sh WASM_BINDGEN` | Builds the wasm package and runs its Node tests and, with `SPINDLE_BROWSER`, its OPFS browser tests |
 | `store/tests/wasi_probe.sh WASI_LIBC_ROOT` | The store compiled for WASI (against an extracted wasi-libc package), run under Node |
 
-The Chrome extension and the browser Linuxes have their own suites; see
+The browser extension and the browser Linuxes have their own suites; see
 [chrome.md](chrome.md#tests) and [browser-linux.md](browser-linux.md). Tests that take a
 real provider key send real, billed requests and say so in their usage line.
 
@@ -109,15 +109,21 @@ The driver's normal dependency tree must not contain `dext-native`, `dext-provid
 
 ## Continuous integration
 
-[`.github/workflows/spindle.yml`](../.github/workflows/spindle.yml) runs on every push and
-pull request:
+[`.github/workflows/spindle.yml`](../.github/workflows/spindle.yml) runs on every branch push and
+pull request, except those that change only the website or the release workflow:
 
 | Job | Runs |
 | --- | --- |
 | `linux` | fmt and Clippy, debug and release workspace tests, engine tests, Node/Python clients, UI tests, `cargo audit` and `cargo deny --workspace --all-features check licenses` in both workspaces (see [Dependency policy](#dependency-policy)) |
 | `portable` | Clippy and tests of `spindle-store` for each portable feature set, plus the native-free dependency checks |
-| `wasm` | Provider and wire crates on `wasm32-unknown-unknown`, the browser-target store, the WASI probe, the embedded package in Node and headless Chrome, the browser Linux build and its Node tests, and Spindle for Chrome against a scripted provider |
+| `wasm` | Provider and wire crates on `wasm32-unknown-unknown`, the browser-target store, the WASI probe, the embedded package in Node and headless Chrome, the browser Linux build and its Node tests, and Spindle for Browser against a scripted provider |
 | `windows` | Native store, CLI and engine tests on Windows |
+
+Two more workflows publish. [`pages.yml`](../.github/workflows/pages.yml) deploys `site/` to
+GitHub Pages when it changes. [`browser-release.yml`](../.github/workflows/browser-release.yml),
+on a `browser-v*` tag, builds Spindle for Browser, runs `extension_real.mjs --scripted` against
+the zip it publishes, and attaches the zip to the tag's release (see
+[chrome.md](chrome.md#install-a-release)).
 
 ## Dependency policy
 

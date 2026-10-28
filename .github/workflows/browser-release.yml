@@ -1,0 +1,108 @@
+name: browser release
+
+# Publishes Spindle for Browser as a zip on a GitHub release. Push a tag browser-vVERSION,
+# where VERSION is spindle/chrome/manifest.json's version; the job builds the extension
+# from that commit (the browser Linux included), checks the unpacked zip in Chrome
+# against a scripted provider, attests where it was built, and attaches it to the
+# tag's release. Running it by hand on an existing tag builds and replaces the zip.
+on:
+  push:
+    tags: ["browser-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing browser-v* tag to build again"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - name: Version from the manifest
+        run: |
+          version=$(node -p "require('./spindle/chrome/manifest.json').version")
+          if [ "$TAG" != "browser-v$version" ]; then
+            echo "tag $TAG does not name the manifest's version $version" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "ZIP=spindle-browser-$version.zip" >> "$GITHUB_ENV"
+      - name: Tools
+        run: |
+          rustup target add wasm32-unknown-unknown i686-unknown-linux-musl
+          # clang compiles SQLite for wasm32 (sqlite-wasm-rs).
+          sudo apt-get update
+          sudo apt-get install -y clang
+          # The browser Linux's boot image is made in a user namespace, which this
+          # runner's AppArmor blocks by default.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          version=$(sed -n 's/^wasm-bindgen = "=\(.*\)"$/\1/p' spindle/embed/Cargo.toml)
+          cargo install wasm-bindgen-cli --version "$version" --locked --root "$RUNNER_TEMP/wasm-bindgen"
+      - name: Build
+        working-directory: spindle
+        run: |
+          chrome/linux/build.sh
+          chrome/build.sh "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen"
+          cp ../LICENSE chrome/dist/LICENSE
+          # The build names no directory of the machine that made it.
+          if grep -r -a -l -F -e "$HOME" -e "$GITHUB_WORKSPACE" chrome/dist; then
+            echo "build paths in the files above" >&2
+            exit 1
+          fi
+          (cd chrome/dist && zip -q -r -X "$RUNNER_TEMP/$ZIP" .)
+          (cd "$RUNNER_TEMP" && sha256sum "$ZIP" > "$ZIP.sha256")
+      - name: Check the zip, unpacked, in Chrome
+        working-directory: spindle
+        run: |
+          unzip -q "$RUNNER_TEMP/$ZIP" -d "$RUNNER_TEMP/spindle-browser"
+          SPINDLE_BROWSER="$(command -v google-chrome)" \
+            node chrome/tests/extension_real.mjs "$RUNNER_TEMP/spindle-browser" --scripted
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/${{ env.ZIP }}
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Spindle for Browser $VERSION, for Chrome and Edge, built from this tag by the browser release workflow.
+
+          **Install** (Chrome or Edge, 116 or later, on desktop):
+
+          1. Download \`$ZIP\` and unzip it into a folder you will keep.
+          2. Open \`chrome://extensions\` (in Edge, \`edge://extensions\`), turn on **Developer mode**, click **Load unpacked** and choose that folder.
+          3. Pin Spindle, open its panel, and in **Settings** add a key or **Sign in**.
+
+          **Update:** unzip the new version over the same folder and click **Reload** on Spindle's card in the extensions page. The browser names an unpacked extension by its folder, so a different folder is a separate install with its own threads.
+
+          This build runs commands in the browser Linux on v86. The faster wasm Linux is in builds made from source with \`SPINDLE_WASM_LINUX\` (docs/browser-linux.md).
+
+          **Verify:** \`sha256sum -c $ZIP.sha256\`, or \`gh attestation verify $ZIP -R $GITHUB_REPOSITORY\`.
+
+          The zip's THIRD-PARTY.md lists the other software it carries, with licenses and sources.
+          EOF
+          cd "$RUNNER_TEMP"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$ZIP" "$ZIP.sha256" -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$ZIP" "$ZIP.sha256" -R "$GITHUB_REPOSITORY" --verify-tag \
+              --title "Spindle for Browser $VERSION" --notes-file notes.md
+          fi

@@ -1,6 +1,6 @@
 # Browser Linux
 
-Spindle for Chrome runs a thread's `bash` commands in a Linux that runs inside the extension
+Spindle for Browser runs a thread's `bash` commands in a Linux that runs inside the extension
 (see [chrome.md](chrome.md)). The extension can carry two of them. The **v86 Linux** is 32-bit
 Alpine Linux emulated by v86, with bash, Python, Node, git and network access through Chrome. The
 optional **wasm Linux** is the Linux kernel compiled to WebAssembly and run without an emulator,
@@ -481,8 +481,9 @@ SPINDLE_WASM_LINUX=chrome/wasm-linux/dist chrome/build.sh /path/to/wasm-bindgen
 ### v86 Linux
 
 [`chrome/linux/build.sh [OUT_DIR]`](../spindle/chrome/linux/build.sh) (default `chrome/linux/dist`)
-needs curl, npm, python3, user namespaces (`unshare -r`), and Rust with the
-`i686-unknown-linux-musl` target. It:
+needs curl, npm, python3, user namespaces (`unshare -r`; Ubuntu 23.10 and later restrict them
+through AppArmor until `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`), and Rust
+with the `i686-unknown-linux-musl` target. It:
 
 1. Fetches the v86 npm package at a pinned version, checks its SHA-256, and checks that it was
    built from the pinned v86 commit. It also fetches the SeaBIOS and VGA BIOS images and v86's

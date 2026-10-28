@@ -6,7 +6,7 @@ section links to the document that covers the mechanism in depth.
 
 ## Session
 
-A **session** (shown as a *thread* in the web UI and the Chrome extension) is one
+A **session** (shown as a *thread* in the web UI and the browser extension) is one
 conversation with a model over one workspace. It lives in a directory (native and Node)
 or under a name in browser storage, and its authoritative state is a single SQLite
 store. Everything else in the directory is a mirror (`session.json` for settings), an

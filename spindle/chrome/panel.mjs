@@ -372,7 +372,7 @@ function showHome() {
   homeLabel('Spindle', '');
   $('title-button').hidden = true;
   $('title').textContent = 'Spindle';
-  $('subtitle').textContent = 'Agent threads that live in Chrome.';
+  $('subtitle').textContent = 'Agent threads that live in your browser.';
   $('prompt').placeholder = 'Start a new thread…';
   renderThreads();
   renderBar();

@@ -1,5 +1,5 @@
 // Real Chrome driven over the DevTools protocol on a pipe (--remote-debugging-pipe), as
-// Spindle for Chrome's tests drive it. Extensions load through Extensions.loadUnpacked
+// Spindle for Browser's tests drive it. Extensions load through Extensions.loadUnpacked
 // (--enable-unsafe-extension-debugging): branded Chrome ignores --load-extension since
 // 137. Clicks and typing are real input events, so the page sees user gestures.
 import { spawn } from 'node:child_process';

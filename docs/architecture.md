@@ -11,7 +11,7 @@ guessing what happened.
 
 The same store and driver run in three kinds of host: the native `spindle` binary (CLI,
 stdio API and browser host), the embedded package (WebAssembly inside a JavaScript app),
-and Spindle for Chrome (the embedded package inside a browser extension).
+and Spindle for Browser (the embedded package inside a browser extension).
 
 - [System context](#system-context)
 - [Layers](#layers)
@@ -31,7 +31,7 @@ flowchart LR
         Terminal["Terminal"]
         Phone["Browser or phone"]
         App["JS / Python / Rust app"]
-        Chrome["Chrome user"]
+        Chrome["Chrome or Edge user"]
     end
 
     subgraph Native["Native host: the spindle binary"]
@@ -51,7 +51,7 @@ flowchart LR
     App --> Stdio
     App --> Serve
     App --> Package
-    Chrome --> Ext["Spindle for Chrome"] --> Package
+    Chrome --> Ext["Spindle for Browser"] --> Package
 
     CLI --> Core
     Stdio --> Core
@@ -233,7 +233,7 @@ Web Locks). `EmbeddedClient` ([`clients/js/embedded.mjs`](../spindle/clients/js/
 speaks the same JSON-RPC protocol as `spindle api`, so an app can switch between the two.
 See [embedded.md](embedded.md).
 
-### Spindle for Chrome
+### Spindle for Browser
 
 A side-panel extension whose threads are embedded-package sessions stored in OPFS,
 running in an offscreen document's worker so they continue while the panel is closed.
@@ -272,8 +272,8 @@ flowchart TB
         D1["App + EmbeddedClient"] --> D2["spindle-embed"] --> D3[("files or OPFS")]
         D1 -->|"app performs requests"| D4["Provider"]
     end
-    subgraph E["5 · Chrome extension"]
-        E1["Spindle for Chrome"] --> E2[("OPFS")]
+    subgraph E["5 · Browser extension"]
+        E1["Spindle for Browser"] --> E2[("OPFS")]
         E1 -.->|"optional"| B3
     end
 ```
@@ -284,7 +284,7 @@ flowchart TB
 | Browser host | `spindle serve` | bubblewrap sandbox | host directory of sessions |
 | App over stdio/HTTP | `spindle` | bubblewrap sandbox (HTTP always; stdio sessions follow their isolation mode) | session directories |
 | App with wasm package | the app | the app's runner, a remote `spindle serve`, or none | Node files, OPFS, or memory |
-| Chrome extension | the extension | browser Linux, or a remote host | OPFS |
+| Browser extension | the extension | browser Linux, or a remote host | OPFS |
 
 A session moves between hosts: a Node session directory is a native session directory,
 and any session can be exported to a single-file bundle and imported elsewhere
@@ -349,5 +349,5 @@ effects a rewind cannot undo. See [SECURITY.md](../SECURITY.md).
 | [`spindle/store/ui/`](../spindle/store/ui) | Web UI assets embedded in the binary |
 | [`spindle/embed/`](../spindle/embed) | wasm package with Node and browser storage |
 | [`spindle/clients/`](../spindle/clients) | Node.js and Python clients |
-| [`spindle/chrome/`](../spindle/chrome) | Spindle for Chrome and its browser Linuxes |
+| [`spindle/chrome/`](../spindle/chrome) | Spindle for Browser and its browser Linuxes |
 | [`dext-engine/`](../dext-engine) | Engine crates: core, transcript, native, provider |

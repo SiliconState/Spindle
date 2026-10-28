@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Builds Spindle for Chrome into one folder to load at chrome://extensions ("Load
-# unpacked"): the extension's files, the package's release wasm with its web glue, the
-# JS clients it runs on, the native UI's text helpers and theme (store/ui, copied so
-# there is one source), and the Linux threads run bash in (chrome/linux/build.sh's
-# output; SPINDLE_LINUX names another). With SPINDLE_WASM_LINUX naming a wasm Linux
-# (chrome/wasm-linux/build-image.sh's output) it carries that too, and plain sh commands
-# run there (linux-route.mjs); without it every command runs on v86. Run from the
-# spindle directory. The icons are the native UI's icon.svg drawn at Chrome's sizes.
+# Builds Spindle for Browser into one folder to load at chrome://extensions or
+# edge://extensions ("Load unpacked"): the extension's files, the package's release wasm
+# with its web glue, the JS clients it runs on, the native UI's text helpers and theme
+# (store/ui, copied so there is one source), and the Linux threads run bash in
+# (chrome/linux/build.sh's output; SPINDLE_LINUX names another). With SPINDLE_WASM_LINUX
+# naming a wasm Linux (chrome/wasm-linux/build-image.sh's output) it carries that too, and
+# plain sh commands run there (linux-route.mjs); without it every command runs on v86. Run
+# from the spindle directory. The icons are the native UI's icon.svg drawn at the
+# browser's sizes; THIRD-PARTY.md names the other software a build carries and where its
+# source is.
 #
 # usage: chrome/build.sh [WASM_BINDGEN_CLI] [OUT_DIR]   (OUT_DIR defaults to chrome/dist)
 set -euo pipefail
@@ -30,7 +32,10 @@ if [ "$have" != "$want" ]; then
     exit 1
 fi
 
-cargo build --locked --release -p spindle-embed --target wasm32-unknown-unknown
+# The wasm names source files in its panic messages: under /src (this checkout's parent,
+# holding spindle/ and dext-engine/) and /cargo, not this machine's directories.
+RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$(cd .. && pwd)=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo" \
+    cargo build --locked --release -p spindle-embed --target wasm32-unknown-unknown
 rm -rf "$out"
 mkdir -p "$out/clients" "$out/icons"
 "$bindgen" --target web --out-dir "$out/web" target/wasm32-unknown-unknown/release/spindle_embed.wasm
@@ -51,4 +56,5 @@ fi
 cp chrome/icons/*.png "$out/icons/"
 cp clients/js/common.mjs clients/js/embedded.mjs clients/js/opfs.mjs "$out/clients/"
 cp store/ui/text.js store/ui/theme.js "$out/"
-echo "Spindle for Chrome in $out ($(du -h "$out/web/spindle_embed_bg.wasm" | cut -f1) wasm, $(du -sh "$out/linux" | cut -f1) Linux$([ -n "$wasm_linux" ] && echo ", $(du -sh "$out/wasm-linux" | cut -f1) wasm Linux"))"
+cp chrome/THIRD-PARTY.md "$out/"
+echo "Spindle for Browser in $out ($(du -h "$out/web/spindle_embed_bg.wasm" | cut -f1) wasm, $(du -sh "$out/linux" | cut -f1) Linux$([ -n "$wasm_linux" ] && echo ", $(du -sh "$out/wasm-linux" | cut -f1) wasm Linux"))"

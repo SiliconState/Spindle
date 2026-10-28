@@ -2,7 +2,7 @@
 
 This guide builds the `spindle` binary, signs in to a model provider, runs a first
 session from the terminal, and starts the browser host. For the embedded JavaScript
-package see [embedded.md](embedded.md); for the Chrome extension see [chrome.md](chrome.md).
+package see [embedded.md](embedded.md); for the browser extension see [chrome.md](chrome.md).
 
 ## Requirements
 

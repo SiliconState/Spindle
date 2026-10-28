@@ -96,7 +96,7 @@ Without one, the model gets file tools only.
 
 ## 5. In a browser
 
-For Spindle itself in Chrome, with no relay and no host, use Spindle for Chrome
+For Spindle itself in Chrome or Edge, with no relay and no host, use Spindle for Browser
 (`chrome/README.md`): an extension may call providers directly. What follows is for
 trying the package inside a web page of your own.
 

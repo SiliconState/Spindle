@@ -1,6 +1,7 @@
-# Spindle for Chrome
+# Spindle for Browser
 
-Spindle running inside Chrome: a side-panel extension whose threads are sessions of
+Spindle running inside your browser, tested on Chrome and Edge: a side-panel extension
+(Manifest V3; Chrome's names below cover Edge's too) whose threads are sessions of
 Spindle's embedded package (`embed/`), kept in the browser's private storage (OPFS).
 No server and no relay: the extension calls your provider directly with your key.
 

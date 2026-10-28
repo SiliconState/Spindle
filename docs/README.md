@@ -31,7 +31,7 @@ implement what each page describes.
 | [Tools and execution](tools.md) | Built-in tools, sandboxed commands, background jobs, images, app tools, tasks, code mode | [`agent/`](../spindle/store/src/agent), [`code_mode.rs`](../spindle/store/src/code_mode.rs) |
 | [Browser host](host.md) | `spindle serve`: listener, pairing, remote access, previews, self-edit, web UI | [`serve/`](../spindle/store/src/serve), [`ui/`](../spindle/store/ui) |
 | [Embedded package](embedded.md) | Spindle inside a JS app via WebAssembly; Node and OPFS storage; moving sessions | [`embed/`](../spindle/embed), [`embedded/`](../spindle/store/src/embedded) |
-| [Chrome extension](chrome.md) | Spindle for Chrome: contexts, threads, keys and sign-in, page tools, build and tests | [`chrome/`](../spindle/chrome) |
+| [Browser extension](chrome.md) | Spindle for Browser: contexts, threads, keys and sign-in, page tools, build and tests | [`chrome/`](../spindle/chrome) |
 | [Browser Linux](browser-linux.md) | The v86 and WebAssembly Linuxes that run commands in the browser | [`chrome/linux`](../spindle/chrome/linux), [`chrome/wasm-linux`](../spindle/chrome/wasm-linux) |
 | [Engine crates](engine.md) | `dext-core`, `dext-transcript`, `dext-native`, `dext-provider`; provider catalog and wire formats | [`dext-engine/`](../dext-engine) |
 

@@ -82,8 +82,8 @@ uses on `wasm32-unknown-unknown`, which the VFS registers with) and `getrandom` 
 its JavaScript backend. `wasm-bindgen` is pinned to an exact version (`=0.2.129`), and
 the wasm-bindgen CLI that generates the JavaScript glue must match it exactly.
 
-Requirements: the Rust target `wasm32-unknown-unknown`, the wasm-bindgen CLI at the
-pinned version, and Node 20 or newer.
+Requirements: the Rust target `wasm32-unknown-unknown`, clang (which compiles SQLite for that
+target), the wasm-bindgen CLI at the pinned version, and Node 20 or newer.
 
 [`embed/kit.sh`](../spindle/embed/kit.sh) (run from the `spindle` directory) checks the
 CLI version against the crate's pin, builds the release wasm, generates both glue
@@ -187,7 +187,7 @@ requests from other origins.
 The page fills authentication headers with a random marker the relay hands out at
 `/relay/config`, and the relay replaces the marker with the key. The
 [browser example worker](../spindle/embed/examples/browser/worker.mjs) passes a
-`fetch` that routes requests through the relay. For Spindle as a Chrome extension, see
+`fetch` that routes requests through the relay. For Spindle as a browser extension, see
 [chrome.md](chrome.md).
 
 ## EmbeddedClient
@@ -635,7 +635,7 @@ The client fills in the templates (claims first, read from the key's JWT payload
 key without the claim is refused before anything is reserved), or adds the headers
 `credentials` returned, and keeps the result in JavaScript.
 
-An app that signs its user in to ChatGPT (an OAuth sign-in, as Spindle for Chrome does)
+An app that signs its user in to ChatGPT (an OAuth sign-in, as Spindle for Browser does)
 returns the access token as the key; refreshing it is the app's, before it answers
 `credentials`. Anthropic's subscription sign-in is not supported here: an Anthropic key
 goes in `x-api-key`. The package receives only `{kind: 'authorized'}`. For the

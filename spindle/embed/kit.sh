@@ -15,7 +15,10 @@ if [ "$have" != "$want" ]; then
     exit 1
 fi
 
-cargo build --locked --release -p spindle-embed --target wasm32-unknown-unknown
+# The wasm names source files in its panic messages: under /src (this checkout's parent,
+# holding spindle/ and dext-engine/) and /cargo, not this machine's directories.
+RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$(cd .. && pwd)=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo" \
+    cargo build --locked --release -p spindle-embed --target wasm32-unknown-unknown
 wasm=target/wasm32-unknown-unknown/release/spindle_embed.wasm
 rm -rf "$out"
 mkdir -p "$out/clients" "$out/examples"

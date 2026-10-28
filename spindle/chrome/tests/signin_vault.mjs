@@ -1,4 +1,4 @@
-// Spindle for Chrome: browser sign-in and the key vault, end to end in real Chrome with
+// Spindle for Browser: browser sign-in and the key vault, end to end in real Chrome with
 // scripted services (no account, no cost). It checks:
 //
 //   1. a provider with a browser sign-in shows Sign in, not a key field; signing in opens

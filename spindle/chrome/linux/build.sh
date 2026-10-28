@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the Linux that Spindle for Chrome runs bash in: Alpine (32-bit x86) with bash,
+# Builds the Linux that Spindle for Browser runs bash in: Alpine (32-bit x86) with bash,
 # coreutils, Python and pip, Node and npm, git and curl, booted by v86 (an x86 emulator
 # in wasm) over its 9p filesystem, with Spindle's runner agent and web proxy as its only
 # services (guest/), its `spindle` command and `spindle-sandbox` (which puts each command

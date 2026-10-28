@@ -9,7 +9,7 @@ extension.
 | `spindle-store` ([`store/`](store)) | Store, decision driver, native session, API, CLI and browser host |
 | `spindle-embed` ([`embed/`](embed)) | WebAssembly package with Node and browser storage |
 | [`clients/`](clients) | Node.js and Python clients (no dependencies) |
-| [`chrome/`](chrome) | Spindle for Chrome and its browser Linuxes |
+| [`chrome/`](chrome) | Spindle for Browser and its browser Linuxes |
 
 The engine crates are in [`../dext-engine`](../dext-engine) and are referenced by path;
 keep the two directories side by side.

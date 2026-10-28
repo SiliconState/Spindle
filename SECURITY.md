@@ -65,7 +65,7 @@ them.
 - The provider catalog contains public endpoints and public OAuth client identifiers.
   Those identifiers are not secrets.
 - The embedded package asks the app for credentials when it needs them and never stores
-  them. Spindle for Chrome keeps provider keys and sign-ins sealed in the extension's own
+  them. Spindle for Browser keeps provider keys and sign-ins sealed in the extension's own
   storage (see below) and sends each only to its provider.
 
 ## Command execution
@@ -170,7 +170,7 @@ See [docs/host.md](docs/host.md).
 - A new binary migrates older stores when it opens them. Rolling back the binary does not
   roll back a migrated store; keep the migration backup until you are sure.
 
-## Spindle for Chrome
+## Spindle for Browser
 
 - Threads, credentials and files stay in the extension's storage. Requests go to the
   chosen provider, to sites a thread's network or scripts are granted, and to a relay or

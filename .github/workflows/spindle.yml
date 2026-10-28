@@ -1,11 +1,13 @@
 name: Spindle checks
 
 on:
-  # The website (site/, published by pages.yml) changes no code.
+  # Branches only: a browser-v* tag runs browser-release.yml, which builds and checks what it
+  # publishes. The website (site/, pages.yml) and the release workflow change no code.
   push:
-    paths-ignore: ["site/**", ".github/workflows/pages.yml"]
+    branches: ["**"]
+    paths-ignore: ["site/**", ".github/workflows/pages.yml", ".github/workflows/browser-release.yml"]
   pull_request:
-    paths-ignore: ["site/**", ".github/workflows/pages.yml"]
+    paths-ignore: ["site/**", ".github/workflows/pages.yml", ".github/workflows/browser-release.yml"]
   workflow_dispatch:
 
 permissions:
@@ -157,7 +159,7 @@ jobs:
             && cargo clippy --locked --release --target i686-unknown-linux-musl -- -D warnings)
           chrome/linux/build.sh
           node chrome/tests/linux_node.mjs chrome/linux/dist
-          # Spindle for Chrome, built and driven through its panel in the runner's
+          # Spindle for Browser, built and driven through its panel in the runner's
           # Chrome against a scripted provider (no account).
           chrome/build.sh "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen"
           SPINDLE_BIN="$PWD/target/debug/spindle" SPINDLE_BROWSER="$(command -v google-chrome)" \

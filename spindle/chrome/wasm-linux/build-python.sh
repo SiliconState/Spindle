@@ -122,6 +122,9 @@ rm -rf "$lib"/test "$lib"/idlelib "$lib"/tkinter "$lib"/turtledemo "$lib"/turtle
     "$lib"/lib2to3 "$lib"/pydoc_data "$lib"/config-3.13* "$root"/usr/lib/pkgconfig "$root"/usr/include \
     "$root"/usr/lib/libpython3.13.a "$root"/usr/share "$root"/usr/bin/idle3* "$root"/usr/bin/pydoc3* "$root"/usr/bin/python3*-config
 find "$lib" -name __pycache__ -prune -exec rm -rf {} +
+# Python keeps its configure-time settings (compiler, flags, directories) in
+# _sysconfigdata; this machine's directories are named there as /toolchain and /python.
+sed -i -e "s|$toolchain|/toolchain|g" -e "s|$out|/python|g" "$lib"/_sysconfigdata_*.py
 # Compiled ahead and never checked against the sources' times (the image gives every
 # file one fixed time, and the library is read-only to commands), named by their paths in
 # the guest, not this machine's (the same sources give the same files).

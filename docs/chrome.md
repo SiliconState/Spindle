@@ -1,6 +1,6 @@
-# Spindle for Chrome
+# Spindle for Browser
 
-Spindle for Chrome is a Manifest V3 side-panel extension that runs Spindle threads inside the
+Spindle for Browser is a Manifest V3 side-panel extension that runs Spindle threads inside the
 browser. Each thread is a session of Spindle's embedded package ([`spindle-embed`](../spindle/embed/),
 see [embedded.md](embedded.md)) stored in the extension's origin private file system (OPFS).
 The threads run in a worker of an offscreen document, so they keep going while the panel is
@@ -9,6 +9,8 @@ sealed in the extension's IndexedDB. Threads can read and act on browser tabs th
 run `bash` in a Linux that runs inside the extension (see [browser-linux.md](browser-linux.md)),
 and move to and from a native Spindle host as `.spindle` files. The extension works on its own;
 connecting a native host is optional and only adds a second place where commands can run.
+It is tested on Chrome and Edge (Chromium 116 or later, on desktop); this page uses Chrome's
+names, which Edge shares.
 
 ## Contents
 
@@ -21,6 +23,7 @@ connecting a native host is optional and only adds a second place where commands
 - [Settings](#settings)
 - [Moving threads to and from a native host](#moving-threads-to-and-from-a-native-host)
 - [Permissions](#permissions)
+- [Install a release](#install-a-release)
 - [Build and load](#build-and-load)
 - [Tests](#tests)
 
@@ -527,12 +530,33 @@ Extension pages run under `script-src 'self' 'wasm-unsafe-eval'`, which is what 
 package's wasm needs. The sandboxed `preview.html` has a separate policy (see
 [Files in and out](#files-in-and-out)).
 
+## Install a release
+
+[`browser-release.yml`](../.github/workflows/browser-release.yml) publishes a build as
+`spindle-browser-VERSION.zip` on the repository's
+[releases](https://github.com/SiliconState/Spindle/releases) when a tag `browser-vVERSION` is
+pushed (`VERSION` is `manifest.json`'s). It builds the extension from that commit with the v86
+Linux (not the wasm Linux), checks that the build names no directory of the machine that made
+it, runs `extension_real.mjs --scripted` against the zip unpacked, attests the zip's
+provenance, and attaches it with its SHA-256. The zip also holds the `LICENSE` and
+[`THIRD-PARTY.md`](../spindle/chrome/THIRD-PARTY.md), which lists the other software it carries,
+with licenses and sources.
+
+1. Unzip it into a folder you will keep. To check it first: `sha256sum -c` with the `.sha256`
+   file, or `gh attestation verify spindle-browser-VERSION.zip -R SiliconState/Spindle`.
+2. Load the folder as below (**Load unpacked**).
+3. To update, unzip the next version over the same folder and click **Reload** on the
+   extension's card. The browser derives an unpacked extension's id from its folder, and its
+   threads and keys live under that id, so a different folder is a separate install.
+
 ## Build and load
 
 Build from the `spindle/` directory. The browser Linux must be built first
 ([browser-linux.md](browser-linux.md#building-the-images)). [`chrome/build.sh`](../spindle/chrome/build.sh)
 refuses to run without it, and refuses a wasm-bindgen CLI whose version differs from the one
-pinned in `embed/Cargo.toml`.
+pinned in `embed/Cargo.toml`. It also needs the `wasm32-unknown-unknown` Rust target and clang,
+which compiles SQLite for it (`sqlite-wasm-rs`). Build paths are remapped (`/src`, `/cargo`), so
+the wasm names no directory of the building machine.
 
 ```sh
 chrome/linux/build.sh                         # the v86 Linux, into chrome/linux/dist
@@ -542,8 +566,8 @@ chrome/build.sh /path/to/wasm-bindgen OUT     # or into another folder
 
 `chrome/build.sh [WASM_BINDGEN_CLI] [OUT_DIR]` builds `spindle-embed` for `wasm32-unknown-unknown`
 (`cargo build --locked --release`), generates its web glue into `OUT/web`, and copies the
-extension files, the JS client, the native UI's `text.js` and `theme.js`, the icons, and the
-browser Linux (`OUT/linux`). Environment variables:
+extension files, the JS client, the native UI's `text.js` and `theme.js`, the icons,
+`THIRD-PARTY.md` and the browser Linux (`OUT/linux`). Environment variables:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -552,7 +576,7 @@ browser Linux (`OUT/linux`). Environment variables:
 
 To load it:
 
-1. Open `chrome://extensions` and turn on **Developer mode**.
+1. Open `chrome://extensions` (in Edge, `edge://extensions`) and turn on **Developer mode**.
 2. Click **Load unpacked** and choose the built folder.
 3. Click the extension's toolbar button to open the side panel.
 4. In **Settings**, add a key for a provider and save it, or **Sign in** to a provider with a
