@@ -10,6 +10,12 @@ use serde_json::{Value, json};
 pub const MANAGED_IMAGE_PLACEHOLDER: &str =
     "[Managed image retained; current disclosure approval and managed host required]";
 
+/// What a failed tool result with no text is sent to Anthropic as. Its API refuses a
+/// `tool_result` that has `is_error` and empty content (HTTP 400), and a command that
+/// fails silently (`grep -q` finding nothing, `test -f` on a missing file) records just
+/// that; every later request of the thread would be refused.
+pub const EMPTY_FAILURE: &str = "(failed with no output)";
+
 /// A user message that represents a fresh prompt (not tool results and not a
 /// runtime-injected note). Used as the current-turn boundary when deciding
 /// which thinking blocks must still be sent back to the provider.
@@ -42,7 +48,8 @@ pub fn current_turn_start(messages: &[Message]) -> usize {
 
 /// Request copy of `messages` for Anthropic Messages: thinking is kept only for
 /// the current turn (and only with a signature unless allowed), tool-result
-/// metadata and Responses reasoning items are dropped.
+/// metadata and Responses reasoning items are dropped, and a failed tool result
+/// with no text says so (`EMPTY_FAILURE`).
 pub fn sanitize_anthropic_messages(
     messages: &[Message],
     preserve_thinking: bool,
@@ -72,7 +79,10 @@ pub fn sanitize_anthropic_messages(
                             ..
                         } => Some(Block::ToolResult {
                             tool_use_id: tool_use_id.clone(),
-                            content: content.clone(),
+                            content: match is_error {
+                                Some(true) if content.trim().is_empty() => EMPTY_FAILURE.into(),
+                                _ => content.clone(),
+                            },
                             is_error: *is_error,
                             metadata: ToolResultMetadata::default(),
                         }),
@@ -602,6 +612,46 @@ mod tests {
                 ]}),
                 json!({"role": "user", "content": [{"type": "text", "text": "[img]"}]}),
             ]
+        );
+    }
+
+    #[test]
+    fn anthropic_failed_tool_results_are_never_empty() {
+        let result = |content: &str, is_error| Block::ToolResult {
+            tool_use_id: "call".into(),
+            content: content.into(),
+            is_error,
+            metadata: ToolResultMetadata::default(),
+        };
+        let messages = vec![Message {
+            role: "user".into(),
+            content: vec![
+                result("", Some(true)),
+                result(" \n", Some(true)),
+                result("", Some(false)),
+                result("", None),
+                result("exit 2", Some(true)),
+            ],
+        }];
+        let wire = anthropic_messages(
+            &sanitize_anthropic_messages(&messages, false, false),
+            &mut placeholder_image,
+        )
+        .expect("wire");
+        let contents: Vec<&str> = wire[0]["content"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .map(|block| block["content"].as_str().expect("text"))
+            .collect();
+        assert_eq!(
+            contents,
+            [EMPTY_FAILURE, EMPTY_FAILURE, "", "", "exit 2"],
+            "only a failed result with no text is filled in"
+        );
+        // The transcript itself is left as recorded.
+        assert!(
+            matches!(&messages[0].content[0], Block::ToolResult { content, .. } if content.is_empty())
         );
     }
 
