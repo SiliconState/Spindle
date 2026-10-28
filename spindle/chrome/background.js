@@ -330,16 +330,20 @@ async function navigate({ url, action = 'go', tab: id, new_tab: fresh }, control
     tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt();
     if (!tab) return { error: id != null ? `there is no tab ${id}` : 'no tab is open' };
     if (!webTab(tab)) return { error: `tab ${tab.id} does not show a web page Spindle may move (a new tab, a browser or extension page): open the address with new_tab` };
-    refuseWhileDialog(tab.id);
-    check(control);
-    try {
-      if (action === 'back') await chrome.tabs.goBack(tab.id);
-      else if (action === 'forward') await chrome.tabs.goForward(tab.id);
-      else if (action === 'reload') await chrome.tabs.reload(tab.id);
-      else await chrome.tabs.update(tab.id, { url });
-    } catch (error) {
-      return { error: `tab ${tab.id} could not go ${action === 'go' ? 'there' : action}: ${error.message}` };
-    }
+    return onTab(tab.id, async () => {
+      refuseWhileDialog(tab.id);
+      check(control);
+      try {
+        if (action === 'back') await chrome.tabs.goBack(tab.id);
+        else if (action === 'forward') await chrome.tabs.goForward(tab.id);
+        else if (action === 'reload') await chrome.tabs.reload(tab.id);
+        else await chrome.tabs.update(tab.id, { url });
+      } catch (error) {
+        return { error: `tab ${tab.id} could not go ${action === 'go' ? 'there' : action}: ${error.message}` };
+      }
+      await settle(tab.id, 20_000, control);
+      return { content: await whereNow(tab.id), details: { tab: tab.id } };
+    });
   }
   await settle(tab.id, 20_000, control);
   return { content: await whereNow(tab.id), details: { tab: tab.id } };
@@ -366,21 +370,33 @@ async function aim(tabId, ref, control) {
   return page(tabId, 'point', { ref }, control);
 }
 
+/** Something else lies over the target: nothing is clicked or typed there. */
+const coveredError = (at, ref) => ({
+  error: `${at.what} [${ref}] is covered by ${at.covered}, so nothing was done (a click would land on that); close or move what covers it, or act on that instead`,
+});
+
 async function click({ ref, tab: id, double, button = 'left' }, control) {
   const tab = await pageTab(id);
-  refuseWhileDialog(tab.id);
-  const at = await aim(tab.id, ref, control);
-  await mouse(tab.id, at, button, double ? 2 : 1, control);
-  await settle(tab.id, 10_000, control);
-  const missed = at.covered ? ` The click landed on ${at.covered}, which lay over it.` : '';
-  return { content: `Clicked ${at.what} [${ref}].${missed} ${await whereNow(tab.id)}`, details: { tab: tab.id } };
+  return onTab(tab.id, async () => {
+    refuseWhileDialog(tab.id);
+    const at = await aim(tab.id, ref, control);
+    if (at.covered) return coveredError(at, ref);
+    await mouse(tab.id, at, button, double ? 2 : 1, control);
+    await settle(tab.id, 10_000, control);
+    return { content: `Clicked ${at.what} [${ref}]. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
+  });
 }
 
-async function type({ ref, text, tab: id, clear, submit }, control) {
-  const tab = await pageTab(id);
+async function type(input, control) {
+  const tab = await pageTab(input.tab);
+  return onTab(tab.id, () => typeInto(tab, input, control));
+}
+
+async function typeInto(tab, { ref, text, clear, submit }, control) {
   refuseWhileDialog(tab.id);
   const at = await aim(tab.id, ref, control);
   if (!at.field) return { error: `${at.what} [${ref}] is not a field one types into` };
+  if (at.covered) return coveredError(at, ref);
   await mouse(tab.id, at, 'left', 1, control);
   // After what the field holds (the click may have put the caret anywhere), or over it.
   await page(tab.id, 'caret', { ref, all: Boolean(clear) }, control);
@@ -395,6 +411,10 @@ async function type({ ref, text, tab: id, clear, submit }, control) {
 
 async function select({ ref, values, tab: id }, control) {
   const tab = await pageTab(id);
+  return onTab(tab.id, () => selectIn(tab, ref, values, control));
+}
+
+async function selectIn(tab, ref, values, control) {
   const chosen = await page(tab.id, 'select', { ref, values: values.map(String) }, control);
   await settle(tab.id, 5_000, control);
   return { content: `Chose ${chosen.map((text) => JSON.stringify(text)).join(', ')} in [${ref}]. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
@@ -402,15 +422,17 @@ async function select({ ref, values, tab: id }, control) {
 
 async function press({ key: name, tab: id }, control) {
   const tab = await pageTab(id);
-  refuseWhileDialog(tab.id);
-  await key(tab.id, name, control);
-  await settle(tab.id, 5_000, control);
-  return { content: `Pressed ${name}. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
+  return onTab(tab.id, async () => {
+    refuseWhileDialog(tab.id);
+    await key(tab.id, name, control);
+    await settle(tab.id, 5_000, control);
+    return { content: `Pressed ${name}. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
+  });
 }
 
 async function scroll({ ref, to = 'down', tab: id }, control) {
   const tab = await pageTab(id);
-  const at = await page(tab.id, 'scroll', { ref, to }, control);
+  const at = await onTab(tab.id, () => page(tab.id, 'scroll', { ref, to }, control));
   const where = `${Math.round(at.y)} of ${Math.round(at.height)} pixels down, ${Math.round(at.view)} shown`;
   return { content: `${ref ? `Scrolled [${ref}] into view` : `Scrolled ${at.pane ? `${at.pane} ` : ''}${to}`}: ${where}.`, details: { tab: tab.id } };
 }
@@ -465,8 +487,33 @@ async function closeTab({ tab: id }, control) {
 const attached = new Map();
 /** Tabs being attached now -> that attach (one at a time per tab). */
 const attaching = new Map();
-/** Tabs where the user closed Chrome's debugging bar: the next action says so, once. */
-const stoppedByUser = new Set();
+/** Tabs where the user closed Chrome's debugging bar: Spindle does not act on them again
+ * until the user turns page actions off and on (consent given anew). Kept in Chrome's
+ * session storage, so a resting service worker does not forget them. */
+const VETOED = 'vetoed-tabs';
+async function vetoed(tabId) {
+  const { [VETOED]: tabs = [] } = await chrome.storage.session.get(VETOED).catch(() => ({}));
+  return tabs.includes(tabId);
+}
+async function veto(tabId) {
+  const { [VETOED]: tabs = [] } = await chrome.storage.session.get(VETOED).catch(() => ({}));
+  if (!tabs.includes(tabId)) await chrome.storage.session.set({ [VETOED]: [...tabs, tabId] });
+}
+async function unveto(tabId) {
+  const { [VETOED]: tabs = [] } = await chrome.storage.session.get(VETOED).catch(() => ({}));
+  if (tabId === undefined) await chrome.storage.session.remove(VETOED);
+  else if (tabs.includes(tabId)) await chrome.storage.session.set({ [VETOED]: tabs.filter((tab) => tab !== tabId) });
+}
+/** Actions on a tab, one at a time: a click or typing is never interleaved with another
+ * thread's on the same tab (focus, then insert, stay together). */
+const tabTurns = new Map();
+function onTab(tabId, work) {
+  const run = (tabTurns.get(tabId) ?? Promise.resolve()).then(work);
+  const settled = run.catch(() => {});
+  tabTurns.set(tabId, settled);
+  settled.then(() => { if (tabTurns.get(tabId) === settled) tabTurns.delete(tabId); });
+  return run;
+}
 /** Tabs showing a JavaScript dialog -> {type, message}; callers waiting for one. */
 const dialogs = new Map();
 const dialogWaiters = new Map();
@@ -481,8 +528,8 @@ function refuseWhileDialog(tabId) {
 
 async function attach(tabId) {
   if (attached.has(tabId)) return;
-  if (stoppedByUser.delete(tabId)) {
-    throw new Error(`the user stopped Spindle acting on tab ${tabId} (they closed Chrome's debugging bar); ask them before acting on it again`);
+  if (await vetoed(tabId)) {
+    throw new Error(`the user stopped Spindle acting on tab ${tabId} (they closed Chrome's debugging bar); Spindle will not act on it again until the user turns page actions off and on in Spindle's settings`);
   }
   if (!attaching.has(tabId)) {
     attaching.set(tabId, (async () => {
@@ -535,9 +582,11 @@ function detach(tabId) {
   chrome.debugger.detach({ tabId }).catch(() => {});
 }
 
+// A closed tab's veto goes with it.
+chrome.tabs.onRemoved.addListener((tabId) => { unveto(tabId).catch(() => {}); });
 chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
   forget(tabId);
-  if (reason === 'canceled_by_user') stoppedByUser.add(tabId);
+  if (reason === 'canceled_by_user') veto(tabId).catch(() => {});
 });
 chrome.debugger.onEvent.addListener(({ tabId }, method, params) => {
   if (method === 'Page.javascriptDialogOpening') {
@@ -562,7 +611,8 @@ async function letGo() {
   const tabs = new Set(attached.keys());
   for (const target of await chrome.debugger.getTargets()) if (target.attached && target.tabId != null) tabs.add(target.tabId);
   for (const tabId of tabs) detach(tabId);
-  stoppedByUser.clear();
+  // Page actions off: turning them on again is the user's consent anew.
+  await unveto().catch(() => {});
 }
 // Chrome's access to sites taken back (in Spindle or Chrome's own settings) turns both
 // switches off: giving it again later, for a thread's network, turns nothing back on.
@@ -915,7 +965,8 @@ function inPage(op, args) {
       // What is there, in the element's own tree (inside a shadow root, its root's).
       const tree = element.getRootNode();
       const top = (typeof tree.elementFromPoint === 'function' ? tree : document).elementFromPoint(x, y);
-      const covered = top && top !== element && !element.contains(top) ? describe(top) : null;
+      const own = top && (top === element || element.contains(top) || (top instanceof HTMLLabelElement && top.control === element));
+      const covered = top && !own ? describe(top) : null;
       return { value: { x, y, what: describe(element), covered, field: editable(element) } };
     }
     if (op === 'caret') {

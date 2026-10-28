@@ -29,7 +29,7 @@ package inside a JavaScript app, and as a Chrome extension that needs no server 
 
 ## Quick start
 
-Requires Rust (edition 2024), a C compiler, and on Linux `bubblewrap` for sandboxed
+Requires Rust 1.89 or newer, a C compiler, and on Linux `bubblewrap` for sandboxed
 commands.
 
 ```sh

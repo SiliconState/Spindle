@@ -84,11 +84,15 @@ export async function pageOf({ path, files, read, html = null, web = false }) {
     if (!name || known.get(name).size > MAX_EMBED) continue;
     element.setAttribute(attribute, `data:${typeOf(name)};base64,${base64(await read(name))}`);
   }
-  // What the page fetches by relative address, from the workspace.
+  // What the page fetches by relative address, from the workspace. A page that may reach
+  // the web gets only the files it names (its markup or scripts mention the file's name),
+  // so it cannot send away unrelated ones; one shut off from the web may have any.
+  const said = web ? doc.documentElement.outerHTML : '';
+  const named = (path) => !web || said.includes(path.split('/').pop());
   const data = {};
   let total = 0;
   for (const file of files) {
-    if (!DATA.test(file.path) || file.size > MAX_DATA_FILE || total + file.size > MAX_DATA) continue;
+    if (!DATA.test(file.path) || file.size > MAX_DATA_FILE || total + file.size > MAX_DATA || !named(file.path)) continue;
     data[file.path] = text(await read(file.path));
     total += file.size;
   }

@@ -13,9 +13,22 @@ const work = fs.mkdtempSync(join(tmpdir(), 'spindle-review-'));
 let browser;
 const replies = [];
 let requests = 0;
+/** What the covered page's button registered (a click that should never land). */
+let coveredClicks = 0;
 const server = http.createServer(async (request, response) => {
   if (request.url === '/page') {
     response.writeHead(200, { 'content-type': 'text/html' }).end('<title>Review page</title><p>Review</p>');
+    return;
+  }
+  if (request.url === '/covered') {
+    response.writeHead(200, { 'content-type': 'text/html' }).end(`<title>Covered page</title>
+<button id="go" onclick="fetch('/clicked')" style="margin:40px">Go</button>
+<div style="position:fixed;inset:0;background:rgba(0,0,0,.3)">Cookie banner</div>`);
+    return;
+  }
+  if (request.url === '/clicked') {
+    coveredClicks += 1;
+    response.writeHead(204).end();
     return;
   }
   const parts = [];
@@ -24,7 +37,9 @@ const server = http.createServer(async (request, response) => {
   // A reply meant for one prompt (`for`) waits for it, so no other request takes it.
   const body = Buffer.concat(parts).toString();
   const at = replies.findIndex((reply) => !reply.for || body.includes(reply.for));
-  const reply = (at >= 0 ? replies.splice(at, 1)[0] : null) ?? { content: 'ready' };
+  let reply = (at >= 0 ? replies.splice(at, 1)[0] : null) ?? { content: 'ready' };
+  // A reply that depends on what the model was just told (a ref a tool returned).
+  if (reply.from) reply = reply.from(body);
   if (reply.refuse) { response.writeHead(reply.refuse).end('refused'); return; }
   response.writeHead(200, { 'content-type': 'text/event-stream' });
   const delta = reply.tool ? { tool_calls: [{ index: 0, id: `call-${requests}`, type: 'function', function: { name: reply.tool, arguments: JSON.stringify(reply.input) } }] } : { content: reply.content };
@@ -118,6 +133,23 @@ try {
   assert.ok(Date.now() - stopAt < 3000, 'Stop does not wait for the 25-second page wait');
   console.log('ok Stop cancels a real page wait');
   await tab.close();
+
+  // A click whose target is covered (a banner over the page) is refused, not landed on the
+  // banner; the tool says what covers it.
+  const covered = await open(browser, `http://127.0.0.1:${port}/covered`);
+  const coveredId = await page.eval(`chrome.tabs.query({}).then((tabs) => tabs.find((tab) => tab.url === 'http://127.0.0.1:${port}/covered').id)`);
+  replies.push(
+    { for: 'click the covered button', tool: 'page_elements', input: { tab: coveredId } },
+    { for: 'click the covered button', from: (body) => ({ tool: 'click', input: { ref: /button \\"Go\\" \[([a-z]{3}\d+)\]/.exec(body)?.[1] ?? 'k0', tab: coveredId } }) },
+    { for: 'click the covered button', content: 'done' },
+  );
+  const coveredThread = await rpc('create', { provider: 'review', runner: 'none', text: 'click the covered button' });
+  await settled(coveredThread.id);
+  const told = await page.eval(`(async () => (await rpc('open', { id: ${JSON.stringify(coveredThread.id)} })).history.messages.flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_result').map((b) => JSON.stringify(b.content)).join(' '))()`).catch((error) => String(error.message));
+  assert.equal(coveredClicks, 0, 'nothing was clicked through the banner');
+  assert.match(told, /covered by/, `the click said what covers it: ${told.slice(0, 300)}`);
+  console.log('ok a covered target is refused, not clicked through');
+  await covered.close();
 
   // Invalid restart settings must not erase or send a failed first turn again.
   replies.push({ refuse: 401 });

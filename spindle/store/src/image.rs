@@ -68,7 +68,7 @@ impl ImageReceipt {
         for (object, metadata) in receipt
             .objects
             .into_iter()
-            .zip(receipt.payload[4..].chunks_exact(9))
+            .zip(receipt.payload[4..].as_chunks::<9>().0)
         {
             if metadata[0] != 1 {
                 return Err(Error::Unsupported);

@@ -88,7 +88,7 @@ impl ArtifactReceipt {
         }
         let mut objects = Vec::with_capacity(count);
         let mut seen = std::collections::BTreeSet::new();
-        for item in bytes[5..header].chunks_exact(72) {
+        for item in bytes[5..header].as_chunks::<72>().0 {
             let digest = std::str::from_utf8(&item[..64]).map_err(|_| Error::Invalid)?;
             let byte_length =
                 u64::from_be_bytes(item[64..].try_into().map_err(|_| Error::Invalid)?);

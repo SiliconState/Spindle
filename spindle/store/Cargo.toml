@@ -2,6 +2,8 @@
 name = "spindle-store"
 version = "0.1.0"
 edition = "2024"
+# File::try_lock (1.89), let-chains and slice::as_chunks
+rust-version = "1.89"
 license = "MIT"
 publish = false
 

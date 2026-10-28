@@ -200,6 +200,14 @@ See [docs/host.md](docs/host.md).
   resolves into a private network is not detected, because Chrome resolves names. With a
   relay set, commands reach whatever addresses the relay allows.
 - Page tools act in the user's real browser tabs with the user's sign-ins. A browser action
-  already dispatched cannot be undone by Stop.
+  already dispatched cannot be undone by Stop. Closing Chrome's debugging bar on a tab keeps
+  Spindle from acting on it until page actions are turned off and on; a click or typing whose
+  target is covered by something else is refused rather than landing on it; actions on one tab
+  run one at a time.
+- A saved key or sign-in is bound to the provider address it was saved for: importing a
+  provider list that points that provider (or its token endpoint) elsewhere does not send the
+  credential there.
+- Previews of workspace pages cannot navigate their frame away; one allowed to load from the
+  web gets only the workspace files it names.
 
 See [docs/chrome.md](docs/chrome.md) and [docs/browser-linux.md](docs/browser-linux.md).

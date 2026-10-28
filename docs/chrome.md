@@ -185,7 +185,7 @@ object stores:
 | --- | --- | --- |
 | `keys` | provider id | The provider's credential, sealed by the vault (see [Keys at rest](#keys-at-rest)): `{version, kind, iv, data}`, where `kind` is `key` or `signin`. |
 | `threads` | thread id | The thread index: `title`, `provider`, `model`, `effort`, `runner`, `network`, `created`, `updated`, `state`, `note`, `summaries`. |
-| `bundles` | thread id, or `prior:ID:UUID` | The `.spindle` file a moved thread went into; private backups made before a first turn is reset. |
+| `bundles` | thread id, or `prior:ID:TIME:UUID` | The `.spindle` file a moved thread went into; private backups made before a first turn is reset (the newest two per thread are kept). |
 | `kv` | name | `catalog`, `host`, `sites`, `relay`, `standing`, `pages`, `vault` (the vault key, or its wrapped form), and `reset:ID` markers. |
 
 A thread's `state` is one of `idle`, `running`, `stopped`, `failed`, `interrupted` or `moved`.
@@ -232,6 +232,10 @@ callback, which opens the provider's record (refreshing a sign-in first when it 
 expire). The embedded client fills the key into the header templates (`auth`) the package derives
 from the catalog; the package never sees it. A provider marked `requires_api_key: false` needs
 none, and a missing or locked credential refuses the request before anything is reserved or sent.
+Each credential records the origin it was saved for (a sign-in also its token endpoint's): if a
+provider list imported later points that provider elsewhere, the request is refused with a
+message to save the key or sign in again, and nothing goes to the new address (a credential
+saved before origins were recorded is bound to the origin in use the first time it is used).
 Credentials are not part of any session, so an exported `.spindle` file carries none;
 `extension_real.mjs` checks that no bundle contains the key.
 
@@ -367,8 +371,15 @@ How the tools run ([`background.js`](../spindle/chrome/background.js)):
   are reachable.
 - **Acting** attaches `chrome.debugger` (protocol 1.3) to the tab on demand and detaches after
   20 s without use (or when network recording stops). Chrome shows its debugging bar while
-  attached. If the user closes that bar, the next action on that tab is refused with a request to
-  ask the user first.
+  attached. If the user closes that bar, Spindle does not act on that tab again until the user
+  turns page actions off and on (the veto is kept in Chrome's session storage, so a resting
+  service worker does not forget it; closing the tab drops it).
+- **One action at a time per tab.** `click`, `type`, `select`, `press`, `scroll` and in-place
+  `navigate` on one tab run one after another, so two threads never interleave focus and input
+  on the same page. `dialog` is not queued: answering a dialog is what lets a waiting action on.
+- **Covered targets.** `click` and `type` aim at the target's center; if another element lies
+  over that point (other than a `<label>` of the target), nothing is clicked or typed and the
+  tool says what covers it.
 - **Dialogs.** A tab with an open JavaScript dialog refuses other tools until `dialog` answers
   it, and actions report a dialog when one opens.
 - **Deadlines.** Each call into a page or the debugger has 20 s, a whole tool 28 s in the
@@ -405,7 +416,7 @@ How a file is shown depends on `kindOf` in [`page.mjs`](../spindle/chrome/page.m
 
 | Kind | Shown as |
 | --- | --- |
-| page (`.html`, `.htm`) | A sandboxed `preview.html` iframe. `pageOf` inlines the page's relative scripts and stylesheets, inlines pictures and media (each at most 16 MiB) as `data:` URLs, and serves small data files (each at most 1 MiB, 8 MiB in all) to the page's `fetch` from memory. |
+| page (`.html`, `.htm`) | A sandboxed `preview.html` iframe. `pageOf` inlines the page's relative scripts and stylesheets, inlines pictures and media (each at most 16 MiB) as `data:` URLs, and serves small data files (each at most 1 MiB, 8 MiB in all) to the page's `fetch` from memory: any of the workspace's while the page is shut off from the web, only those whose names the page mentions once it may load from the web. |
 | picture | An `<img>`. |
 | Markdown | Rendered with the native UI's parser. |
 | text and code | Plain text (the file tab shows the first 2 MiB). |
@@ -415,7 +426,9 @@ A preview gets a Content Security Policy as its first element. By default it all
 outside the page itself and `data:`/`blob:` URLs, and `form-action 'none'`. When the page refers
 to sites, the panel and the file tab offer **Load from the web**, which switches to a policy that also allows
 `https:` loads. Forms are never sent. The manifest's sandbox policy is the upper bound of both.
-`preview.html` writes the first HTML its parent posts and ignores everything after it.
+`preview.html` writes the first HTML its parent posts and ignores everything after it. Extension
+pages allow frames from the extension only (`frame-src 'self'`), so a preview cannot navigate its
+own frame to another site (with data in the address); its links do not leave the preview.
 
 Downloads go through `chrome.downloads.download` (with a link click as fallback). `downloadName`
 replaces separators and reserved characters, a leading dot (`.env` becomes `_env`) and Windows
@@ -502,6 +515,7 @@ then waits for the host connection to settle before it starts.
 | `debugger` | Page actions: input, screenshots of any tab, dialogs, network recording. Chrome does not offer it as an optional permission, so the extension declares it and the Page actions switch decides whether it is used. |
 | `downloads` | Saving workspace files and `.zip`/`.spindle` files. |
 | `unlimitedStorage` | OPFS sessions and the saved Linux state. |
+| `storage` | Chrome's session storage, for tabs whose debugging bar the user closed. |
 | `favicon` | Site icons on browser steps (`_favicon/`). |
 | `activeTab` | Declared in the manifest. |
 | optional `https://*/*`, `http://*/*` | Provider origins and your Spindle host's (asked one origin at a time), a browser sign-in's token endpoint and loopback redirect, page reading, a thread's network through Chrome, sites scripts may call. |

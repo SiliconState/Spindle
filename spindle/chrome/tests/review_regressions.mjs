@@ -170,10 +170,19 @@ const pageContext = vm.createContext({
     runtime: { onInstalled: event, onMessage: event },
     permissions: { contains: async () => true, onRemoved: event },
     debugger: { onDetach: event, onEvent: event, sendCommand: async (_, method, params) => { sent.push({ method, params }); return { body: 'pong' }; } },
-    tabs: { get: async (tab) => ({ id: tab, url: 'https://public.example/' }) },
+    tabs: { get: async (tab) => ({ id: tab, url: 'https://public.example/' }), onRemoved: event },
+    // Chrome's session storage, in memory.
+    storage: { session: (() => {
+      const kept = {};
+      return {
+        get: async (key) => (key in kept ? { [key]: kept[key] } : {}),
+        set: async (values) => { Object.assign(kept, values); },
+        remove: async (key) => { delete kept[key]; },
+      };
+    })() },
   },
 });
-vm.runInContext(`${background}\nglobalThis.test = { watched, attached, network, recordNetwork, cdp, calls, inPage };`, pageContext);
+vm.runInContext(`${background}\nglobalThis.test = { watched, attached, network, recordNetwork, cdp, calls, inPage, attach, veto, unveto, onTab };`, pageContext);
 const bg = pageContext.test;
 bg.attached.set(7, null);
 bg.watched.set(7, new Map([['1234.56', { id: '1234.56' }]]));
@@ -195,4 +204,15 @@ await assert.rejects(late, /stopped/);
 assert.equal(sent.filter(({ method }) => method === 'Input.insertText').length, 0, 'Stop during debugger attach blocks the input after it');
 assert.match(bg.inPage('select', { expires: Date.now() - 1 }).error, /timed out/);
 vm.runInContext('for (const timer of attached.values()) clearTimeout(timer);', pageContext);
-console.log('review-regressions passed: operation races, reset safety, early Stop, gateway bounds/redirects, IPv6, CDP body IDs');
+// Closing Chrome's debugging bar keeps Spindle off that tab for every later action, not
+// just the next one, until page actions go off and on (letGo clears the veto).
+await bg.veto(9);
+for (let n = 0; n < 2; n++) await assert.rejects(bg.attach(9), /closed Chrome's debugging bar/, `attempt ${n + 1} is refused`);
+await bg.unveto();
+// Actions on one tab never interleave: a second waits until the first has finished.
+const order = [];
+const step = (name, ms) => () => new Promise((done) => { order.push(`${name} starts`); setTimeout(() => { order.push(`${name} ends`); done(); }, ms); });
+await Promise.all([bg.onTab(4, step('A', 30)), bg.onTab(4, step('B', 1)), bg.onTab(5, step('C', 1))]);
+assert.deepEqual(order.filter((line) => line[0] !== 'C'), ['A starts', 'A ends', 'B starts', 'B ends']);
+assert.ok(order.indexOf('C starts') < order.indexOf('A ends'), 'another tab does not wait');
+console.log('review-regressions passed: operation races, reset safety, early Stop, gateway bounds/redirects, IPv6, CDP body IDs, the debugging-bar veto kept, one action per tab');

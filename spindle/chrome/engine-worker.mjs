@@ -114,8 +114,8 @@ const GUIDE_START = [
   "Your commands run in a small Linux inside the user's browser (Alpine: bash, coreutils, Python 3 with pip, Node with",
   'npm, git, curl, jq, ripgrep). Each command starts afresh but for the workspace, so install packages into it',
   '(`npm install`, `python3 -m venv .venv`). With network on (the bash tool says whether), commands reach websites over',
-  'HTTP and HTTPS, which Chrome fetches through the proxy their environment names (without the user\'s cookies; nothing',
-  "on the user's computer or local network); if the user set a relay, they reach any address through it. Without",
+  'HTTP and HTTPS, which Chrome fetches through the proxy their environment names (without the user\'s cookies; the',
+  "user's computer and local network addresses and names are refused); if the user set a relay, they reach any address through it. Without",
   "network, connections are refused: ask the user to turn the thread's network on (its model menu) rather than",
   'working around it. The Linux is emulated and slow: give a command that runs long, or makes Spindle calls, a',
   'timeout of a few minutes.',
@@ -144,8 +144,8 @@ const EARLIER_GUIDES = [[
   "Your commands run in a small Linux inside the user's browser (Alpine: bash, coreutils, Python 3 with pip, Node with",
   'npm, git, curl, jq, ripgrep). Each command starts afresh but for the workspace, so install packages into it',
   '(`npm install`, `python3 -m venv .venv`). With network on (the bash tool says whether), commands reach websites over',
-  'HTTP and HTTPS, which Chrome fetches through the proxy their environment names (without the user\'s cookies; nothing',
-  "on the user's computer or local network); if the user set a relay, they reach any address through it.",
+  'HTTP and HTTPS, which Chrome fetches through the proxy their environment names (without the user\'s cookies; the',
+  "user's computer and local network addresses and names are refused); if the user set a relay, they reach any address through it.",
   'Scripts there can ask Spindle for calls, each journaled so a call that was cut off is never sent twice:',
   "from bash, `spindle model PROMPT` prints a model's answer, `spindle tool NAME '{\"json\": \"args\"}'` calls a tool",
   '(such as read_page or list_tabs), `spindle search` lists the tools, `spindle http URL` calls a site the user',
@@ -194,6 +194,12 @@ const EARLIER_GUIDES = [[
   'Prefer one script that loops, filters and aggregates (asking models or tools as it goes) and prints only what you',
   'need over many separate tool calls.',
 ].join(' ')];
+// Every guide as it read before its network sentence named precisely what is refused.
+const NETWORK_NOW = "cookies; the user's computer and local network addresses and names are refused);";
+const NETWORK_BEFORE = "cookies; nothing on the user's computer or local network);";
+EARLIER_GUIDES.push(...[LINUX_GUIDE, ...EARLIER_GUIDES]
+  .filter((guide) => guide.includes(NETWORK_NOW))
+  .map((guide) => guide.replace(NETWORK_NOW, NETWORK_BEFORE)));
 
 /** The user's standing instructions in a thread's, between these lines. */
 const STANDING_START = "[The user's standing instructions]";
@@ -386,7 +392,27 @@ function changeHost(host) {
  * to expire); the package puts it where the provider's catalog entry says (`auth`). */
 async function credentials(facts) {
   const profile = catalog.providers.find((p) => p.id === facts.provider);
-  const held = await vault.secret(facts.provider, (secret) => refreshed(profile, secret, reach));
+  const name = profile?.display_name ?? facts.provider;
+  const again = (held) => (held.kind === 'signin' ? 'sign in again' : 'save the key again');
+  // A credential goes only where it was saved for: a provider list imported later that
+  // points this provider (or its sign-in's token endpoint) elsewhere does not get it.
+  const moved = (held, was, now) => new Error(
+    `${name}'s address changed since its ${held.kind === 'signin' ? 'sign-in' : 'key'} was saved (${was} -> ${now ?? 'none'}): ${again(held)} to use it there`,
+  );
+  const api = originOf(profile?.base_url);
+  const held = await vault.secret(facts.provider, (secret) => {
+    const token = originOf(flowOf(profile)?.token_url);
+    if (secret.kind === 'signin' && secret.tokenOrigin && secret.tokenOrigin !== token) throw moved(secret, secret.tokenOrigin, token);
+    if (secret.origin && secret.origin !== api) throw moved(secret, secret.origin, api);
+    return refreshed(profile, secret, reach);
+  });
+  if (held?.origin && held.origin !== api) throw moved(held, held.origin, api);
+  // Saved before credentials named their origin: bound to the one in use now.
+  if (held && !held.origin && api) {
+    await vault.keep(facts.provider, {
+      ...held, origin: api, ...(held.kind === 'signin' && { tokenOrigin: originOf(flowOf(profile)?.token_url) }),
+    });
+  }
   if (held?.kind === 'key') return { key: held.key };
   if (held?.kind === 'signin' && held.ended) {
     announceVault();
@@ -396,6 +422,15 @@ async function credentials(facts) {
   if (profile?.requires_api_key === false) return {};
   const missing = flowOf(profile) ? 'sign in' : 'add its key';
   throw new Error(`Spindle has no credential for ${profile?.display_name ?? facts.provider}: ${missing} in Settings, Providers`);
+}
+
+/** A URL's origin, or null. */
+function originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
 }
 
 /** fetch, saying what to do when Chrome refuses a provider the extension may not reach. */
@@ -636,17 +671,34 @@ async function checkCreation(provider, settings) {
 async function replaceFirst(id, provider, settings) {
   await checkCreation(provider, settings);
   turnFilesKept = { key: null, value: null };
-  const backup = `prior:${id}:${crypto.randomUUID()}`;
+  // Its time in the name, so the newest are found without reading any bundle.
+  const backup = `prior:${id}:${String(Date.now()).padStart(15, '0')}:${crypto.randomUUID()}`;
   await write('bundles', backup, { bytes: await client.exportSession(dirOf(id), { keep: true }) });
   await write('kv', `reset:${id}`, { type: 'reset', id, backup });
   try {
     await discard(id);
     await client.create(dirOf(id), provider, settings);
     await remove('kv', `reset:${id}`);
+    await prunePriors(id);
   } catch (error) {
     await restoreFirst({ id, backup });
     throw error;
   }
+}
+
+/** How many of a thread's reset backups are kept (the newest). */
+const KEPT_PRIORS = 2;
+
+/** A thread's older reset backups go: the newest `KEPT_PRIORS` stay (ones from before
+ * names carried their time count as oldest). */
+async function prunePriors(id) {
+  const prefix = `prior:${id}:`;
+  const time = (key) => {
+    const part = key.slice(prefix.length).split(':');
+    return part.length > 1 ? part[0] : '';
+  };
+  const priors = (await keysOf('bundles')).filter((key) => key.startsWith(prefix)).sort((a, b) => time(a).localeCompare(time(b)));
+  for (const key of priors.slice(0, Math.max(0, priors.length - KEPT_PRIORS))) await remove('bundles', key);
 }
 
 async function restoreFirst({ id, backup }) {
@@ -1143,7 +1195,7 @@ const ops = {
     const profile = catalog.providers.find((p) => p.id === provider);
     const text = typeof key === 'string' ? key.trim() : '';
     if (!profile || !text) throw failure('invalid', 'a key needs a provider from the list and some text');
-    await vault.keep(provider, { kind: 'key', key: text });
+    await vault.keep(provider, { kind: 'key', key: text, origin: originOf(profile.base_url) });
     announceVault();
     return snapshot();
   },
@@ -1169,7 +1221,8 @@ const ops = {
     if (!flowOf(profile)) throw failure('invalid', `${profile?.display_name ?? provider} does not sign in through a browser here`);
     // A code is good for one exchange: none while its tokens could not be kept.
     if (!(await vault.usableNow())) throw failure('locked', "Spindle's keys are locked: unlock them, then sign in");
-    await vault.keep(provider, await exchange(profile, { code, verifier, redirect }, reach));
+    const tokens = await exchange(profile, { code, verifier, redirect }, reach);
+    await vault.keep(provider, { ...tokens, origin: originOf(profile.base_url), tokenOrigin: originOf(flowOf(profile).token_url) });
     announceVault();
     return snapshot();
   },

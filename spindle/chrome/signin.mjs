@@ -146,6 +146,9 @@ function signedIn(body, previous) {
   return {
     kind: 'signin', access, refresh: refresh ?? previous?.refresh ?? null, expires,
     account: typeof account === 'string' ? account : null,
+    // Where the sign-in may go stays as it was saved (the engine checks it).
+    ...(previous?.origin && { origin: previous.origin }),
+    ...(previous?.tokenOrigin && { tokenOrigin: previous.tokenOrigin }),
   };
 }
 

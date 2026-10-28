@@ -8,7 +8,7 @@ package see [embedded.md](embedded.md); for the Chrome extension see [chrome.md]
 
 | Need | Why |
 | --- | --- |
-| Rust stable with edition 2024 support, Cargo | Builds every crate |
+| Rust 1.89 or newer (`spindle-store` declares `rust-version`), Cargo | Builds every crate |
 | A C compiler | Builds the bundled SQLite |
 | Linux with `bubblewrap` and unprivileged user namespaces | Sandboxed commands (`--isolation required`). macOS and Windows run commands with weaker host-runner limits; see [tools.md](tools.md). |
 | Node.js 20 or newer (optional) | The JavaScript clients, the embedded package and UI tests |

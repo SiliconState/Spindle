@@ -11,7 +11,12 @@
 
 const HEADER = 4096;
 const MAGIC = new TextEncoder().encode('spindle-opfs-slot-v1');
-const MAX_PATH = HEADER - MAGIC.length - 2;
+/** Where a slot's generation is kept: the header's last 8 bytes (zero in older slots).
+ * A file that replaces another is named first, under a newer generation, and the old
+ * slot let go of after; a crash between leaves two slots with one path, and the newer
+ * one is the file (`openOpfsPool` lets the older go). */
+const GENERATION = HEADER - 8;
+const MAX_PATH = GENERATION - MAGIC.length - 2;
 /** The fd `openSync` gives a directory (synced by flushing its slots' headers). */
 const DIRECTORY = -2;
 
@@ -38,8 +43,30 @@ export async function openOpfsPool({ directory = 'spindle', slots = 48 } = {}) {
   } catch (error) {
     throw failure('EBUSY', `the OPFS pool is held by another worker or tab (${error.message})`);
   }
-  for (const slot of pool) slot.path = readPath(slot.handle);
-  return new OpfsFs(pool, dir);
+  return new OpfsFs(pool, dir, adoptSlots(pool));
+}
+
+/** Reads each slot's header into it (`path`, `generation`) and lets go of the older of
+ * two slots one replacement left with the same path (a crash between its two steps):
+ * the newest generation is the file. Returns the newest generation seen. */
+export function adoptSlots(pool) {
+  let latest = 0;
+  const named = new Map();
+  for (const slot of pool) {
+    ({ path: slot.path, generation: slot.generation } = readHeader(slot.handle));
+    latest = Math.max(latest, slot.generation);
+    if (!slot.path) continue;
+    const other = named.get(slot.path);
+    const [kept, gone] = !other || slot.generation > other.generation ? [slot, other] : [other, slot];
+    named.set(slot.path, kept);
+    if (gone) {
+      writePath(gone.handle, '', 0);
+      gone.handle.truncate(HEADER);
+      gone.handle.flush();
+      gone.path = '';
+    }
+  }
+  return latest;
 }
 
 /** Opens slots `from`..`to` (all or none: on a failure the ones opened are closed). */
@@ -57,16 +84,17 @@ async function openSlots(dir, from, to) {
   return slots;
 }
 
-function readPath(handle) {
-  if (handle.getSize() < HEADER) return '';
+function readHeader(handle) {
+  if (handle.getSize() < HEADER) return { path: '', generation: 0 };
   const header = new Uint8Array(HEADER);
   handle.read(header, { at: 0 });
-  if (!MAGIC.every((byte, at) => header[at] === byte)) return '';
+  if (!MAGIC.every((byte, at) => header[at] === byte)) return { path: '', generation: 0 };
   const length = header[MAGIC.length] | (header[MAGIC.length + 1] << 8);
-  return new TextDecoder().decode(header.subarray(MAGIC.length + 2, MAGIC.length + 2 + length));
+  const path = new TextDecoder().decode(header.subarray(MAGIC.length + 2, MAGIC.length + 2 + length));
+  return { path, generation: Number(new DataView(header.buffer).getBigUint64(GENERATION, true)) };
 }
 
-function writePath(handle, path) {
+function writePath(handle, path, generation) {
   const bytes = new TextEncoder().encode(path);
   if (bytes.length > MAX_PATH) throw failure('ENAMETOOLONG', path);
   const header = new Uint8Array(HEADER);
@@ -74,6 +102,7 @@ function writePath(handle, path) {
   header[MAGIC.length] = bytes.length & 0xff;
   header[MAGIC.length + 1] = bytes.length >> 8;
   header.set(bytes, MAGIC.length + 2);
+  new DataView(header.buffer).setBigUint64(GENERATION, BigInt(generation), true);
   if (handle.getSize() < HEADER) handle.truncate(HEADER);
   handle.write(header, { at: 0 });
   handle.flush();
@@ -84,9 +113,16 @@ export class OpfsFs {
   #pool;
   #dir;
   #closed = false;
-  constructor(pool, dir) {
+  #generation;
+  constructor(pool, dir, generation = 0) {
     this.#pool = pool;
     this.#dir = dir;
+    this.#generation = generation;
+  }
+  /** The next slot generation (a later name is a newer one). */
+  #next() {
+    this.#generation += 1;
+    return this.#generation;
   }
 
   /** How many slots hold no file. */
@@ -128,7 +164,7 @@ export class OpfsFs {
     if (free < 0) throw failure('ENOSPC', 'the OPFS pool is full; open it with more slots');
     const slot = this.#pool[free];
     slot.handle.truncate(HEADER);
-    writePath(slot.handle, path);
+    writePath(slot.handle, path, this.#next());
     slot.path = path;
     return free;
   }
@@ -149,7 +185,7 @@ export class OpfsFs {
     const at = this.#find(path);
     if (at < 0) throw failure('ENOENT', path);
     const slot = this.#pool[at];
-    writePath(slot.handle, '');
+    writePath(slot.handle, '', 0);
     slot.handle.truncate(HEADER);
     slot.handle.flush();
     slot.path = '';
@@ -165,15 +201,25 @@ export class OpfsFs {
   renameSync(from, to) {
     const moving = this.#pool.filter((slot) => slot.path === from || slot.path.startsWith(`${from}/`));
     if (!moving.length) throw failure('ENOENT', from);
-    // A file replaces a file, as rename(2) does (the old one is gone first: a crash
-    // between leaves neither, never two slots with one path); directories never merge.
+    // A file replaces a file, as rename(2) does: it takes the name first, under a newer
+    // generation, and the old slot is let go of after, so a crash between leaves the
+    // new file under the name (the older slot goes when the pool is next opened), never
+    // no file. Directories never merge.
     const replaced = this.#find(to);
-    if (replaced >= 0 && moving.length === 1 && moving[0].path === from) this.unlinkSync(to);
-    else if (this.existsSync(to)) throw failure('EEXIST', to);
+    const file = moving.length === 1 && moving[0].path === from;
+    if (replaced >= 0 && !file) throw failure('EEXIST', to);
+    if (replaced < 0 && this.existsSync(to)) throw failure('EEXIST', to);
+    const old = replaced >= 0 ? this.#pool[replaced] : null;
     for (const slot of moving) {
       const path = to + slot.path.slice(from.length);
-      writePath(slot.handle, path);
+      writePath(slot.handle, path, this.#next());
       slot.path = path;
+    }
+    if (old) {
+      writePath(old.handle, '', 0);
+      old.handle.truncate(HEADER);
+      old.handle.flush();
+      old.path = '';
     }
   }
   mkdirSync() {}

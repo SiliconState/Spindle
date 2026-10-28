@@ -191,14 +191,14 @@ thread_local! {
 /// A quick key of a chunk's bytes (not a digest: equal keys are compared in full).
 fn quick(bytes: &[u8]) -> u64 {
     let mut hash = (bytes.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let mut words = bytes.chunks_exact(8);
-    for word in &mut words {
-        let value = u64::from_le_bytes(word.try_into().unwrap_or_default());
+    let (words, rest) = bytes.as_chunks::<8>();
+    for word in words {
+        let value = u64::from_le_bytes(*word);
         hash = (hash ^ value)
             .wrapping_mul(0xbf58_476d_1ce4_e5b9)
             .rotate_left(29);
     }
-    for byte in words.remainder() {
+    for byte in rest {
         hash = (hash ^ u64::from(*byte)).wrapping_mul(0x94d0_49bb_1331_11eb);
     }
     hash
@@ -379,7 +379,8 @@ pub fn load(db: &Connection, stored: &[u8], bound: usize) -> Result<Vec<u8>> {
         return Err(Error::Incompatible);
     }
     let mut out = Vec::with_capacity(length);
-    for digest in rest[8..].chunks_exact(32) {
+    for digest in rest[8..].as_chunks::<32>().0 {
+        let digest = digest.as_slice();
         let packed: Vec<u8> = db
             .query_row(
                 "SELECT bytes FROM chunks WHERE digest=?1",
