@@ -8,9 +8,18 @@
 <meta property="og:title" content="Spindle for Browser: an agent that lives in your browser">
 <meta property="og:description" content="From open tabs to finished work, with a workspace you can rewind and take with you. Open source, MIT.">
 <meta property="og:type" content="website">
+<meta property="og:site_name" content="Spindle">
+<meta property="og:url" content="https://siliconstate.github.io/Spindle/browser/">
+<meta property="og:image" content="https://siliconstate.github.io/Spindle/assets/og-browser.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Spindle for Browser: an agent that lives in your browser, beside a sketch of its side panel.">
+<meta name="twitter:card" content="summary_large_image">
 <meta name="color-scheme" content="light dark">
+<link rel="canonical" href="https://siliconstate.github.io/Spindle/browser/">
 <link rel="icon" href="../assets/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/site.js" defer></script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -21,10 +30,10 @@
       <a href="#what">Features</a>
       <a href="#durable">Durable</a>
       <a href="#control">Safety</a>
-      <a href="#install">Install</a>
       <a href="#faq">FAQ</a>
       <a href="https://github.com/SiliconState/Spindle">GitHub</a>
     </nav>
+    <a class="cta" href="#install">Install</a>
   </div>
 </header>
 
@@ -38,7 +47,7 @@
           with you. Research across pages. Run Python and JavaScript. Build reports, datasets and small
           applications in a Linux environment inside your browser.</p>
         <div class="actions">
-          <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/latest">Download</a>
+          <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/download/browser-v0.1.1/spindle-browser-0.1.1.zip">Download <small>0.1.1 · 74 MB zip</small></a>
           <a class="button" href="#install">Install guide</a>
         </div>
         <p class="trust">Open source. Bring your own model. No required desktop app or backend.</p>
@@ -117,41 +126,10 @@
     </div>
   </section>
 
-  <section class="block" aria-labelledby="speed-h">
+  <section class="block" id="uses" aria-labelledby="uses-h">
     <div class="wrap">
       <div class="head">
-        <span class="num">03 &mdash; SPEED</span>
-        <h2 id="speed-h">Faster still with the wasm Linux.</h2>
-        <p>Built from source with its optional wasm Linux, the extension runs the commands it can there, at the
-          machine's own speed with no emulator in between: plain <code>sh</code> commands run 2.2 to 8.6 times
-          faster. What the wasm Linux cannot run (bash itself, Node, git, the network) stays on the v86 Linux,
-          which is the one release zips carry.</p>
-      </div>
-      <figure class="diagram">
-        <p class="bar-key"><span class="key-track"></span>v86 Linux, the whole bar <span class="key-fill"></span>wasm Linux</p>
-        <ul class="bars" aria-label="Time on the wasm Linux as a share of the time on the v86 Linux">
-          <li class="bar"><span>First command after install<br><small>21 s &rarr; 0.54 s</small></span>
-            <span class="track" title="v86 21 s, wasm 0.54 s"><span class="fill" style="width:2.6%"></span></span><b>39x</b></li>
-          <li class="bar"><span>Python summing 3 million squares<br><small>8,353 &rarr; 326 ms</small></span>
-            <span class="track" title="v86 8,353 ms, wasm 326 ms"><span class="fill" style="width:3.9%"></span></span><b>25.6x</b></li>
-          <li class="bar"><span>Python importing six modules<br><small>1,299 &rarr; 171 ms</small></span>
-            <span class="track" title="v86 1,299 ms, wasm 171 ms"><span class="fill" style="width:13.2%"></span></span><b>7.6x</b></li>
-          <li class="bar"><span><code>python3 -c pass</code><br><small>418 &rarr; 102 ms</small></span>
-            <span class="track" title="v86 418 ms, wasm 102 ms"><span class="fill" style="width:24.4%"></span></span><b>4.1x</b></li>
-          <li class="bar"><span>Python writing 200 files<br><small>894 &rarr; 300 ms</small></span>
-            <span class="track" title="v86 894 ms, wasm 300 ms"><span class="fill" style="width:33.6%"></span></span><b>3.0x</b></li>
-        </ul>
-        <figcaption>Median of five runs in headless Chrome 153, the same commands on both Linuxes
-          (<a href="https://github.com/SiliconState/Spindle/blob/main/docs/browser-linux.md#measured-speed">the full table</a>).
-          The first command is a one-time cost: v86 resumes its saved state on later starts.</figcaption>
-      </figure>
-    </div>
-  </section>
-
-  <section class="block" aria-labelledby="uses-h">
-    <div class="wrap">
-      <div class="head">
-        <span class="num">04 &mdash; USE IT FOR</span>
+        <span class="num">03 &mdash; USE IT FOR</span>
         <h2 id="uses-h">Work that starts on a web page.</h2>
       </div>
       <div class="grid three">
@@ -171,10 +149,10 @@
     </div>
   </section>
 
-  <section class="block" aria-labelledby="which-h">
+  <section class="block" id="which" aria-labelledby="which-h">
     <div class="wrap">
       <div class="head">
-        <span class="num">05 &mdash; WHICH SPINDLE</span>
+        <span class="num">04 &mdash; WHICH SPINDLE</span>
         <h2 id="which-h">In your browser, or wherever you work.</h2>
         <p>The same sessions run in both. Start in the browser, move the thread to your machine for the heavy
           part, and bring it back.</p>
@@ -199,7 +177,7 @@
   <section class="block" id="control" aria-labelledby="control-h">
     <div class="wrap">
       <div class="head">
-        <span class="num">06 &mdash; STAY IN CONTROL</span>
+        <span class="num">05 &mdash; STAY IN CONTROL</span>
         <h2 id="control-h">It acts when you say, where you can see.</h2>
       </div>
       <div class="grid two">
@@ -239,10 +217,10 @@
     </div>
   </section>
 
-  <section class="block" aria-labelledby="providers-h">
+  <section class="block" id="models" aria-labelledby="providers-h">
     <div class="wrap">
       <div class="head">
-        <span class="num">07 &mdash; YOUR MODEL</span>
+        <span class="num">06 &mdash; YOUR MODEL</span>
         <h2 id="providers-h">Bring the model you already pay for.</h2>
         <p>Requests go from your browser straight to the provider. No Spindle server sits in between.</p>
       </div>
@@ -265,17 +243,17 @@
   <section class="block" id="install" aria-labelledby="install-h">
     <div class="wrap">
       <div class="head">
-        <span class="num">08 &mdash; INSTALL</span>
+        <span class="num">07 &mdash; INSTALL</span>
         <h2 id="install-h">Download, load, sign in.</h2>
         <p>Spindle for Browser is not in the Chrome Web Store or Edge Add-ons yet. Each release is a zip built and
           checked by the repository's own workflow; you load it as an unpacked extension.</p>
       </div>
       <ol class="steps">
         <li><div><h3>Download the zip.</h3>
-          <p>From the <a href="https://github.com/SiliconState/Spindle/releases/latest">latest release</a>, download
-            <code>spindle-browser-VERSION.zip</code> and unzip it into a folder you will keep. To check it, use the
-            <code>.sha256</code> file beside it, or <code>gh attestation verify</code> with the zip and
-            <code>-R SiliconState/Spindle</code>.</p></div></li>
+          <p>Use the Download button, or take <code>spindle-browser-VERSION.zip</code> from the
+            <a href="https://github.com/SiliconState/Spindle/releases/latest">latest release</a>, and unzip it into a
+            folder you will keep. To check it, use the <code>.sha256</code> file beside it on the release, or
+            <code>gh attestation verify</code> with the zip and <code>-R SiliconState/Spindle</code>.</p></div></li>
         <li><div><h3>Load it.</h3>
           <p>Open <code>chrome://extensions</code> (in Edge, <code>edge://extensions</code>), turn on
             <strong>Developer mode</strong>, click <strong>Load unpacked</strong> and choose the folder. Pin Spindle
@@ -291,16 +269,48 @@
       <h3 class="subhead">Or build it yourself</h3>
       <p class="note">On Linux, or in WSL on Windows (copy <code>chrome/dist</code> to a Windows folder to load it).
         It needs Rust, clang, curl, npm, python3 and user namespaces; Ubuntu 23.10 and later allow them only after
-        <code>sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0</code>.</p>
+        <code class="long">sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0</code>.</p>
 <pre><code>rustup target add wasm32-unknown-unknown i686-unknown-linux-musl
 cargo install wasm-bindgen-cli --version 0.2.129 --locked
 git clone https://github.com/SiliconState/Spindle.git
 cd Spindle/spindle
 chrome/linux/build.sh   <span class="c"># the browser Linux, into chrome/linux/dist</span>
 chrome/build.sh         <span class="c"># the extension, into chrome/dist</span></code></pre>
-      <p class="note">For the faster wasm Linux, build it and pass <code>SPINDLE_WASM_LINUX</code>
+      <p class="note">For the faster wasm Linux (<a href="#speed">below</a>), build it and pass
+        <code>SPINDLE_WASM_LINUX</code>
         (<a href="https://github.com/SiliconState/Spindle/blob/main/docs/browser-linux.md#building-the-images">how</a>).
         <a href="https://github.com/SiliconState/Spindle/blob/main/docs/chrome.md">How it is built</a>.</p>
+    </div>
+  </section>
+
+  <section class="block" id="speed" aria-labelledby="speed-h">
+    <div class="wrap">
+      <div class="head">
+        <span class="num">08 &mdash; SPEED</span>
+        <h2 id="speed-h">Faster still, built from source.</h2>
+        <p>Release zips carry the v86 Linux, an emulated PC. Built from source with its optional wasm Linux, the
+          extension runs the commands it can there, at the machine's own speed with no emulator in between: plain
+          <code>sh</code> commands run 2.2 to 8.6 times faster, and Python up to 26 times. What the wasm Linux
+          cannot run (bash itself, Node, git, the network) stays on the v86 Linux.</p>
+      </div>
+      <figure class="diagram">
+        <ul class="bars" aria-label="How many times faster each command ran on the wasm Linux than on the v86 Linux">
+          <li class="bar"><span>First command after install<br><small>21 s &rarr; 0.54 s</small></span>
+            <span class="scale"><span class="fill" style="--x:1"></span><b>39&times;</b></span></li>
+          <li class="bar"><span>Python summing 3 million squares<br><small>8,353 &rarr; 326 ms</small></span>
+            <span class="scale"><span class="fill" style="--x:.659"></span><b>25.6&times;</b></span></li>
+          <li class="bar"><span>Python importing six modules<br><small>1,299 &rarr; 171 ms</small></span>
+            <span class="scale"><span class="fill" style="--x:.195"></span><b>7.6&times;</b></span></li>
+          <li class="bar"><span><code>python3 -c pass</code><br><small>418 &rarr; 102 ms</small></span>
+            <span class="scale"><span class="fill" style="--x:.105"></span><b>4.1&times;</b></span></li>
+          <li class="bar"><span>Python writing 200 files<br><small>894 &rarr; 300 ms</small></span>
+            <span class="scale"><span class="fill" style="--x:.077"></span><b>3.0&times;</b></span></li>
+        </ul>
+        <figcaption>Times faster on the wasm Linux than on the v86 Linux, with both times under each name: the
+          median of five runs in headless Chrome 153, the same commands on both Linuxes
+          (<a href="https://github.com/SiliconState/Spindle/blob/main/docs/browser-linux.md#measured-speed">the full table</a>).
+          The first command is a one-time cost: v86 resumes its saved state on later starts.</figcaption>
+      </figure>
     </div>
   </section>
 
@@ -336,6 +346,20 @@ chrome/build.sh         <span class="c"># the extension, into chrome/dist</span>
       <details class="qa"><summary>Where are my threads kept?</summary>
         <div><p>In the extension's own storage on this computer. Removing the extension removes them; move a thread
           to a <code>.spindle</code> file first to keep it.</p></div></details>
+    </div>
+  </section>
+
+  <section class="block closing" aria-labelledby="get-h">
+    <div class="wrap">
+      <p class="eyebrow">Spindle for Browser 0.1.1</p>
+      <h2 id="get-h">Put it beside your next tab.</h2>
+      <div class="actions">
+        <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/download/browser-v0.1.1/spindle-browser-0.1.1.zip">Download <small>0.1.1 · 74 MB zip</small></a>
+        <a class="button" href="#install">Install guide</a>
+        <a class="button" href="https://github.com/SiliconState/Spindle">Source on GitHub</a>
+      </div>
+      <p class="note">For Chrome and Edge 116 or later, on desktop. Release notes, checksums and earlier versions are
+        on <a href="https://github.com/SiliconState/Spindle/releases">the releases page</a>.</p>
     </div>
   </section>
 </main>
