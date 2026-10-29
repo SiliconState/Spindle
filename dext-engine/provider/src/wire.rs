@@ -11,10 +11,11 @@ use serde_json::{Value, json};
 pub const MANAGED_IMAGE_PLACEHOLDER: &str =
     "[Managed image retained; current disclosure approval and managed host required]";
 
-/// What a failed tool result with no text is sent to Anthropic as. Its API refuses a
-/// `tool_result` that has `is_error` and empty content (HTTP 400), and a command that
+/// What a failed tool result with no text is sent as, to every provider. A command that
 /// fails silently (`grep -q` finding nothing, `test -f` on a missing file) records just
-/// that; every later request of the thread would be refused.
+/// that. Anthropic's API refuses a `tool_result` that has `is_error` and empty content
+/// (HTTP 400), which would refuse every later request of the thread; a format with no
+/// failure flag would show it as an empty success.
 pub const EMPTY_FAILURE: &str = "(failed with no output)";
 
 /// The line a failed tool result starts with for a provider whose format has no
