@@ -860,11 +860,16 @@ placeholder text.
 
 | Function | Contract | Behavior |
 |---|---|---|
-| `sanitize_anthropic_messages` | Anthropic Messages | Keeps thinking only from the current turn (the last fresh user prompt on) and only with a signature, drops tool-result metadata and Responses reasoning items |
+| `sanitize_anthropic_messages` | Anthropic Messages | Keeps thinking only from the current turn (the last fresh user prompt on) and only with a signature, drops tool-result metadata and Responses reasoning items; a failed tool result with no text is sent as `(failed with no output)` (the API refuses an empty one) |
 | `anthropic_messages` | Anthropic Messages | Blocks serialized as Anthropic content; each image becomes its own following `user` message |
-| `chat_messages` | Chat Completions | A leading `system` message; user text joined; each tool result a `tool` message (results whose call is not in the transcript are dropped); assistant tool calls with JSON-string arguments; optional `reasoning_content` replay from a given message index |
-| `responses_input` | OpenAI Responses, ChatGPT | `message` items (`input_text` / `output_text`), `function_call` and `function_call_output` items keyed by `call_id`; reasoning items replayed for the current turn when requested and well-formed |
+| `chat_messages` | Chat Completions | A leading `system` message; user text joined; each tool result a `tool` message (results whose call is not in the transcript are dropped; a failed one marked, below); assistant tool calls with JSON-string arguments; optional `reasoning_content` replay from a given message index |
+| `responses_input` | OpenAI Responses, ChatGPT | `message` items (`input_text` / `output_text`), `function_call` and `function_call_output` items keyed by `call_id` (a failed result marked, below); reasoning items replayed for the current turn when requested and well-formed |
 | `chat_tools`, `responses_tools` | | Tool definitions in each format |
+
+Chat Completions and Responses have no failure flag for a tool result, so
+`flagless_tool_result` writes it into the text: a failed result starts with a `(failed)`
+line, and one with no text is `(failed with no output)`. A command that exits non-zero thus
+never reads as a success. The transcript keeps the result as recorded.
 
 `is_fresh_user_prompt_message` treats user messages starting with `[runtime-note]`,
 `[queued-update]`, `[queued-user-update]` or `[prior conversation,` as injected notes, not

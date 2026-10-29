@@ -1,5 +1,6 @@
 //! Pure transcript-to-provider wire shaping shared by every Dext host.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use anyhow::Result;
@@ -15,6 +16,21 @@ pub const MANAGED_IMAGE_PLACEHOLDER: &str =
 /// fails silently (`grep -q` finding nothing, `test -f` on a missing file) records just
 /// that; every later request of the thread would be refused.
 pub const EMPTY_FAILURE: &str = "(failed with no output)";
+
+/// The line a failed tool result starts with for a provider whose format has no
+/// failure flag (Chat Completions, Responses).
+pub const FAILED: &str = "(failed)";
+
+/// A tool result's text for a format with no failure flag: a failed result says so,
+/// so a command that exited non-zero never reads as a success, nor one with no output
+/// as an empty success.
+pub fn flagless_tool_result(content: &str, is_error: Option<bool>) -> Cow<'_, str> {
+    match is_error {
+        Some(true) if content.trim().is_empty() => Cow::Borrowed(EMPTY_FAILURE),
+        Some(true) => Cow::Owned(format!("{FAILED}\n{content}")),
+        _ => Cow::Borrowed(content),
+    }
+}
 
 /// A user message that represents a fresh prompt (not tool results and not a
 /// runtime-injected note). Used as the current-turn boundary when deciding
@@ -277,6 +293,7 @@ pub fn chat_messages(
                         if let Block::ToolResult {
                             tool_use_id,
                             content,
+                            is_error,
                             ..
                         } = b
                         {
@@ -285,7 +302,9 @@ pub fn chat_messages(
                             }
                             msgs.push(OaiMessage {
                                 role: "tool".to_string(),
-                                content: Some(Value::String(content.clone())),
+                                content: Some(Value::String(
+                                    flagless_tool_result(content, *is_error).into_owned(),
+                                )),
                                 reasoning_content: None,
                                 tool_calls: None,
                                 tool_call_id: Some(tool_use_id.clone()),
@@ -477,6 +496,7 @@ pub fn responses_input(
                 Block::ToolResult {
                     tool_use_id,
                     content,
+                    is_error,
                     ..
                 } => {
                     if !valid_ids.contains(tool_use_id) {
@@ -485,7 +505,7 @@ pub fn responses_input(
                     items.push(json!({
                         "type": "function_call_output",
                         "call_id": tool_use_id,
-                        "output": content,
+                        "output": flagless_tool_result(content, *is_error),
                     }));
                 }
                 Block::ImageReference { .. } => {
@@ -653,6 +673,65 @@ mod tests {
         assert!(
             matches!(&messages[0].content[0], Block::ToolResult { content, .. } if content.is_empty())
         );
+    }
+
+    #[test]
+    fn flagless_formats_mark_failed_tool_results() {
+        let result = |id: &str, content: &str, is_error| Block::ToolResult {
+            tool_use_id: id.into(),
+            content: content.into(),
+            is_error,
+            metadata: ToolResultMetadata::default(),
+        };
+        let messages = vec![
+            Message {
+                role: "assistant".into(),
+                content: ["a", "b", "c", "d"]
+                    .map(|id| Block::ToolUse {
+                        id: id.into(),
+                        name: "bash".into(),
+                        input: json!({}),
+                    })
+                    .to_vec(),
+            },
+            Message {
+                role: "user".into(),
+                content: vec![
+                    result("a", "", Some(true)),
+                    result("b", "3 tests failed", Some(true)),
+                    result("c", "", Some(false)),
+                    result("d", "ok", None),
+                ],
+            },
+        ];
+        let expected = [
+            EMPTY_FAILURE.to_string(),
+            format!("{FAILED}\n3 tests failed"),
+            String::new(),
+            "ok".into(),
+        ];
+        let chat = serde_json::to_value(chat_messages(
+            &messages,
+            "sys",
+            None,
+            &mut placeholder_image,
+        ))
+        .expect("serialize");
+        let chat: Vec<&str> = chat
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| message["content"].as_str().expect("text"))
+            .collect();
+        assert_eq!(chat, expected, "chat completions");
+        let responses = responses_input(&messages, false, &mut placeholder_image);
+        let responses: Vec<&str> = responses
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .map(|item| item["output"].as_str().expect("text"))
+            .collect();
+        assert_eq!(responses, expected, "responses");
     }
 
     #[test]

@@ -72,7 +72,7 @@
   "outcome": "ok",
   "requests": [
     "{\"max_tokens\":4096,\"messages\":[{\"content\":\"You are an assistant working in a workspace of files with the read_file, write_file and edit_file tools. Refer to files by relative paths; workspace files persist between calls. Prefer edit_file for small changes to existing files. You may issue several tool calls at once; they run in order, each on the workspace the previous one left. Check results and keep going until the task is done. Then reply with a short plain-text summary of what you did.\",\"role\":\"system\"},{\"content\":\"[t:tool-refused] do not run commands\",\"role\":\"user\"}],\"model\":\"fake-model\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a UTF-8 text file from the workspace with line numbers. offset is the first line (1-based), limit the number of lines (default 2000); the window is 8 KiB by default (max_output up to 262144 bytes) with a note on how to continue.\",\"name\":\"read_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"limit\":{\"minimum\":1,\"type\":\"integer\"},\"max_output\":{\"maximum\":262144,\"minimum\":4096,\"type\":\"integer\"},\"offset\":{\"minimum\":1,\"type\":\"integer\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Create or overwrite a workspace file with the given content (up to 1 MiB; parent directories are implied).\",\"name\":\"write_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"content\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Replace exact text in a workspace file. old_string must occur exactly once unless replace_all is true.\",\"name\":\"edit_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"new_string\":{\"type\":\"string\"},\"old_string\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"},\"replace_all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"old_string\",\"new_string\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
-    "{\"max_tokens\":4096,\"messages\":[{\"content\":\"You are an assistant working in a workspace of files with the read_file, write_file and edit_file tools. Refer to files by relative paths; workspace files persist between calls. Prefer edit_file for small changes to existing files. You may issue several tool calls at once; they run in order, each on the workspace the previous one left. Check results and keep going until the task is done. Then reply with a short plain-text summary of what you did.\",\"role\":\"system\"},{\"content\":\"[t:tool-refused] do not run commands\",\"role\":\"user\"},{\"content\":null,\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\",\"name\":\"bash\"},\"id\":\"call_1\",\"type\":\"function\"}]},{\"content\":\"unknown tool `bash`; available: read_file, write_file, edit_file\",\"role\":\"tool\",\"tool_call_id\":\"call_1\"}],\"model\":\"fake-model\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a UTF-8 text file from the workspace with line numbers. offset is the first line (1-based), limit the number of lines (default 2000); the window is 8 KiB by default (max_output up to 262144 bytes) with a note on how to continue.\",\"name\":\"read_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"limit\":{\"minimum\":1,\"type\":\"integer\"},\"max_output\":{\"maximum\":262144,\"minimum\":4096,\"type\":\"integer\"},\"offset\":{\"minimum\":1,\"type\":\"integer\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Create or overwrite a workspace file with the given content (up to 1 MiB; parent directories are implied).\",\"name\":\"write_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"content\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Replace exact text in a workspace file. old_string must occur exactly once unless replace_all is true.\",\"name\":\"edit_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"new_string\":{\"type\":\"string\"},\"old_string\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"},\"replace_all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"old_string\",\"new_string\"],\"type\":\"object\"}},\"type\":\"function\"}]}"
+    "{\"max_tokens\":4096,\"messages\":[{\"content\":\"You are an assistant working in a workspace of files with the read_file, write_file and edit_file tools. Refer to files by relative paths; workspace files persist between calls. Prefer edit_file for small changes to existing files. You may issue several tool calls at once; they run in order, each on the workspace the previous one left. Check results and keep going until the task is done. Then reply with a short plain-text summary of what you did.\",\"role\":\"system\"},{\"content\":\"[t:tool-refused] do not run commands\",\"role\":\"user\"},{\"content\":null,\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\",\"name\":\"bash\"},\"id\":\"call_1\",\"type\":\"function\"}]},{\"content\":\"(failed)\\nunknown tool `bash`; available: read_file, write_file, edit_file\",\"role\":\"tool\",\"tool_call_id\":\"call_1\"}],\"model\":\"fake-model\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a UTF-8 text file from the workspace with line numbers. offset is the first line (1-based), limit the number of lines (default 2000); the window is 8 KiB by default (max_output up to 262144 bytes) with a note on how to continue.\",\"name\":\"read_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"limit\":{\"minimum\":1,\"type\":\"integer\"},\"max_output\":{\"maximum\":262144,\"minimum\":4096,\"type\":\"integer\"},\"offset\":{\"minimum\":1,\"type\":\"integer\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Create or overwrite a workspace file with the given content (up to 1 MiB; parent directories are implied).\",\"name\":\"write_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"content\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"type\":\"object\"}},\"type\":\"function\"},{\"function\":{\"description\":\"Replace exact text in a workspace file. old_string must occur exactly once unless replace_all is true.\",\"name\":\"edit_file\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"new_string\":{\"type\":\"string\"},\"old_string\":{\"type\":\"string\"},\"path\":{\"description\":\"Path relative to the workspace.\",\"type\":\"string\"},\"replace_all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"old_string\",\"new_string\"],\"type\":\"object\"}},\"type\":\"function\"}]}"
   ],
   "store": {
     "admissions": [
@@ -93,7 +93,7 @@
       {
         "command_id": "prepare-r3",
         "kind": "dext-turn-v1",
-        "payload": "73940a8b0966c3ec8c015ff9",
+        "payload": "86db9a6a56aeb5030e8cc645",
         "scope": "operator",
         "sequence": 3
       },
@@ -159,7 +159,7 @@
       {
         "adapter": "dext-model-v1",
         "id": "3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/2",
-        "input": "6daa541f0a3526708fc837e6",
+        "input": "3cb2425292e33f0dee24a3c4",
         "position": 0,
         "revision": 4
       }
@@ -181,7 +181,7 @@
         "revision": 3
       },
       {
-        "canonical": "938b932ebd6a4a0c05e9da7a",
+        "canonical": "7a291ca5b355527aa144d57d",
         "id": "commit-prepare-r3",
         "revision": 4
       },
@@ -204,7 +204,7 @@
       },
       {
         "attempt": "a:3c7a4fc54a7c2facf56f2af58e4e9378a928c450c5118945dd8b3e78718624bb/m/2",
-        "result": "cd25a4c71d7a644fdecbe489",
+        "result": "f7ba13c3f689cce9a6eed012",
         "workspace": null
       }
     ],
@@ -238,7 +238,7 @@
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "14af06145bbeb73a2d3885da",
+        "continuation": "5e970c013347bc50888b10b9",
         "engine": "dext-turn-v1",
         "revision": 4,
         "scope": "operator",
