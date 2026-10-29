@@ -1,22 +1,37 @@
 # Spindle
 
-A durable coding agent. Every step of a session is a committed revision of the
-conversation, the workspace files and the app state together, so a run that is killed
-resumes where it stopped, a model request is never sent twice by accident, and rewinding
-restores all three at once.
+**An agent that lives wherever you work.**
 
-Spindle runs as a native command (`spindle`), as a browser host for phones and desktops
-(`spindle serve`), behind a JSON-RPC or HTTP API for your own programs, as a WebAssembly
-package inside a JavaScript app, and as a browser extension for Chrome and Edge that needs no
-server at all.
+Spindle is a durable, embeddable agent engine. Every step of a session is a committed
+revision of the conversation, the workspace files and the app state together, so a run that
+is killed resumes where it stopped, a model request is never sent twice by accident, and
+going back restores all three at once. The same core, with the same rules and the same
+session format, runs as a native binary or compiled to WebAssembly inside another program,
+which is what lets it live in a terminal, on a server, inside your app or in a browser.
 
-Website: [siliconstate.github.io/Spindle](https://siliconstate.github.io/Spindle/), with a page
-for [Spindle for Browser](https://siliconstate.github.io/Spindle/browser/).
+Website: [siliconstate.github.io/Spindle](https://siliconstate.github.io/Spindle/).
 
 > **Status:** experimental, single-operator software. Read [SECURITY.md](SECURITY.md)
 > before giving it real work.
 
-## Why it is different
+## The core
+
+Spindle's core is two layers of this repository:
+
+- **The engine crates** ([`dext-engine/`](dext-engine)): model and turn types, transcripts,
+  the provider catalog and its request formats, and the strict command runner.
+- **Spindle** ([`spindle/store`](spindle/store)): the SQLite store that commits every step,
+  and the decision driver that says what a turn needs next, with no network and no clock.
+
+Something has to carry out what the driver asks for (send a model request, run a command,
+answer an app's tool). That is the host, and there are two:
+
+| Host | What it is | Who performs effects | Where commands run | Read |
+| --- | --- | --- | --- | --- |
+| **Native** | The `spindle` binary: a CLI (`new`, `say`, `continue`, `rewind`), JSON-RPC over stdio (`spindle api`) and the `/v1` HTTP API, with Node.js and Python clients | The binary itself | A bubblewrap sandbox on Linux; elsewhere, or without bubblewrap, on the host itself, and Spindle says so (`--isolation required` refuses instead) | [Getting started](docs/getting-started.md), [CLI](docs/cli.md), [API](docs/API.md) |
+| **Embedded** | `spindle-embed`: the same store and driver compiled to WebAssembly, in Node or a browser worker | The program around it: it sends the model requests and runs the commands | A runner the program provides, or a `spindle serve` host as a remote runner | [Embedded package](docs/embedded.md) |
+
+## Why it is durable
 
 - **Reserve, then send; record, then use.** Each model request, command and tool call is
   reserved in the store before it is performed and its result recorded before the agent
@@ -25,16 +40,85 @@ for [Spindle for Browser](https://siliconstate.github.io/Spindle/browser/).
 - **One revision holds everything.** Conversation, a content-addressed workspace tree and
   JSON app state commit in one SQLite transaction. Rewind goes back to any eligible
   revision; a call made again after a rewind gets a fresh id.
-- **The store decides, hosts act.** A portable decision driver (no network, no clocks,
-  builds for wasm) tells a host what the turn needs next. The native host, the embedded
-  package and the browser extension all run the same driver.
-- **Sessions move.** Export a session to a single-file bundle and continue it in another
-  host: terminal to browser and back.
+- **The store decides, hosts act.** Because the driver only decides, the same rules hold in
+  both hosts, down to a WebAssembly worker inside a browser.
+
+## Built on Spindle
+
+These use the core; none of them is part of it.
+
+| | What it is | Built on | Read |
+| --- | --- | --- | --- |
+| **Spindle for Browser** | The first product: an extension for Chrome and Edge. Threads keep going with the panel closed, read and act on your tabs once you allow it, and run commands in a Linux inside the browser | `spindle-embed` | [Spindle for Browser](docs/chrome.md), [its page](https://siliconstate.github.io/Spindle/browser/) |
+| **The web UI** | `spindle serve` (Unix): a phone-friendly UI over a directory of threads, on loopback, each device paired once and reached from elsewhere through your own authenticating HTTPS proxy | The native binary | [Web UI host](docs/host.md) |
+| **Examples** | A Node script; a browser page with its worker, behind a local relay that keeps the key out of the page; client examples in Node.js and Python | `spindle-embed`, the API clients | [Embedded package](docs/embedded.md), [Clients](docs/clients.md) |
+
+## How the parts fit
+
+```mermaid
+flowchart TB
+    subgraph built["Built on Spindle"]
+        Ext["Spindle for Browser"]
+        WebUI["Web UI<br/>spindle serve"]
+        Yours["Your program"]
+    end
+    Native["Native host: the spindle binary<br/>CLI · JSON-RPC · HTTP /v1<br/>performs effects itself"]
+    Embedded["Embedded host: spindle-embed, wasm<br/>the program performs effects"]
+    Core["Spindle: decision driver + SQLite store<br/>on the engine crates"]
+
+    Ext --> Embedded
+    WebUI --> Native
+    Yours --> Native
+    Yours --> Embedded
+    Native --> Core
+    Embedded --> Core
+    Ext -.-|".spindle file, either way"| Native
+    Ext -.->|"optional remote runner"| Native
+```
+
+**What every use of the core shares**
+
+- **The store and its rules.** A session's SQLite store holds revisions, content-addressed
+  objects, attempts and receipts. Wherever it runs, a request is reserved before it leaves
+  and its result recorded before the agent uses it.
+- **The session format.** A session exported from one host continues in another, history and
+  unknown outcomes included: `spindle export-session` and `import-session` natively,
+  **Move to a file** and **Import a .spindle thread** in Spindle for Browser.
+- **How providers are spoken to.** The provider catalog format (`providers.json`) and the
+  request formats come from the engine crates, so a provider entry means the same thing
+  everywhere.
+
+**What differs**
+
+- **Who performs effects.** The native binary sends model requests and runs commands itself.
+  With `spindle-embed`, the program around it does; Spindle for Browser is such a program.
+- **Where commands run.** A bubblewrap sandbox or the host itself, a runner the program
+  supplies, or in Spindle for Browser a Linux inside the browser (v86, plus a faster wasm
+  Linux when built from source).
+- **Tools.** Only Spindle for Browser has page tools, for reading and acting on tabs. Only the
+  native binary has a spending limit per thread (`--max-usd`) and your Rust toolchain,
+  read-only, for commands (`--toolchain`).
+- **Keys and sign-in.** The native binary uses Dext's sign-in flows and credential store and
+  reads a key when it sends a request. Spindle for Browser takes keys or a ChatGPT sign-in
+  (not a Claude subscription sign-in) and seals them in the extension's storage. A session
+  never holds a key, so a `.spindle` file carries none.
+
+**What is not connected**
+
+- There is no Spindle cloud or service. Requests go to the model provider you chose, not
+  through anything of Spindle's.
+- Spindle for Browser does not need the native binary, and the native binary does not need
+  the browser. Their sessions never share storage: they meet only through a `.spindle` file
+  you move, or when you connect a `spindle serve` host to the extension as a place to run commands.
+- Copies do not sync. Moving a session seals the copy it left; copying it (`--keep`) leaves
+  two, of which you continue one.
+
+More diagrams: [docs/architecture.md](docs/architecture.md).
 
 ## Quick start
 
-Requires Rust 1.89 or newer, a C compiler, and on Linux `bubblewrap` for sandboxed
-commands.
+**Spindle, from source.** Requires Rust 1.89 or newer, a C compiler, and on Linux `bubblewrap`
+for sandboxed commands.
 
 ```sh
 git clone https://github.com/SiliconState/Spindle.git
@@ -49,36 +133,16 @@ cargo build --release --locked -p spindle-store --features cli --bin spindle
 ./target/release/spindle --dir ../demo files
 ```
 
-Interrupted? `spindle --dir ../demo continue`. Browser UI:
-`spindle --dir ../host serve --port 8790`, then pair with the key in
-`../host/pairing.key`. Full walkthrough: [docs/getting-started.md](docs/getting-started.md).
+Interrupted? `spindle --dir ../demo continue`. The web UI:
+`spindle --dir ../host serve --port 8790`, then pair with the key in `../host/pairing.key`
+(a phone reaches it through a reverse proxy,
+[docs/host.md](docs/host.md#remote-access-through-a-reverse-proxy)). Full walkthrough:
+[docs/getting-started.md](docs/getting-started.md).
 
-Spindle for Browser (Chrome and Edge) needs no build: download `spindle-browser-VERSION.zip`
-from the [latest release](https://github.com/SiliconState/Spindle/releases/latest), unzip it,
-and load the folder with **Load unpacked**
+**Spindle for Browser.** It needs no build: download `spindle-browser-VERSION.zip` from the
+[latest release](https://github.com/SiliconState/Spindle/releases/latest), unzip it, and load
+the folder with **Load unpacked** in `chrome://extensions` or `edge://extensions`
 ([docs/chrome.md](docs/chrome.md#install-a-release)).
-
-## Architecture
-
-```mermaid
-flowchart LR
-    CLI["spindle CLI"] --> Native
-    Stdio["spindle api<br/>JSON-RPC"] --> Native
-    Serve["spindle serve<br/>web UI + HTTP /v1"] --> Native
-    App["JS app"] --> Embedded
-    Chrome["Browser extension"] --> Embedded
-
-    Native["Native host<br/>performs effects"] --> Driver
-    Embedded["Embedded host, wasm<br/>app performs effects"] --> Driver
-
-    Driver["Decision driver"] --> Store[("SQLite store<br/>revisions, objects,<br/>attempts, receipts")]
-    Native --> Providers["Model providers"]
-    Native --> Sandbox["bubblewrap sandbox"]
-    Embedded -.-> Providers
-    Chrome --> BrowserLinux["Linux in the browser"]
-```
-
-More diagrams and the full picture: [docs/architecture.md](docs/architecture.md).
 
 ## Documentation
 
@@ -87,9 +151,9 @@ More diagrams and the full picture: [docs/architecture.md](docs/architecture.md)
 | [Getting started](docs/getting-started.md) | [CLI](docs/cli.md) | [Store](docs/store.md) |
 | [Concepts](docs/concepts.md) | [API (v1)](docs/API.md) | [Driver and session](docs/driver.md) |
 | [Architecture](docs/architecture.md) | [Clients](docs/clients.md) | [Tools and execution](docs/tools.md) |
-| [Security](SECURITY.md) | [Testing](docs/testing.md) | [Browser host](docs/host.md) |
+| [Security](SECURITY.md) | [Testing](docs/testing.md) | [Web UI host](docs/host.md) |
 | | | [Embedded package](docs/embedded.md) |
-| | | [Browser extension](docs/chrome.md) |
+| | | [Spindle for Browser](docs/chrome.md) |
 | | | [Browser Linux](docs/browser-linux.md) |
 | | | [Engine crates](docs/engine.md) |
 
@@ -97,16 +161,17 @@ All of it is indexed in [docs/README.md](docs/README.md).
 
 ## Repository layout
 
-| Path | Contents |
-| --- | --- |
-| [`spindle/store`](spindle/store) | `spindle-store`: the store, decision driver, native session, API, CLI and browser host |
-| [`spindle/store/ui`](spindle/store/ui) | The web UI, embedded into the binary (no frontend build step) |
-| [`spindle/embed`](spindle/embed) | `spindle-embed`: the WebAssembly package with Node and browser storage |
-| [`spindle/clients`](spindle/clients) | Dependency-free Node.js and Python clients |
-| [`spindle/chrome`](spindle/chrome) | Spindle for Browser and the Linuxes it runs commands in |
-| [`spindle/src`](spindle/src) | `spindle-reference`: an in-memory reference model of the store's rules |
-| [`dext-engine`](dext-engine) | Engine crates: model and turn types, transcripts, provider catalog and wire formats, the strict runner |
-| [`docs`](docs) | Documentation |
+| Path | Part | What it is |
+| --- | --- | --- |
+| [`dext-engine`](dext-engine) | Core | The engine crates Spindle builds on: model and turn types (`core`), transcripts (`transcript`), the provider catalog and request formats (`provider`), and the strict command runner (`native`) |
+| [`spindle/store`](spindle/store) | Core, native host | `spindle-store`: the SQLite store and its rules, the decision driver, the native session that performs effects, and the `spindle` binary with its CLI, JSON-RPC API, `/v1` HTTP API and `spindle serve` |
+| [`spindle/embed`](spindle/embed) | Embedded host | `spindle-embed`: the same core compiled to WebAssembly, storing sessions in files under Node or in OPFS in a browser worker; the program around it performs the effects. Its `examples/` are small programs built on it |
+| [`spindle/clients`](spindle/clients) | Clients | Dependency-free clients: Node.js and Python for the JSON-RPC and HTTP APIs, and the JavaScript side of `spindle-embed` (its runners, OPFS storage and app tools) |
+| [`spindle/src`](spindle/src) | Core, reference | `spindle-reference`: an in-memory reference model of the store's rules |
+| [`spindle/chrome`](spindle/chrome) | Built on Spindle | Spindle for Browser, on `spindle-embed`: the side panel, the offscreen engine worker that keeps threads going, the page tools, the sealed key vault, and the Linuxes commands run in (`linux/`, v86 with Alpine; `wasm-linux/`, the optional faster wasm Linux) |
+| [`spindle/store/ui`](spindle/store/ui) | Built on Spindle | The web UI that `spindle serve` hosts, built into the binary (no frontend build step) |
+| [`docs`](docs) | | Documentation, written from the code |
+| [`site`](site) | | The website, published with GitHub Pages |
 
 ## Development
 
