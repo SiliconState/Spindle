@@ -213,6 +213,9 @@ loads the site grants and relay, and then repairs what an earlier stop left behi
 goes on unchanged:
 
 - the browser Linux guide in the thread's instructions is replaced with the current wording;
+- a style line comes before the standing instructions (which win over it): pages the thread
+  makes follow the system's light or dark theme and offer a System/Light/Dark switch, and
+  nothing it writes uses em dashes. New and imported threads get it at once;
 - the user's standing instructions are placed between `[The user's standing instructions]`
   markers;
 - if the thread offers page tools, it gets the current page tool definitions;

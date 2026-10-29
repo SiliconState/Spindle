@@ -206,15 +206,20 @@ const STANDING_START = "[The user's standing instructions]";
 const STANDING_END = "[End of the user's standing instructions]";
 const STANDING = /\[The user's standing instructions\]\n([\s\S]*?)\n\[End of the user's standing instructions\]/;
 
-/** A thread's instructions as they are, with the Linux guide in (`on`) or out and the
- * user's standing instructions as `standing` says (undefined: as they are). */
+/** What every thread is told about what it writes, before the user's standing
+ * instructions (which win). A later wording must still take this one out. */
+const STYLE = "Pages you make follow the system's light or dark theme and offer a System/Light/Dark switch; never write em dashes.";
+
+/** A thread's instructions as they are, with the style line, the Linux guide in (`on`)
+ * or out and the user's standing instructions as `standing` says (undefined: as they
+ * are). */
 function guided(instructions, on, standing) {
   let rest = String(instructions ?? '');
   for (const guide of [LINUX_GUIDE, ...EARLIER_GUIDES]) rest = rest.replace(guide, '');
   const kept = STANDING.exec(rest)?.[1] ?? '';
-  rest = rest.replace(STANDING, '').trim();
+  rest = rest.replace(STANDING, '').replace(STYLE, '').trim();
   const user = (standing ?? kept).trim();
-  return [rest, user && `${STANDING_START}\n${user}\n${STANDING_END}`, on && LINUX_GUIDE].filter(Boolean).join('\n\n');
+  return [rest, STYLE, user && `${STANDING_START}\n${user}\n${STANDING_END}`, on && LINUX_GUIDE].filter(Boolean).join('\n\n');
 }
 
 /** Before a turn, a thread gets what is current, if it differs (if it cannot, the turn

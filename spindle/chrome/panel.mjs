@@ -2384,9 +2384,9 @@ const WASM_STATES = {
 
 function renderCommands() {
   const linux = engine?.linux ?? { state: 'not started' };
-  $('linux-state').textContent = `${LINUX_STATES[linux.state] ?? linux.state}${linux.detail ? ` — ${linux.detail}` : ''}`;
+  $('linux-state').textContent = `${LINUX_STATES[linux.state] ?? linux.state}${linux.detail ? `: ${linux.detail}` : ''}`;
   $('wasm-linux-row').hidden = !linux.wasm;
-  if (linux.wasm) $('wasm-linux-state').textContent = `${WASM_STATES[linux.wasm.state] ?? linux.wasm.state}${linux.wasm.detail ? ` — ${linux.wasm.detail}` : ''}`;
+  if (linux.wasm) $('wasm-linux-state').textContent = `${WASM_STATES[linux.wasm.state] ?? linux.wasm.state}${linux.wasm.detail ? `: ${linux.wasm.detail}` : ''}`;
   const relay = engine?.relay ?? null;
   const relayHost = relay ? new URL(relay).host : null;
   $('network-state').textContent = relay

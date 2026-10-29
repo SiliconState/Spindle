@@ -522,6 +522,7 @@ try {
   await panel.screenshot(join(shots, '03c-code-through-bash.png'));
   check("a bash script makes Spindle calls: a nested model's answer and a page tool (code mode through bash)", () => {
     assert.match(guide, /spindle model/, 'the thread is told about Spindle calls');
+    assert.match(guide, /System\/Light\/Dark switch; never write em dashes/, 'the thread is told the style line');
     assert.equal(bridged, 'idle', `state ${bridged}`);
     assert.ok(bridgeCard && !bridgeCard.failed, `the bash call: ${JSON.stringify(bridgeCard)}`);
     assert.match(bridgeCard.text, /teal/i, 'the nested model answered the script');
