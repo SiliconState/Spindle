@@ -1,19 +1,20 @@
-// Runs before the stylesheet paints: Paper unless this screen chose Dark or System, and
-// the textured background unless it chose Plain. Settings > Appearance selects through
-// spindleTheme.set and spindleTheme.setTexture.
+// Runs before the stylesheet paints: Paper unless this screen chose Light, Dark or System
+// (Light or Dark as the system is), and the textured background unless it chose Plain.
+// Settings > Appearance selects through spindleTheme.set and spindleTheme.setTexture.
 (() => {
   const media = matchMedia('(prefers-color-scheme: dark)');
-  const modes = ['paper','dark','system'];
+  const colors = {paper: '#f6f2e9', light: '#f6f7f5', dark: '#111511'};
+  const modes = ['paper','light','dark','system'];
   const textures = ['textured','plain'];
   let mode = 'paper';
   let texture = 'textured';
   try {const saved = localStorage.getItem('spindle-theme'); if (modes.includes(saved)) mode = saved;} catch {}
   try {const saved = localStorage.getItem('spindle-texture'); if (textures.includes(saved)) texture = saved;} catch {}
   function apply() {
-    const dark = mode === 'dark' || (mode === 'system' && media.matches);
-    document.documentElement.dataset.theme = dark ? 'dark' : 'paper';
+    const shown = mode === 'system' ? (media.matches ? 'dark' : 'light') : mode;
+    document.documentElement.dataset.theme = shown;
     document.documentElement.dataset.texture = texture;
-    document.querySelector('meta[name="theme-color"]').content = dark ? '#111511' : '#f6f2e9';
+    document.querySelector('meta[name="theme-color"]').content = colors[shown];
   }
   function set(next) {
     if (!modes.includes(next)) return;

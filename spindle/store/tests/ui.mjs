@@ -169,14 +169,20 @@ test('Paper is default even on a dark system; selection persists', () => {
   assert.equal(current.root.dataset.theme, 'dark', 'System follows the dark system');
   current.media.matches = false;
   current.media.change();
-  assert.equal(current.root.dataset.theme, 'paper');
+  assert.equal(current.root.dataset.theme, 'light', 'System follows the light system with Light, not Paper');
+  assert.equal(current.meta.content, '#f6f7f5');
+  current.api.set('light');
+  assert.equal(current.storage.get('spindle-theme'), 'light');
+  current.media.matches = true;
+  current.media.change();
+  assert.equal(current.root.dataset.theme, 'light', 'Light chosen stays light on a dark system');
   current.api.set('paper');
   assert.equal(current.storage.get('spindle-theme'), 'paper');
   assert.equal(theme('dark').root.dataset.theme, 'dark');
   assert.equal(theme('invalid').root.dataset.theme, 'paper');
 });
 
-test('the background is textured unless this screen chose plain, in either theme', () => {
+test('the background is textured unless this screen chose plain, in any theme', () => {
   const current = theme(null, false);
   assert.equal(current.root.dataset.texture, 'textured');
   current.api.setTexture('plain');

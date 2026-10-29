@@ -2,7 +2,7 @@
 // turn of 34 steps (browser steps, files written and edited, commands in the browser
 // Linux; some failing, one failing and done again), a message sent while it runs, a
 // report written as a page and an answer with a table. Run once in each theme (Paper,
-// Light (Paper, plain), Dark, Auto in a light and in a dark system), it checks what the
+// Light (plain), Dark, Auto in a light and in a dark system), it checks what the
 // panel shows of it:
 //
 //   - steps in groups: the running turn's group open, its running step spinning and
@@ -228,7 +228,7 @@ assert.ok(tab, 'the test page is open in a tab');
 
 const THEMES = [
   { name: 'paper', mode: 'paper', texture: 'textured', scheme: 'light' },
-  { name: 'light', mode: 'paper', texture: 'plain', scheme: 'light' },
+  { name: 'light', mode: 'light', texture: 'plain', scheme: 'light' },
   { name: 'dark', mode: 'dark', texture: 'textured', scheme: 'light' },
   { name: 'auto-light', mode: 'system', texture: 'textured', scheme: 'light' },
   { name: 'auto-dark', mode: 'system', texture: 'textured', scheme: 'dark' },

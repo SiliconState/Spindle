@@ -2607,7 +2607,7 @@ async function renderPages() {
 
 function renderTheme() {
   const theme = globalThis.spindleTheme;
-  const mode = { paper: 'Paper', dark: 'Dark', system: 'System' }[theme?.get()] ?? 'Paper';
+  const mode = { paper: 'Paper', light: 'Light', dark: 'Dark', system: 'System' }[theme?.get()] ?? 'Paper';
   $('appearance-summary').textContent = `${mode} · ${theme?.texture() === 'plain' ? 'plain' : 'textured'}`;
   const marks = [['theme-choice', 'mode', theme?.get(), (value) => theme?.set(value)], ['texture-choice', 'texture', theme?.texture(), (value) => theme?.setTexture(value)]];
   for (const [group, key, value, choose] of marks) {

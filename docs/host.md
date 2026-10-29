@@ -290,7 +290,7 @@ served wrapped in a CSS `base` layer so a [skin](#host-skin) layer can sit over 
 | [`commands.js`](../spindle/store/ui/commands.js) | Typed commands recognized in the composer. |
 | [`terminal.js`](../spindle/store/ui/terminal.js) | Bounded ANSI renderer for live command output. |
 | [`text.js`](../spindle/store/ui/text.js) | Search, line diff, Markdown export and labels. |
-| [`theme.js`](../spindle/store/ui/theme.js) | Paper, Dark or System theme and textured or plain background, remembered per screen. |
+| [`theme.js`](../spindle/store/ui/theme.js) | Paper, Light, Dark or System theme (System is Light or Dark as the device is) and textured or plain background, remembered per screen. |
 | [`sw.js`](../spindle/store/ui/sw.js) | Service worker that only shows run notifications; no fetch handler, nothing cached, no push server. |
 | [`manifest.webmanifest`](../spindle/store/ui/manifest.webmanifest), [`icon.svg`](../spindle/store/ui/icon.svg) | Home-screen installation. |
 

@@ -465,7 +465,7 @@ Global settings (the gear button) are stored in IndexedDB and applied by the eng
 | Commands | Sites scripts may call | `kv/sites` | Address prefixes that scripts' `spindle http` may reach: **Read it** allows `GET` and `HEAD`, **Read and change it** also `POST`, `PUT`, `PATCH`, `DELETE`. Adding one asks Chrome for that origin. The package checks each grant (`setHttpGrants`). |
 | Commands | Your Spindle host | `kv/host` | A host address and API token (made on the host with `spindle --dir HOST token new chrome`). Kept only after the host answers. |
 | Your instructions | standing instructions | `kv/standing` | Up to 8000 characters, added to new threads at once and to other threads before their next turn. |
-| Appearance | Paper, Dark or System; Textured or Plain | `localStorage` (`theme.js`) | The panel's look. |
+| Appearance | Paper, Light, Dark or System (Light or Dark as the system is); Textured or Plain | `localStorage` (`theme.js`) | The panel's look. |
 | About | Open in a tab, Restart engine | — | Opens `panel.html` in a tab (useful when Chrome cannot show a permission prompt in the side panel); closes and restarts the offscreen engine. |
 
 Settings for one thread are in its model menu (the chip above the message box):

@@ -180,7 +180,8 @@ No server and no relay: the extension calls your provider directly with your key
 - **Deleting:** the × beside a thread in the list (or Delete this thread in its menu)
   removes it and its workspace from this browser, after you confirm (stop a running
   thread first).
-- **Appearance:** the native UI's Paper, Dark or System theme, with a Textured or Plain
+- **Appearance:** the native UI's Paper, Light, Dark or System (Light or Dark as the
+  system is) theme, with a Textured or Plain
   background.
 
 ## Build and install

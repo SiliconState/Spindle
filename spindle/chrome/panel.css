@@ -22,6 +22,23 @@
   --grain: #2a21141a;
   --steer: #efe7d3;
 }
+/* Light: Paper's inks on neutral white and grey, without the warm tint. */
+:root[data-theme="light"], :root[data-theme="light"] dialog, :root[data-theme="light"] #toast {
+  --page: #f6f7f5;
+  --surface: #ffffff;
+  --soft: #eef0ec;
+  --input: #ffffff;
+  --ink: #1f231d;
+  --muted: #5a6056;
+  --line: #d6dad2;
+  --rule: #b9beb4;
+  --accent-soft: #e7eedf;
+  --on-accent: #ffffff;
+  --terminal: #f0f2ee;
+  --shadow: #1a201814;
+  --grain: #1a20180f;
+  --steer: #eaeee5;
+}
 :root[data-theme="dark"], :root[data-theme="dark"] dialog, :root[data-theme="dark"] #toast {
   color-scheme: dark;
   --page: #111511;
@@ -55,7 +72,7 @@ html {
   color: var(--ink);
   -webkit-font-smoothing: antialiased;
 }
-/* Settings > Appearance > Background: Plain drops the grain, in either theme. */
+/* Settings > Appearance > Background: Plain drops the grain, in any theme. */
 :root[data-texture="plain"] { background-image: none; }
 body { margin: 0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; line-height: 1.55; }
 button, input, select, textarea { font: inherit; color: inherit; }

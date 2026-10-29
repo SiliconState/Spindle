@@ -37,7 +37,7 @@ const state = (more = {}) => ({head: 10, revision: 10, busy: false, complete: tr
 const response = (value, status = 200) => ({ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(value)});
 async function app(custom = () => undefined, hash = '') {
   const nodes = new Map([...html.matchAll(/id="([^"]+)"/g)].map(m => [m[1], new Node()]));
-  for(const id of ['theme-choice']) for(const mode of ['paper','dark','system']) {const button = new Node('button'); button.dataset.mode = mode; nodes.get(id).append(button);}
+  for(const id of ['theme-choice']) for(const mode of ['paper','light','dark','system']) {const button = new Node('button'); button.dataset.mode = mode; nodes.get(id).append(button);}
   for(const mode of ['model','digest']) {const button = new Node('button'); button.dataset.mode = mode; nodes.get('compaction-choice').append(button);}
   const storage = new Map(), calls = [], streams = [], events = {}, timers = [];
   const context = createContext({
