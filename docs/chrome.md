@@ -359,7 +359,7 @@ every tab. A new install starts with both switches off.
 | `list_tabs` | reading | Lists tabs (id, title, address) and marks the one the user is looking at. |
 | `read_page` | reading (`scroll` also needs actions) | Address, title, selected text and visible text of a tab (default 20,000 characters, at most 100,000). With `scroll: N` (1 to 30) it scrolls down and collects each new line once, for feeds that load as they scroll. |
 | `page_elements` | reading | An indented outline of headings, links, buttons, fields, lists, tables and text, each actionable part with a ref such as `kqm12`. |
-| `page_html` | reading | The page's or one part's HTML, without `<script>` unless asked (default 50,000 characters, at most 200,000). |
+| `page_html` | reading | The page's or one part's HTML, without `<script>` unless asked and without password values (default 50,000 characters, at most 200,000). |
 | `screenshot` | reading, plus the `<all_urls>` grant (visible tab) or actions (any tab) | A JPEG of a tab saved to `screenshots/` in the workspace. |
 | `navigate` | actions (reading for `/workspace/NAME`) | Go to an http(s) address, back, forward or reload, in a tab or a new tab; or open a workspace file in a tab for the user. |
 | `click`, `type`, `press` | actions | Input through Chrome's debugger, so pages receive it as real input. |
@@ -393,8 +393,12 @@ How the tools run ([`background.js`](../spindle/chrome/background.js)):
   service worker, and the engine waits 35 s before it cancels the call. Stopping a turn, a
   deadline passing, or page actions being turned off cancel the remaining steps of a call. A
   request already handed to Chrome cannot be undone.
-- **Reruns.** Reading tools and `screenshot` are declared `rerun: 'safe'`; the other acting
-  tools are `rerun: 'no'`, so Spindle never repeats a click by itself (see [tools.md](tools.md)).
+- **Cut-off actions.** A tool that fails once it has begun acting (its input reached the page,
+  or Chrome was told to open, move or close a tab), or whose answer from Chrome is lost,
+  answers `unknown` rather than failed: the model checks the page before repeating it, and a
+  script makes no further calls. A tool declared `rerun: 'safe'` just fails.
+- **Reruns.** Reading tools, `screenshot` and `wait_for` are declared `rerun: 'safe'`; the other
+  acting tools are `rerun: 'no'`, so Spindle never repeats a click by itself (see [tools.md](tools.md)).
 - **Workspace files.** `navigate` to `/workspace/NAME` (or `file:///workspace/NAME`) is rewritten
   by the engine into `view.html?thread=ID&path=NAME` in a new tab.
 - **Screenshots.** The visible tab is captured with `chrome.tabs.captureVisibleTab` once the user

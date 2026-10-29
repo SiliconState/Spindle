@@ -492,7 +492,7 @@ Answers an app tool call announced by an [`app_tool`](#app-tool-calls) event. Se
 | `content` | string | one of `content`, `error`, `unknown` | Text for the model (at most 4 MiB). |
 | `error` | string | | Text for the model; marks the call failed. |
 | `failed` | boolean | no | With `content`. |
-| `unknown` | boolean | | `true`: the app cannot tell whether a call asked `again` ran; `content` may add what it knows. |
+| `unknown` | boolean | | `true`: the app cannot tell whether the call ran (it was asked `again`, or the app began acting and lost track of it); `content` says what it knows, and the model reads it as the reason. |
 | `files` | object | no | Workspace changes kept with the result. |
 | `state` | object | no | A JSON merge patch to the app state, committed in the same step as the result. |
 | `details` | any | no | Private data (at most 1 MiB) for the app's own UI; never sent to the model. |

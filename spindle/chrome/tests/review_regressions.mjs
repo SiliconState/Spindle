@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { local, wireNetwork } from '../linux-net.mjs';
+import { ACTING_NAMES, uncertain } from '../page-tools.mjs';
 
 const tick = () => new Promise((done) => setImmediate(done));
 const deferred = () => {
@@ -12,7 +13,12 @@ const deferred = () => {
 };
 
 // Run the actual engine functions with explicit storage/client dependencies.
-const engineSource = readFileSync(new URL('../engine-worker.mjs', import.meta.url), 'utf8')
+const WAIT_LINE = /const PAGE_TOOL_WAIT = [\d_]+;/;
+const engineFile = readFileSync(new URL('../engine-worker.mjs', import.meta.url), 'utf8');
+assert.match(engineFile, WAIT_LINE);
+const engineSource = engineFile
+  // Chrome's silence is waited out in a moment here, not 35 s.
+  .replace(WAIT_LINE, 'const PAGE_TOOL_WAIT = 200;')
   .replace(/^import .*;\n/gm, '')
   .split('const starting = (async () => {')[0];
 const records = new Map();
@@ -21,7 +27,7 @@ const warnings = [];
 const context = vm.createContext({
   crypto: globalThis.crypto, console: { ...console, warn: (...args) => warnings.push(args) }, setTimeout, clearTimeout, Uint8Array, URL, URLSearchParams,
   BroadcastChannel: class { postMessage(message) { messages.push(message); } },
-  CHANNEL: 'test', self: {}, linuxRunner: () => ({ warm() {} }), PAGE_TOOLS: [],
+  CHANNEL: 'test', self: {}, linuxRunner: () => ({ warm() {} }), PAGE_TOOLS: [], uncertain,
   read: async (store, key) => records.get(`${store}:${key}`),
   write: async (store, key, value) => records.set(`${store}:${key}`, value),
   remove: async (store, key) => records.delete(`${store}:${key}`),
@@ -34,7 +40,7 @@ const context = vm.createContext({
     return next;
   },
 });
-vm.runInContext(`${engineSource}\nglobalThis.test = { operate, ops, running, renew, replaceFirst, creationSettings, setClient: (value) => { client = value; poolOpening = Promise.resolve({ free: 100, rmSync() {} }); } };`, context);
+vm.runInContext(`${engineSource}\nglobalThis.test = { operate, ops, running, renew, replaceFirst, creationSettings, pageTool, cancelPageTools, setClient: (value) => { client = value; poolOpening = Promise.resolve({ free: 100, rmSync() {} }); } };`, context);
 const engine = context.test;
 const id = '0123456789abcdef';
 let entered = 0;
@@ -114,6 +120,28 @@ assert.equal(keptFiles.files[0].path, 'kept.txt');
 assert.equal(keptFiles.before, null, 'missing comparison history does not hide the workspace');
 assert.equal(warnings.length, 1, 'missing history is reported, not silently lost');
 
+// A page tool call goes to Chrome and comes back with Chrome's answer; cut off by the
+// turn's end, an action's outcome is unknown and a read just failed.
+const posted = [];
+context.self.postMessage = (message) => posted.push(message);
+const toolThread = 'fedcba9876543210';
+const clicking = engine.pageTool('click', { ref: 'abc1' }, `/threads/${toolThread}`);
+const asked = posted.find((message) => message.type === 'page_tool');
+assert.equal(asked?.name, 'click', 'the call reached Chrome');
+// As engine.mjs sends Chrome's answer back.
+context.self.onmessage({ data: { type: 'page_tool_answer', call: asked.call, answer: { content: 'Clicked' } } });
+assert.deepEqual(await clicking, { content: 'Clicked' });
+const cutClick = engine.pageTool('click', { ref: 'abc1' }, `/threads/${toolThread}`);
+const cutRead = engine.pageTool('read_page', {}, `/threads/${toolThread}#task`);
+engine.cancelPageTools(toolThread);
+assert.deepEqual(await cutClick, { unknown: true, content: 'the turn ended before the page tool finished' });
+assert.deepEqual(await cutRead, { error: 'the turn ended before the page tool finished' });
+assert.equal(posted.filter((message) => message.type === 'page_tool_cancel').length, 2);
+// Chrome never answering is the same: unknown for an action, a failure for a read.
+assert.deepEqual(await engine.pageTool('type', { ref: 'abc1', text: 'x' }, `/threads/${toolThread}`), { unknown: true, content: 'Chrome did not answer the page tool in time' });
+assert.deepEqual(await engine.pageTool('list_tabs', {}, `/threads/${toolThread}`), { error: 'Chrome did not answer the page tool in time' });
+assert.equal(posted.filter((message) => message.type === 'page_tool_cancel').length, 4);
+
 // Drive the gateway through its real connection handler, with fetch captured.
 function connection() {
   const handlers = new Map();
@@ -163,7 +191,7 @@ const background = readFileSync(new URL('../background.js', import.meta.url), 'u
 const sent = [];
 const event = { addListener() {} };
 const pageContext = vm.createContext({
-  console, setTimeout, clearTimeout, URL, read: async () => ({ reading: true, acting: true }), PAGE_ACCESS: [],
+  console, setTimeout, clearTimeout, URL, crypto: globalThis.crypto, read: async () => ({ reading: true, acting: true }), PAGE_ACCESS: [], ACTING_NAMES, uncertain,
   pageSwitches: () => ({ reading: true, acting: true }),
   chrome: {
     sidePanel: { setPanelBehavior: async () => {} },
@@ -182,7 +210,7 @@ const pageContext = vm.createContext({
     })() },
   },
 });
-vm.runInContext(`${background}\nglobalThis.test = { watched, attached, network, recordNetwork, cdp, calls, inPage, attach, veto, unveto, vetoed, onTab };`, pageContext);
+vm.runInContext(`${background}\nglobalThis.test = { watched, attached, network, recordNetwork, cdp, calls, inPage, attach, veto, unveto, vetoed, onTab, run };`, pageContext);
 const bg = pageContext.test;
 bg.attached.set(7, null);
 bg.watched.set(7, new Map([['1234.56', { id: '1234.56' }]]));
@@ -222,4 +250,69 @@ const step = (name, ms) => () => new Promise((done) => { order.push(`${name} sta
 await Promise.all([bg.onTab(4, step('A', 30)), bg.onTab(4, step('B', 1)), bg.onTab(5, step('C', 1))]);
 assert.deepEqual(order.filter((line) => line[0] !== 'C'), ['A starts', 'A ends', 'B starts', 'B ends']);
 assert.ok(order.indexOf('C starts') < order.indexOf('A ends'), 'another tab does not wait');
-console.log('review-regressions passed: operation races, reset safety, early Stop, gateway bounds/redirects, IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too), one action per tab');
+// An action that fails once its input reached the page is unknown (it may have acted); one
+// that fails before is a plain failure. A lost answer is unknown for actions only.
+pageContext.chrome.debugger.attach = async () => {};
+pageContext.chrome.tabs.get = async (tab) => ({ id: tab, url: 'https://public.example/', status: 'complete' });
+pageContext.chrome.debugger.sendCommand = async (_, method, params) => {
+  if (params?.type === 'keyUp') throw new Error('Target closed');
+};
+const cut = await bg.run('press', { key: 'Enter', tab: 14 });
+assert.equal(cut.unknown, true, JSON.stringify(cut));
+assert.match(cut.content, /began acting on the page, then failed \(.*Target closed/);
+pageContext.chrome.debugger.attach = async () => { throw new Error('no'); };
+await assert.rejects(bg.run('press', { key: 'Enter', tab: 15 }), /would not let Spindle act/, 'nothing sent: a plain failure');
+vm.runInContext('for (const timer of attached.values()) clearTimeout(timer);', pageContext);
+// The page refusing an in-page change (no such option) changed nothing: a plain failure.
+pageContext.chrome.scripting = { executeScript: async () => [{ result: { error: 'no option of abc1 is Z' } }] };
+await assert.rejects(bg.run('select', { ref: 'abc1', values: ['Z'], tab: 16 }), /no option/);
+// A read safe to repeat that scrolled, then failed, just failed.
+let reads = 0;
+pageContext.chrome.scripting.executeScript = async ({ args }) => {
+  if (args?.[0] === 'scroll') return [{ result: { value: { y: 0, height: 0, view: 0 } } }];
+  if (++reads > 1) throw new Error('Frame was removed');
+  return [{ result: { url: 'https://public.example/', title: 'Feed', text: 'one' } }];
+};
+const reread = await bg.run('read_page', { tab: 17, scroll: 3 });
+assert.equal(reread.unknown, undefined, JSON.stringify(reread));
+assert.match(reread.error, /then failed \(Frame was removed\)/);
+// Moving and closing tabs run through the lines that mark them acting; Chrome refusing a
+// move it was asked for is said plainly (nothing moved).
+pageContext.chrome.runtime.getURL = (path) => `chrome-extension://spindle/${path}`;
+const moved = [];
+Object.assign(pageContext.chrome.tabs, {
+  update: async (tab, { url }) => { moved.push(`update ${tab} ${url}`); },
+  create: async ({ url }) => { moved.push(`create ${url}`); return { id: 31 }; },
+  remove: async (tab) => { moved.push(`remove ${tab}`); },
+});
+assert.match((await bg.run('navigate', { url: 'https://public.example/next', tab: 18 })).content, /^Tab 18 is at/);
+assert.match((await bg.run('navigate', { url: 'https://public.example/new', new_tab: true })).content, /^Tab 31 is at/);
+assert.match((await bg.run('navigate', { url: 'chrome-extension://spindle/view.html?thread=t&path=a.md' })).content, /^Opened a\.md/);
+assert.match((await bg.run('close_tab', { tab: 19 })).content, /^Closed tab 19/);
+assert.deepEqual(moved, ['update 18 https://public.example/next', 'create https://public.example/new', 'create chrome-extension://spindle/view.html?thread=t&path=a.md', 'remove 19']);
+pageContext.chrome.tabs.update = async () => { throw new Error('Tabs cannot be edited right now'); };
+assert.match((await bg.run('navigate', { url: 'https://public.example/x', tab: 18 })).error, /could not go there/);
+assert.deepEqual(uncertain('click', 'lost'), { unknown: true, content: 'lost' });
+for (const name of ['read_page', 'screenshot', 'wait_for']) assert.deepEqual(uncertain(name, 'lost'), { error: 'lost' }, name);
+// The engine's document carries calls to Chrome and Chrome's answers back; an answer that
+// never comes back is unknown for an action, a plain failure for a read.
+const relays = [];
+globalThis.Worker = class { constructor() { this.posted = []; relays.push(this); } postMessage(message) { this.posted.push(message); } };
+let chromeReply = async () => undefined;
+const toBackground = [];
+globalThis.chrome = { runtime: { sendMessage: async (message) => { toBackground.push(message); return chromeReply(message); } } };
+await import('../engine.mjs');
+const [relay] = relays;
+const relayed = async (name, reply) => {
+  chromeReply = reply;
+  await relay.onmessage({ data: { type: 'page_tool', call: `relay-${name}`, name, input: {} } });
+  return relay.posted.at(-1);
+};
+assert.deepEqual(await relayed('click', async () => ({ content: 'Clicked' })), { type: 'page_tool_answer', call: 'relay-click', answer: { content: 'Clicked' } });
+assert.deepEqual((await relayed('click', async () => { throw new Error('The message port closed'); })).answer, { unknown: true, content: "Chrome's answer to the page tool was lost: The message port closed" });
+assert.deepEqual((await relayed('read_page', async () => undefined)).answer, { error: 'Chrome gave no answer' });
+await relay.onmessage({ data: { type: 'page_tool_cancel', call: 'relay-click' } });
+assert.deepEqual(toBackground.at(-1), { type: 'page_tool_cancel', call: 'relay-click' });
+delete globalThis.Worker;
+delete globalThis.chrome;
+console.log('review-regressions passed: operation races, reset safety, early Stop, gateway bounds/redirects, IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too), one action per tab, uncertain actions unknown (engine, its document and the background)');

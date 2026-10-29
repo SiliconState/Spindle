@@ -2,7 +2,7 @@
 // tools' work for the engine (the engine's document cannot reach tabs). Reading needs
 // page reading on; acting needs page actions on as well (chrome.debugger: clicks, keys
 // and typing reach the page as the user's would, and a tab's network can be watched).
-import { ACTING_NAMES, PAGE_ACCESS, PICTURE_ACCESS, pageSwitches } from './page-tools.mjs';
+import { ACTING_NAMES, PAGE_ACCESS, PICTURE_ACCESS, pageSwitches, uncertain } from './page-tools.mjs';
 import { read, write } from './shared.mjs';
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
@@ -59,7 +59,8 @@ const NO_ACTIONS =
 async function run(name, input, call = crypto.randomUUID()) {
   const work = TOOLS[name];
   if (!work) return { error: `there is no page tool ${name}` };
-  const control = { until: Date.now() + TOOL_MS, cancelled: false };
+  // `acted`: input reached the page, or Chrome was told to move or close a tab.
+  const control = { until: Date.now() + TOOL_MS, cancelled: false, acted: false };
   calls.set(call, control);
   try {
     return await deadline((async () => {
@@ -69,6 +70,13 @@ async function run(name, input, call = crypto.randomUUID()) {
       check(control);
       return work(input, control);
     })(), TOOL_MS, 'the page tool');
+  } catch (error) {
+    // A failure once the tool began acting does not say the action did not happen: its
+    // outcome is unknown (checked rather than repeated), unless the tool is safe to
+    // repeat, such as a read that scrolled. A cancelled or late tool acts no further:
+    // every action checks `control` just before it goes.
+    if (!control.acted) throw error;
+    return uncertain(name, `it began acting on the page, then failed (${error?.message ?? error})`);
   } finally {
     control.cancelled = true;
     calls.delete(call);
@@ -129,12 +137,19 @@ async function page(tabId, op, args = {}, control) {
   if (['point', 'caret', 'select', 'scroll'].includes(op) && !(await acting())) throw new Error(NO_ACTIONS);
   check(control);
   refuseWhileDialog(tabId);
+  // `point` only measures; these change the page, unless it refuses first (then this
+  // changed nothing, and the call stands as it did).
+  const was = control?.acted;
+  if (control && ['caret', 'select', 'scroll'].includes(op)) control.acted = true;
   const [answer] = await deadline(
     chrome.scripting.executeScript({ target: { tabId }, func: inPage, args: [op, { ...args, expires: control?.until }], injectImmediately: true }),
     DEADLINE_MS, `tab ${tabId}`,
   );
   const result = answer?.result;
-  if (result?.error) throw new Error(result.error);
+  if (result?.error) {
+    if (control) control.acted = was;
+    throw new Error(result.error);
+  }
   return result?.value;
 }
 
@@ -309,6 +324,7 @@ async function navigate({ url, action = 'go', tab: id, new_tab: fresh }, control
   // own for the user, never in place of a page.
   if (typeof url === 'string' && url.startsWith(chrome.runtime.getURL('view.html?'))) {
     const path = new URL(url).searchParams.get('path') ?? '';
+    control.acted = true;
     const tab = await chrome.tabs.create({ url, active: true });
     return { content: `Opened ${path} from the workspace in a tab for the user (tab ${tab.id}).`, details: { tab: tab.id } };
   }
@@ -325,6 +341,7 @@ async function navigate({ url, action = 'go', tab: id, new_tab: fresh }, control
   let tab;
   if (fresh) {
     if (!url) return { error: 'a new tab needs a url' };
+    control.acted = true;
     tab = await chrome.tabs.create({ url, active: true });
   } else {
     tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt();
@@ -333,6 +350,7 @@ async function navigate({ url, action = 'go', tab: id, new_tab: fresh }, control
     return onTab(tab.id, async () => {
       refuseWhileDialog(tab.id);
       check(control);
+      control.acted = true;
       try {
         if (action === 'back') await chrome.tabs.goBack(tab.id);
         else if (action === 'forward') await chrome.tabs.goForward(tab.id);
@@ -476,6 +494,7 @@ async function closeTab({ tab: id }, control) {
   if (!tab) return { error: `there is no tab ${id}` };
   if (!webTab(tab)) return { error: `tab ${id} does not show a web page: Spindle closes only those` };
   check(control);
+  control.acted = true;
   await chrome.tabs.remove(id);
   return { content: `Closed tab ${id} (${tab.title || tab.url || 'untitled'}).` };
 }
@@ -555,6 +574,8 @@ async function cdp(tabId, method, params = {}, control) {
   await attach(tabId);
   if (!(await acting())) throw new Error(NO_ACTIONS);
   check(control);
+  // Input and a dialog's answer act on the page; a picture or the network only look.
+  if (control && /^Input\.|^Page\.handleJavaScriptDialog$/.test(method)) control.acted = true;
   clearTimeout(attached.get(tabId));
   attached.set(tabId, watched.has(tabId) ? null : setTimeout(() => detach(tabId), 20_000));
   // A dialog the command opened ends the wait for it (it answers once the dialog is).
@@ -1044,6 +1065,8 @@ function inPage(op, args) {
       // Into a document of its own: nothing in the copy runs or loads.
       const copy = document.implementation.createHTMLDocument('').importNode(element, true);
       if (!args.scripts) for (const script of copy.querySelectorAll('script')) script.remove();
+      // A password stays out, as in the outline (some pages mirror it into the attribute).
+      for (const field of [copy, ...copy.querySelectorAll('input')]) if (field.type === 'password') field.removeAttribute('value');
       const html = copy.outerHTML;
       return { value: { text: html.slice(0, args.max), total: html.length } };
     }

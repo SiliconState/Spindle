@@ -26,6 +26,14 @@ const server = http.createServer(async (request, response) => {
 <div style="position:fixed;inset:0;background:rgba(0,0,0,.3)">Cookie banner</div>`);
     return;
   }
+  if (request.url === '/moving') {
+    // The field is replaced as the click lands on it: the click reaches the page, typing
+    // cannot follow.
+    response.writeHead(200, { 'content-type': 'text/html' }).end(`<title>Moving page</title>
+<input aria-label="Name" style="margin:40px" onmousedown="this.replaceWith(Object.assign(document.createElement('input'), { ariaLabel: 'Name' }))">
+<input type="password" aria-label="Secret" value="mirrored-secret">`);
+    return;
+  }
   if (request.url === '/clicked') {
     coveredClicks += 1;
     response.writeHead(204).end();
@@ -150,6 +158,27 @@ try {
   assert.match(told, /covered by/, `the click said what covers it: ${told.slice(0, 300)}`);
   console.log('ok a covered target is refused, not clicked through');
   await covered.close();
+
+  // Typing whose click reached the page but could not finish is unknown, not a plain
+  // failure (it may have acted); the page's HTML keeps a mirrored password out.
+  const moving = await open(browser, `http://127.0.0.1:${port}/moving`);
+  const movingId = await page.eval(`chrome.tabs.query({}).then((tabs) => tabs.find((tab) => tab.url === 'http://127.0.0.1:${port}/moving').id)`);
+  replies.push(
+    { for: 'type into the moving field', tool: 'page_elements', input: { tab: movingId } },
+    { for: 'type into the moving field', from: (body) => ({ tool: 'type', input: { ref: /textbox \\"Name\\"[^[]*\[([a-z]{3}\d+)\]/.exec(body)?.[1] ?? 'k0', text: 'Ada', tab: movingId } }) },
+    { for: 'type into the moving field', tool: 'page_html', input: { tab: movingId } },
+    { for: 'type into the moving field', content: 'done' },
+  );
+  const movingThread = await rpc('create', { provider: 'review', runner: 'none', text: 'type into the moving field' });
+  await settled(movingThread.id);
+  const results = await page.eval(`(async () => (await rpc('open', { id: ${JSON.stringify(movingThread.id)} })).history.messages.flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_result').map((b) => JSON.stringify(b.content)))()`);
+  assert.equal(results.length, 3, `three tool results: ${results.join(' | ').slice(0, 600)}`);
+  assert.match(results[1], /could not confirm whether this call ran: it began acting on the page, then failed \(.*not on this page any more/, results[1]);
+  assert.doesNotMatch(results[1], /asked again/, results[1]);
+  assert.match(results[2], /type=\\"password\\"/, 'the HTML was read');
+  assert.doesNotMatch(results[2], /mirrored-secret/, 'no password in the HTML');
+  console.log('ok an action cut off after it reached the page is unknown; page_html hides passwords');
+  await moving.close();
 
   // Invalid restart settings must not erase or send a failed first turn again.
   replies.push({ refuse: 401 });

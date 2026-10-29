@@ -87,7 +87,7 @@ const READING = [
 ];
 
 /** Acting: page actions on as well (Chrome's debugger). Not run again by themselves (a
- * click may not be safe to repeat), but for a picture. */
+ * click may not be safe to repeat), but for a picture and a wait. */
 const ACTING = [
   {
     name: 'screenshot',
@@ -200,6 +200,7 @@ const ACTING = [
       },
       additionalProperties: false,
     },
+    rerun: 'safe',
   },
   {
     name: 'dialog',
@@ -244,3 +245,11 @@ export const PAGE_TOOLS = [
   ...ACTING.map((tool) => ({ rerun: 'no', ...tool })),
 ];
 export const ACTING_NAMES = new Set(ACTING.map((tool) => tool.name));
+
+/** A page tool's answer when what it did is not known (`why`: Chrome's answer never
+ * came, or the tool failed once it had begun acting): one safe to repeat (a read, a
+ * picture, a wait) just failed; an action may have reached the page, so whether it did
+ * is unknown (the model checks before trying again, and a script makes no further calls). */
+export function uncertain(name, why) {
+  return PAGE_TOOLS.find((tool) => tool.name === name)?.rerun === 'safe' ? { error: why } : { unknown: true, content: why };
+}

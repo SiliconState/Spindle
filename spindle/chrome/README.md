@@ -84,9 +84,9 @@ No server and no relay: the extension calls your provider directly with your key
   tabs and read the page you are looking at with `list_tabs` and `read_page`, see its
   parts (`page_elements`: headings, links, buttons, fields, tables, each part to act on
   with a ref such as `kqm12`, which names a part of that page only) and its HTML
-  (`page_html`, scripts left out). With page actions on, `read_page` with `scroll`
-  reads a feed that loads as it scrolls in one call (down that many screens, each new
-  line once). `screenshot` pictures the tab showing once you have let Spindle picture
+  (`page_html`, scripts and passwords left out). With page actions on, `read_page` with
+  `scroll` reads a feed that loads as it scrolls in one call (down that many screens,
+  each new line once). `screenshot` pictures the tab showing once you have let Spindle picture
   pages (saved in the workspace, shown in the panel; a script can show it to a vision
   model with `spindle model --image FILE`).
 - **Screenshots of your own:** the camera beside the message box pictures the tab you
@@ -258,7 +258,9 @@ session as a private bundle before replacing it: a failed replacement or interru
 reset restores it. Prior records are retained until that thread is deleted. A move
 sealed before its index update is recognized on engine restart. Stop, a page-tool
 deadline, and disabling page actions fence further browser steps; a request already
-dispatched to Chrome cannot be undone.
+dispatched to Chrome cannot be undone. An action cut off once its input reached the page
+(or Chrome was told to move or close a tab) answers unknown rather than failed, so the
+model checks the page before repeating it and a script makes no further calls.
 
 The UI's look, its Markdown and text helpers (`store/ui/text.js`) and its theme switch
 (`store/ui/theme.js`) are the native UI's, copied in at build time.

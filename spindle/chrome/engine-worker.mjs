@@ -7,7 +7,7 @@ import { EmbeddedClient, remoteRunner } from './clients/embedded.mjs';
 import { linuxRunner } from './linux-runner.mjs';
 import { openOpfsPool } from './clients/opfs.mjs';
 import { titleFrom } from './text.js';
-import { PAGE_TOOLS } from './page-tools.mjs';
+import { PAGE_TOOLS, uncertain } from './page-tools.mjs';
 import { CHANNEL, keysOf, read, remove, update, valuesOf, write } from './shared.mjs';
 import { endedText, exchange, flowOf, refreshed } from './signin.mjs';
 import * as vault from './vault.mjs';
@@ -475,12 +475,12 @@ function pageTool(name, input, session) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       self.postMessage({ type: 'page_tool_cancel', call });
-      answerTool(call, { error: 'Chrome did not answer the page tool in time' });
+      answerTool(call, uncertain(name, 'Chrome did not answer the page tool in time'));
     }, PAGE_TOOL_WAIT);
     toolCalls.set(call, Object.assign((answer) => {
       clearTimeout(timer);
       resolve(answer);
-    }, { session }));
+    }, { session, tool: name }));
     self.postMessage({ type: 'page_tool', call, name, input });
   });
 }
@@ -489,7 +489,7 @@ function cancelPageTools(id) {
   for (const [call, answer] of toolCalls) {
     if (idOf(answer.session?.split('#')[0] ?? '') !== id) continue;
     self.postMessage({ type: 'page_tool_cancel', call });
-    answerTool(call, { error: 'the turn ended before the page tool finished' });
+    answerTool(call, uncertain(answer.tool, 'the turn ended before the page tool finished'));
   }
 }
 

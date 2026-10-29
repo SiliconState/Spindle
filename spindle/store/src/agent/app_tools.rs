@@ -337,7 +337,8 @@ pub enum AppAnswer {
         /// Retained for the app/UI, never passed into model history.
         details: Option<Value>,
     },
-    /// The app cannot tell whether a call asked `again` ran (with what it does know).
+    /// The app cannot tell whether a call ran (asked `again`, or cut off after it began),
+    /// with what it does know.
     Unknown(String),
     /// Nobody answered in time.
     NoAnswer,
@@ -494,16 +495,16 @@ pub trait AppTools: Send + Sync {
     fn call(&self, call: &AppCall<'_>, interrupt: &AtomicBool) -> AppAnswer;
 }
 
-/// What the model reads for an answer the app could not give.
+/// What the model reads for an answer the app could not give: the app's note says why;
+/// without one, the call was asked again after an interruption.
 pub(crate) fn unknown_text(note: &str) -> String {
-    let mut text = "The app could not confirm whether this call ran: it was asked again after \
-                    an interruption. Check its effect before repeating it."
-        .to_string();
-    if !note.trim().is_empty() {
-        text.push(' ');
-        text.push_str(note.trim());
-    }
-    text
+    let why = match note.trim().trim_end_matches('.') {
+        "" => "it was asked again after an interruption",
+        note => note,
+    };
+    format!(
+        "The app could not confirm whether this call ran: {why}. Check its effect before repeating it."
+    )
 }
 
 /// What the model reads when nobody answered a call.
@@ -582,6 +583,11 @@ mod tests {
         assert_eq!(
             AppAnswer::from_json(&json!({"unknown": true})).unwrap(),
             AppAnswer::Unknown(String::new())
+        );
+        assert!(unknown_text("").contains("ran: it was asked again after an interruption. Check"));
+        assert!(
+            unknown_text(" Chrome did not answer in time. ")
+                .contains("ran: Chrome did not answer in time. Check")
         );
         assert!(AppAnswer::from_json(&json!({})).is_err());
         assert!(AppAnswer::from_json(&json!({"content": "a", "error": "b"})).is_err());
