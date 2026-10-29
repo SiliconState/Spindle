@@ -7,7 +7,8 @@
 //
 //   - steps in groups: the running turn's group open, its running step spinning and
 //     timed; every group shut once the turn ends, its summary counting steps, failures
-//     and retries (a failure done again later shows "failed → retried ✓");
+//     and retries (a failure done again later shows "failed → retried ✓"), its time
+//     never more than the turn ran;
 //   - steps in plain words in their tense ("Running build_report.py", "Ran …"), browser
 //     steps with the page's icon and name, the full command (with a copy button) inside;
 //   - the message sent while it ran as a bubble of its own; "Latest" while scrolled up;
@@ -267,6 +268,7 @@ for (const theme of THEMES) {
   say(`${name}: the turn`);
   const before = await panel.eval('spindlePanel.current');
   await panel.type('#prompt', 'Look at the Field notes page, build a chip report from it and data/table.csv, and tell me what you found.');
+  const turnStarted = Date.now();
   await panel.click('#send');
   const thread = await panel.until(`spindlePanel.current !== ${JSON.stringify(before)} && spindlePanel.current`, { what: 'the thread' });
   // Held mid-run: the panel as a running turn shows it.
@@ -306,6 +308,7 @@ for (const theme of THEMES) {
   if (jump) await panel.click('#jump');
   say(`${name}: waiting for the end`);
   const state = await panel.until(`(() => { const s = spindlePanel.threads.get(${JSON.stringify(thread)})?.state; return s && s !== 'running' ? s : null; })()`, { timeout: 180_000, what: 'the turn to end' });
+  const turnMs = Date.now() - turnStarted;
   await panel.until(`document.querySelector('#history .workspace-card .ws-tree') || null`, { timeout: 30_000, what: 'the workspace card' });
   await new Promise((done) => setTimeout(done, 500));
   const after = await panel.eval(`(() => {
@@ -391,11 +394,16 @@ for (const theme of THEMES) {
     assert.match(running.group, /step \d+ of \d+/, JSON.stringify(running));
     assert.notEqual(running.spinning, 'none', JSON.stringify(running));
   });
-  check(`${name}: after the turn every group is shut with its count, failures and retries; labels in the past tense; times; browser steps with an icon; the command with a copy button`, () => {
+  check(`${name}: after the turn every group is shut with its count, failures and retries, its time within the turn's; labels in the past tense; times; browser steps with an icon; the command with a copy button`, () => {
     assert.ok(after.groups.length >= 3, JSON.stringify(after.groups));
     assert.ok(after.groups.every((g) => !g.open || g.single), JSON.stringify(after.groups));
     assert.ok(after.groups.some((g) => /^Ran \d+ steps · \d+ failed · 1 retried$/.test(g.label)), JSON.stringify(after.groups));
     assert.ok(after.groups.every((g) => g.single || /^Ran \d+ steps/.test(g.label)), JSON.stringify(after.groups));
+    // The groups' times are time on the clock: together never more than the turn ran
+    // (each shown time rounded, so a second of slack a group).
+    const shownMs = (text) => [...text.matchAll(/([\d.]+)(ms|s|m|h)\b/g)].reduce((sum, [, n, unit]) => sum + Number(n) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[unit], 0);
+    const groupsMs = after.groups.reduce((sum, g) => sum + shownMs(g.time), 0);
+    assert.ok(groupsMs > 0 && groupsMs <= turnMs + 1000 * after.groups.length, `groups ${groupsMs} ms, turn ${turnMs} ms: ${JSON.stringify(after.groups)}`);
     assert.ok(after.failed.some((f) => /failed → retried ✓$/.test(f) && /build_report\.py/.test(f)), JSON.stringify(after.failed));
     assert.ok(after.failed.some((f) => / = failed$/.test(f)), JSON.stringify(after.failed));
     for (const want of ['Listed open tabs', 'Read 127.0.0.1', 'Read the parts of 127.0.0.1', 'Typed into the “Search” field on 127.0.0.1', 'Clicked the “Go” button on 127.0.0.1', 'Ran build_report.py', 'Wrote report.html', 'Edited build_report.py', 'Read table.csv', 'Wrote notes.txt', 'Searched for “,”', 'Made folder out']) {

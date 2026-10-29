@@ -602,7 +602,7 @@ whole.
 | [`review_browser.mjs`](../spindle/chrome/tests/review_browser.mjs) | a build, `SPINDLE_BROWSER` | In a disposable profile with no provider key: the workspace across several turns, one send while a permission prompt waits, the camera waiting for permission, Stop cancelling a page wait, an invalid restart sending nothing, recovery from an interrupted reset and from a sealed move, file cards. |
 | [`review_regressions.mjs`](../spindle/chrome/tests/review_regressions.mjs) | Node only | Engine operation ordering, reset rollback, early Stop, page-step cancellation, gateway redirect and buffer bounds, IPv6 address checks, dotted CDP request ids. |
 | [`panel_long_run.mjs`](../spindle/chrome/tests/panel_long_run.mjs) | a build, `SPINDLE_BROWSER` | One long scripted turn in each theme: step groups, labels, Stop, Latest, the workspace page, label contrast. |
-| [`panel_steps.mjs`](../spindle/chrome/tests/panel_steps.mjs) | Node only | `steps.mjs` labels, tenses, retried failures, durations, scratch files. |
+| [`panel_steps.mjs`](../spindle/chrome/tests/panel_steps.mjs) | Node only | `steps.mjs` labels, tenses, retried failures, durations, a group's time on the clock (steps run at once counted once), scratch files. |
 
 **Scripted or real provider.** `extension_real.mjs --scripted` serves a scripted provider from
 the test itself, needs no account and costs nothing. With `--provider ID` (and `SPINDLE_KEY`,

@@ -127,9 +127,10 @@ No server and no relay: the extension calls your provider directly with your key
   starts after waiting on something; a name Chrome refuses (`.env`, `con.txt`) is saved
   as `_env`, `_con.txt`.
 - **A long run, readable:** a turn's steps (its tool calls) gather into a group that says
-  how many there were, how many failed and how many were done again; the running turn's
-  group stays open, its running step spinning with its time, and every group shuts when
-  the turn ends. Each step says what it does in plain words, in its tense (Running
+  how many there were, how many failed and how many were done again, and how long they
+  took on the clock (steps that ran at once, such as a batch of tasks, count once); the
+  running turn's group stays open, its running step spinning with its time (or how many
+  run at once), and every group shuts when the turn ends. Each step says what it does in plain words, in its tense (Running
   build_report.py, Ran build_report.py), a browser step with the site's icon and its
   page's name (from the tabs and page parts earlier steps read: Clicked the “Go” button
   on example.com); opened, its full command with a copy button and what it gave back. A
@@ -230,7 +231,7 @@ from the folder's path).
 | Part | Runs in | Does |
 | --- | --- | --- |
 | `panel.html`, `panel.mjs`, `panel.css` | the side panel (one per window) | the UI; asks the engine, draws its events; the workspace page |
-| `steps.mjs` | the panel | steps in plain words (their tense, the page and part a browser step acted on), retried failures, durations, scratch files |
+| `steps.mjs` | the panel | steps in plain words (their tense, the page and part a browser step acted on), retried failures, durations, a group's time on the clock, scratch files |
 | `engine.html`, `engine.mjs` | an offscreen document (one per profile) | keeps the engine worker alive; carries page tool calls |
 | `engine-worker.mjs` | that document's Dedicated Worker | every thread: `EmbeddedClient` over the OPFS pool (a session stays open only while something uses it), credentials from the vault (`vault.mjs`), the thread index |
 | `vault.mjs` | the engine worker | credentials at rest: sealed with AES-GCM, optionally behind a passphrase |

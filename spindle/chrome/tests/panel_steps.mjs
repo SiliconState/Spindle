@@ -1,9 +1,10 @@
 // The panel's step labels (chrome/steps.mjs): plain words in the tense of where a step is,
-// the page and part a browser step acted on, retried failures, durations, scratch files.
+// the page and part a browser step acted on, retried failures, durations, a group's time on
+// the clock (steps run at once counted once), scratch files.
 //
 // usage: node chrome/tests/panel_steps.mjs
 import assert from 'node:assert/strict';
-import { describe, duration, isScratch, partsFrom, retried, tabsFrom } from '../steps.mjs';
+import { describe, duration, elapsed, isScratch, isSpan, partsFrom, retried, tabsFrom } from '../steps.mjs';
 
 const label = (name, input, state = 'done', tabs, parts) => describe(name, input, state, tabs, parts).label;
 
@@ -61,8 +62,24 @@ const steps = [
 assert.deepEqual([...retried(steps)], [0]);
 assert.deepEqual([...retried([{ name: 'bash', input: { command: 'ls x' }, failed: true }, { name: 'bash', input: { command: 'ls x' }, running: true }])], []);
 
-assert.deepEqual([0, 820, 1234, 9949, 9960, 14_400, 59_600, 61_000, 125_000, -1].map(duration),
-  ['0ms', '820ms', '1.2s', '9.9s', '10s', '14s', '1m', '1m 1s', '2m 5s', '']);
+assert.deepEqual([0, 820, 1234, 9949, 9960, 14_400, 59_600, 61_000, 125_000, 3_047_000, 3_599_400, 3_600_000, 3_870_000, 7_190_000, -1].map(duration),
+  ['0ms', '820ms', '1.2s', '9.9s', '10s', '14s', '1m', '1m 1s', '2m 5s', '50m 47s', '59m 59s', '1h', '1h 5m', '2h', '']);
+
+// A group's time is the time any of its steps was running: five tasks run at once for ten
+// minutes took ten minutes, not fifty; steps one after another add up; gaps between them
+// (the model thinking) are not steps' time.
+const minute = 60_000;
+const at = (start, end) => ({ span: [start * minute, end * minute] });
+assert.equal(elapsed([at(0, 10), at(0, 10), at(0, 9), at(0, 10), at(1, 10)]), 10 * minute);
+assert.equal(elapsed([at(0, 2), at(2, 5), at(6, 7)]), 6 * minute);
+assert.equal(elapsed([at(5, 9), at(0, 3), at(2, 6)]), 9 * minute, 'out of order and overlapping');
+assert.equal(elapsed([at(0, 10), at(2, 4)]), 10 * minute, 'one inside another');
+assert.equal(elapsed([at(0, 1), { ms: 30_000 }, { ms: undefined }]), 1.5 * minute, 'a duration alone is added');
+assert.equal(elapsed([]), 0);
+// What is not a span (a damaged stored timing, a clock set back) is left out, never
+// subtracted; a negative duration alone too.
+assert.equal(elapsed([at(0, 4), { span: [3 * minute, 1 * minute] }, { span: ['a', 'b'] }, { span: [NaN, 5] }, { ms: -500 }]), 4 * minute);
+assert.ok(isSpan([1, 1]) && isSpan([0, 5]) && !isSpan([5, 0]) && !isSpan([1]) && !isSpan('1,2') && !isSpan([1, Infinity]) && !isSpan(null));
 assert.ok(isScratch('notes.txt') && isScratch('build_report.py') && isScratch('tests/test_a.js') && isScratch('src/__pycache__/a.pyc'));
 assert.ok(!isScratch('report.html') && !isScratch('data/table.csv') && !isScratch('README.md') && !isScratch('latest/index.html'));
-console.log('panel-steps passed: labels in three tenses, pages and parts named, retried failures, durations, scratch files');
+console.log('panel-steps passed: labels in three tenses, pages and parts named, retried failures, durations, a group\'s time on the clock, scratch files');

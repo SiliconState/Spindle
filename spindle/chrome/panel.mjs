@@ -8,7 +8,7 @@ import { kindOf, pageOf, previewFrame, saveFile, typeOf } from './page.mjs';
 import { mdNodes } from './markdown.mjs';
 import { CHANNEL, accessFor, keysOf, read, remove, startEngine, write } from './shared.mjs';
 import { flowOf, signInInTab, signInSites } from './signin.mjs';
-import { describe, duration, isScratch, partsFrom, retried, tabsFrom } from './steps.mjs';
+import { describe, duration, elapsed, isScratch, isSpan, partsFrom, retried, tabsFrom } from './steps.mjs';
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => {
@@ -90,8 +90,9 @@ function copyButton(text, label) {
   return button;
 }
 
-/** How long the steps seen running here took: tool call id -> ms (for this browser
- * session; a thread opened later shows what it knows). */
+/** When the steps seen running here ran: tool call id -> [start, end] in ms since the epoch
+ * (for this browser session; a thread opened later shows what it knows). An older panel
+ * kept a duration alone, which is still read. */
 const timings = (() => {
   try {
     return new Map(JSON.parse(sessionStorage.getItem('spindle-step-times') || '[]'));
@@ -99,9 +100,9 @@ const timings = (() => {
     return new Map();
   }
 })();
-function keepTiming(id, ms) {
+function keepTiming(id, span) {
   if (!id) return;
-  timings.set(id, ms);
+  timings.set(id, span);
   while (timings.size > 4000) timings.delete(timings.keys().next().value);
   try {
     sessionStorage.setItem('spindle-step-times', JSON.stringify([...timings]));
@@ -622,7 +623,8 @@ function setOpen(group, open) {
 }
 
 /** A run of steps says what it holds: how many, how many failed (a failed one done again
- * successfully later counts as retried), and the step running now. */
+ * successfully later counts as retried), the step running now (or how many run at once),
+ * and, done, how long it took on the clock. */
 function updateSteps(steps) {
   const cards = [...steps.list.children].filter((child) => child.classList.contains('tool'));
   if (!cards.length) return;
@@ -637,13 +639,18 @@ function updateSteps(steps) {
       stateText(card);
     }
   });
-  const runningCard = cards.find((card) => card.classList.contains('running'));
+  const running = cards.filter((card) => card.classList.contains('running'));
+  const runningCard = running[0];
   const failed = list.filter((step, index) => step.failed && !again.has(index)).length;
-  const total = cards.reduce((sum, card) => sum + (card.ms ?? 0), 0);
+  // Steps that ran at once (a batch of tasks) overlap: the group took the time any of
+  // them was running, not their durations added up.
+  const total = elapsed(cards.map((card) => ({ span: card.span, ms: card.ms })));
   const count = `${cards.length} step${cards.length === 1 ? '' : 's'}`;
-  const words = runningCard
-    ? [`${runningCard.querySelector('.tool-label').textContent}…`, `step ${cards.indexOf(runningCard) + 1} of ${cards.length}`]
-    : [`Ran ${count}`, failed && `${failed} failed`, again.size && `${again.size} retried`];
+  const words = running.length > 1
+    ? [`${running.length} running at once…`, count]
+    : runningCard
+      ? [`${runningCard.querySelector('.tool-label').textContent}…`, `step ${cards.indexOf(runningCard) + 1} of ${cards.length}`]
+      : [`Ran ${count}`, failed && `${failed} failed`, again.size && `${again.size} retried`];
   steps.querySelector('.group-label').textContent = words.filter(Boolean).join(' · ');
   steps.querySelector('.group-time').textContent = !runningCard && total ? duration(total) : '';
   steps.group.querySelector('.group-head').title = runningCard ? 'Steps of the running turn' : `${count}${failed ? `, ${failed} failed` : ''}: show or hide them`;
@@ -780,7 +787,8 @@ function toolCard(name, input, id = null, live = false) {
   card.dataset.tool = name;
   if (id) card.dataset.id = id;
   card.input = input;
-  if (live) card.started = Date.now();
+  // On the page's steady clock: a step's time stays right if the system clock is changed.
+  if (live) card.started = performance.now();
   const summary = el('summary');
   summary.append(el('span', 'tool-status'), el('span', 'tool-icon'), el('span', 'tool-label'), el('span', 'tool-time'),
     el('span', 'tool-name', name), el('span', 'tool-state', 'running'));
@@ -831,7 +839,7 @@ function relabel(card) {
   } else if (browser && !url && !place.firstChild) {
     place.replaceChildren(icon('globe', 14));
   }
-  card.querySelector('.tool-time').textContent = card.ms != null ? duration(card.ms) : card.started ? duration(Date.now() - card.started) : '';
+  card.querySelector('.tool-time').textContent = card.ms != null ? duration(card.ms) : card.started != null ? duration(performance.now() - card.started) : '';
 }
 
 /** The little icon Chrome keeps for a site (the extension's favicon service). */
@@ -847,12 +855,18 @@ function stateText(card) {
 function settle(card, text, failed) {
   card.classList.remove('running');
   card.classList.toggle('failed', failed);
-  if (card.started) {
-    card.ms = Date.now() - card.started;
-    keepTiming(card.dataset.id, card.ms);
+  if (card.started != null) {
+    // How long it ran (steady clock), placed at when it ended (wall clock), so spans of
+    // steps from different pages and panels line up.
+    const end = Date.now();
+    card.span = [end - (performance.now() - card.started), end];
+    keepTiming(card.dataset.id, card.span);
   } else if (card.dataset.id && timings.has(card.dataset.id)) {
-    card.ms = timings.get(card.dataset.id);
+    const kept = timings.get(card.dataset.id);
+    if (isSpan(kept)) card.span = kept;
+    else if (Number.isFinite(kept) && kept >= 0) card.ms = kept;
   }
+  if (card.span) card.ms = card.span[1] - card.span[0];
   const pre = el('pre', 'result', text.length > 20000 ? `${text.slice(0, 20000)}\n[…]` : text);
   card.detail.append(pre);
   // What a step found out about tabs and pages (one that failed found out nothing).
@@ -872,7 +886,7 @@ function settle(card, text, failed) {
 // The running steps' times go on as they run.
 setInterval(() => {
   for (const card of document.querySelectorAll('#history .tool.running')) {
-    if (card.started) card.querySelector('.tool-time').textContent = duration(Date.now() - card.started);
+    if (card.started != null) card.querySelector('.tool-time').textContent = duration(performance.now() - card.started);
   }
 }, 1000);
 

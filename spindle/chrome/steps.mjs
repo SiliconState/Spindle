@@ -262,14 +262,38 @@ export function retried(steps) {
   return found;
 }
 
-/** A duration as a row shows it: 820ms, 1.2s, 14s, 2m 5s. */
+/** A duration as a row shows it: 820ms, 1.2s, 14s, 2m 5s, 1h 4m. */
 export function duration(ms) {
   if (!Number.isFinite(ms) || ms < 0) return '';
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 9950) return `${(ms / 1000).toFixed(1)}s`;
   const seconds = Math.round(ms / 1000);
   if (seconds < 60) return `${seconds}s`;
-  return `${Math.floor(seconds / 60)}m${seconds % 60 ? ` ${seconds % 60}s` : ''}`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m${seconds % 60 ? ` ${seconds % 60}s` : ''}`;
+  const minutes = Math.round(seconds / 60);
+  return `${Math.floor(minutes / 60)}h${minutes % 60 ? ` ${minutes % 60}m` : ''}`;
+}
+
+/** Whether `span` is a step's [start, end] in ms: two numbers, the end not before the start
+ * (anything else, such as a damaged stored timing, is not one). */
+export function isSpan(span) {
+  return Array.isArray(span) && span.length === 2 && span.every(Number.isFinite) && span[1] >= span[0];
+}
+
+/** How long a run of steps took on the clock: the time at least one of them was running,
+ * so steps that ran at once (a batch of tasks) count once, never added up. `steps` are
+ * {span: [start, end]} (ms) or, when only a duration is known, {ms}; those are added. */
+export function elapsed(steps) {
+  const spans = steps.map((step) => step.span).filter(isSpan).sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  let reached = -Infinity;
+  for (const [start, end] of spans) {
+    if (end <= reached) continue;
+    total += end - Math.max(start, reached);
+    reached = end;
+  }
+  const alone = (step) => !isSpan(step.span) && Number.isFinite(step.ms) && step.ms >= 0;
+  return steps.reduce((sum, step) => (alone(step) ? sum + step.ms : sum), total);
 }
 
 /** Files a command run in a sandbox is not meant to leave (kept out of sight by default). */
