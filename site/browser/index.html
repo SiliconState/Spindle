@@ -97,7 +97,7 @@
             journaled like any other step.</p></div>
         <div class="card"><span class="tag">Files</span><h3>Files in, files out.</h3>
           <p>Drop files on the panel or picture a tab. Get files back as cards, HTML as a sandboxed preview
-            shut off from the web until you allow it, and everything as one <code>.zip</code>.</p></div>
+            that runs no script and reaches no site until you allow it, and everything as one <code>.zip</code>.</p></div>
         <div class="card"><span class="tag">Keys</span><h3>Sealed, never sent elsewhere.</h3>
           <p>Keys and sign-ins are sealed with AES-GCM in the extension's storage, under an optional passphrase,
             and go only to the provider they were saved for. Or sign in with ChatGPT.</p></div>
@@ -164,7 +164,7 @@
             <tr><td>Runs</td><td>In Chrome or Edge: a side panel and a worker that outlives it</td><td>A native binary: your terminal, <code>spindle serve</code> for your phone, or inside your app</td></tr>
             <tr><td>Commands</td><td>A Linux inside the browser, or a Spindle host you connect</td><td>A bubblewrap sandbox on Linux, with your Rust toolchain read-only if you ask</td></tr>
             <tr><td>Your tabs</td><td>Reads and acts on them, once you switch that on</td><td>No</td></tr>
-            <tr><td>Spending limit</td><td>None in the browser</td><td><code>--max-usd</code> per thread</td></tr>
+            <tr><td>Spending limit</td><td>A dollar limit per thread, on its model page</td><td><code>--max-usd</code> per thread</td></tr>
             <tr><td>Setup</td><td>Load the extension, add a key or sign in</td><td>Build one binary, <code>spindle login</code></td></tr>
             <tr><td>Best for</td><td>Work that starts on a page, or a machine with nothing installed</td><td>Real repositories, long builds, servers</td></tr>
           </tbody>
