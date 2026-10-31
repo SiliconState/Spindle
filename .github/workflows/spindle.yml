@@ -71,6 +71,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      # The cli build's API smoke tests run a command in the host's sandbox.
+      - name: Install sandbox fixture dependencies
+        if: matrix.features == 'cli'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap python3 nodejs
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Portable feature gates
         working-directory: spindle
         env:

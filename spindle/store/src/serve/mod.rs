@@ -3982,7 +3982,6 @@ fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dext_transcript::turn::TurnContinuation;
     use std::io::Read;
     /// serve.lock is an flock on one open file description. A child that another test
     /// is forking holds a copy of it until exec closes it (O_CLOEXEC), so an immediate
@@ -5021,7 +5020,7 @@ mod tests {
         use dext_core::model::{Encoding, Identity, ModelWait, PreparedRequest};
         use dext_core::recovery::Contract;
         use dext_transcript::checkpoint::{NativeResponse, TranscriptCheckpoint};
-        use dext_transcript::turn::Effect;
+        use dext_transcript::turn::{Effect, TurnContinuation};
         use spindle_store::broker::{DispatchRequest, ModelReservation};
         use spindle_store::completion::Attempt;
         use spindle_store::transition::{Observation, Proposal};
