@@ -3,7 +3,8 @@
 //! compaction, a rewind and a turn after it). The fixture is raw-deflated to keep the
 //! repository small.
 #![cfg(feature = "dext-turn")]
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
+use spindle_store::artifact::Stage;
 use spindle_store::view::View;
 use spindle_store::{Command, Error, LEGACY_BACKUP, MAX_PAYLOAD, Store, codec};
 use std::collections::BTreeMap;
@@ -69,6 +70,45 @@ fn values(path: &Path) -> BTreeMap<(String, String), Vec<u8>> {
     out
 }
 
+/// Every object by digest: its stored bytes and `size` (None before schema 20).
+fn objects(path: &Path) -> BTreeMap<String, (Vec<u8>, Option<i64>)> {
+    let db = Connection::open(path).unwrap();
+    let sized = db
+        .prepare("SELECT 1 FROM pragma_table_info('objects') WHERE name='size'")
+        .unwrap()
+        .exists([])
+        .unwrap();
+    let sql = if sized {
+        "SELECT digest,bytes,size FROM objects"
+    } else {
+        "SELECT digest,bytes,NULL FROM objects"
+    };
+    let mut statement = db.prepare(sql).unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// Makes a migrated store the schema-19 store the previous build left: every object
+/// kept as it is, no `size` column.
+fn as_schema_19(database: &Path) {
+    let db = Connection::open(database).unwrap();
+    for (digest, (bytes, size)) in objects(database) {
+        if size.is_some() {
+            let whole = miniz_oxide::inflate::decompress_to_vec(&bytes).unwrap();
+            db.execute(
+                "UPDATE objects SET bytes=?1,size=NULL WHERE digest=?2",
+                params![whole, digest],
+            )
+            .unwrap();
+        }
+    }
+    db.execute_batch("ALTER TABLE objects DROP COLUMN size; PRAGMA user_version=19;")
+        .unwrap();
+}
+
 fn schema(path: &Path) -> i64 {
     Connection::open(path)
         .unwrap()
@@ -95,7 +135,7 @@ fn a_schema_14_store_migrates_in_place_losslessly_and_keeps_a_backup() {
     assert!(view.read(|view| view.steps(0)).unwrap().len() as u64 >= head - 1);
 
     let mut store = Store::open(&realm.0).unwrap();
-    assert_eq!(schema(&database), 19);
+    assert_eq!(schema(&database), 20);
     let migrated = values(&database);
     assert_eq!(
         migrated.keys().collect::<Vec<_>>(),
@@ -234,13 +274,14 @@ fn schema_17_migrates_without_reencoding_and_metadata_is_retained() {
     let realm = Realm::legacy();
     let database = realm.0.join("authority.sqlite");
     drop(Store::open(&realm.0).unwrap());
+    as_schema_19(&database);
     Connection::open(&database)
         .unwrap()
         .execute_batch("DROP TABLE task_runs; DROP TABLE retry_delays; DROP TABLE app_details; DROP TABLE instance; DROP TABLE meta; PRAGMA user_version=17;")
         .unwrap();
     let original = values(&database);
     let mut store = Store::open(&realm.0).unwrap();
-    assert_eq!(schema(&database), 19);
+    assert_eq!(schema(&database), 20);
     assert_eq!(values(&database), original);
     store
         .set_metadata("settings", b"{\"model\":\"fixture\"}")
@@ -271,10 +312,11 @@ fn schema_18_preserves_all_metadata_and_history_and_keeps_its_backup() {
         store.set_metadata(key, value).unwrap();
     }
     drop(store);
+    as_schema_19(&database);
     Connection::open(&database).unwrap().execute_batch("DROP TABLE task_runs; DROP TABLE retry_delays; DROP TABLE app_details; DROP TABLE instance; PRAGMA user_version=18;").unwrap();
     let original = values(&database);
     let mut store = Store::open(&realm.0).unwrap();
-    assert_eq!(schema(&database), 19);
+    assert_eq!(schema(&database), 20);
     assert_eq!(values(&database), original);
     for (key, value) in metadata {
         assert_eq!(store.metadata(key).unwrap().unwrap(), value);
@@ -291,7 +333,7 @@ fn schema_18_preserves_all_metadata_and_history_and_keeps_its_backup() {
 
 #[test]
 fn other_schemas_are_refused_untouched() {
-    for version in [13, 20] {
+    for version in [13, 21] {
         let realm = Realm::legacy();
         let database = realm.0.join("authority.sqlite");
         Connection::open(&database)
@@ -329,6 +371,7 @@ fn a_schema_16_store_gains_app_state_and_its_open_record_and_keeps_a_backup() {
     let database = realm.0.join("authority.sqlite");
     drop(Store::open(&realm.0).unwrap());
     std::fs::remove_file(realm.0.join(LEGACY_BACKUP)).unwrap();
+    as_schema_19(&database);
     {
         let db = Connection::open(&database).unwrap();
         db.execute_batch(
@@ -347,7 +390,7 @@ fn a_schema_16_store_gains_app_state_and_its_open_record_and_keeps_a_backup() {
     drop(view);
 
     let store = Store::open(&realm.0).unwrap();
-    assert_eq!(schema(&database), 19);
+    assert_eq!(schema(&database), 20);
     assert_eq!(
         values(&database),
         original,
@@ -369,4 +412,139 @@ fn a_schema_16_store_gains_app_state_and_its_open_record_and_keeps_a_backup() {
         .query_row("SELECT closed FROM opens WHERE id=1", [], |row| row.get(0))
         .unwrap();
     assert_eq!(closed, 0, "an owner that never closed is not marked closed");
+}
+
+/// The fixture at schema 19 with a large text file and an incompressible one among its
+/// objects (pinned by a stage of the fixture's scope, as a command's files are).
+fn schema_19_realm() -> (Realm, Vec<u8>, Vec<u8>) {
+    let realm = Realm::legacy();
+    let database = realm.0.join("authority.sqlite");
+    let text = br#"{"row":"spindle keeps a workspace","n":12345}"#.repeat(4096);
+    let mut noise = vec![0u8; 256 * 1024];
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    for byte in &mut noise {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        *byte = seed as u8;
+    }
+    let mut store = Store::open(&realm.0).unwrap();
+    let stage = Stage {
+        id: "fixture-files".into(),
+        scope: "operator".into(),
+        owner_epoch: store.epoch(),
+    };
+    store.begin_stage(&stage).unwrap();
+    store.put_object(&stage, &text).unwrap();
+    store.put_object(&stage, &noise).unwrap();
+    drop(store);
+    std::fs::remove_file(realm.0.join(LEGACY_BACKUP)).unwrap();
+    as_schema_19(&database);
+    (realm, text, noise)
+}
+
+#[test]
+fn a_schema_19_store_packs_its_objects_in_place_and_keeps_a_backup() {
+    let (realm, text, noise) = schema_19_realm();
+    let database = realm.0.join("authority.sqlite");
+    let before = objects(&database);
+    assert!(before.values().all(|(_, size)| size.is_none()));
+    // An observer reads the unmigrated store: sizes and bytes as they are.
+    let digest = spindle_store::artifact::object_digest(&text);
+    let mut view = View::open(&realm.0).unwrap();
+    assert_eq!(view.read(|view| view.object(&digest)).unwrap(), text);
+    drop(view);
+
+    let mut store = Store::open(&realm.0).unwrap();
+    assert_eq!(schema(&database), 20);
+    let after = objects(&database);
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        before.keys().collect::<Vec<_>>()
+    );
+    let (stored, size) = &after[&digest];
+    assert_eq!(*size, Some(text.len() as i64));
+    assert!(
+        stored.len() * 20 < text.len(),
+        "{} -> {}",
+        text.len(),
+        stored.len()
+    );
+    let noisy = spindle_store::artifact::object_digest(&noise);
+    assert_eq!(
+        after[&noisy],
+        (noise.clone(), None),
+        "incompressible bytes stay as they are"
+    );
+    for (digest, (bytes, _)) in &before {
+        if bytes.len() < 1024 {
+            assert_eq!(
+                after[digest],
+                (bytes.clone(), None),
+                "small objects stay as they are"
+            );
+        }
+        assert_eq!(&store.read_object("operator", digest).unwrap(), bytes);
+    }
+    store.check_integrity().unwrap();
+    drop(store);
+
+    // The backup is the schema-19 store; the view reads both alike.
+    let backup = realm.0.join("authority.v19.sqlite");
+    assert_eq!(schema(&backup), 19);
+    assert_eq!(objects(&backup), before);
+    let mut view = View::open(&realm.0).unwrap();
+    assert_eq!(view.read(|view| view.object(&digest)).unwrap(), text);
+    let size = |path: &Path| std::fs::metadata(path).unwrap().len();
+    assert!(
+        size(&database) + text.len() as u64 / 2 < size(&backup),
+        "the packed file gives the space back: {} vs {}",
+        size(&database),
+        size(&backup)
+    );
+}
+
+#[test]
+fn a_damaged_packed_object_is_refused_where_it_is_read() {
+    let (realm, text, _) = schema_19_realm();
+    let database = realm.0.join("authority.sqlite");
+    drop(Store::open(&realm.0).unwrap());
+    let digest = spindle_store::artifact::object_digest(&text);
+    let (stored, size) = objects(&database)[&digest].clone();
+    let db = Connection::open(&database).unwrap();
+    // A stream that inflates to more or fewer bytes than its row says, a size it could
+    // not have been packed from, and flipped bytes inside the stream.
+    let mut flipped = stored.clone();
+    let at = flipped.len() / 2;
+    flipped[at] ^= 0x5a;
+    for (bytes, size, opens) in [
+        (stored.clone(), size.map(|size| size + 1), true),
+        (stored.clone(), size.map(|size| size - 1), true),
+        (flipped, size, true),
+        // A size no packed row can have is refused by the open's own checks.
+        (stored.clone(), Some(stored.len() as i64), false),
+    ] {
+        db.execute(
+            "UPDATE objects SET bytes=?1,size=?2 WHERE digest=?3",
+            params![bytes, size, digest],
+        )
+        .unwrap();
+        // An open does not inflate every object; the read and the full check refuse it.
+        if opens {
+            let mut store = Store::open(&realm.0).unwrap();
+            assert!(store.read_object("operator", &digest).is_err());
+            drop(store);
+            let mut store = Store::open(&realm.0).unwrap();
+            assert!(store.check_integrity().is_err());
+        } else {
+            assert!(Store::open(&realm.0).is_err());
+        }
+    }
+    // A size that is not a whole number of bytes is refused by the open too.
+    db.execute(
+        "UPDATE objects SET bytes=?1,size=?2 WHERE digest=?3",
+        params![stored, size.unwrap() as f64 + 0.5, digest],
+    )
+    .unwrap();
+    assert!(Store::open(&realm.0).is_err());
 }

@@ -44,7 +44,7 @@ use `--workspace --all-features` to include `spindle-store` and `spindle-embed`.
 | `admission.rs`, `transition.rs` | Admission consumption, owner lock and schema checks, and atomic revision publication |
 | `workspace.rs`, `artifact.rs` | Workspace trees, manifests, objects and garbage collection |
 | `ownership.rs` | Owned child scopes: attachment, cancellation, suspension, settlement and takeover |
-| `connection.rs` | Caller-supplied connections, lock contention, and the fence shared with the embedded package |
+| `connection.rs` | Caller-supplied connections, schema-19 in-place/image migration, lock contention, the shared owner fence, and native metadata writes refused for embedded-owned or moved stores |
 | `turn.rs`, `dext_recovery.rs` | Turn scheduling and recovery, including Unix kill-at-a-point cases |
 | `driver.rs` | The portable driver against a scripted host (builds with `--no-default-features --features driver`) |
 | `traces.rs` | Characterization traces of whole turns (`fixtures/traces/*.json`): plain, tools, files, app tools, refusals, drops, cuts, reopen cases, steering, compaction |
@@ -52,11 +52,12 @@ use `--workspace --all-features` to include `spindle-store` and `spindle-embed`.
 | `native_transcript.rs`, `image.rs`, `worker_lifecycle.rs` | Native transcripts and the pinned image worker (Linux); expected fault-injection panics are printed by the lifecycle cases |
 | `usage.rs`, `usage_turns.rs` | Spend accounting and budgets: compaction summaries, nested `model()` calls, retries, drops, send-now cuts, rewinds and restarts |
 | `pack_session.rs` | Session packs across whole turns |
-| `migration.rs` | Upgrading a store written by an older schema (`fixtures/schema14.sqlite.deflate`) |
+| `migration.rs` | Older-schema upgrades, packed schema-20 objects with stable digests, migration backups and refusal of damaged records |
 | `power_loss.rs` | Power loss and disk-full through a crash-simulating SQLite VFS (`support/crash_vfs.rs`; Linux) |
 | `bundle.rs` | Store images and session bundles, including damaged and hostile input |
 | `api.rs` | `spindle api` end to end over JSON-RPC (Unix), plus the Node and Python client smoke tests when those interpreters are installed. The golden frames in `fixtures/protocol/` are checked by a unit test in `src/api/stdio.rs` |
-| `embedded.rs` | The embedded host against the native session on the same scripted bytes |
+| `embedded.rs` | Native/embedded parity, shared usage and budgets (nested calls, summaries and task trees), queued tasks, stopped reports, resume and settings fit |
+| `bench.rs` | Ignored local benchmark of the embedded host built natively: small sessions, long history reads/reopens/exports, compaction, timings and peak resident memory |
 | `host_tools.rs`, `self_edit.rs` | Host tools and self-edit threads end to end through `spindle serve` |
 
 `power_loss.rs` runs a sample of crash points by default; `SPINDLE_POWER_LOSS=all` sweeps
@@ -73,7 +74,7 @@ parent crash tests invoke, not disabled coverage.
 | --- | --- | --- |
 | `dext-core` | `turn.rs`, `response.rs`, `model_wait.rs`, `image.rs` | Turn, response and model-wait state; image framing |
 | `dext-transcript` | `checkpoint.rs`, `continuation.rs`, `runtime_checkpoint.rs`, `turn.rs` | Checkpoint codecs and checked continuation |
-| `dext-native` | `strict.rs`, `strict_slots.rs`, `host_runner.rs`, `cgroup.rs` | The strict runner, per-user slots, host runner, cgroup cleanup |
+| `dext-native` | `strict.rs`, `strict_reuse.rs`, `strict_slots.rs`, `host_runner.rs`, `cgroup.rs` | Shared-mapping writes retained on Linux, workspace reuse by place without stale links/modes/leftovers, runner slots, host runner, cgroup cleanup |
 | `dext-provider` | `portable.rs` | Provider shaping without native features |
 
 ## JavaScript suites
@@ -84,8 +85,14 @@ parent crash tests invoke, not disabled coverage.
 | `SPINDLE_BROWSER=/path/to/chromium node --test store/tests/ui_browser.mjs` | The web UI in a real headless browser |
 | `SPINDLE_BIN=target/release/spindle node clients/js/smoke_test.mjs` | The Node client against a real `spindle api` |
 | `SPINDLE_BIN=target/release/spindle python3 clients/python/smoke_test.py` | The Python client |
-| `embed/tests/package.sh WASM_BINDGEN` | Builds the wasm package and runs its Node tests and, with `SPINDLE_BROWSER`, its OPFS browser tests |
+| `embed/tests/package.sh WASM_BINDGEN` | Builds the wasm package and runs Node and optional OPFS browser tests. Includes `node_compact.mjs`: shrink session/task stores, preserve history/files/head, remove interrupted copies and refuse busy sessions (needs `node:sqlite`, Node 22.5+) |
 | `store/tests/wasi_probe.sh WASI_LIBC_ROOT` | The store compiled for WASI (against an extracted wasi-libc package), run under Node |
+
+The embedded [`browser_opfs.mjs`](../spindle/embed/tests/browser_opfs.mjs) checks
+worker/session exclusion, reopen after Chrome restarts, and OPFS compaction with
+history and files intact when sibling Node glue and `node:sqlite` can create the
+fragmented fixture. [`node_opfs_replace.mjs`](../spindle/embed/tests/node_opfs_replace.mjs)
+also checks short header I/O, same-path rename, and interrupted replacements.
 
 The browser extension and the browser Linuxes have their own suites; see
 [chrome.md](chrome.md#tests) and [browser-linux.md](browser-linux.md). Tests that take a
@@ -116,14 +123,45 @@ pull request, except those that change only the website or the release workflow:
 | --- | --- |
 | `linux` | fmt and Clippy, debug and release workspace tests, engine tests, Node/Python clients, UI tests, `cargo audit` and `cargo deny --workspace --all-features check licenses` in both workspaces (see [Dependency policy](#dependency-policy)) |
 | `portable` | Clippy and tests of `spindle-store` for each portable feature set, plus the native-free dependency checks |
-| `wasm` | Provider and wire crates on `wasm32-unknown-unknown`, the browser-target store, the WASI probe, the embedded package in Node and headless Chrome, the browser Linux build and its Node tests, and Spindle for Browser against a scripted provider |
+| `wasm` | Provider and wire crates on wasm32, browser-target store, WASI, embedded Node/OPFS tests, browser Linux, scripted extension, plus `review_regressions`, `linux_route`, `panel_steps`, `linux_warm`, `vault_host`, `engine_renew` and real-Chrome `review_browser` |
 | `windows` | Native store, CLI and engine tests on Windows |
 
 Two more workflows publish. [`pages.yml`](../.github/workflows/pages.yml) deploys `site/` to
 GitHub Pages when it changes. [`browser-release.yml`](../.github/workflows/browser-release.yml),
-on a `browser-v*` tag, builds Spindle for Browser, runs `extension_real.mjs --scripted` against
-the zip it publishes, and attaches the zip to the tag's release (see
+on a `browser-v*` tag, builds Spindle for Browser and tests the exact unpacked zip
+with `extension_real.mjs --scripted`, `review_browser.mjs` and
+`node --expose-gc chrome/tests/engine_renew.mjs UNPACKED/web`. It checks
+`build.json`'s version and both 12-hex source fingerprints, then attests and
+attaches the zip and SHA-256 to the release (see
 [chrome.md](chrome.md#install-a-release)).
+
+The extension's focused suites are linked in [chrome.md](chrome.md#tests):
+`panel_tree.mjs` checks closed-folder rendering, change counts, filter/redraw state
+and navigation through large trees; `linux_warm.mjs` checks lazy v86 starts;
+`vault_host.mjs` checks sealing and passphrase handling for the host token;
+`engine_renew.mjs` checks old wasm memory is released and fresh sessions work.
+`review_browser.mjs` covers contained/static previews and version choices,
+template/reparse sanitizing, WebRTC and DNS leakage checks with a positive netlog
+control, background task cards/reports, queued file messages, reset backup cleanup,
+one copy per moved thread and Storage > Free. These tests use scripted services,
+not provider accounts.
+
+## Local engine benchmarks
+
+From `spindle/`, run
+[`embed/tests/bench.sh`](../spindle/embed/tests/bench.sh):
+
+```sh
+embed/tests/bench.sh [--quick] /path/to/wasm-bindgen OUT_DIR [EARLIER_DIR]
+```
+
+It builds release wasm and runs [`bench.mjs`](../spindle/embed/tests/bench.mjs)
+under Node, then [`store/tests/bench.rs`](../spindle/store/tests/bench.rs) natively
+with `--ignored --nocapture`. A model that answers immediately isolates local
+engine time and memory from network latency. Reports are `wasm.json` and
+`native.json`; an earlier report directory prints side-by-side changes. Scenarios
+cover small sessions, long histories and compaction; wasm also measures file trees
+and concurrent sessions. They are local measurements, not a CI timing gate.
 
 ## Dependency policy
 

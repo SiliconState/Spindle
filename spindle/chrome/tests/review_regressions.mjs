@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import { local, wireNetwork } from '../linux-net.mjs';
+import { local, storeRefusal, wireNetwork } from '../linux-net.mjs';
 import { ACTING_NAMES, uncertain } from '../page-tools.mjs';
 
 const tick = () => new Promise((done) => setImmediate(done));
@@ -25,12 +25,15 @@ const records = new Map();
 const messages = [];
 const warnings = [];
 const context = vm.createContext({
-  crypto: globalThis.crypto, console: { ...console, warn: (...args) => warnings.push(args) }, setTimeout, clearTimeout, Uint8Array, URL, URLSearchParams,
+  crypto: globalThis.crypto, console: { ...console, warn: (...args) => warnings.push(args) }, setTimeout, clearTimeout, Uint8Array, URL, URLSearchParams, btoa,
   BroadcastChannel: class { postMessage(message) { messages.push(message); } },
-  CHANNEL: 'test', self: {}, linuxRunner: () => ({ warm() {} }), PAGE_TOOLS: [], uncertain,
+  CHANNEL: 'test', self: {}, linuxRunner: () => ({ warm() {} }), PAGE_TOOLS: [], uncertain, storeRefusal, firstGlue: {},
   read: async (store, key) => records.get(`${store}:${key}`),
   write: async (store, key, value) => records.set(`${store}:${key}`, value),
+  writeDurably: async (store, key, value) => records.set(`${store}:${key}`, value),
+  keysOf: async (store) => [...records.keys()].filter((name) => name.startsWith(`${store}:`)).map((name) => name.slice(store.length + 1)),
   remove: async (store, key) => records.delete(`${store}:${key}`),
+  removeDurably: async (store, key) => records.delete(`${store}:${key}`),
   update: async (store, key, change) => {
     const name = `${store}:${key}`;
     const value = records.get(name);
@@ -172,6 +175,25 @@ try {
   assert.match(redirect.output(), /403 Forbidden/);
   redirect.wired.end({ hard: true });
 
+  // The browser's own extension store is closed to every extension (Chrome says CORS):
+  // the guest is told so, not to turn on a network it has.
+  globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+  const store = connection();
+  store.input(Buffer.from('GET https://chromewebstore.google.com/search/spindle HTTP/1.1\r\nHost: chromewebstore.google.com\r\n\r\n'));
+  await tick();
+  assert.match(store.output(), /^HTTP\/1\.1 403 [^]*extension store, which the browser never lets an extension reach/);
+  assert.doesNotMatch(store.output(), /network on again/);
+  store.wired.end({ hard: true });
+  const elsewhere = connection();
+  elsewhere.input(Buffer.from('GET https://public.example/down HTTP/1.1\r\nHost: public.example\r\n\r\n'));
+  await tick();
+  assert.match(elsewhere.output(), /^HTTP\/1\.1 502 [^]*network on again/, 'another site that fails is told as before');
+  elsewhere.wired.end({ hard: true });
+  assert.ok(storeRefusal('https://chrome.google.com/webstore/detail/x'));
+  assert.ok(storeRefusal('https://microsoftedge.microsoft.com/addons/search/x'));
+  assert.equal(storeRefusal('https://chrome.google.com/'), null);
+  assert.equal(storeRefusal('not a url'), null);
+
   const line = connection();
   line.input(Buffer.from(`SPINDLE-ORIGIN ${'x'.repeat(65536)}`));
   assert.match(line.output(), /400 Bad Request/, 'the origin preamble is bounded too');
@@ -191,6 +213,8 @@ const background = readFileSync(new URL('../background.js', import.meta.url), 'u
 const sent = [];
 const event = { addListener() {} };
 const pageContext = vm.createContext({
+  // The service worker's own: where it was loaded from, and its events (previews, unused here).
+  location: new URL('chrome-extension://spindle/background.js'), self: { addEventListener() {} },
   console, setTimeout, clearTimeout, URL, crypto: globalThis.crypto, read: async () => ({ reading: true, acting: true }), PAGE_ACCESS: [], ACTING_NAMES, uncertain,
   pageSwitches: () => ({ reading: true, acting: true }),
   chrome: {
@@ -315,4 +339,67 @@ await relay.onmessage({ data: { type: 'page_tool_cancel', call: 'relay-click' } 
 assert.deepEqual(toBackground.at(-1), { type: 'page_tool_cancel', call: 'relay-click' });
 delete globalThis.Worker;
 delete globalThis.chrome;
-console.log('review-regressions passed: operation races, reset safety, early Stop, gateway bounds/redirects, IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too), one action per tab, uncertain actions unknown (engine, its document and the background)');
+// A message with files sent while a turn runs waits for the turn to end, then goes as
+// the next turn (after what the turn left unread); one the thread cannot take then is
+// held, saying why, for the user to take back into the box.
+{
+  const thread = 'abcdefabcdefabcd';
+  records.set(`threads:${thread}`, { id: thread, runner: 'none', state: 'idle', summaries: true });
+  const prompts = [];
+  const turns = [deferred(), deferred(), deferred()];
+  let activity = 'idle';
+  let accepts = true;
+  engine.setClient({
+    async prompt(dir, text, options) { prompts.push({ text, options }); return turns[prompts.length - 1].promise; },
+    async steer() { return { queued: 1 }; },
+    async status() { return { activity, accepts_prompt: accepts, stop_text: 'stopped', wake: { why: 'an unknown outcome' } }; },
+    async settings() { return {}; },
+    tools: { definitions: () => [] },
+    async closeSession() {},
+  });
+  vm.runInContext('poolOpening = Promise.resolve({ free: Infinity, rmSync() {} });', context);
+  const settle = async () => { for (let i = 0; i < 20; i++) await tick(); };
+  const announced = () => messages.filter((message) => message.type === 'queued' && message.thread === thread).at(-1)?.queued;
+  const shot = { path: 'shot.png', bytes: new Uint8Array([137, 80]) };
+  await engine.operate('send', { id: thread, text: 'first' });
+  await settle();
+  assert.equal(prompts.length, 1);
+  assert.equal((await engine.operate('send', { id: thread, text: 'just text' })).steered, 1, 'text alone steers the running turn');
+  assert.equal((await engine.operate('send', { id: thread, text: 'look at this', files: [shot] })).queued, true);
+  assert.equal(announced().text, 'look at this');
+  assert.equal(announced().names[0], 'shot.png');
+  assert.equal(announced().held, null);
+  await assert.rejects(engine.operate('send', { id: thread, text: 'more', files: [shot] }), /already waits/);
+  turns[0].resolve({ stopped: { complete: true }, unsent: ['unread steer'] });
+  await settle();
+  assert.equal(prompts.length, 2, 'the waiting message went as the next turn');
+  assert.equal(prompts[1].text, 'unread steer\n\nlook at this\n\n[Attached, in the workspace: shot.png (2 bytes)]');
+  assert.equal(prompts[1].options.files[0].path, 'shot.png');
+  assert.equal(announced(), null);
+  const ended = messages.filter((message) => message.type === 'turn_end' && message.thread === thread).at(-1);
+  assert.equal(ended.unsent.length, 0, 'what the turn did not read went with it, not back to the box');
+  // The thread needs the user when the turn ends: nothing is sent, and it is taken back.
+  assert.equal((await engine.operate('send', { id: thread, text: 'again', files: [shot] })).queued, true);
+  activity = 'blocked';
+  turns[1].resolve({ stopped: { complete: true }, unsent: ['also unread'] });
+  await settle();
+  assert.equal(prompts.length, 2, 'nothing sent to a thread that needs the user first');
+  assert.equal(announced().held, 'an unknown outcome');
+  const back = await engine.operate('unqueue', { id: thread });
+  assert.match(back.text, /^also unread\n\nagain$/);
+  assert.equal(back.files[0].path, 'shot.png');
+  assert.equal(announced(), null);
+  assert.equal(await engine.operate('unqueue', { id: thread }), null);
+  // Nor to one whose last turn did not finish (stopped by the user, say).
+  activity = 'idle';
+  accepts = false;
+  await engine.operate('send', { id: thread, text: 'third' });
+  await settle();
+  assert.equal((await engine.operate('send', { id: thread, text: 'after the stop', files: [shot] })).queued, true);
+  turns[2].resolve({ stopped: { complete: false, reason: 'stopped' } });
+  await settle();
+  assert.equal(prompts.length, 3, 'nothing sent after a turn that did not finish');
+  assert.match(announced().held, /^the last turn did not finish \(stopped\): retry, continue or take it back first$/);
+}
+
+console.log('review-regressions passed: operation races, reset safety, early Stop, a message with files waiting for the turn to end, gateway bounds/redirects (the extension store told as closed), IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too), one action per tab, uncertain actions unknown (engine, its document and the background)');

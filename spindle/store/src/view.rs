@@ -25,6 +25,8 @@ pub struct ReadView<'a> {
     root: Option<std::path::PathBuf>,
     /// A schema-14 store not yet migrated by its owner keeps values uncompressed.
     legacy: bool,
+    /// Its objects have their `size` column (schema 20: some are kept deflated).
+    sized: bool,
 }
 
 enum ViewConnection<'a> {
@@ -42,15 +44,18 @@ impl std::ops::Deref for ViewConnection<'_> {
     }
 }
 
-/// Whether the store holds uncompressed (schema 14) values; refuses anything else.
-fn legacy(db: &Connection) -> Result<bool> {
+/// How the store keeps its records: (whether its values are uncompressed (schema 14),
+/// whether its objects have their `size` column (schema 20)); refuses anything else.
+fn encoding(db: &Connection) -> Result<(bool, bool)> {
     let app: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let schema: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match (app == crate::APP_ID, schema) {
+        (true, crate::SCHEMA) => Ok((false, true)),
         // Schema 15 values decode as schema 16 ones (no chunks yet); 14 kept them raw.
         // 16 differs from 17 only by tables it lacks (no app state, read as empty).
-        (true, crate::SCHEMA | 18 | 17 | 16 | 15) => Ok(false),
-        (true, 14) => Ok(true),
+        // Before 20 every object is kept as it is.
+        (true, 15..=19) => Ok((false, false)),
+        (true, 14) => Ok((true, false)),
         _ => Err(Error::Incompatible),
     }
 }
@@ -67,6 +72,35 @@ fn stored(
     } else {
         crate::packed_blob(db, row, column, crate::MAX_PAYLOAD)
     }
+}
+
+/// Manifests decoded lately, by digest (across threads: the web host opens a view
+/// per request). A manifest is its digest, so a tree kept here is the one decoding it
+/// again would give; the larger ones are decoded each time rather than kept.
+static DECODED: std::sync::Mutex<Vec<(String, std::sync::Arc<crate::workspace::Tree>)>> =
+    std::sync::Mutex::new(Vec::new());
+const DECODED_KEPT: usize = 2;
+const DECODED_MAX: usize = 8 * 1024 * 1024;
+
+fn decoded(root: &str) -> Option<std::sync::Arc<crate::workspace::Tree>> {
+    let kept = DECODED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    kept.iter()
+        .find(|(digest, _)| digest == root)
+        .map(|(_, tree)| tree.clone())
+}
+
+fn remember(root: &str, manifest: usize, tree: &std::sync::Arc<crate::workspace::Tree>) {
+    if manifest > DECODED_MAX {
+        return;
+    }
+    let mut kept = DECODED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    kept.retain(|(digest, _)| digest != root);
+    kept.truncate(DECODED_KEPT - 1);
+    kept.insert(0, (root.to_owned(), tree.clone()));
 }
 
 /// One committed revision as recorded.
@@ -126,11 +160,12 @@ impl ReadView<'static> {
         db.busy_timeout(Duration::from_millis(500))?;
         db.pragma_update(None, "query_only", "ON")?;
         db.pragma_update(None, "trusted_schema", "OFF")?;
-        let legacy = legacy(&db)?;
+        let (legacy, sized) = encoding(&db)?;
         Ok(Self {
             db: ViewConnection::Owned(db),
             root: Some(store.to_path_buf()),
             legacy,
+            sized,
         })
     }
 }
@@ -143,6 +178,7 @@ impl<'a> ReadView<'a> {
             db: ViewConnection::Borrowed(&store.db),
             root: None,
             legacy: false,
+            sized: true,
         }
     }
 
@@ -153,12 +189,31 @@ impl<'a> ReadView<'a> {
             return reads(self);
         }
         self.db.execute_batch("BEGIN")?;
-        let result = legacy(&self.db).and_then(|legacy| {
+        let result = encoding(&self.db).and_then(|(legacy, sized)| {
             self.legacy = legacy;
+            self.sized = sized;
             reads(self)
         });
         let _ = self.db.execute_batch("ROLLBACK");
         result
+    }
+
+    /// `artifact::STORED`, as a store from before schema 20 answers it (no `size`).
+    fn stored_query(&self) -> &'static str {
+        if self.sized {
+            crate::artifact::STORED
+        } else {
+            "SELECT bytes,NULL FROM objects WHERE digest=?1"
+        }
+    }
+
+    /// `artifact::SIZE`, as a store from before schema 20 answers it.
+    fn size_query(&self) -> &'static str {
+        if self.sized {
+            crate::artifact::SIZE
+        } else {
+            "SELECT length(bytes) FROM objects WHERE digest=?1"
+        }
     }
 
     /// Configuration/accounting bytes, without acquiring the owner lock.
@@ -172,7 +227,7 @@ impl<'a> ReadView<'a> {
         crate::meta::get(&self.db, key)
     }
 
-    #[cfg(feature = "agent")]
+    #[cfg(any(feature = "agent", feature = "embedded"))]
     pub(crate) fn retain_metadata(&self, key: &str, bytes: &[u8]) -> Result<()> {
         match &self.db {
             ViewConnection::Borrowed(db) => {
@@ -180,6 +235,10 @@ impl<'a> ReadView<'a> {
                 crate::meta::put(&tx, key, bytes)?;
                 tx.commit()?;
             }
+            // An app reads through its own store only.
+            #[cfg(not(feature = "agent"))]
+            ViewConnection::Owned(_) => return Err(Error::Unsupported),
+            #[cfg(feature = "agent")]
             ViewConnection::Owned(_) => {
                 let dir = self
                     .root
@@ -243,7 +302,7 @@ impl<'a> ReadView<'a> {
         if current < 17 {
             return Ok((0, true));
         }
-        let row: Option<(u64, i64)> = self.db.query_row(
+        let row: Option<(u64, i64)> = crate::cached_row(&self.db,
             "SELECT o.crashes,o.closed FROM opens o JOIN head h ON h.id=1 WHERE o.id=1 AND o.head=h.revision",
             [],
             |row| Ok((crate::nonnegative_id(row, 0)?, row.get(1)?)),
@@ -277,7 +336,8 @@ impl<'a> ReadView<'a> {
     /// owner admitted and never started).
     pub fn queued(&mut self) -> Result<u64> {
         // A rewind's own admission is the rewind's record, not waiting input.
-        Ok(self.db.query_row(
+        Ok(crate::cached_row(
+            &self.db,
             &format!(
                 "SELECT count(*) FROM admissions a WHERE a.kind!=?1 AND {}",
                 crate::rewind::QUEUED
@@ -287,16 +347,19 @@ impl<'a> ReadView<'a> {
         )?)
     }
 
-    pub fn queued_inputs(&self) -> Result<Vec<(String, Vec<u8>)>> {
+    /// The engine's admitted inputs no step has consumed (or dropped) yet, in order:
+    /// `(sequence, command, payload)`.
+    pub fn queued_inputs(&self) -> Result<Vec<(u64, String, Vec<u8>)>> {
         let mut query = self.db.prepare(&format!(
-            "SELECT a.command_id,a.payload FROM admissions a WHERE a.scope=?1 AND a.kind=?2 AND {} ORDER BY a.sequence LIMIT 257",
+            "SELECT a.sequence,a.command_id,a.payload FROM admissions a WHERE a.scope=?1 AND a.kind=?2 AND {} ORDER BY a.sequence LIMIT 257",
             crate::rewind::QUEUED
         ))?;
         let rows = query
             .query_map(params![SCOPE, crate::turn::ENGINE], |row| {
                 Ok((
-                    crate::bounded_label(row, 0)?,
-                    stored(&self.db, self.legacy, row, 1)?,
+                    crate::nonnegative_id(row, 0)?,
+                    crate::bounded_label(row, 1)?,
+                    stored(&self.db, self.legacy, row, 2)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -338,7 +401,8 @@ impl<'a> ReadView<'a> {
     /// the session has no turn yet.
     pub fn head(&mut self) -> Result<(u64, Vec<u8>, Option<String>)> {
         let legacy = self.legacy;
-        Ok(self.db.query_row(
+        Ok(crate::cached_row(
+            &self.db,
             "SELECT r.revision,r.continuation,r.workspace FROM head h JOIN revisions r ON r.revision=h.revision WHERE h.id=1",
             [],
             |row| {
@@ -438,7 +502,8 @@ impl<'a> ReadView<'a> {
 
     /// How many model replies are stored at or before receipt row `through`.
     pub fn model_receipt_count(&mut self, through: i64) -> Result<u64> {
-        Ok(self.db.query_row(
+        Ok(crate::cached_row(
+            &self.db,
             "SELECT count(*) FROM receipts q JOIN attempts a ON a.id=q.attempt WHERE a.implementation='dext-provider-v1' AND q.rowid<=?1",
             [through],
             |row| crate::nonnegative_id(row, 0),
@@ -504,6 +569,21 @@ impl<'a> ReadView<'a> {
         crate::meta::call_id(&self.db, effect)
     }
 
+    /// The keys of the session's tasks (`task_runs` without their inputs and answers).
+    pub fn task_keys(&self) -> Result<Vec<String>> {
+        let schema: i64 = self
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if schema < 19 {
+            return Ok(vec![]);
+        }
+        let mut query = self.db.prepare("SELECT task FROM task_runs LIMIT 4097")?;
+        let keys = query
+            .query_map([], |row| crate::bounded_label(row, 0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(keys)
+    }
+
     pub fn task_runs(&self) -> Result<Vec<crate::meta::TaskRun>> {
         let schema: i64 = self
             .db
@@ -521,7 +601,7 @@ impl<'a> ReadView<'a> {
         if schema < 19 {
             return Ok(None);
         }
-        let millis = self.db.query_row("SELECT d.millis FROM retry_delays d JOIN attempts a ON a.id=d.attempt WHERE a.effect=?1", [effect], |row| crate::nonnegative_id(row, 0)).optional()?;
+        let millis = crate::cached_row(&self.db, "SELECT d.millis FROM retry_delays d JOIN attempts a ON a.id=d.attempt WHERE a.effect=?1", [effect], |row| crate::nonnegative_id(row, 0)).optional()?;
         Ok(millis.map(Duration::from_millis))
     }
 
@@ -532,13 +612,14 @@ impl<'a> ReadView<'a> {
         if schema < 19 {
             return Ok(None);
         }
-        Ok(self.db.query_row("SELECT d.value FROM app_details d JOIN attempts a ON a.id=d.attempt JOIN intents i ON i.id=a.effect JOIN revisions r ON r.revision=i.revision WHERE a.effect=?1 AND r.scope=?2", params![effect, SCOPE], |row| crate::packed_blob(&self.db, row, 0, crate::transition::MAX_STATE)).optional()?)
+        Ok(crate::cached_row(&self.db, "SELECT d.value FROM app_details d JOIN attempts a ON a.id=d.attempt JOIN intents i ON i.id=a.effect JOIN revisions r ON r.revision=i.revision WHERE a.effect=?1 AND r.scope=?2", params![effect, SCOPE], |row| crate::packed_blob(&self.db, row, 0, crate::transition::MAX_STATE)).optional()?)
     }
 
     /// Whether a pending effect already has a recorded result, such as a model reply
     /// that Continue adopts without sending anything again.
     pub fn recorded(&mut self, effect: &str) -> Result<bool> {
-        Ok(self.db.query_row(
+        Ok(crate::cached_row(
+            &self.db,
             "SELECT EXISTS(SELECT 1 FROM attempts a JOIN receipts q ON q.attempt=a.id WHERE a.effect=?1)",
             [effect],
             |row| row.get(0),
@@ -597,17 +678,13 @@ impl<'a> ReadView<'a> {
     /// The files of a workspace root with their sizes. Only the manifest is verified
     /// here; `object` verifies each file's bytes when it is read.
     pub fn files(&mut self, root: &str) -> Result<Vec<File>> {
-        let manifest = self.object(root)?;
-        let entries = crate::workspace::decode(&manifest)?;
-        let mut out = Vec::with_capacity(entries.len());
-        for entry in entries {
+        let tree = self.shared_tree(root)?;
+        let mut out = Vec::with_capacity(tree.files.len());
+        for entry in tree.files.iter().cloned() {
             let size: Option<i64> = self
                 .db
-                .query_row(
-                    "SELECT length(bytes) FROM objects WHERE digest=?1",
-                    [&entry.object],
-                    |row| row.get(0),
-                )
+                .prepare_cached(self.size_query())?
+                .query_row([&entry.object], |row| row.get(0))
                 .optional()?;
             let size = size.ok_or(Error::Incompatible)?;
             out.push(File {
@@ -620,8 +697,30 @@ impl<'a> ReadView<'a> {
 
     /// The links and empty directories of a workspace root (files: `files`).
     pub fn tree(&mut self, root: &str) -> Result<crate::workspace::Tree> {
+        Ok((*self.shared_tree(root)?).clone())
+    }
+
+    /// The file `path` of a workspace root, if it has one.
+    pub fn entry(&mut self, root: &str, path: &str) -> Result<Option<Entry>> {
+        let tree = self.shared_tree(root)?;
+        Ok(tree.files.iter().find(|entry| entry.path == path).cloned())
+    }
+
+    /// How many files a workspace root holds.
+    pub fn file_count(&mut self, root: &str) -> Result<usize> {
+        Ok(self.shared_tree(root)?.files.len())
+    }
+
+    /// The decoded manifest of a workspace root. Files opened one by one (a page's
+    /// assets, a download of them all) and every status read decode it once.
+    fn shared_tree(&mut self, root: &str) -> Result<std::sync::Arc<crate::workspace::Tree>> {
+        if let Some(tree) = decoded(root) {
+            return Ok(tree);
+        }
         let manifest = self.object(root)?;
-        crate::workspace::decode_tree(&manifest)
+        let tree = std::sync::Arc::new(crate::workspace::decode_tree(&manifest)?);
+        remember(root, manifest.len(), &tree);
+        Ok(tree)
     }
 
     /// The verified bytes of a stored object (a file or a workspace manifest).
@@ -631,11 +730,8 @@ impl<'a> ReadView<'a> {
         }
         let bytes: Vec<u8> = self
             .db
-            .query_row(
-                "SELECT bytes FROM objects WHERE digest=?1",
-                [digest],
-                |row| crate::bounded_blob(row, 0, crate::artifact::MAX_OBJECT),
-            )
+            .prepare_cached(self.stored_query())?
+            .query_row([digest], |row| crate::artifact::object_at(row, 0))
             .optional()?
             .ok_or(Error::Invalid)?;
         if crate::artifact::object_digest(&bytes) != digest {
@@ -780,8 +876,9 @@ impl ReadView<'_> {
         let mut records = Vec::new();
         for chunk in stages.chunks(512) {
             let mut statement = self.db.prepare(&format!(
-                "SELECT p.stage,o.digest,o.bytes FROM staging_pins p JOIN objects o ON o.digest=p.digest
+                "SELECT p.stage,o.digest,o.bytes,{} FROM staging_pins p JOIN objects o ON o.digest=p.digest
                  JOIN artifact_stages s ON s.id=p.stage WHERE s.scope=? AND p.stage IN ({})",
+                if self.sized { "o.size" } else { "NULL" },
                 vec!["?"; chunk.len()].join(",")
             ))?;
             let rows = statement.query_map(
@@ -792,7 +889,7 @@ impl ReadView<'_> {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        crate::bounded_blob(row, 2, crate::artifact::MAX_OBJECT)?,
+                        crate::artifact::object_at(row, 2)?,
                     ))
                 },
             )?;

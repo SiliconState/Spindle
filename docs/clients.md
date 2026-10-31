@@ -151,8 +151,24 @@ Python takes keyword arguments with snake_case names.
 | `tasks` | `tasks(dir)` | `tasks(dir)` |
 | `app_tool_result` | Sent automatically for registered tools; otherwise `call('app_tool_result', ...)` | The same; otherwise `call("app_tool_result", ...)` |
 
-Methods without a wrapper (for example `steer` with `now`) go through `call`. In
-Python, `timeout` on `prompt` and `task_start` is how many seconds to wait for the
+Methods without a wrapper (for example `steer` with `now`, or native
+`capabilities`) go through `call`: JavaScript `call('capabilities')`, Python
+`call("capabilities")`. Native `capabilities` reports this host's tools, sandbox,
+runners, budgets and task modes; it has no HTTP counterpart. Status and HTTP session
+objects expose the stable `activity` code unchanged; clients do not infer activity
+from the human-readable `state` sentence. See [API.md](API.md#status-object).
+
+The embedded JS client has dedicated `capabilities()` and `fit(dir, {runner})`
+wrappers, `usage(dir)`, queued tasks with `tasks`, `taskWait` and `taskStop`,
+`compactSession(dir)` and synchronous `checkBundle(bytes)`. Embedded `taskWait`
+returns current state without waiting, unlike native `taskWait`'s timeout. Its
+`remoteRunner` names remote runs and posts their stop route when aborted; mint its
+host token with `token new NAME --runner`, not a full session-access token. The
+HTTP clients have no run-status/stop wrappers; JavaScript can use `request` for
+those routes. See [embedded.md](embedded.md#embeddedclient) and
+[`embedded.mjs`](../spindle/clients/js/embedded.mjs).
+
+In Python, `timeout` on `prompt` and `task_start` is how many seconds to wait for the
 reply. When it passes, `concurrent.futures.TimeoutError` is raised, and the turn keeps
 running.
 

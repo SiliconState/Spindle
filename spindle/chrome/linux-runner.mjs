@@ -29,10 +29,10 @@ const WASM_FAILURES = 3;
 /** `onCode(session, request, signal)` answers a script's Spindle call (the code-mode
  * bridge); `signal` ends with the command, so no call outlives it. `onStatus(state,
  * detail, kind)` tells a Linux's state, `kind` 'v86' or 'wasm' (told 'not started' once
- * the extension is found to carry it). `route`: 'auto' (linux-route.mjs decides), or
- * 'v86' / 'wasm' to send every command to that one, with no fallback (tests and
- * benchmarks). */
-export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: false, error: 'no Spindle calls here' }), route = 'auto' } = {}) {
+ * the extension is found to carry it). `onRan(session, kind)`: a command of `session`
+ * ran on `kind`'s Linux. `route`: 'auto' (linux-route.mjs decides), or 'v86' / 'wasm'
+ * to send every command to that one, with no fallback (tests and benchmarks). */
+export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: false, error: 'no Spindle calls here' }), onRan = () => {}, route = 'auto' } = {}) {
   const machines = {
     v86: { url: 'linux-worker.mjs', worker: null, idle: 0 },
     wasm: { url: 'wasm-linux-worker.mjs', worker: null, idle: 0 },
@@ -185,12 +185,15 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
           sessions.get(id)?.ended.abort();
           sessions.delete(id);
         }
+        onRan(session, 'wasm');
         if (route === 'wasm' || signal?.aborted || !wantsV86(result)) return told(result);
       }
       const id = ++next;
       sessions.set(id, { session, ended: new AbortController(), read, called: false });
       try {
-        return told(await runOn('v86', id, job, signal));
+        const result = await runOn('v86', id, job, signal);
+        onRan(session, 'v86');
+        return told(result);
       } finally {
         sessions.get(id)?.ended.abort();
         sessions.delete(id);
@@ -208,10 +211,14 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
       for (const machine of Object.values(machines)) machine.worker?.postMessage({ type: 'forget', session });
     },
 
-    /** Starts (or resumes) the Linuxes ahead of the first command. */
-    warm() {
-      ensure('v86').postMessage({ type: 'start' });
-      rest('v86');
+    /** Starts (or resumes) the Linuxes ahead of the first command: the wasm Linux, and
+     * v86 unless `v86` is false (then v86, and its guest's memory, wait for a command
+     * that needs it: a thread that only talks or reads pages never starts it). */
+    warm({ v86 = true } = {}) {
+      if (v86) {
+        ensure('v86').postMessage({ type: 'start' });
+        rest('v86');
+      }
       wasmFound.then((found) => {
         if (!found || wasm === false) return;
         ensure('wasm').postMessage({ type: 'start' });

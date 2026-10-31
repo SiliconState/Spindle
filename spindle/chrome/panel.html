@@ -9,15 +9,17 @@
 <script src="theme.js"></script>
 </head>
 <body data-view="home">
-<header>
-  <button id="home" class="brand" aria-label="Spindle">s<span class="brand-dot">_</span></button>
+<header id="top">
+  <button id="home" type="button" class="brand" aria-label="Spindle"><span class="brand-mark" aria-hidden="true">S<span class="brand-dot">_</span></span></button>
   <div class="heading">
-    <h1 id="title">Spindle</h1>
-    <p id="subtitle">Agent threads that live in your browser.</p>
-    <button id="title-button" type="button" aria-label="Thread menu" hidden></button>
+    <div class="title-line"><h1 id="title">Spindle</h1><span id="title-caret" data-icon="down" data-size="12"></span></div>
+    <p id="subtitle"></p>
+    <button id="title-button" type="button" aria-label="Thread menu" title="Rename, files, move or delete this thread" hidden></button>
   </div>
-  <button id="settings" aria-label="Settings">⚙&#xFE0E;</button>
+  <button id="spend" type="button" hidden></button>
+  <button id="settings" type="button" class="head-icon" aria-label="Settings" title="Settings"></button>
 </header>
+<div id="spend-bar" aria-hidden="true"><div id="spend-fill"></div></div>
 <div id="banner" role="alert" hidden><span id="banner-text"></span><span id="banner-actions"></span></div>
 <main id="main">
   <section id="welcome">
@@ -28,22 +30,32 @@
       while this panel is closed. Turn on page reading in Settings and it can read the tabs you are on; turn on a
       thread's network and its commands reach the web.</p>
     </div>
-    <div id="threads"></div>
-    <label class="import-row"><input id="import-file" type="file" accept=".spindle" hidden><span>Import a .spindle thread</span></label>
+    <div id="search-box" class="search" hidden>
+      <span data-icon="search" data-size="16"></span>
+      <label for="thread-search" class="sr-only">Search threads</label>
+      <input id="thread-search" type="search" placeholder="Search threads" autocomplete="off" spellcheck="false">
+    </div>
+    <nav id="threads" aria-label="Threads"></nav>
+    <label class="import-row"><input id="import-file" type="file" accept=".spindle" hidden><span data-icon="upload" data-size="14"></span><span>Import a .spindle thread</span></label>
   </section>
   <section id="thread" hidden aria-label="Conversation">
     <div id="history"></div>
     <div id="notice" class="notice state" hidden></div>
+    <div id="halted" class="halted-actions" hidden>
+      <button id="resume" type="button" class="primary" hidden title="Pick up where it left off">Continue</button>
+      <button id="retry" type="button" hidden title="Send the last model request again">Retry</button>
+      <button id="takeback" type="button" hidden title="Take this unfinished turn back: your message returns to the box below">Take back</button>
+    </div>
   </section>
   <section id="workspace" hidden aria-labelledby="ws-heading">
-    <div class="ws-bar">
-      <button id="ws-done" type="button" class="ws-back" aria-label="Back to the conversation" title="Back to the conversation">‹ Conversation</button>
-      <h2 id="ws-heading" class="ws-heading" tabindex="-1">Workspace</h2>
-      <button id="files-zip" type="button" class="icon-button" aria-label="Download all files as a .zip" title="Download all files as a .zip"></button>
+    <div class="ws-bar page-head">
+      <button id="ws-done" type="button" class="head-icon" aria-label="Back to the conversation" title="Back to the conversation"></button>
+      <div class="page-title"><h2 id="ws-heading" class="ws-heading" tabindex="-1">Workspace</h2><p id="ws-sub" class="page-sub"></p></div>
+      <button id="files-zip" type="button" class="head-icon" aria-label="Download all files as a .zip" title="Download all files as a .zip"></button>
     </div>
     <div id="ws-list">
       <div class="ws-tools">
-        <input id="ws-filter" type="search" placeholder="Filter files…" aria-label="Filter files" autocomplete="off" spellcheck="false">
+        <div class="search"><span data-icon="search" data-size="14"></span><input id="ws-filter" type="search" placeholder="Filter files" aria-label="Filter files" autocomplete="off" spellcheck="false"></div>
         <button id="ws-scratch" type="button" role="switch" class="mini-switch" aria-checked="false" title="Show scratch files (.txt, .py, tests/)">Scratch</button>
       </div>
       <p id="ws-note" class="note"></p>
@@ -63,107 +75,142 @@
     </div>
   </section>
 </main>
-<div id="toast" role="status" popover="manual" hidden></div>
+<div id="toast" role="status" popover="manual" hidden><span id="toast-text"></span><button id="toast-action" type="button" hidden></button></div>
 <footer id="dock">
-  <button id="jump" type="button" hidden aria-label="Jump to the latest" title="Jump to the latest"><span aria-hidden="true">↓</span> Latest</button>
-  <div id="bar">
-    <span id="phase" role="status"></span>
-    <button id="model-chip" type="button" aria-haspopup="dialog"></button>
-    <button id="resume" type="button" hidden>Continue</button>
-    <button id="retry" type="button" hidden>Retry</button>
-    <button id="takeback" type="button" hidden title="Take this unfinished turn back: your message returns to the box below">Take back</button>
+  <button id="jump" type="button" hidden aria-label="Jump to the latest" title="Jump to the latest"></button>
+  <div id="box" class="composer-box">
+    <div id="bar">
+      <span id="status-mark" aria-hidden="true"></span>
+      <span id="phase" role="status"></span>
+      <span id="elapsed" class="mono" aria-hidden="true"></span>
+      <button id="task-chip" type="button" hidden></button>
+      <button id="status-go" type="button" class="link-like" hidden></button>
+      <span class="grow"></span>
+      <button id="model-chip" type="button" aria-haspopup="dialog"><span id="model-words"></span></button>
+    </div>
+    <div id="carry" class="box-line" hidden><span id="carry-text"></span><button id="carry-drop" type="button" class="line-icon" aria-label="Start without those files" title="Start without those files"></button></div>
+    <div id="queued" class="box-line" hidden><span id="queued-text"></span><button id="queued-back" type="button" class="link-like" title="Put it back in the box, to change or send it">Take back</button></div>
+    <div id="attached" hidden></div>
+    <form id="composer">
+      <button id="add" type="button" class="box-icon" aria-expanded="false" aria-controls="add-menu" aria-label="Add: upload a file or capture this tab" title="Add: upload a file or capture this tab"></button>
+      <span id="add-menu" hidden>
+        <button id="attach" type="button" class="box-icon" aria-label="Upload a file" title="Upload a file (it goes into the thread's workspace)"></button>
+        <button id="shoot" type="button" class="box-icon" aria-label="Capture this tab" title="Capture the tab you are on (it goes with your message)"></button>
+        <span class="box-divider" aria-hidden="true"></span>
+      </span>
+      <input id="attach-file" type="file" multiple hidden>
+      <textarea id="prompt" rows="1" placeholder="Start a new thread…" aria-label="Message"></textarea>
+      <button id="send" type="submit" class="primary" aria-label="Send"></button>
+    </form>
   </div>
-  <div id="carry" hidden><span id="carry-text"></span><button id="carry-drop" type="button" aria-label="Start without those files" title="Start without those files">×</button></div>
-  <div id="attached" hidden></div>
-  <form id="composer">
-    <button id="attach" type="button" aria-label="Attach files" title="Attach files (they go into the thread's workspace)">+</button>
-    <input id="attach-file" type="file" multiple hidden>
-    <button id="shoot" type="button" aria-label="Screenshot the tab you are on" title="Screenshot the tab you are on (it goes with your message)"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M4 8h3l2-2.5h6L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg></button>
-    <textarea id="prompt" rows="1" placeholder="Start a new thread…" aria-label="Message"></textarea>
-    <button id="send" class="primary" aria-label="Send">↑</button>
-  </form>
 </footer>
 
-<dialog id="model-dialog" aria-labelledby="model-heading">
-  <div class="sheet-head"><div><p class="eyebrow" id="model-label">New threads</p><h2 id="model-heading">Model</h2></div><button data-close="model-dialog" aria-label="Close">×</button></div>
-  <p id="model-halted" class="note attention" hidden>Its last turn stopped before it finished. A change starts that turn over: it is taken back and your message is sent again.</p>
-  <div class="field">
-    <span class="field-label" id="provider-heading">Provider</span>
-    <div class="picker" id="model-provider"></div>
+<dialog id="model-dialog" class="page" aria-labelledby="model-heading">
+  <div class="page-head">
+    <button type="button" class="head-icon" data-close="model-dialog" aria-label="Back without saving" title="Back without saving"></button>
+    <div class="page-title"><h2 id="model-heading">Model</h2><p class="page-sub" id="model-label" hidden></p></div>
   </div>
-  <div class="field">
-    <span class="field-label" id="name-heading">Model</span>
-    <div class="picker" id="model-name"></div>
-  </div>
-  <div class="field" id="effort-field">
-    <span class="field-label" id="effort-heading">Effort</span>
-    <div id="model-effort" class="segmented wrap" role="radiogroup" aria-labelledby="effort-heading"></div>
-    <p id="effort-note" class="field-note"></p>
-  </div>
-  <div class="field">
-    <span class="field-label" id="runner-heading">Commands run in</span>
-    <div id="model-runner" class="segmented" role="radiogroup" aria-labelledby="runner-heading">
-      <button type="button" role="radio" data-value="app">This browser</button><button type="button" role="radio" data-value="remote">Your host</button><button type="button" role="radio" data-value="none">Nowhere</button>
+  <div class="page-body">
+    <p id="model-halted" class="note attention" hidden>Its last turn stopped before it finished. A change starts that turn over: it is taken back and your message is sent again.</p>
+    <fieldset id="model-scope" class="seg seg-2" role="radiogroup" aria-labelledby="scope-heading">
+      <legend id="scope-heading" class="sr-only">Apply to</legend>
+      <button type="button" role="radio" data-scope="thread">This thread</button><button type="button" role="radio" data-scope="new">New threads</button>
+    </fieldset>
+    <div class="card pick-card">
+      <div class="pick-row" id="provider-row"><span class="pick-label" id="provider-heading">Provider</span><div class="picker" id="model-provider"></div></div>
+      <div class="pick-row" id="name-row"><span class="pick-label" id="name-heading">Model</span><div class="picker" id="model-name"></div></div>
     </div>
-    <p id="runner-note" class="field-note"></p>
+    <div class="field" id="effort-field">
+      <span class="field-label" id="effort-heading">Effort</span>
+      <div id="model-effort" class="seg" role="radiogroup" aria-labelledby="effort-heading"></div>
+      <p id="effort-note" class="field-note"></p>
+    </div>
+    <div class="field">
+      <span class="field-label" id="runner-heading">Commands run in</span>
+      <div id="model-runner" class="seg seg-3" role="radiogroup" aria-labelledby="runner-heading">
+        <button type="button" role="radio" data-value="app" data-icon="browser">Browser</button><button type="button" role="radio" data-value="remote" data-icon="monitor">Host</button><button type="button" role="radio" data-value="none" data-icon="ban">None</button>
+      </div>
+      <p id="runner-note" class="field-note"></p>
+    </div>
+    <div class="card switch-card">
+      <div class="switch-row">
+        <div><strong id="network-heading">Network for commands</strong><small id="network-note"></small></div>
+        <button id="model-network" type="button" role="switch" class="switch" aria-labelledby="network-heading" aria-describedby="network-note"></button>
+      </div>
+      <div class="switch-row">
+        <div><strong id="tasks-heading">Tasks</strong><small id="tasks-note"></small></div>
+        <button id="model-tasks" type="button" role="switch" class="switch" aria-labelledby="tasks-heading" aria-describedby="tasks-note"></button>
+      </div>
+      <div class="switch-row" id="budget-field">
+        <div><label for="model-budget" id="budget-heading">Spend limit</label><small id="budget-note"></small></div>
+        <span class="money-input"><span aria-hidden="true">$</span><input id="model-budget" type="number" min="0" step="0.01" inputmode="decimal" placeholder="None" autocomplete="off" aria-describedby="budget-note"></span>
+      </div>
+    </div>
+    <p id="model-note" class="note"></p>
   </div>
-  <div class="switch-row field">
-    <div><strong id="network-heading">Network for commands</strong><small id="network-note"></small></div>
-    <button id="model-network" type="button" role="switch" class="switch" aria-labelledby="network-heading" aria-describedby="network-note"></button>
-  </div>
-  <p id="model-note" class="note"></p>
-  <div class="confirm-actions"><button id="model-apply" type="button" class="primary">Use it</button></div>
+  <div class="page-foot"><button id="model-apply" type="button" class="primary wide">Save</button></div>
 </dialog>
 
-<dialog id="settings-dialog" aria-labelledby="settings-heading">
-  <div class="sheet-head"><div><p class="eyebrow">Spindle for Browser</p><h2 id="settings-heading">Settings</h2></div><button data-close="settings-dialog" aria-label="Close">×</button></div>
-  <p id="settings-note" class="note attention" hidden></p>
-  <details class="fold" data-fold="providers">
-    <summary><span class="fold-title">Providers</span><span class="fold-state" id="providers-summary"></span></summary>
-    <div class="fold-body">
-      <p class="note">Keys and sign-ins stay in this browser, encrypted in Spindle's own storage, and go
-      only to their provider. Saving one lets Spindle reach that provider's site.</p>
-      <div id="providers"></div>
-      <div id="vault" class="vault"></div>
-      <details class="subfold" data-fold="catalog">
-        <summary><span class="fold-title">Provider list</span><span class="fold-state" id="catalog-summary"></span></summary>
-        <p id="catalog-state" class="note"></p>
-        <div class="confirm-actions">
-          <label class="button-like"><input id="catalog-file" type="file" accept=".json,application/json" hidden><span>Import providers.json</span></label>
-          <button id="catalog-builtin" type="button">Use the built-ins</button>
+<dialog id="settings-dialog" class="page" aria-labelledby="settings-heading">
+  <div class="page-head">
+    <button type="button" class="head-icon" data-close="settings-dialog" aria-label="Back" title="Back"></button>
+    <div class="page-title"><h2 id="settings-heading">Settings</h2></div>
+  </div>
+  <div class="page-body flush">
+    <p id="settings-note" class="note attention" hidden></p>
+    <details class="fold" data-fold="providers">
+      <summary><span class="fold-title">Providers</span><span class="fold-state" id="providers-summary"></span></summary>
+      <div class="fold-body">
+        <p class="fold-note">Keys stay in this browser, encrypted, and go only to their provider.</p>
+        <ul id="providers" class="list-card" aria-label="Providers"></ul>
+        <div class="list-card sub-rows">
+          <details class="subfold" data-fold="vault">
+            <summary><span class="sub-icon" data-icon="lock"></span><span class="fold-title">Passphrase</span><span class="fold-state" id="vault-summary"></span></summary>
+            <div id="vault" class="vault"></div>
+          </details>
+          <details class="subfold" data-fold="catalog">
+            <summary><span class="sub-icon" data-icon="list"></span><span class="fold-title">Provider list</span><span class="fold-state" id="catalog-summary"></span></summary>
+            <div class="sub-body">
+              <p id="catalog-state" class="note"></p>
+              <div class="confirm-actions">
+                <label class="button-like"><input id="catalog-file" type="file" accept=".json,application/json" hidden><span>Import providers.json</span></label>
+                <button id="catalog-builtin" type="button">Use the built-ins</button>
+              </div>
+            </div>
+          </details>
         </div>
-      </details>
-    </div>
-  </details>
-  <details class="fold" data-fold="pages">
-    <summary><span class="fold-title">Pages</span><span class="fold-state" id="pages-summary"></span></summary>
-    <div class="fold-body">
-      <div class="switch-row">
-        <div><strong id="page-reading-label">Page reading</strong><small>Threads list your tabs, read the page you are on
-        (or one they name), and see its parts and HTML.</small></div>
-        <button id="page-reading" type="button" role="switch" class="switch" aria-labelledby="page-reading-label"></button>
       </div>
-      <div class="switch-row">
-        <div><strong id="page-actions-label">Page actions</strong><small>Threads also go to addresses, click, type, choose,
-        press keys, scroll, wait, picture pages, close tabs and watch a tab's network.</small></div>
-        <button id="page-actions" type="button" role="switch" class="switch" aria-labelledby="page-actions-label"></button>
+    </details>
+    <details class="fold" data-fold="pages">
+      <summary><span class="fold-title">Pages</span><span class="fold-state" id="pages-summary"></span></summary>
+      <div class="fold-body padded">
+        <div class="switch-row">
+          <div><strong id="page-reading-label">Read pages</strong><small>Tabs, page text, parts and HTML</small></div>
+          <button id="page-reading" type="button" role="switch" class="switch" aria-labelledby="page-reading-label"></button>
+        </div>
+        <div class="switch-row">
+          <div><strong id="page-actions-label">Act on pages</strong><small title="Go to addresses, click, type, choose, press keys, scroll, wait, picture pages, close tabs and watch a tab's network. Chrome shows that Spindle is debugging a tab while it acts on it; closing that bar stops it there.">Open, click, type, scroll, picture, network</small></div>
+          <button id="page-actions" type="button" role="switch" class="switch" aria-labelledby="page-actions-label"></button>
+        </div>
+        <p class="warn-note" role="note"><span class="warn-icon" data-icon="warning"></span><span>Acting threads are signed in as you, and a page's text can try to steer them.</span></p>
+        <div id="site-rules" hidden></div>
+        <p class="note" id="site-access"></p>
+        <button id="site-access-remove" type="button" class="danger-line" hidden><span data-icon="ban"></span>Remove Chrome's site access</button>
       </div>
-      <p class="note">Acting, a thread works in your browser signed in as you, so a page's text can steer it. Chrome
-      shows that Spindle is debugging a tab while it acts on it; closing that bar stops it there.</p>
-      <p class="note" id="site-access"></p>
-      <button id="site-access-remove" type="button" class="danger wide" hidden>Take back Chrome's access to sites</button>
-    </div>
-  </details>
-  <details class="fold" data-fold="commands">
-    <summary><span class="fold-title">Commands</span><span class="fold-state" id="commands-summary"></span></summary>
-    <div class="fold-body">
-      <p class="note">Threads run bash in a Linux inside this browser (bash, Python, Node, git, curl), sealed off from
-      your computer and from Spindle's keys. It starts with the first command. A thread's commands reach the web
-      only once you turn its network on (the thread's model menu).</p>
-      <dl class="facts"><dt>Linux</dt><dd id="linux-state"></dd><div id="wasm-linux-row" hidden><dt>wasm Linux</dt><dd id="wasm-linux-state"></dd></div><dt>Network</dt><dd id="network-state"></dd></dl>
-      <details class="subfold" data-fold="relay">
-        <summary><span class="fold-title">Relay</span><span class="fold-state" id="relay-summary"></span></summary>
-        <p class="note">Without one, a thread with network reaches websites through Chrome (HTTP and HTTPS; no
+    </details>
+    <details class="fold" data-fold="commands">
+      <summary><span class="fold-title">Commands</span><span class="fold-state" id="commands-summary"></span></summary>
+      <div class="fold-body padded">
+        <p class="fold-note tight">Threads run bash in a Linux inside this browser (bash, Python, Node, git, curl), sealed off from
+        your computer and from Spindle's keys. It starts with the first command; a thread's commands reach the web only
+        once you turn its network on.</p>
+        <dl class="facts"><dt>Linux</dt><dd id="linux-state"></dd><div id="wasm-linux-row" hidden><dt>wasm Linux</dt><dd id="wasm-linux-state"></dd></div><dt>Network</dt><dd id="network-state"></dd></dl>
+      </div>
+    </details>
+    <details class="fold" data-fold="relay">
+      <summary><span class="fold-title">Relay</span><span class="fold-state" id="relay-summary"></span></summary>
+      <div class="fold-body padded">
+        <p class="fold-note tight">Without one, a thread with network reaches websites through Chrome (HTTP and HTTPS; no
         cookies). With a relay you run (a WISP server, such as wisp-js or epoxy-server), its commands reach any
         address through it: ssh, git over SSH, databases. Names are then looked up over DNS-over-HTTPS
         (cloudflare-dns.com). Spindle runs no relay of its own.</p>
@@ -171,78 +218,91 @@
           <label>Relay address<input id="relay-url" placeholder="wisps://relay.example.com/" spellcheck="false"></label>
           <div class="confirm-actions"><button id="relay-off" type="button" class="danger">Stop using it</button><button class="primary">Use it</button></div>
         </form>
-      </details>
-      <details class="subfold" data-fold="sites">
-        <summary><span class="fold-title">Sites scripts may call</span><span class="fold-state" id="sites-summary"></span></summary>
-        <p class="note">A script can call a site you list here with <code>spindle http URL</code>, whatever its
+      </div>
+    </details>
+    <details class="fold" data-fold="sites">
+      <summary><span class="fold-title">Sites scripts may call</span><span class="fold-state" id="sites-summary"></span></summary>
+      <div class="fold-body padded">
+        <p class="fold-note tight">A script can call a site you list here with <code>spindle http URL</code>, whatever its
         thread's network: journaled like every Spindle call, sent without your cookies. Chrome asks once for each.</p>
-        <div id="sites"></div>
+        <div id="sites" class="list-card"></div>
         <form id="site-form" autocomplete="off">
           <label>Address<input id="site-url" placeholder="https://api.example.com/v1/" spellcheck="false"></label>
           <div class="field"><span class="field-label" id="site-access-heading">Scripts may</span>
-            <div id="site-access-kind" class="segmented" role="radiogroup" aria-labelledby="site-access-heading"><button type="button" role="radio" data-value="read" aria-checked="true" title="GET">Read it</button><button type="button" role="radio" data-value="write" aria-checked="false" title="GET, POST, PUT, PATCH, DELETE">Read and change it</button></div>
+            <div id="site-access-kind" class="seg seg-2" role="radiogroup" aria-labelledby="site-access-heading"><button type="button" role="radio" data-value="read" aria-checked="true" title="GET">Read it</button><button type="button" role="radio" data-value="write" aria-checked="false" title="GET, POST, PUT, PATCH, DELETE">Read and change it</button></div>
             <p class="field-note" id="site-access-note">GET requests only.</p></div>
           <div class="confirm-actions"><button class="primary">Add site</button></div>
         </form>
-      </details>
-      <details class="subfold" data-fold="host">
-        <summary><span class="fold-title">Your Spindle host</span><span class="fold-state" id="host-summary"></span></summary>
-        <p class="note">Connected, a thread can run its commands in your host's sandbox instead (choose it in the
-        thread's model menu). Make a token on the host: <code>spindle --dir HOST token new chrome</code>.</p>
+      </div>
+    </details>
+    <details class="fold" data-fold="host">
+      <summary><span class="fold-title">Your Spindle host</span><span class="fold-state" id="host-summary"></span></summary>
+      <div class="fold-body padded">
+        <p class="fold-note tight">Connected, a thread can run its commands in your host's sandbox instead (choose Host in the
+        thread's model page). Make a token on the host: <code>spindle --dir HOST token new chrome --runner</code> (it runs commands and reaches nothing else there).</p>
         <form id="host-form" autocomplete="off">
           <label>Address<input id="host-url" placeholder="http://localhost:8790" spellcheck="false"></label>
-          <label>API token<input id="host-token" type="password" autocomplete="off" spellcheck="false"></label>
+          <label>Runner token<input id="host-token" type="password" autocomplete="off" spellcheck="false"></label>
           <div class="confirm-actions"><button id="host-disconnect" type="button" class="danger">Disconnect</button><button class="primary">Connect</button></div>
         </form>
         <p id="host-state" class="note"></p>
-      </details>
-    </div>
-  </details>
-  <details class="fold" data-fold="instructions">
-    <summary><span class="fold-title">Your instructions</span><span class="fold-state" id="instructions-summary"></span></summary>
-    <div class="fold-body">
-      <p class="note">What every thread should know or keep to, such as how you like pages and reports made.
-      New threads start with them; others take them before their next message.</p>
-      <form id="standing-form">
-        <textarea id="standing" rows="4" maxlength="8000" placeholder="Make pages follow the light or dark setting of the browser…" aria-label="Your instructions for every thread"></textarea>
-        <div class="confirm-actions"><button class="primary">Save</button></div>
-      </form>
-    </div>
-  </details>
-  <details class="fold" data-fold="appearance">
-    <summary><span class="fold-title">Appearance</span><span class="fold-state" id="appearance-summary"></span></summary>
-    <div class="fold-body">
-      <p class="appearance-label" id="theme-heading">Theme</p>
-      <div id="theme-choice" class="segmented" role="group" aria-labelledby="theme-heading">
-        <button type="button" data-mode="paper">Paper</button><button type="button" data-mode="light">Light</button><button type="button" data-mode="dark">Dark</button><button type="button" data-mode="system">System</button>
       </div>
-      <p class="appearance-label" id="texture-heading">Background</p>
-      <div id="texture-choice" class="segmented" role="group" aria-labelledby="texture-heading">
-        <button type="button" data-texture="textured">Textured</button><button type="button" data-texture="plain">Plain</button>
+    </details>
+    <details class="fold" data-fold="instructions">
+      <summary><span class="fold-title">Your instructions</span><span class="fold-state" id="instructions-summary"></span></summary>
+      <div class="fold-body padded">
+        <p class="fold-note tight">What every thread should know or keep to, such as how you like pages and reports made.
+        New threads start with them; others take them before their next message.</p>
+        <form id="standing-form">
+          <textarea id="standing" rows="4" maxlength="8000" placeholder="Make pages follow the light or dark setting of the browser…" aria-label="Your instructions for every thread"></textarea>
+          <div class="confirm-actions"><button class="primary">Save</button></div>
+        </form>
       </div>
-    </div>
-  </details>
-  <details class="fold" data-fold="about">
-    <summary><span class="fold-title">About</span><span class="fold-state" id="about-summary"></span></summary>
-    <div class="fold-body">
-      <dl id="about" class="facts"></dl>
-      <div class="confirm-actions"><button id="open-tab" type="button">Open in a tab</button><button id="restart-engine" type="button">Restart engine</button></div>
-    </div>
-  </details>
+    </details>
+    <details class="fold" data-fold="appearance">
+      <summary><span class="fold-title">Appearance</span><span class="fold-state" id="appearance-summary"></span></summary>
+      <div class="fold-body padded">
+        <p class="field-label" id="theme-heading">Theme</p>
+        <div id="theme-choice" class="seg" role="group" aria-labelledby="theme-heading">
+          <button type="button" data-mode="paper">Paper</button><button type="button" data-mode="light">Light</button><button type="button" data-mode="dark">Dark</button><button type="button" data-mode="system">System</button>
+        </div>
+        <p class="field-label" id="texture-heading">Background</p>
+        <div id="texture-choice" class="seg seg-2" role="group" aria-labelledby="texture-heading">
+          <button type="button" data-texture="textured">Textured</button><button type="button" data-texture="plain">Plain</button>
+        </div>
+      </div>
+    </details>
+    <details class="fold" data-fold="storage">
+      <summary><span class="fold-title">Storage</span><span class="fold-state" id="storage-summary"></span></summary>
+      <div class="fold-body">
+        <p class="fold-note">What Spindle keeps in this browser, largest first. Freeing space leaves every thread as it is.</p>
+        <ul id="storage" class="list-card" aria-label="Storage"></ul>
+        <p id="storage-note" class="fold-note" role="status" hidden></p>
+        <div class="confirm-actions storage-actions"><button id="storage-free-all" type="button" class="primary" hidden>Free all</button></div>
+      </div>
+    </details>
+    <details class="fold" data-fold="about">
+      <summary><span class="fold-title">About</span><span class="fold-state mono" id="about-summary"></span></summary>
+      <div class="fold-body padded">
+        <dl id="about" class="facts"></dl>
+        <div class="confirm-actions"><button id="open-tab" type="button">Open in a tab</button><button id="restart-engine" type="button">Restart engine</button></div>
+      </div>
+    </details>
+  </div>
 </dialog>
 
 <dialog id="thread-dialog" aria-labelledby="thread-label">
   <div class="sheet-head"><div class="menu-title"><p class="eyebrow" id="thread-label">This thread</p>
     <form id="rename-form" class="title-form"><input id="rename" maxlength="80" required autocomplete="off" aria-label="Thread name"></form></div>
-    <button data-close="thread-dialog" aria-label="Close">×</button></div>
+    <button type="button" class="head-icon" data-close="thread-dialog" aria-label="Close" title="Close"></button></div>
   <p id="thread-facts" class="note"></p>
   <nav class="menu" aria-label="Thread actions">
-    <button id="menu-files" type="button">Workspace<small>the thread's files: browse, preview, download</small></button>
-    <button id="menu-fresh" type="button">New thread with these files<small>its workspace, without the conversation</small></button>
-    <button id="menu-export" type="button">Move to a file<small>.spindle; continue it with spindle import-session</small></button>
-    <button id="menu-copy" type="button">Export a copy<small>.spindle; this thread stays here</small></button>
+    <button id="menu-files" type="button"><span data-icon="workspace"></span><span>Workspace<small>the thread's files: browse, preview, download</small></span></button>
+    <button id="menu-fresh" type="button"><span data-icon="plus"></span><span>New thread with these files<small>its workspace, without the conversation</small></span></button>
+    <button id="menu-export" type="button"><span data-icon="download"></span><span>Move to a file<small>.spindle; continue it with spindle import-session</small></span></button>
+    <button id="menu-copy" type="button"><span data-icon="copy"></span><span>Export a copy<small>.spindle; this thread stays here</small></span></button>
   </nav>
-  <button id="menu-delete" type="button" class="danger wide">Delete this thread</button>
+  <button id="menu-delete" type="button" class="danger-line"><span data-icon="trash"></span>Delete this thread</button>
 </dialog>
 
 <dialog id="confirm-dialog">
@@ -253,6 +313,7 @@
     <div class="confirm-actions"><button value="no" type="submit">Cancel</button><button id="confirm-yes" value="yes" type="submit" class="primary">Confirm</button></div>
   </form>
 </dialog>
+<div id="row-menu" class="row-menu" popover="auto" role="menu" aria-label="Thread actions"></div>
 <script type="module" src="panel.mjs"></script>
 </body>
 </html>

@@ -17,7 +17,6 @@ use crate::agent::Result;
 pub(crate) use crate::driver::task_tool::refuse_conflicts;
 pub use crate::driver::task_tool::{MAX_DEPTH, NAME, Workspace, definition, refusal};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,11 +25,7 @@ use std::time::Duration;
 
 /// The directory of the task `key` names (a call's effect id, or an app's task id).
 pub fn task_dir(parent: &Path, key: &str) -> PathBuf {
-    let digest: String = Sha256::digest(key.as_bytes())[..10]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    parent.join("tasks").join(digest)
+    parent.join("tasks").join(crate::reads::task_name(key))
 }
 
 /// The tasks a session started, in name order.
@@ -79,9 +74,10 @@ pub fn offered(settings: &Settings, dir: &Path) -> bool {
 }
 
 /// What a task call came to: an answer to record (`AppAnswer::Stopped` records
-/// nothing), or why the task cannot go on by itself now. Then the call stays
-/// unanswered: the session's next `continue` asks again, once the task's own session
-/// is settled (a request of unknown outcome retried, say).
+/// nothing), or why the task cannot go on by itself now. Then a call in the foreground
+/// stays unanswered: the session's next `continue` asks again, once the task's own
+/// session is settled (a request of unknown outcome retried, say); one in the background
+/// stops, saying why (its session hears so; started again, it goes on).
 pub(crate) type Run = std::result::Result<AppAnswer, String>;
 
 struct TaskSlot(std::fs::File);
@@ -245,20 +241,26 @@ pub(crate) fn spawn_registered(
                 ),
                 Err(error) => Err(format!("invalid retained task input: {error}")),
             }))
-            .unwrap_or_else(|_| Err("task worker panicked; inspect its session".into()));
-            let answer = match result {
+            .unwrap_or_else(|_| Err("task worker panicked (its session is kept as it was)".into()));
+            // Stopped (by a person, or with its session) it has no answer; one that could
+            // not go on stops saying why (so its session hears that, and starting it again
+            // takes it up).
+            let (answered, kept) = match result {
                 Ok(AppAnswer::Result {
                     content, failed, ..
-                }) => Some(
-                    json!({"content":content,"failed":failed})
-                        .to_string()
-                        .into_bytes(),
+                }) => (
+                    true,
+                    Some(json!({"content":content,"failed":failed}).to_string()),
                 ),
-                _ => None,
+                Ok(_) => (false, None),
+                Err(why) => (false, Some(crate::turn::stopped_why(&why))),
+            };
+            let end = match (&kept, answered) {
+                (Some(answer), true) => crate::meta::TaskEnd::Answered(answer.as_bytes()),
+                (why, _) => crate::meta::TaskEnd::Stopped(why.as_deref().map(str::as_bytes)),
             };
             let mut finished = guard(&live.finished);
-            let retained =
-                crate::meta::finish_task(&parent, &record.task, &record.input, answer.as_deref());
+            let retained = crate::meta::finish_task(&parent, &record.task, &record.input, end);
             *finished = true;
             live.changed.notify_all();
             drop(finished);
@@ -270,9 +272,15 @@ pub(crate) fn spawn_registered(
         });
     if let Err(error) = spawned {
         lives.remove(&failed_path);
-        crate::meta::finish_task(&failed_parent, &failed_record.0, &failed_record.1, None)
-            .map_err(super::store_error)?;
-        return Err(format!("cannot start task worker: {error}"));
+        let why = format!("cannot start task worker: {error}");
+        crate::meta::finish_task(
+            &failed_parent,
+            &failed_record.0,
+            &failed_record.1,
+            crate::meta::TaskEnd::Stopped(Some(crate::turn::stopped_why(&why).as_bytes())),
+        )
+        .map_err(super::store_error)?;
+        return Err(why);
     }
     Ok(())
 }
@@ -901,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn panicking_task_releases_its_cancellation_watcher_and_retains_a_stop() {
+    fn panicking_task_releases_its_cancellation_watcher_and_retains_a_stop_saying_why() {
         let root = std::env::temp_dir().join(format!("spindle-task-panic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         struct Panics;
@@ -925,6 +933,12 @@ mod tests {
         let result = parent.wait_task("panic", Duration::from_secs(5)).unwrap();
         assert_eq!(result["state"], "stopped", "{result}");
         assert_eq!(result["pending"], false, "{result}");
+        assert!(
+            result["answer"]["content"]
+                .as_str()
+                .is_some_and(|said| said.starts_with("task worker panicked")),
+            "{result}"
+        );
         drop(parent);
         std::fs::remove_dir_all(root).unwrap();
     }

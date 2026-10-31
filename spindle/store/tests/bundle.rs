@@ -281,6 +281,9 @@ fn a_damaged_cut_foreign_or_escaping_bundle_is_refused() {
     history(&mut store);
     let good = bundle::write(files(&store)).unwrap().bytes;
     bundle::read(&good).unwrap();
+    // A copy's bundle (its stores checked as far as the bundle records them) is the same
+    // bundle, byte for byte: only how much was checked before writing it differs.
+    assert_eq!(bundle::write_copy(files(&store)).unwrap().bytes, good);
     let mut flipped = good.clone();
     let middle = flipped.len() / 2;
     flipped[middle] ^= 1;
@@ -396,6 +399,7 @@ fn a_damaged_cut_foreign_or_escaping_bundle_is_refused() {
             ],
         ),
     ] {
+        assert!(bundle::write_copy(files.clone()).is_err(), "copy: {what}");
         assert!(bundle::write(files).is_err(), "{what}");
     }
     // A settings mirror that disagrees with its store (even one that is not JSON) is

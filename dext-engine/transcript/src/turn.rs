@@ -262,9 +262,22 @@ impl TurnContinuation {
         Ok(next)
     }
     pub fn transcript(&self) -> Result<TranscriptCheckpoint, Error> {
+        self.transcript_ref().map(std::borrow::Cow::into_owned)
+    }
+    /// `transcript`, borrowed where the continuation holds it as it is (a tool batch's
+    /// is built: a copy, with its results appended once the batch is complete).
+    pub fn transcript_ref(&self) -> Result<std::borrow::Cow<'_, TranscriptCheckpoint>, Error> {
         match &self.state {
-            State::Transcript(transcript) => Ok(transcript.clone()),
-            State::Model(wait) => Ok(wait.transcript().clone()),
+            State::Transcript(transcript) => Ok(std::borrow::Cow::Borrowed(transcript)),
+            State::Model(wait) => Ok(std::borrow::Cow::Borrowed(wait.transcript())),
+            State::Tools(tools) => tools.transcript().map(std::borrow::Cow::Owned),
+        }
+    }
+    /// `transcript`, taking the continuation instead of copying from it.
+    pub fn into_transcript(self) -> Result<TranscriptCheckpoint, Error> {
+        match self.state {
+            State::Transcript(transcript) => Ok(transcript),
+            State::Model(wait) => Ok(wait.into_transcript()),
             State::Tools(tools) => tools.transcript(),
         }
     }

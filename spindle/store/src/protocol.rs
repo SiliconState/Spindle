@@ -444,7 +444,7 @@ impl Event<'_> {
                 json!({"type": "tool_result", "content": content, "failed": failed})
             }
             Event::TaskReported { task, text } => {
-                json!({"type":"task_reported","task":task,"text":text})
+                json!({"type":"task_reported","task":task,"name":crate::reads::task_name(task),"text":text})
             }
             Event::Task { task, event } => json!({"type":"task","task":task,"event":event}),
             Event::AppToolDetails { call, details } => {

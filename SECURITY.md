@@ -46,8 +46,9 @@ them.
 
 - Session stores keep prompts, model requests and replies, files, app state, tool results
   and usage **unencrypted** in the session directory. The browser host also keeps
-  `host.sqlite`, uploads and a trash directory; migrations keep a backup of the previous
-  store. Deleting a session is not secure erasure.
+  `host.sqlite`, uploads and a trash directory; native migrations keep a backup of the
+  previous store. Schema 19-to-20 embedded migration is in place without a backup;
+  store compaction removes free pages, not history. Deleting a session is not secure erasure.
 - Do not put secrets or personal data into a session unless you accept that they are
   retained there and sent to the provider.
 - Session directories, the host directory, `pairing.key`, API tokens and the Dext state
@@ -115,8 +116,11 @@ See [docs/tools.md](docs/tools.md) for the full execution model.
   not globally unique across sessions. An app that runs side effects for app tool calls
   must deduplicate by **session identity plus call id**. Spindle does not make a third-party
   API idempotent.
-- Dollar budgets refuse a request before it is sent when its worst case would not fit;
-  they depend on catalog prices and conservative estimates, not exact provider billing.
+- Dollar budgets on both hosts use the same [ledger](spindle/store/src/spend.rs)
+  and refuse a request before it is sent when its worst case would not fit. They
+  depend on catalog prices and conservative estimates, not exact provider billing.
+  Embedded task-tree accounting covers hosts open together; after a restart, earlier
+  child spend counts in its own store only ([embedded.md](docs/embedded.md#settings-and-limits)).
 - The store relies on SQLite and the filesystem honoring flushes, and on one cooperating
   owner per session. Owner epochs fence store writes, not processes or remote receivers.
   There is no anti-rollback protection: restoring an old but consistent copy of a store
@@ -141,19 +145,36 @@ flowchart LR
   it for a random per-device token in an `HttpOnly; SameSite=Strict` cookie (`Secure` when
   the request came through the configured HTTPS origin). `host.sqlite` stores only each
   token's SHA-256, so one screen can be revoked without re-pairing the others.
-- **API tokens.** `spindle token new NAME` mints a named bearer token for `/v1`; tokens
-  can be listed and revoked.
+- **API tokens.** `spindle token new NAME` mints a named bearer token for `/v1`;
+  tokens can be listed and revoked. Prefer `token new NAME --runner` for a remote
+  command runner: only `GET /v1`, `/v1/runner`, `/v1/run` and that token's run status
+  and stop routes are reachable. Session, transcript and phone `/api` access are
+  refused, including when it is supplied as a cookie
+  ([`serve/v1.rs`](spindle/store/src/serve/v1.rs)).
+- **Deadlines.** A request head must arrive within 10 seconds overall. Once
+  authorized, its body has 10 seconds, or 2 minutes for uploads and `/v1/run`;
+  trickled bytes do not extend those deadlines
+  ([`serve/http.rs`](spindle/store/src/serve/http.rs)).
 - **Remote access** must go through an authenticated HTTPS reverse proxy with
   `--origin https://HOST`. With `--access-team` and `--access-aud`, the host itself
   verifies the Cloudflare Access token on every request that arrived through the public
   origin: an RS256 JWT signed by one of the team's current keys, issued by the team, for
   that application's audience, and unexpired. A stolen device cookie alone does not pass.
-- **Previews** of workspace sites are served under random, read-only tokens that expire
-  after 30 minutes and are held only in memory. Every preview response is sandboxed
-  (`allow-scripts allow-forms allow-modals`, never `allow-same-origin`), so it runs in an
-  opaque origin without the host's cookies, storage or API, and its fetches are limited to
-  the token's own files. An operator can grant one preview token access to the GitHub API;
-  that can disclose page data to GitHub.
+- **Previews** use random, read-only grants expiring after 30 minutes, held only
+  in memory. Scripts default off (`scripts: false`); true grants every page, a
+  path only that page. A GitHub grant also permits scripts, even if `scripts` is
+  false or omitted, and adds only API connections and avatar images. Every response
+  has `Connection-Allowlist` for its token prefix (plus those GitHub origins),
+  empty without a live token, and
+  `X-DNS-Prefetch-Control: off`. Meta refreshes and resource hints are removed.
+  Where the browser enforces the allowlist, all other connections, including WebRTC,
+  are blocked. `GET /api/preview/check` detects this; a `contained` grant checks
+  again before running its page. Elsewhere **Run scripts** allows one page version
+  on that device, and can disclose what the page shows: CSP alone is not an offline
+  guarantee. Sandboxes never grant `allow-same-origin`, host cookies, storage or
+  API access; forms submit nowhere. Features `preview_scripts` and
+  `preview_contained` advertise the controls. See
+  [`preview.rs`](spindle/store/src/serve/preview.rs) and [host.md](docs/host.md#previews).
 - The host is a trusted single-operator API, not tenant-scoped authorization. Exposing the
   loopback port, a proxy misconfiguration, or a compromised process of the same user
   defeats these checks.
@@ -175,8 +196,10 @@ See [docs/host.md](docs/host.md).
 - Threads, credentials and files stay in the extension's storage. Requests go to the
   chosen provider, to sites a thread's network or scripts are granted, and to a relay or
   Spindle host only if the user configures one.
-- API keys and browser sign-ins are sealed at rest with AES-GCM, each bound to its
-  provider. By default the sealing key is a non-extractable key in the same profile: this
+- API keys, browser sign-ins and the connected host's runner token are sealed at
+  rest with AES-GCM, bound to their separate record ids (the host uses `:host`,
+  not a provider id). The host URL is readable, never its token. By default the
+  sealing key is a non-extractable key in the same profile: this
   keeps credentials out of the profile's files as text, but a copy of the whole profile
   carries that key too. A passphrase (Settings, Providers) wraps the sealing key with a key
   derived by PBKDF2-SHA-256 (600,000 rounds), so a copy of the profile made afterwards is
@@ -207,7 +230,22 @@ See [docs/host.md](docs/host.md).
 - A saved key or sign-in is bound to the provider address it was saved for: importing a
   provider list that points that provider (or its token endpoint) elsewhere does not send the
   credential there.
-- Previews of workspace pages cannot navigate their frame away; one allowed to load from the
-  web gets only the workspace files it names.
+- Previews of workspace pages cannot navigate their frame away. The service worker
+  sets an empty `Connection-Allowlist` for offline previews; scripts run without a
+  choice only when that protection is detected. Otherwise static previews remove
+  scripts and frames until the user allows that version. Choices bind the page,
+  scripts and named data files, checked against workspace digests; changes ask again.
+  Meta refreshes and resource hints, including those inside templates, are removed,
+  DNS prefetch is off, and markup that cannot be safely reparsed is shown as text.
+  **Load from the web** allows scripts and HTTPS connections under a separate
+  allowlist. Allowed uncontained scripts can disclose page data despite CSP.
+  Sources: [`page.mjs`](spindle/chrome/page.mjs),
+  [`preview.js`](spindle/chrome/preview.js), [`background.js`](spindle/chrome/background.js).
+- A move durably commits its bundle before sealing and removes redundant OPFS
+  stores only after reading the saved bytes back. Storage > Free checks older
+  moved bundles whole before deleting sealed stores. Reset backups are temporary,
+  removed once the reset or recovery finishes. Strict IndexedDB commits and synced,
+  checked store replacements reduce crash windows; they are not secure erasure or
+  protection against an old profile copy ([chrome.md](docs/chrome.md#storage-controls)).
 
 See [docs/chrome.md](docs/chrome.md) and [docs/browser-linux.md](docs/browser-linux.md).

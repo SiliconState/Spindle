@@ -1046,12 +1046,12 @@ fn tagged(tag: &[u8], value: &Value) -> Result<Vec<u8>> {
 fn records(db: &Connection, scope: &str, kind: &str, tag: &[u8]) -> Result<Vec<(String, Value)>> {
     let upper = format!("{}f", &kind[..kind.len() - 1]);
     let mut query = db.prepare_cached(
-        "SELECT o.digest,o.bytes FROM artifact_stages s JOIN staging_pins p ON p.stage=s.id JOIN objects o ON o.digest=p.digest WHERE s.id>=?1 AND s.id<?2 AND s.scope=?3",
+        "SELECT o.digest,o.bytes,o.size FROM artifact_stages s JOIN staging_pins p ON p.stage=s.id JOIN objects o ON o.digest=p.digest WHERE s.id>=?1 AND s.id<?2 AND s.scope=?3",
     )?;
     let rows = query.query_map(params![kind, upper, scope], |row| {
         Ok((
             crate::bounded_label(row, 0)?,
-            crate::bounded_blob(row, 1, crate::artifact::MAX_OBJECT)?,
+            crate::artifact::checked_at(row, 0, 1)?,
         ))
     })?;
     let mut out = vec![];
@@ -1330,10 +1330,8 @@ impl Scoped {
 
 fn load_snapshot(db: &Connection, digest: &str) -> Result<Snapshot> {
     let bytes: Vec<u8> = db
-        .prepare_cached("SELECT bytes FROM objects WHERE digest=?1")?
-        .query_row([digest], |row| {
-            crate::bounded_blob(row, 0, crate::artifact::MAX_OBJECT)
-        })?;
+        .prepare_cached(crate::artifact::STORED)?
+        .query_row([digest], |row| crate::artifact::object_at(row, 0))?;
     if crate::artifact::object_digest(&bytes) != digest || !bytes.starts_with(SNAPSHOT) {
         return Err(Error::Incompatible);
     }

@@ -1092,6 +1092,9 @@ pub trait Inbox: Send + Sync {
 }
 
 impl Step<'_> {
+    /// What a finished turn does about its background tasks: reads the report of one
+    /// that ended (its answer, or that it stopped without one, and why when it says: the
+    /// session goes on either way), or waits while any still runs.
     pub(crate) fn task_report_need(
         &mut self,
         revision: u64,
@@ -1101,12 +1104,6 @@ impl Step<'_> {
             return Ok(Some(Need::Continue));
         }
         let runs = self.store.task_runs().map_err(store_error)?;
-        if let Some(run) = runs.iter().find(|run| run.queued && run.state == "stopped") {
-            return Err(format!(
-                "background task `{}` stopped without an answer; inspect its session before starting it again",
-                run.task
-            ));
-        }
         Ok(runs
             .iter()
             .any(|run| run.queued && run.state == "running")
@@ -1120,44 +1117,51 @@ impl Step<'_> {
     ) -> Result<bool> {
         let runs = self.store.task_runs().map_err(store_error)?;
         let mut retained = None;
-        for (_, payload) in crate::view::ReadView::from_store(self.store)
+        for (sequence, command, payload) in crate::view::ReadView::from_store(self.store)
             .queued_inputs()
             .map_err(store_error)?
         {
             if let Action::TaskReport { task, text } =
                 Action::decode(&payload).map_err(store_error)?
             {
-                retained = Some((task, text));
+                retained = Some((sequence, command, task, text));
                 break;
             }
         }
-        let run = match &retained {
-            Some((task, _)) => Some(
-                runs.iter()
-                    .find(|run| &run.task == task)
-                    .ok_or("admitted task report has no task")?,
-            ),
-            None => runs
-                .iter()
-                .find(|run| run.queued && run.state == "finished" && run.delivered.is_none()),
+        let pending = |run: &&crate::meta::TaskRun| {
+            run.queued
+                && matches!(run.state.as_str(), "finished" | "stopped")
+                && run.delivered.is_none()
         };
-        let Some(run) = run else {
-            return Ok(false);
+        let report = |run: &crate::meta::TaskRun| {
+            crate::turn::task_report_of(&run.task, run.state == "stopped", run.answer.as_deref())
+                .map_err(store_error)
         };
-        if !run.queued || run.state != "finished" || run.delivered.is_some() {
-            return Err("admitted task report is not pending".into());
+        // One admitted before a crash goes as it was admitted, unless its task moved on
+        // since (started again after it stopped, say): then it tells nothing true now,
+        // and is dropped for the task's report as it stands.
+        let mut chosen = None;
+        if let Some((sequence, command, task, text)) = retained {
+            match runs.iter().find(|run| run.task == task).filter(pending) {
+                Some(run) if report(run)? == text => chosen = Some((run, command, text)),
+                _ => self
+                    .store
+                    .drop_admission(sequence, &format!("drop-{sequence}"))
+                    .map_err(store_error)?,
+            }
         }
-        let text = crate::turn::task_report_text(
-            &run.task,
-            run.answer.as_deref().ok_or("finished task has no answer")?,
-        )
-        .map_err(store_error)?;
-        if retained.is_some_and(|(_, kept)| kept != text) {
-            return Err("admitted task report differs from its retained answer".into());
-        }
+        let (run, command, text) = match chosen {
+            Some(chosen) => chosen,
+            None => {
+                let Some(run) = runs.iter().find(pending) else {
+                    return Ok(false);
+                };
+                (run, self.report_command(&run.task)?, report(run)?)
+            }
+        };
         let after = state.task_report(text.clone()).map_err(turn_error)?;
         self.commit_action(
-            format!("task-report-{}", run.task),
+            command,
             &Action::TaskReport {
                 task: run.task.clone(),
                 text: text.clone(),
@@ -1170,6 +1174,25 @@ impl Step<'_> {
             text: &text,
         });
         Ok(true)
+    }
+
+    /// The command a task's next report goes as: a task started again after it reported
+    /// stopping reports again, under a command of its own.
+    fn report_command(&mut self, task: &str) -> Result<String> {
+        let base = format!("task-report-{task}");
+        let mut command = base.clone();
+        for next in 2.. {
+            if self
+                .store
+                .admitted(SCOPE, &command)
+                .map_err(store_error)?
+                .is_none()
+            {
+                break;
+            }
+            command = format!("{base}-{next}");
+        }
+        Ok(command)
     }
 
     fn steer_queued(&mut self, revision: u64, state: &TurnContinuation) -> Result<bool> {
@@ -1311,8 +1334,8 @@ impl Step<'_> {
         budget: usize,
         force: bool,
     ) -> Result<Option<CompactCall>> {
-        let transcript = state.transcript().map_err(turn_error)?;
-        let size = transcript_bytes(&transcript)?.len();
+        let transcript = state.transcript_ref().map_err(turn_error)?;
+        let size = transcript_len(&transcript)?;
         let command = format!("compact-r{revision}");
         // A compaction admitted before a crash is committed exactly as admitted (its
         // summary was paid for once and is never asked for again), whatever the size.
@@ -1359,7 +1382,7 @@ impl Step<'_> {
                     dropped: transcript.messages[..cut].to_vec(),
                     prompt,
                     keep,
-                    transcript,
+                    transcript: transcript.into_owned(),
                 }
             }
         };
@@ -1472,7 +1495,7 @@ impl Step<'_> {
             });
         }
         self.ensure_idle()?;
-        let prior = TurnContinuation::restore(&snapshot.continuation).map_err(turn_error)?;
+        let prior = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
         let transcript = prior.transcript().map_err(turn_error)?;
         let command = self.turn_command(snapshot.revision, &prompt)?;
         if self
@@ -1491,7 +1514,7 @@ impl Step<'_> {
                 overflowed: false,
             });
         }
-        let history = transcript_bytes(&transcript)?.len();
+        let history = transcript_len(&transcript)?;
         let overflowed = std::mem::take(&mut self.driver.compact_next);
         let force = overflowed || 2 * history + live.reply_reserve > crate::MAX_PAYLOAD;
         let pending = StartPending {
@@ -1546,7 +1569,7 @@ impl Step<'_> {
                         "`{command}` holds another command; run `spindle doctor`"
                     ));
                 };
-                let initial = TurnContinuation::restore(&initial).map_err(turn_error)?;
+                let initial = crate::turn::restored(&initial).map_err(turn_error)?;
                 let request =
                     ModelWait::restore(&request).map_err(|_| "invalid admitted model request")?;
                 (initial, request.request().clone())
@@ -2053,9 +2076,9 @@ fn admitted_prompt(payload: &[u8]) -> Option<String> {
     let Ok(Action::Start { initial, .. }) = Action::decode(payload) else {
         return None;
     };
-    let transcript = TurnContinuation::restore(&initial)
+    let transcript = crate::turn::restored(&initial)
         .ok()?
-        .transcript()
+        .into_transcript()
         .ok()?;
     match transcript.messages.last()?.content.as_slice() {
         [Block::Text { text }] => Some(text.clone()),
@@ -2133,6 +2156,13 @@ pub(crate) fn context_overflow(status: u16, body: &str) -> bool {
 pub(crate) fn transcript_bytes(transcript: &TranscriptCheckpoint) -> Result<Vec<u8>> {
     transcript
         .checkpoint()
+        .map_err(|error| format!("history rejected ({error:?})"))
+}
+
+/// `transcript_bytes(transcript)?.len()`, without building them.
+fn transcript_len(transcript: &TranscriptCheckpoint) -> Result<usize> {
+    transcript
+        .checkpoint_len()
         .map_err(|error| format!("history rejected ({error:?})"))
 }
 
@@ -2237,7 +2267,7 @@ impl Step<'_> {
         if snapshot.revision == 0 {
             return Err("this session has no turns yet".into());
         }
-        let state = TurnContinuation::restore(&snapshot.continuation).map_err(turn_error)?;
+        let state = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
         Ok((snapshot.revision, state))
     }
     pub(crate) fn proposal(
@@ -2356,7 +2386,7 @@ impl Step<'_> {
         if snapshot.revision == 0 {
             return Ok(());
         }
-        let prior = TurnContinuation::restore(&snapshot.continuation).map_err(turn_error)?;
+        let prior = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
         match prior.control().phase() {
             Phase::Stopped(Stop::Complete) => Ok(()),
             Phase::Stopped(stop) => Err(format!(

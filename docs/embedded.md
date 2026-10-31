@@ -125,7 +125,8 @@ message, and API faults use the fault's kind.
 | `Embedded.setRunner(identity)` / `setAppRunner(identity)` | Bind the remote runner's or the app runner's sandbox identity (64 hex digits, or `null`) |
 | `Embedded.setHttpGrants(json)` | The sites script `http()` calls may reach |
 | `Embedded.ownSession(dir, release)` | OPFS: the app holds `dir`'s Web Lock; `release` gives it back |
-| `Embedded.exportSession(dir, keep, settings)` / `importSession(dir, bytes)` | Session bundles (see [Moving sessions](#moving-sessions)) |
+| `Embedded.exportSession(dir, keep, settings, whole)` / `importSession(dir, bytes)` | Session bundles (see [Moving sessions](#moving-sessions)) |
+| `Embedded.checkBundle(bytes)` | Checks a bundle as an import would, writing nothing; returns JSON `{head, identity, files}` |
 | `Embedded.catalog()` / `efforts(provider, model)` | The catalog in use (no credentials); the effort levels a route accepts |
 | `installNodeFs(fs, platform)` | Gives the VFS its `fs` and registers it (see [Node storage](#node-and-electron-storage)) |
 | `nodeLockHolder(database)` | What a store's lock file says about its owner |
@@ -232,9 +233,14 @@ overlap, and each returns a Promise of its result. `prompt`, `resume`, `retry`,
 | `settings(dir, changes)` | `settings` |
 | `state(dir, revision)`, `setState(dir, patch, { expectedHead })` | `state`, `state_set` |
 | `recover(dir)` | `recover` |
-| `taskStart(dir, task, prompt, options)` | `task_start` (only `report: 'wait'`) |
-| `exportSession(dir, { keep, settings })` | A session bundle as a `Uint8Array` (see [Moving sessions](#moving-sessions)) |
-| `importSession(dir, bytes)` | Continues a bundle as `dir`; resolves with the status plus `imported` |
+| `usage(dir)` | `usage`: the session's own spend, not its tasks' |
+| `capabilities()`, `fit(dir, { runner })` | What the package runs, and the settings changes a session needs here; see [Settings and limits](#settings-and-limits) |
+| `taskStart(dir, task, prompt, options)` | `task_start`, with `report: 'wait'` or `'queue'` |
+| `tasks(dir)`, `taskWait(dir, task)`, `taskStop(dir, task)` | Task listing, current state (does not wait), and cancellation |
+| `compactSession(dir)` | Method `compact`: returns free store pages to disk; `{session, before, after, stores}` |
+| `exportSession(dir, { keep, settings, whole })` | A session bundle as a `Uint8Array` (see [Moving sessions](#moving-sessions)) |
+| `checkBundle(bytes)` | Synchronously checks the bundle whole, writing nothing; `{head, identity, files}` |
+| `importSession(dir, bytes)` | Continues a bundle as `dir`; resolves with the status plus `imported` and `fit` |
 | `tool(definition)` | Registers an app tool (the same shape as the stdio client's; see [clients.md](clients.md#app-tools)) |
 | `connectRunner(kind, runner)` | Connects (or with `null`, disconnects) the `'app'` or `'remote'` runner and binds the sandbox identity it declares |
 | `setHttpGrants(grants)` | The sites script `http()` calls may reach |
@@ -248,8 +254,12 @@ The embedded backend ([`backend.rs`](../spindle/store/src/embedded/backend.rs))
 answers `info`, `providers`, `list`, `create`, `open`, `status`, `close`, `prompt`,
 `continue`, `retry`, `rewind`, `task_start`, `stop`, `steer`, `state`, `state_set`,
 `app_tool_result`, `history`, `files`, `read`, `targets`, `settings`, `recover`,
-`code_call` and `code_answer`. Any other method (for example `usage`, `doctor`,
-`export`, `tasks`, `task_wait`, `task_stop`) fails with `method_not_found`.
+`usage`, `capabilities`, `fit`, `tasks`, `task_wait`, `task_stop`, `compact`,
+`code_call` and `code_answer`. `doctor` and workspace `export` are not offered
+(`method_not_found`); session bundles use the methods above. `info.features`
+includes `usage`, `capabilities` and `tasks` for these additions. Status has stable
+`activity` codes shared with the native host, plus `waiting_tasks` and `background`,
+and a `background` count; `list` entries instead carry boolean `background`. See [API.md](API.md).
 
 ### Events and errors
 
@@ -307,33 +317,40 @@ sequenceDiagram
   A->>C: prompt(dir, text)
   C->>E: handle prompt request
   E->>S: record the prompt
-  E-->>C: event frames and work authorize
+  E-->>C: work authorize
   C->>A: credentials(facts)
   A-->>C: key
-  Note over C: fills the auth templates, the headers stay in JavaScript
   C->>E: deliver authorized
-  E->>S: reserve the model request
-  E-->>C: work fetch with endpoint and body
-  C->>P: POST endpoint with headers
-  loop each body chunk
-    P-->>C: SSE bytes
-    C->>E: chunk(bytes)
-    E-->>C: model_delta events
-    C-->>A: event
-  end
+  E->>S: reserve request
+  E-->>C: work fetch
+  C->>P: POST with headers
+  P-->>C: SSE bytes
+  C->>E: chunk(bytes)
+  E-->>C: model_delta events
+  C-->>A: event
   C->>E: deliver response status
-  E->>S: record the response and commit the step
-  opt the model called tools
-    E->>S: file tools run inside the store
-    E-->>C: work run, for bash
-    C->>R: run(command, files)
-    R-->>C: output and changed files
-    C->>E: deliver ran
-    Note over E,C: the next model request is authorized and fetched the same way
-  end
-  E-->>C: reply frame with head and stopped
+  E->>S: record and commit
+  E->>S: run file tools
+  E-->>C: work run, for bash
+  C->>R: run(command, files)
+  R-->>C: output and files
+  C->>E: deliver ran
+  E-->>C: work authorize
+  C->>A: credentials(facts)
+  A-->>C: key
+  C->>E: deliver authorized
+  E-->>C: work fetch
+  C->>P: next request
+  P-->>C: final reply
+  C->>E: chunks and response
+  E->>S: record and commit
+  E-->>C: reply head and stop
   C-->>A: prompt resolves
 ```
+
+The app fills authentication templates only in JavaScript. Each response chunk
+repeats the chunk/event exchange; a tool-using round is shown, and its next model
+request is authorized and fetched the same way. Tool-free replies skip dispatch.
 
 ### Unknown outcomes
 
@@ -365,7 +382,11 @@ storage ([`embed/src/places.rs`](../spindle/embed/src/places.rs)).
 
 Every store is opened through `Store::from_connection` behind a guard that is released
 only after SQLite has closed. The store runs SQLite in exclusive locking mode with a
-zero busy timeout, so one connection uses a database at a time.
+zero busy timeout, so one connection uses a database at a time. Schema 19 migrates
+in place to schema 20, which packs workspace objects; older schemas need a native
+open first. Every store sets `journal_size_limit` to 16 MiB: after a checkpoint
+consumes a grown WAL, the file is truncated back to that limit rather than keeping
+its peak size.
 
 ### Node and Electron storage
 
@@ -392,6 +413,8 @@ through the VFS.
   file left
   by a crashed owner is never taken over automatically, because nothing can tell a dead
   app from a live one. The session stays refused until an operator deletes the file.
+  A native host writes no metadata into a store the package holds or a session sealed
+  as moved, even after the package's SQLite connection has closed for a compaction.
 - **Other details.** Temporary files are not supported (SQLite's `temp_store` stays in
   memory). New directories are created with mode `0700` and files with mode `0600`.
   ENOSPC and EDQUOT map to `SQLITE_FULL`.
@@ -423,7 +446,9 @@ runs over that pool.
 - Each slot holds one file. Its first 4096 bytes are a header with the magic
   `spindle-opfs-slot-v1` and the path the slot holds, and the file's data follows.
   Directories are path prefixes, `mkdirSync` does nothing, and a rename rewrites slot
-  headers. A file that replaces another takes the name first, under a newer generation
+  headers. Header reads and writes complete the full 4096 bytes even when an access
+  handle transfers fewer bytes per call; renaming a file to itself is a no-op. A file
+  that replaces another takes the name first, under a newer generation
   (the header's last 8 bytes), and the old slot is emptied after, so a crash between
   leaves the new file under the name and the next open empties the older slot. A
   directory of several files moves under a record of the move, kept in a free slot from
@@ -444,6 +469,25 @@ OPFS stores have no lock file of their own. Inside OPFS a session keeps only its
 and each task's `task.json`. No `session.json` or `owner.lock` is kept, because each
 file takes a pool slot and no native host opens an OPFS directory in place. A session
 leaves OPFS only as a bundle.
+
+### Giving space back
+
+`compactSession(dir)` (JSON-RPC `compact {dir}`) compacts the session's store and
+its tasks' stores without removing history. An open session closes first; a turn
+or background task still running refuses it with `busy`. It returns `{session,
+before, after, stores}`, sizes in bytes. Memory storage answers zeros and leaves
+the session open.
+
+For Node and OPFS, [`places.rs`](../spindle/embed/src/places.rs) holds exclusion
+through the replacement. Each store is opened to copy it beside itself with
+`Store::compact_into` (`VACUUM INTO`, pages written directly to disk, not another
+whole image in memory). The original closes; the copy is synced, opened alone
+and checked page by page and record by record, with its head compared to the
+original. Only then is it renamed over the store. A crash leaves the old store
+or a whole compacted store under its name;
+the next compaction removes an unfinished `.compact` copy. Free pages left by a
+migration or deleted objects can thus be returned to disk, rather than only reused
+by SQLite. This is different from conversation compaction, which summarizes history.
 
 ### Memory storage
 
@@ -489,16 +533,24 @@ sandbox, the turn fails before the command runs. New sessions default to
 
 `remoteRunner({ url, token, fetch })` (in [`embedded.mjs`](../spindle/clients/js/embedded.mjs))
 sends each command to a native Spindle host started with `spindle serve`, authenticated
-with a host API token (see [cli.md](cli.md) and [host.md](host.md)). The host runs
+with a token minted by `spindle --dir HOST token new NAME --runner` (see
+[cli.md](cli.md) and [host.md](host.md)); that token reaches no sessions or transcripts. The host runs
 the command in its sandbox, over a copy of the workspace sent with the request, and
 returns the output and the changed files. The embedded store records them as the
 call's result and new workspace, so a rewind still covers what the command did. The
-host keeps nothing from a run.
+host keeps no workspace from a run. The client gives each run a `run` id and, when
+its signal aborts, posts `/v1/run/ID/stop` with a separate 10-second deadline.
+The host retains a stop that overtakes the upload. Against an older host returning
+404 for the stop route, the remote command runs out its timeout. `GET /v1/run/ID`
+reports the run's state to its starting token only. The original request still
+returns its result if the client waits. These routes require feature `run_stop`;
+see [API.md](API.md#routes).
 
 | Route | Request | Response |
 | --- | --- | --- |
 | `GET /v1/runner` | Bearer token | `{helper, isolated, implementation}`: the sandbox identity (64 hex digits) |
-| `POST /v1/run` | `{command, timeout_s, network, files: [{path, base64, executable}], links: [{path, target}], directories}` | `{output, success, writes: [{path, base64, executable}], deletes, links, directories, failure, helper}` |
+| `POST /v1/run` | `{command, timeout_s, network, files: [{path, base64, executable}], links: [{path, target}], directories, run?}` | `{output, success, writes: [{path, base64, executable}], deletes, links, directories, failure, helper}` |
+| `GET /v1/run/ID`, `POST /v1/run/ID/stop` | The same starting token | `{run, state}`: `running`, `stopping`, `stopped` or `finished` |
 
 [`agent/runner.rs`](../spindle/store/src/agent/runner.rs) and
 [`serve/v1.rs`](../spindle/store/src/serve/v1.rs) implement the host side:
@@ -511,8 +563,9 @@ host keeps nothing from a run.
   sent back.
 - A malformed request is answered with `400` (`bad_request`), and a request without a
   valid token with `401`.
-- The host runs the command to its end or its timeout. Aborting the HTTP request does
-  not interrupt it there.
+- Disconnecting a request alone does not interrupt the host command; the explicit
+  named-run stop does. The embedded client's abort sends that stop separately.
+  If it fails, the command may continue until its timeout.
 
 `connectRunner('remote', runner)` calls `identity()` (with a 10-second timeout) and
 binds that identity to the sessions whose `runner` is `remote`. With no remote runner
@@ -570,13 +623,17 @@ A bundle may carry only paths a session directory has: `store/authority.sqlite`,
 `session.json`, and under `tasks/<key>/` (nested at most 16 deep) the same files plus
 `task.json`. It holds at most 4096 files, and each sidecar is JSON of at most 4 MiB.
 Reading checks the framing, every digest, the manifest, every path and every store
-(as a full open would), and the store schema must match this build. Each
+(as a full check would); stores use schema 20 or schema 19, which migrates on open. Each
 `session.json` is rebuilt from its store's own settings. All of this happens before a
 host writes any file. Files are ordered deepest task first, with each place's store
 after its sidecars and the session's own store last, so an import cut short leaves no
 session behind.
 
-`exportSession(dir, { keep, settings })` is refused while an operation runs. It images
+`exportSession(dir, { keep, settings, whole })` is refused while an operation or
+background task runs. A move checks every store record before sealing. A copy
+(`keep: true`) checks pages, schema and bundle facts; importing always checks every
+record. `whole: true` makes a copy do the full check too, for a backup the app may
+need to return to. It images
 the session's store and every task store (opening each, so nothing else runs it
 meanwhile) and writes the bundle. Unless `keep` is set, the session then moves: its
 place is sealed first (if sealing fails, nothing moves and no bundle is returned), its
@@ -588,7 +645,9 @@ session settings, and `provider` and `model` must be named together.
 `importSession(dir, bytes)` requires a place with nothing in it (otherwise it fails
 with `conflict`). It writes the files in bundle order, opens the session (the same
 session, with its identity, history and unknown outcomes), and resolves with its
-status plus `imported: {head, identity, files}`.
+status plus `imported: {head, identity, files}` and `fit: {changes, notes, refused}`.
+`fit` changes nothing itself. `checkBundle(bytes)` performs the same whole check
+without importing or writing files, returning `{head, identity, files}`.
 
 On the native side, bundles are made and continued with
 `spindle --dir DIR export-session FILE [--keep]` and
@@ -658,8 +717,8 @@ model writes the summary, which is another authorized and fetched request; the d
 stands in when it fails), `isolation: 'auto'`, `effort: 'default'` and `runner:
 'none'`. `create` and `settings` accept `provider`, `model`, `network`, `isolation`,
 `effort`, `compaction`, `tools`, `builtin_tools`, `instructions`, `resend_unknown`,
-`tasks` and `runner`, plus `toolchain`, `sources` and `max_usd` only in their cleared
-forms (`false`, `[]`, `null`).
+`tasks`, `runner` and `max_usd`, plus `toolchain` and `sources` only in their cleared
+forms (`false`, `[]`).
 `network` is passed to the runner as the session's grant.
 
 `check_settings` in [`host.rs`](../spindle/store/src/embedded/host.rs) refuses the
@@ -671,15 +730,58 @@ following, naming each (with its fix where there is one):
 | `toolchain: true` | Needs a native host |
 | `sources` other than `[]` | Names host directories the app does not have |
 | `self_edit` | A native host's own setting; the package cannot change it, so such a session runs only on a native host |
-| `max_usd` other than `null` | Needs the native host's spend ledger; enforce budgets in the app |
+
+`capabilities()` reports `host: 'embedded'`, `builtin_tools: ['files', 'none']`,
+`runners: ['app']` (also `'remote'` when connected), `network: true`, `budget: true`,
+`tasks: ['wait', 'queue']`, `compaction: ['model', 'digest']`, and false for
+`toolchain`, `sources` and `self_edit`. `fit(dir, {runner})` proposes one settings
+patch (`runner` defaults to `app`), explains changes and carried settings in
+`notes: [{setting, from, to, why}]`, and lists unsupported self-edit in `refused`.
+It turns `all` tools into `files`, supplies a runner when needed and clears host
+sources and toolchain; network and budget carry over. An import returns this
+report too, without applying it.
+
+**Spend and budgets.** [`spend.rs`](../spindle/store/src/spend.rs) is the ledger
+shared with the native host. `max_usd` is a dollar cap (null removes it). Recorded
+replies, compaction summaries and scripts' nested model calls count at retained
+catalog prices; unknown sends count at their worst case. A fresh request that
+would not fit is not sent (the embedded backend reports this failure as `failed`,
+not native stdio's `budget` code). A budget alone can change between steps,
+including mid-turn; `continue` can send the prepared request once it fits. With a
+budget, each newly counted call emits `cost`. Without one the package does no
+accounting work during turns and emits no `cost`; `usage(dir)` counts the records
+when asked.
+Calls counted here are undated. `usage` is this session's own spend, not its tasks'.
+
+**Background tasks.** A model's `task {background: true}` or app's
+`taskStart(..., {report: 'queue'})` returns immediately (`{task, queued: true}`
+for `task_start`), while the child does its work under a `dir#key` session label.
+`tasks` returns `{tasks: [{task, state, queued, answer, pending, delivered, prompt}]}`;
+`prompt` is its first prompt line. `task_wait` returns the current task state without
+waiting; the app follows work and events. `task_stop` stops the child where it is.
+Its retained report is read at the parent's next model boundary or `continue`:
+an answer, or `[task KEY: stopped]` with a reason when it could not go on. A stopped
+task cannot wedge its parent. Reports emit `task_reported` and appear in history
+as task-report text blocks.
+
+A finished parent turn waits for its running tasks (`activity: 'waiting_tasks'`).
+Stopping only that wait ends the turn as finished and leaves the tasks running
+(`background` between turns); a native host instead stops them too. Reports wait
+for the parent's next turn. Close, export and compaction refuse running background
+tasks. After an app restart, the next turn reattaches them; reads do not. Unknown
+requests are never resent: such a child stops and reports why. Starting the same
+task id again requires matching input, resumes a stopped child and does not rerun
+a finished one. Depth, model policy, route and effort are checked before retention.
+Under a budget, child settings may narrow the parent's cap, and all open hosts of
+the task tree share spend and worst-case in-flight reservations, including nested
+calls and summaries. After a restart, earlier child spend counts in its own store
+only. Sources: [`host.rs`](../spindle/store/src/embedded/host.rs) and
+[`env.rs`](../spindle/store/src/embedded/env.rs).
 
 Other limits that follow from the code:
 
-- Background tasks are not supported: a session that waits for them fails. `task_start`
-  accepts only `report: 'wait'`. Tasks the model starts run as child sessions inside
-  the same package.
-- `usage`, `doctor`, `export`, `tasks`, `task_wait` and `task_stop` are not available
-  (`method_not_found`). Session packs never become active.
+- `doctor` and workspace `export` are not available (`method_not_found`). Session
+  packs never become active.
 - Providers that sign in by transforming the key are refused (a ChatGPT sign-in's
   account header is filled from the token's claim; see [Credentials](#credentials)).
 - The Node VFS has no temporary files, and a lock file left by a crashed owner needs

@@ -3,13 +3,23 @@
 //! and fonts) renders in the Files dialog and in its own tab.
 //!
 //! A preview document must never act with the host's authority. Every preview response
-//! carries a policy that sandboxes it (`sandbox allow-scripts allow-forms
-//! allow-modals`, never `allow-same-origin`): it runs in an opaque origin, without the host's cookies,
-//! storage or service worker, and cannot navigate or frame the host. Its fetch
-//! directives name only the token's own prefix, so scripts can load sibling files and
-//! nothing else by default. An explicit paired-host grant may add GitHub API connections
-//! and avatars for that token only; this can disclose page data to those sites. No
-//! host API path is granted, and forms never submit anywhere.
+//! carries a policy that sandboxes it (never `allow-same-origin`): it runs in an opaque
+//! origin, without the host's cookies, storage or service worker, and cannot navigate
+//! or frame the host. Its fetch directives name only the token's own prefix, so scripts
+//! can load sibling files and nothing else by default. A policy cannot keep a script from
+//! sending what the page shows out through WebRTC, a resource hint or a navigation (the
+//! browser looks the host up before refusing it), so every response also carries a
+//! Connection-Allowlist (`allowlist`) naming the token's prefix (and GitHub, for a GitHub
+//! grant; nothing at all without a grant, and for `check`): Chrome (152 and later) makes
+//! no connection for the page, its frames or its workers, of any kind, that the list does
+//! not name. Its scripts run only under a token minted to let them
+//! (`allow-scripts allow-forms allow-modals`): the UI asks for one without the user where
+//! the browser holds a preview to its allowlist (it asks `check`), and otherwise only
+//! once the user lets that version of the page run. Without one the page shows as it is
+//! without scripts (its `<noscript>` too), and its meta refreshes are taken out. An
+//! explicit paired-host grant may add GitHub API connections and avatars for that token
+//! only (letting scripts run too); this can disclose page data to those sites. No host
+//! API path is granted, and forms never submit anywhere.
 //!
 //! A sandboxed document's requests carry no SameSite cookie, so each one is authorized
 //! by a token in its path instead: 256 random bits, bound to one thread and revision,
@@ -41,7 +51,39 @@ struct Grant {
     session: String,
     revision: u64,
     expires: Instant,
-    github: bool,
+    reach: Reach,
+}
+
+/// What a token's pages may do: run their scripts (on the one page the user let, or on
+/// every page of the revision), and reach GitHub too. A `contained` grant runs them only
+/// where the browser keeps a running page offline (the UI asks for one where `check` says
+/// so): its pages carry `GUARD`, and nothing but its pages runs scripts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Reach {
+    pub(super) scripts: Scripts,
+    pub(super) github: bool,
+    pub(super) contained: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) enum Scripts {
+    #[default]
+    None,
+    /// That page only: a page it frames or links to shows without its scripts.
+    Page(String),
+    All,
+}
+
+impl Reach {
+    /// Whether `page` (a path of the revision) runs its scripts under this grant.
+    fn runs(&self, page: &str) -> bool {
+        let named = match &self.scripts {
+            Scripts::None => false,
+            Scripts::Page(only) => only == page,
+            Scripts::All => true,
+        };
+        named && (!self.contained || mime(page).starts_with("text/html"))
+    }
 }
 
 #[derive(Default)]
@@ -61,7 +103,7 @@ impl Grants {
         &self,
         session: &str,
         revision: u64,
-        github: bool,
+        reach: Reach,
     ) -> super::Result<(String, Duration)> {
         let token = random()?;
         let now = Instant::now();
@@ -75,13 +117,13 @@ impl Grants {
             session: session.into(),
             revision,
             expires: now + TTL,
-            github,
+            reach,
         });
         Ok((token, TTL))
     }
 
-    /// The thread and revision a live token grants.
-    fn resolve(&self, token: &str) -> Option<(String, u64, bool)> {
+    /// The thread and revision a live token grants, and what its pages may do.
+    fn resolve(&self, token: &str) -> Option<(String, u64, Reach)> {
         if !token_ok(token) {
             return None;
         }
@@ -92,7 +134,7 @@ impl Grants {
         grants
             .iter()
             .find(|grant| grant.key == wanted)
-            .map(|grant| (grant.session.clone(), grant.revision, grant.github))
+            .map(|grant| (grant.session.clone(), grant.revision, grant.reach.clone()))
     }
 
     /// Retires every token of a deleted thread.
@@ -144,9 +186,15 @@ pub(super) fn mime(path: &str) -> &'static str {
 }
 
 /// Every preview response's policy. `origin` is the host page's origin (the only page
-/// that may frame a preview) and `token` the grant whose prefix bounds every load.
-pub(super) fn policy(origin: &str, token: &str, github: bool) -> String {
+/// that may frame a preview) and `token` the grant whose prefix bounds every load;
+/// `scripts`: this response's page may run them (and with `github`, reach GitHub).
+pub(super) fn policy(origin: &str, token: &str, scripts: bool, github: bool) -> String {
     let own = format!("{origin}{PREFIX}{token}/");
+    if !scripts {
+        return format!(
+            "sandbox; default-src 'none'; script-src 'none'; style-src {own} 'unsafe-inline'; img-src {own} data: blob:; font-src {own} data:; media-src {own} data: blob:; connect-src 'none'; frame-src {own}; child-src {own}; worker-src 'none'; manifest-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors {origin}"
+        );
+    }
     let connect = if github {
         " https://api.github.com"
     } else {
@@ -161,6 +209,49 @@ pub(super) fn policy(origin: &str, token: &str, github: bool) -> String {
         "sandbox allow-scripts allow-forms allow-modals; default-src 'none'; script-src {own} 'unsafe-inline'; style-src {own} 'unsafe-inline'; img-src {own} data: blob:{images}; font-src {own} data:; media-src {own} data: blob:; connect-src {own}{connect}; frame-src {own}; child-src {own}; worker-src 'none'; manifest-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors {origin}"
     )
 }
+
+/// What a token's pages may connect to (their Connection-Allowlist): the token's own
+/// files, and with `github`, GitHub's API and avatars. Chrome (152 and later) holds every
+/// connection a page makes to it, those its policy cannot reach included (WebRTC,
+/// resource hints, navigations), in every frame and worker it opens; other browsers
+/// ignore it. `origin` and `token` are checked plain (`serve`).
+pub(super) fn allowlist(origin: &str, token: &str, github: bool) -> String {
+    let github = if github {
+        r#" "https://api.github.com/*" "https://avatars.githubusercontent.com/*""#
+    } else {
+        ""
+    };
+    format!(r#"("{origin}{PREFIX}{token}/*"{github})"#)
+}
+
+/// Script that sets `held`: whether the browser holds this document to its
+/// Connection-Allowlist. A connection made under one is given none of its ICE servers, as
+/// under nothing else (Spindle for Browser's preview.js checks the same); asking sends
+/// nothing, and without WebRTC there is no telling.
+macro_rules! held {
+    () => {
+        "let held=false;try{const probe=new RTCPeerConnection({iceServers:[{urls:'stun:127.0.0.1:9'}]});held=probe.getConfiguration().iceServers.length===0;probe.close()}catch{}"
+    };
+}
+
+/// `GET /api/preview/check`: a page that tells the page framing it whether this browser
+/// holds a preview to its Connection-Allowlist, so that the UI runs a page's scripts in
+/// its preview without asking only where it does. It holds and reads nothing.
+pub(super) const CHECK: &str = "check";
+const CHECK_PAGE: &str = concat!(
+    "<!doctype html><meta charset=utf-8><title>Spindle preview check</title><script>",
+    held!(),
+    "parent.postMessage({spindleContained:held},'*')</script>"
+);
+
+/// Runs before anything else in a page of a `contained` grant: where the browser does not
+/// keep it offline (a link opened in another browser, say), the rest of the page is taken
+/// as text, so nothing in it runs, and the page says why.
+const GUARD: &str = concat!(
+    "<script>(()=>{",
+    held!(),
+    "if(!held)document.write('<p>This page runs only where the browser keeps it offline, which this one cannot.</p><plaintext hidden>')})();</script>"
+);
 
 /// Percent-encodes a workspace path for a Location header (`/` kept).
 fn encode(path: &str) -> String {
@@ -188,16 +279,17 @@ fn find(host: &Host, session: &str, revision: u64, path: &str) -> super::Result<
         let Some((_, Some(root))) = view.at(revision)? else {
             return Ok(Found::Missing);
         };
-        let files = view.files(&root)?;
-        if let Some(file) = files.iter().find(|file| file.entry.path == path) {
-            return view.object(&file.entry.object).map(Found::File);
+        // The manifest alone (decoded once for a page's assets), never every size.
+        if let Some(entry) = view.entry(&root, path)? {
+            return view.object(&entry.object).map(Found::File);
         }
-        let index = format!("{path}/index.html");
-        Ok(if files.iter().any(|file| file.entry.path == index) {
-            Found::Directory
-        } else {
-            Found::Missing
-        })
+        Ok(
+            if view.entry(&root, &format!("{path}/index.html"))?.is_some() {
+                Found::Directory
+            } else {
+                Found::Missing
+            },
+        )
     })
     .map_err(err)
 }
@@ -220,16 +312,56 @@ pub(super) fn serve(
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':')
     });
+    if rest == CHECK && plain && request.method == "GET" {
+        let policy = format!(
+            "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; frame-ancestors {origin}"
+        );
+        return http::preview_headers(
+            stream,
+            200,
+            "text/html; charset=utf-8",
+            "",
+            Some(CHECK_PAGE.len()),
+            &policy,
+            http::NOWHERE,
+        )
+        .and_then(|()| stream.write_all(CHECK_PAGE.as_bytes()))
+        .map_err(|e| Refused(500, err(e)));
+    }
     let grant = host.previews.resolve(token).filter(|_| plain);
-    let policy = if let Some((_, _, github)) = &grant {
-        policy(origin, token, *github)
+    // What the path names (a directory's own index.html), and whether its scripts run:
+    // on the page the grant lets them on only.
+    let wanted = if path.is_empty() || path.ends_with('/') {
+        format!("{path}index.html")
     } else {
-        "sandbox; default-src 'none'; frame-ancestors 'none'".to_string()
+        path.to_string()
+    };
+    let scripts = grant
+        .as_ref()
+        .is_some_and(|(_, _, reach)| reach.runs(&wanted));
+    let (policy, allowlist) = if let Some((_, _, reach)) = &grant {
+        (
+            policy(origin, token, scripts, reach.github),
+            allowlist(origin, token, reach.github),
+        )
+    } else {
+        (
+            "sandbox; default-src 'none'; frame-ancestors 'none'".to_string(),
+            http::NOWHERE.to_string(),
+        )
     };
     let reply = |stream: &mut TcpStream, status: u16, mime: &str, body: &[u8], extra: &str| {
-        http::preview_headers(stream, status, mime, extra, Some(body.len()), &policy)
-            .and_then(|()| stream.write_all(body))
-            .map_err(|e| Refused(500, err(e)))
+        http::preview_headers(
+            stream,
+            status,
+            mime,
+            extra,
+            Some(body.len()),
+            &policy,
+            &allowlist,
+        )
+        .and_then(|()| stream.write_all(body))
+        .map_err(|e| Refused(500, err(e)))
     };
     let missing = |stream: &mut TcpStream| {
         reply(
@@ -249,7 +381,7 @@ pub(super) fn serve(
             "",
         );
     }
-    let Some((session, revision, _)) = grant else {
+    let Some((session, revision, grant_reach)) = grant else {
         return missing(stream);
     };
     if host.live(&session).is_err() {
@@ -260,11 +392,6 @@ pub(super) fn serve(
         let location = format!("Location: {PREFIX}{token}/\r\n");
         return reply(stream, 308, "text/plain; charset=utf-8", b"", &location);
     }
-    let wanted = if path.is_empty() || path.ends_with('/') {
-        format!("{path}index.html")
-    } else {
-        path.to_string()
-    };
     if !spindle_store::workspace::valid_path(&wanted) {
         return missing(stream);
     }
@@ -277,7 +404,15 @@ pub(super) fn serve(
                 Ok(Found::File(bytes)) => Some(bytes),
                 _ => None,
             };
-            let page = bundle(&html, &wanted, &format!("{PREFIX}{token}/"), read);
+            let contained = grant_reach.contained;
+            let page = bundle(
+                &html,
+                &wanted,
+                &format!("{PREFIX}{token}/"),
+                read,
+                scripts,
+                contained,
+            );
             reply(
                 stream,
                 200,
@@ -312,7 +447,10 @@ const INLINED_FILE: usize = 4 * 1024 * 1024;
 
 /// A previewed page made whole: the shim first, then the page with its own stylesheets
 /// (`<link rel=stylesheet href>`), classic scripts (`<script src>` without
-/// async/defer/module) and images (`<img src>`) of this revision inlined. A sandboxed
+/// async/defer/module) and images (`<img src>`) of this revision inlined; with
+/// `scripts` and `contained`, `GUARD` before all of it (right after a doctype). Without
+/// `scripts` (its scripts may not run) there is no shim and no script, read or kept;
+/// meta refreshes go either way (a page in a preview does not move it). A sandboxed
 /// page's subrequests carry no cookies, so behind Cloudflare Access (unless its cookie
 /// is SameSite=None) they would reach the login page instead of the files; one request
 /// for the page is all a preview then needs. URLs inside inlined stylesheets are
@@ -323,6 +461,8 @@ pub(super) fn bundle(
     path: &str,
     own: &str,
     read: impl Fn(&str) -> Option<Vec<u8>>,
+    scripts: bool,
+    contained: bool,
 ) -> String {
     let base = path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let mut budget = INLINED;
@@ -337,32 +477,67 @@ pub(super) fn bundle(
     };
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len() + SHIM.len());
-    // The shim goes right after <head> (or <html>, or the doctype: anything before a
-    // doctype would put the page in quirks mode), else first of all.
-    let doctype = {
-        let start = lower.len()
-            - lower
-                .trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n'])
-                .len();
-        lower[start..]
-            .starts_with("<!doctype")
-            .then(|| lower[start..].find('>').map(|end| start + end + 1))
-            .flatten()
+    // Where the page proper starts (`lead`): past space, comments and `<?…>`, all a
+    // doctype may follow without putting the page in quirks mode; and past its doctype
+    // (`doctype`), if it has one there.
+    let (lead, doctype) = {
+        let mut start = 0;
+        loop {
+            start = lower.len()
+                - lower[start..]
+                    .trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n', '\x0c'])
+                    .len();
+            let rest = &lower[start..];
+            let skipped = if rest.starts_with("<!--") {
+                // A comment ends at `-->`, or at `--!>` as browsers also read it.
+                [
+                    rest.find("-->").map(|end| end + 3),
+                    rest.find("--!>").map(|end| end + 4),
+                ]
+                .into_iter()
+                .flatten()
+                .min()
+            } else if rest.starts_with("<?") {
+                rest.find('>').map(|end| end + 1)
+            } else {
+                let doctype = rest
+                    .starts_with("<!doctype")
+                    .then(|| rest.find('>').map(|end| start + end + 1))
+                    .flatten();
+                break (start, doctype);
+            };
+            match skipped {
+                Some(length) => start += length,
+                None => break (start, None),
+            }
+        }
     };
+    // The shim goes right after <head> (or <html>) of the page proper, else after its
+    // doctype, else first of all.
+    let from = doctype.unwrap_or(lead);
     let at = ["<head", "<html"]
         .iter()
         .find_map(|tag| {
-            let start = lower.find(tag)?;
+            let start = from + lower[from..].find(tag)?;
             Some(start + lower[start..].find('>')? + 1)
         })
         .or(doctype)
         .unwrap_or(0);
     let mut i = 0;
-    if at > 0 {
-        out.push_str(&html[..at]);
+    // The guard goes before anything that could run: right after a doctype (only space,
+    // comments and `<?…>` come before one), else first of all.
+    if scripts && contained {
+        i = doctype.unwrap_or(0);
+        out.push_str(&html[..i]);
+        out.push_str(GUARD);
+    }
+    if at > i {
+        out.push_str(&html[i..at]);
         i = at;
     }
-    out.push_str(SHIM);
+    if scripts {
+        out.push_str(SHIM);
+    }
     while let Some(next) = lower[i..].find('<').map(|at| i + at) {
         out.push_str(&html[i..next]);
         let rest = &lower[next..];
@@ -372,8 +547,29 @@ pub(super) fn bundle(
                 .find(close)
                 .map_or(html.len(), |end| next + end + close.len())
         };
+        // A raw-text element ends at its end tag however it is spelled (`</SCRIPT >`):
+        // where that tag starts, and one past it (the page's end both, without one).
+        let raw_bounds = |name: &str| {
+            let mut at = next;
+            while let Some(found) = lower[at..].find(&format!("</{name}")) {
+                let after = at + found + 2 + name.len();
+                match lower.as_bytes().get(after) {
+                    None => return (html.len(), html.len()),
+                    Some(b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') => {
+                        let end = lower[after..]
+                            .find('>')
+                            .map_or(html.len(), |end| after + end + 1);
+                        return (at + found, end);
+                    }
+                    Some(_) => at = after,
+                }
+            }
+            (html.len(), html.len())
+        };
+        let raw_close = |name: &str| raw_bounds(name).1;
         if rest.starts_with("<!--") {
-            let end = raw_end("-->");
+            // A comment ends at `-->`, or at `--!>` as browsers also read it.
+            let end = raw_end("-->").min(raw_end("--!>"));
             out.push_str(&html[next..end]);
             i = end;
             continue;
@@ -389,8 +585,28 @@ pub(super) fn bundle(
             .unwrap_or_default()
             .to_ascii_lowercase();
         match name.as_str() {
+            // Without its scripts: none kept (an SVG's self-closed one is its tag alone).
+            "script" if !scripts => {
+                let end = raw_close("script");
+                i = if end == html.len() && tag.ends_with("/>") {
+                    tag_end
+                } else {
+                    end
+                };
+            }
+            // No meta refresh, and no page's own say over DNS prefetching (the response
+            // turns it off).
+            "meta"
+                if attributes(tag).get("http-equiv").is_some_and(|value| {
+                    let value = value.trim();
+                    value.eq_ignore_ascii_case("refresh")
+                        || value.eq_ignore_ascii_case("x-dns-prefetch-control")
+                }) =>
+            {
+                i = tag_end;
+            }
             "script" => {
-                let end = raw_end("</script>");
+                let end = raw_close("script");
                 let attributes = attributes(tag);
                 let classic = !["async", "defer", "nomodule"]
                     .iter()
@@ -412,10 +628,40 @@ pub(super) fn bundle(
                 }
                 i = end;
             }
+            // Text in a page, markup inside SVG or MathML (where `<p>` or `<meta>`, say,
+            // would break out as a page's own element): no `<` in it is read as a tag
+            // either way (`&lt;` and `\3c ` read back as `<` where it is text).
             "style" | "textarea" | "title" => {
-                let end = raw_end(&format!("</{name}>"));
-                out.push_str(&html[next..end]);
+                let (close, end) = raw_bounds(&name);
+                let close = close.max(tag_end);
+                out.push_str(tag);
+                let text = &html[tag_end..close];
+                out.push_str(&if name == "style" {
+                    text.replace('<', "\\3c ")
+                } else {
+                    text.replace('<', "&lt;")
+                });
+                out.push_str(&html[close..end]);
                 i = end;
+            }
+            // Hints that reach a host before anything asks (a preconnect looks a name
+            // up and connects even in a sandbox without scripts): none here.
+            "link"
+                if attributes(tag).get("rel").is_some_and(|rel| {
+                    rel.split_ascii_whitespace().any(|r| {
+                        matches!(
+                            r.to_ascii_lowercase().as_str(),
+                            "preconnect"
+                                | "dns-prefetch"
+                                | "prefetch"
+                                | "prerender"
+                                | "preload"
+                                | "modulepreload"
+                        )
+                    })
+                }) =>
+            {
+                i = tag_end;
             }
             "link" => {
                 let attributes = attributes(tag);
@@ -463,16 +709,28 @@ pub(super) fn bundle(
     out
 }
 
-/// The end (one past `>`) of the tag starting at `start`, skipping quoted attributes.
+/// The end (one past `>`) of the tag starting at `start`, skipping quoted attribute
+/// values (a quote starts one only right after `=`, as a browser reads a tag: a stray
+/// quote elsewhere is part of a name).
 fn tag_close(html: &str, start: usize) -> Option<usize> {
     let bytes = html.as_bytes();
     let mut quote = None;
+    let mut after_equals = false;
     for (offset, byte) in bytes[start..].iter().enumerate() {
         match (quote, byte) {
-            (None, b'"' | b'\'') => quote = Some(*byte),
             (Some(q), b) if *b == q => quote = None,
+            (Some(_), _) => continue,
+            (None, b'"' | b'\'') if after_equals => {
+                quote = Some(*byte);
+                continue;
+            }
             (None, b'>') => return Some(start + offset + 1),
             _ => {}
+        }
+        match byte {
+            b'=' => after_equals = true,
+            b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' => {}
+            _ => after_equals = false,
         }
     }
     None
@@ -651,9 +909,12 @@ mod tests {
     #[test]
     fn tokens_are_scoped_bounded_and_expire() {
         let grants = Grants::default();
-        let (token, ttl) = grants.mint("s", 3, false).unwrap();
+        let (token, ttl) = grants.mint("s", 3, Reach::default()).unwrap();
         assert!(token_ok(&token) && ttl <= Duration::from_secs(3600));
-        assert_eq!(grants.resolve(&token), Some(("s".into(), 3, false)));
+        assert_eq!(
+            grants.resolve(&token),
+            Some(("s".into(), 3, Reach::default()))
+        );
         // Forged, malformed and near-miss tokens resolve to nothing.
         let mut near = token.clone().into_bytes();
         near[0] = if near[0] == b'0' { b'1' } else { b'0' };
@@ -667,18 +928,33 @@ mod tests {
             assert_eq!(grants.resolve(&forged), None, "{forged}");
         }
         // Only MAX_GRANTS stay outstanding: the oldest gives way.
+        let scripted = Reach {
+            scripts: Scripts::Page("site/index.html".into()),
+            ..Reach::default()
+        };
+        assert!(scripted.runs("site/index.html") && !scripted.runs("site/other.html"));
         let later: Vec<String> = (0..MAX_GRANTS)
-            .map(|n| grants.mint("t", n as u64, n == 0).unwrap().0)
+            .map(|n| {
+                let reach = if n == 0 {
+                    scripted.clone()
+                } else {
+                    Reach::default()
+                };
+                grants.mint("t", n as u64, reach).unwrap().0
+            })
             .collect();
         assert_eq!(grants.resolve(&token), None, "the oldest was retired");
-        assert_eq!(grants.resolve(&later[0]), Some(("t".into(), 0, true)));
+        assert_eq!(
+            grants.resolve(&later[0]),
+            Some(("t".into(), 0, scripted.clone()))
+        );
         grants.forget("t");
         assert_eq!(
             grants.resolve(&later[1]),
             None,
             "a deleted thread's tokens go"
         );
-        let (fresh, _) = grants.mint("s", 4, true).unwrap();
+        let (fresh, _) = grants.mint("s", 4, scripted.clone()).unwrap();
         grants.age(TTL + Duration::from_secs(1));
         assert_eq!(grants.resolve(&fresh), None, "expired");
         assert!(lock(&grants.0).is_empty(), "expired grants are dropped");
@@ -706,7 +982,14 @@ mod tests {
 <script defer src="js/app.js"></script><script src="https://cdn.example/x.js"></script>
 <script src="../escape.js"></script><!-- <script src="js/app.js"></script> -->
 <script>let inline = 1;</script></body></html>"#;
-        let page = bundle(html, "site/index.html", "/api/preview/T/", files);
+        let page = bundle(
+            html,
+            "site/index.html",
+            "/api/preview/T/",
+            files,
+            true,
+            false,
+        );
         // The shim runs before anything else in the page.
         let shim = page.find(SHIM).unwrap();
         assert!(shim > page.find("<head>").unwrap() && shim < page.find("<title>").unwrap());
@@ -733,16 +1016,148 @@ mod tests {
             r#"<!-- <script src="js/app.js"></script> -->"#,
             "<script>let inline = 1;</script>",
             r#"<body data-x="a>b">"#,
-            "<title>A <b> title</title>",
+            "<title>A &lt;b> title</title>",
         ] {
             assert!(page.contains(kept), "{kept}: {page}");
         }
         // A page without a head still gets the shim first, after any doctype.
-        assert!(bundle("<p>hi</p>", "a.html", "/p/", |_| None).starts_with(SHIM));
-        assert!(
-            bundle("<!DOCTYPE html><p>hi</p>", "a.html", "/p/", |_| None)
-                .starts_with(&format!("<!DOCTYPE html>{SHIM}"))
+        assert!(bundle("<p>hi</p>", "a.html", "/p/", |_| None, true, false).starts_with(SHIM));
+        // A contained grant's page: the guard before anything that could run (after a
+        // doctype), the shim after it; none where nothing runs anyway.
+        let guarded = bundle(
+            "<!doctype html><script>early()</script><html><head><title>t</title>",
+            "a.html",
+            "/p/",
+            |_| None,
+            true,
+            true,
         );
+        assert!(
+            guarded.starts_with(&format!("<!doctype html>{GUARD}<script>early()</script>")),
+            "{guarded}"
+        );
+        assert!(
+            guarded.contains(&format!("<head>{SHIM}<title>")),
+            "{guarded}"
+        );
+        assert!(GUARD.contains(held!()) && CHECK_PAGE.contains(held!()));
+        // Comments and `<?…>` before the doctype are passed over to it (else the guard
+        // first would put the page in quirks mode); anything else is not.
+        for (page, head) in [
+            (
+                "<!-- (c) --> \n<?xml version='1.0'?><!DOCTYPE html><p>hi</p>",
+                "<!-- (c) --> \n<?xml version='1.0'?><!DOCTYPE html>",
+            ),
+            ("<!--><!doctype html><p>hi</p>", "<!--><!doctype html>"),
+            ("<p>x</p><!doctype html>", ""),
+            ("<!-- open <!doctype html>", ""),
+            // A `<head>` in a comment is no place for it; a comment can end at `--!>`.
+            (
+                "<!-- see <head> --><!doctype html><script>evil()</script>",
+                "<!-- see <head> --><!doctype html>",
+            ),
+            (
+                "<!-- a --!><script>evil()</script><!-- b --><!doctype html>",
+                "",
+            ),
+        ] {
+            let guarded = bundle(page, "a.html", "/p/", |_| None, true, true);
+            assert!(guarded.starts_with(&format!("{head}{GUARD}")), "{guarded}");
+        }
+        // Text that SVG would read as markup (breaking out as the page's own elements)
+        // reads as text everywhere, and renders as it did.
+        let svg = bundle(
+            "<svg><textarea><p><link rel=preconnect href=\"https://leak.example/\"></textarea><style>a::after{content:'<'}<meta http-equiv=refresh content=0></style><title>x<p>y</title></svg>",
+            "a.html",
+            "/p/",
+            |_| None,
+            false,
+            false,
+        );
+        assert_eq!(
+            svg,
+            "<svg><textarea>&lt;p>&lt;link rel=preconnect href=\"https://leak.example/\"></textarea><style>a::after{content:'\\3c '}\\3c meta http-equiv=refresh content=0></style><title>x&lt;p>y</title></svg>"
+        );
+        assert!(!bundle("<p>hi</p>", "a.html", "/p/", |_| None, false, true).contains(GUARD));
+        assert!(
+            bundle(
+                "<!DOCTYPE html><p>hi</p>",
+                "a.html",
+                "/p/",
+                |_| None,
+                true,
+                false
+            )
+            .starts_with(&format!("<!DOCTYPE html>{SHIM}"))
+        );
+        // Its scripts not let run: no shim and no script, none of their files read; its
+        // stylesheet and pictures still put in. A meta refresh goes either way.
+        let read = std::cell::RefCell::new(vec![]);
+        let quiet = bundle(
+            &html.replace(
+                "<title>",
+                r#"<meta http-equiv="Refresh" content="0;url=https://elsewhere.example/?d=1"><meta charset="utf-8"><title>"#,
+            ),
+            "site/index.html",
+            "/api/preview/T/",
+            |path| {
+                read.borrow_mut().push(path.to_string());
+                files(path)
+            },
+            false,
+            false,
+        );
+        let outside_comments = quiet.replace(r#"<!-- <script src="js/app.js"></script> -->"#, "");
+        assert!(
+            !quiet.contains(SHIM) && !outside_comments.contains("<script"),
+            "{quiet}"
+        );
+        assert!(
+            !quiet.contains("elsewhere.example") && quiet.contains(r#"<meta charset="utf-8">"#)
+        );
+        assert!(quiet.contains("<style>body{") && quiet.contains("data:image/png;base64,UE5H"));
+        assert!(
+            !read.borrow().iter().any(|path| path.ends_with(".js")),
+            "{:?}",
+            read.borrow()
+        );
+        let moved = bundle(
+            r#"<meta http-equiv=refresh content="1;url=/x"><p>x</p>"#,
+            "a.html",
+            "/p/",
+            |_| None,
+            true,
+            false,
+        );
+        assert!(!moved.contains("refresh"), "{moved}");
+        // Hints that reach a host by themselves go; raw text ends however its end tag is
+        // spelled; a stray quote is no attribute value; `--!>` ends a comment.
+        let tricky = bundle(
+            concat!(
+                r#"<link rel="preconnect" href="https://x.example"><link rel=DNS-Prefetch href=//y.example>"#,
+                r#"<link rel="stylesheet preload" href="https://z.example/s.css">"#,
+                r#"<script>a()</SCRIPT ><p id=x">kept</p><!-- c --!><script>b()</script>"#,
+                r#"<svg><script href="x"/></svg><p>after</p>"#,
+            ),
+            "a.html",
+            "/p/",
+            |_| None,
+            false,
+            false,
+        );
+        for gone in [
+            "preconnect",
+            "DNS-Prefetch",
+            "preload",
+            "<script",
+            "a()",
+            "b()",
+        ] {
+            assert!(!tricky.contains(gone), "{gone}: {tricky}");
+        }
+        for kept in [r#"<p id=x">kept</p>"#, "<p>after</p>", "<!-- c --!>"] {
+            assert!(tricky.contains(kept), "{kept}: {tricky}");
+        }
         // Paths: relative only, never out of the workspace.
         assert_eq!(
             resolve("site", "./a/../b.js?x#y").as_deref(),
@@ -786,7 +1201,14 @@ mod tests {
         ] {
             assert_eq!(mime(path), expected, "{path}");
         }
-        let policy = policy("https://host.example", "ab", false);
+        // Scripts not let run: a sandbox without them, and no script source at all.
+        let quiet = policy("https://host.example", "ab", false, false);
+        assert!(
+            quiet.starts_with("sandbox; default-src 'none'; script-src 'none';"),
+            "{quiet}"
+        );
+        assert!(quiet.contains("connect-src 'none'") && quiet.contains("form-action 'none'"));
+        let policy = policy("https://host.example", "ab", true, false);
         assert!(policy.starts_with("sandbox allow-scripts allow-forms allow-modals;"));
         assert!(!policy.contains("allow-same-origin") && !policy.contains("allow-top-navigation"));
         for directive in [
@@ -800,7 +1222,7 @@ mod tests {
             assert!(policy.contains(directive), "{directive}: {policy}");
         }
         assert!(!policy.contains("github"));
-        let connected = super::policy("https://host.example", "ab", true);
+        let connected = super::policy("https://host.example", "ab", true, true);
         for directive in [
             "connect-src https://host.example/api/preview/ab/ https://api.github.com;",
             "img-src https://host.example/api/preview/ab/ data: blob: https://avatars.githubusercontent.com;",
@@ -812,6 +1234,15 @@ mod tests {
             assert!(connected.contains(directive), "{connected}");
         }
         assert!(!connected.contains("allow-same-origin") && !connected.contains('*'));
+        // What its pages may connect to: its own files, and GitHub when granted.
+        assert_eq!(
+            allowlist("https://host.example", "ab", false),
+            r#"("https://host.example/api/preview/ab/*")"#
+        );
+        assert_eq!(
+            allowlist("https://host.example", "ab", true),
+            r#"("https://host.example/api/preview/ab/*" "https://api.github.com/*" "https://avatars.githubusercontent.com/*")"#
+        );
         assert_eq!(encode("a b/ü.html"), "a%20b/%C3%BC.html");
     }
 }

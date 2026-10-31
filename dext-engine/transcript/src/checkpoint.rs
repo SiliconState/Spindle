@@ -136,6 +136,12 @@ impl TranscriptCheckpoint {
         encode(b"DNT1", self)
     }
 
+    /// The length of what `checkpoint` gives (and its refusals), without building it.
+    pub fn checkpoint_len(&self) -> Result<usize, Error> {
+        self.validate()?;
+        encodes(b"DNT1", self)
+    }
+
     pub fn restore(bytes: &[u8]) -> Result<Self, Error> {
         let transcript: Self = decode(b"DNT1", bytes)?;
         transcript.validate()?;
@@ -226,6 +232,55 @@ impl Write for BoundedWriter {
     }
 }
 
+/// Writes nothing: what is written must be the next bytes of `rest`.
+struct SameAs<'a> {
+    rest: &'a [u8],
+}
+impl Write for SameAs<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let rest = self
+            .rest
+            .strip_prefix(bytes)
+            .ok_or_else(|| std::io::Error::other("not the checkpoint's encoding"))?;
+        self.rest = rest;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Keeps nothing: counts what is written, with `BoundedWriter`'s bounds.
+struct BoundedCount {
+    length: usize,
+    structure: StructureBound,
+}
+impl Write for BoundedCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_CHECKPOINT_BYTES.saturating_sub(self.length) {
+            return Err(std::io::Error::other("checkpoint bound"));
+        }
+        self.structure
+            .scan(bytes)
+            .map_err(|_| std::io::Error::other("checkpoint structure bound"))?;
+        self.length += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The length of `encode(magic, value)` when it succeeds, without building it.
+pub(crate) fn encodes<T: Serialize>(magic: &[u8; 4], value: &T) -> Result<usize, Error> {
+    let mut count = BoundedCount {
+        length: magic.len(),
+        structure: StructureBound::default(),
+    };
+    serde_json::to_writer(&mut count, value).map_err(|_| Error::Encoding)?;
+    Ok(count.length)
+}
+
 pub(crate) fn encode<T: Serialize>(magic: &[u8; 4], value: &T) -> Result<Vec<u8>, Error> {
     let mut writer = BoundedWriter {
         bytes: magic.to_vec(),
@@ -248,8 +303,11 @@ pub(crate) fn decode<T: DeserializeOwned + Serialize>(
     structure_bound(&bytes[4..])?;
     let value = serde_json::from_slice(&bytes[4..]).map_err(|_| Error::Encoding)?;
     // Exact v1 encodings reject unknown/duplicate fields, aliases and trailing data
-    // without changing the existing CLI/session serde compatibility contract.
-    if encode(magic, &value)? != bytes {
+    // without changing the existing CLI/session serde compatibility contract. The value
+    // is encoded against the bytes rather than into a second copy of them: they passed
+    // the bounds above, so an encoding equal to them passes them too.
+    let mut same = SameAs { rest: &bytes[4..] };
+    if serde_json::to_writer(&mut same, &value).is_err() || !same.rest.is_empty() {
         return Err(Error::Encoding);
     }
     Ok(value)
@@ -264,16 +322,28 @@ struct StructureBound {
 }
 impl StructureBound {
     fn scan(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        for &byte in bytes {
+        let mut at = 0;
+        while at < bytes.len() {
             if self.quoted {
                 if self.escaped {
                     self.escaped = false;
-                } else if byte == b'\\' {
+                    at += 1;
+                    continue;
+                }
+                // Inside a string only a quote or a backslash means anything.
+                let Some(found) = bytes[at..].iter().position(|&b| b == b'"' || b == b'\\') else {
+                    return Ok(());
+                };
+                at += found;
+                if bytes[at] == b'\\' {
                     self.escaped = true;
-                } else if byte == b'"' {
+                } else {
                     self.quoted = false;
                 }
+                at += 1;
             } else {
+                let byte = bytes[at];
+                at += 1;
                 match byte {
                     b'"' => self.quoted = true,
                     b'{' | b'[' => {
@@ -356,5 +426,114 @@ mod tests {
             assert!(!scan.escaped);
             assert_eq!(scan.depth, 0);
         }
+    }
+
+    /// The scan as it was, a byte at a time: the string-skipping one must match it.
+    fn scanned_bytewise(bytes: &[u8], state: &mut StructureBound) -> Result<(), Error> {
+        for &byte in bytes {
+            if state.quoted {
+                if state.escaped {
+                    state.escaped = false;
+                } else if byte == b'\\' {
+                    state.escaped = true;
+                } else if byte == b'"' {
+                    state.quoted = false;
+                }
+            } else {
+                match byte {
+                    b'"' => state.quoted = true,
+                    b'{' | b'[' => {
+                        state.depth += 1;
+                        state.count += 1;
+                    }
+                    b'}' | b']' => {
+                        state.depth = state.depth.checked_sub(1).ok_or(Error::Encoding)?;
+                    }
+                    b',' | b':' => state.count += 1,
+                    _ => {}
+                }
+                if state.depth > MAX_DEPTH || state.count > MAX_STRUCTURE {
+                    return Err(Error::Bounds);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn string_skipping_scan_matches_the_bytewise_scan_at_every_split() {
+        let mut inputs: Vec<Vec<u8>> = [
+            br#"{"a":"x\"y","b":["\\",{"c":"]}{["}],"d":"\\\""}"#.as_slice(),
+            br#""unterminated \"#,
+            br#"]]"#,
+            br#"{"k":"v"}}"#,
+            br#""""\"\\""#,
+        ]
+        .iter()
+        .map(|bytes| bytes.to_vec())
+        .collect();
+        inputs.push("[".repeat(MAX_DEPTH + 1).into_bytes());
+        inputs.push(",".repeat(MAX_STRUCTURE + 1).into_bytes());
+        // Pseudo-random mixes of the bytes that matter and ones that do not.
+        let mut x = 7u32;
+        for _ in 0..200 {
+            let bytes = (0..64)
+                .map(|_| {
+                    x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    b"\"\\{}[],:ab"[(x >> 16) as usize % 10]
+                })
+                .collect();
+            inputs.push(bytes);
+        }
+        for bytes in &inputs {
+            // The long inputs are checked whole; the short ones at every split too.
+            let splits = if bytes.len() > 256 {
+                vec![0]
+            } else {
+                (0..=bytes.len()).collect()
+            };
+            for split in splits {
+                let (mut fast, mut slow) = (StructureBound::default(), StructureBound::default());
+                let fast_result = fast
+                    .scan(&bytes[..split])
+                    .and_then(|()| fast.scan(&bytes[split..]));
+                let slow_result = scanned_bytewise(&bytes[..split], &mut slow)
+                    .and_then(|()| scanned_bytewise(&bytes[split..], &mut slow));
+                assert_eq!(
+                    fast_result,
+                    slow_result,
+                    "{}",
+                    String::from_utf8_lossy(bytes)
+                );
+                if fast_result.is_ok() {
+                    assert_eq!(
+                        (fast.quoted, fast.escaped, fast.depth, fast.count),
+                        (slow.quoted, slow.escaped, slow.depth, slow.count)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn counting_and_comparing_writers_agree_with_encoding() {
+        let value = serde_json::json!({"text": "quote\" and \\", "list": [1, 2, {"k": null}]});
+        let bytes = encode(b"TEST", &value).unwrap();
+        assert_eq!(encodes(b"TEST", &value).unwrap(), bytes.len());
+        assert!(decode::<serde_json::Value>(b"TEST", &bytes).unwrap() == value);
+        // Trailing whitespace parses, but is not the value's encoding.
+        let mut spaced = bytes.clone();
+        spaced.push(b' ');
+        assert!(decode::<serde_json::Value>(b"TEST", &spaced).is_err());
+        // Nor is one with its keys out of order (Value sorts them), or a shorter one.
+        let mut reordered = b"TEST".to_vec();
+        reordered.extend_from_slice(br#"{"text":"quote\" and \\","list":[1,2,{"k":null}]}"#);
+        assert!(serde_json::from_slice::<serde_json::Value>(&reordered[4..]).unwrap() == value);
+        assert!(decode::<serde_json::Value>(b"TEST", &reordered).is_err());
+        assert!(decode::<serde_json::Value>(b"TEST", &bytes[..bytes.len() - 1]).is_err());
+        let deep =
+            (0..=MAX_DEPTH).fold(serde_json::json!(0), |inner, _| serde_json::json!([inner]));
+        assert!(encode(b"TEST", &deep).is_err());
+        assert!(encodes(b"TEST", &deep).is_err());
     }
 }

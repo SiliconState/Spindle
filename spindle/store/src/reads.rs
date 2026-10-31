@@ -9,6 +9,7 @@ use dext_core::turn::{Phase, Stop};
 use dext_transcript::Message;
 use dext_transcript::turn::{Effect, TurnContinuation};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -24,7 +25,7 @@ fn view_error(error: crate::Error) -> String {
 }
 
 fn restore(bytes: &[u8]) -> Result<TurnContinuation> {
-    TurnContinuation::restore(bytes).map_err(|_| "unreadable continuation".to_string())
+    crate::turn::restored(bytes).map_err(|_| "unreadable continuation".to_string())
 }
 /// The committed continuation and workspace root at `revision` (the head when None),
 /// with the head and the revision read. Revision 0 is the empty state before the
@@ -52,8 +53,9 @@ fn at(
 pub fn head_on(view: &mut ReadView<'_>) -> Result<Value> {
     let read = view.read(|view| {
         let (head, continuation, root) = view.head()?;
+        // A count needs the manifest alone, not each file's size.
         let files = match &root {
-            Some(root) => view.files(root)?.len(),
+            Some(root) => view.file_count(root)?,
             None => 0,
         };
         let mut recorded = false;
@@ -61,7 +63,7 @@ pub fn head_on(view: &mut ReadView<'_>) -> Result<Value> {
         if head == 0 {
             return Ok((head, None, files, recorded, rejection));
         }
-        let Ok(state) = TurnContinuation::restore(&continuation) else {
+        let Ok(state) = crate::turn::restored(&continuation) else {
             return Err(crate::Error::Incompatible);
         };
         if state.control().phase() == Phase::ModelWait {
@@ -111,6 +113,29 @@ pub fn head_on(view: &mut ReadView<'_>) -> Result<Value> {
         "rejection": rejection,
     }))
 }
+/// What a session is doing, as one stable code (status `activity`), from its status's
+/// head fields and `wake` and what its host knows live. While a turn runs: `stopping`
+/// (a stop was asked), `waiting_app` (for the app's answer to one of its tools'
+/// calls), `model` (a model step), `tools` (its tools) or `running` (between them).
+/// Between turns: `blocked` (it needs a person first: `wake.why` says what),
+/// `resumable` (`continue` takes it on) or `idle`.
+pub fn activity(status: &Value, running: bool, stopping: bool, waiting_app: bool) -> &'static str {
+    if running {
+        return match status["phase"].as_str() {
+            _ if stopping => "stopping",
+            _ if waiting_app => "waiting_app",
+            Some("model_wait") => "model",
+            Some("tools_wait") => "tools",
+            _ => "running",
+        };
+    }
+    match status["wake"]["work"].as_str() {
+        Some("blocked") => "blocked",
+        Some("ready") => "resumable",
+        _ => "idle",
+    }
+}
+
 pub fn messages_on(view: &mut ReadView<'_>, revision: Option<u64>) -> Result<Value> {
     messages_from(view, revision, 0)
 }
@@ -118,21 +143,25 @@ pub fn messages_on(view: &mut ReadView<'_>, revision: Option<u64>) -> Result<Val
 /// on (a screen that holds the ones before): `{head, revision, messages, total,
 /// app_details}`, `total` counting them all.
 pub fn messages_from(view: &mut ReadView<'_>, revision: Option<u64>, from: usize) -> Result<Value> {
-    let (head, revision, continuation, _, raw_details) = view
+    let (head, revision, continuation, _, raw_details, tasks) = view
         .read(|view| {
             let (head, revision, continuation, root) = at(view, revision)?;
             let details = view.app_details_at(revision)?;
-            Ok((head, revision, continuation, root, details))
+            // Only to mark reports: a store that cannot list them shows none marked.
+            let tasks = view.task_keys().unwrap_or_default();
+            Ok((head, revision, continuation, root, details, tasks))
         })
         .map_err(|_| no_revision(revision))?;
     let (messages, total): (Vec<Value>, usize) = if revision == 0 {
         (vec![], 0)
     } else {
         let transcript = restore(&continuation)?
-            .transcript()
+            .into_transcript()
             .map_err(|_| "unreadable transcript".to_string())?;
         let total = transcript.messages.len();
-        (window(&transcript.messages, from), total)
+        let mut messages = window(&transcript.messages, from);
+        annotate_reports(&mut messages, &tasks);
+        (messages, total)
     };
     let details = raw_details.into_iter().map(|(effect, bytes)| {
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| "unreadable private app details".to_string())?;
@@ -217,12 +246,9 @@ pub fn read_on(view: &mut ReadView<'_>, revision: Option<u64>, path: &str) -> Re
     view.read(|view| {
         let (_, _, _, root) = at(view, revision)?;
         let root = root.ok_or(crate::Error::Invalid)?;
-        let file = view
-            .files(&root)?
-            .into_iter()
-            .find(|file| file.entry.path == path)
-            .ok_or(crate::Error::Invalid)?;
-        view.object(&file.entry.object)
+        // Found in the manifest: one file's read never looks at the others.
+        let entry = view.entry(&root, path)?.ok_or(crate::Error::Invalid)?;
+        view.object(&entry.object)
     })
     .map_err(|_| format!("no file `{path}` in the workspace at that revision"))
 }
@@ -247,6 +273,49 @@ pub fn targets_among(view: &mut ReadView<'_>, listed: usize) -> Result<Vec<Value
         .into_iter()
         .map(|(revision, kind)| json!({"revision": revision, "kind": rewind_kind(kind)}))
         .collect())
+}
+
+/// A task's short name, from its key (a call's id, or `app:` and an app's own id): as a
+/// native host names the task's directory, and as events and `tasks` name it.
+pub fn task_name(task: &str) -> String {
+    Sha256::digest(task.as_bytes())[..10]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Adds `report: {task, state}` to each task report among `messages` (the message a
+/// session reads when one of its `tasks` ends: `[task KEY: finished|failed|stopped]`,
+/// then the task's answer), `task` being its short name, so screens show it as the
+/// task's and not as something the user wrote.
+pub fn annotate_reports(messages: &mut [Value], tasks: &[String]) {
+    for message in messages
+        .iter_mut()
+        .filter(|message| message["role"] == "user")
+    {
+        for block in message["content"].as_array_mut().into_iter().flatten() {
+            let report = (block["type"] == "text")
+                .then(|| block["text"].as_str())
+                .flatten()
+                .and_then(|text| report_head(text, tasks))
+                .map(|(task, state)| json!({"task": task_name(task), "state": state}));
+            if let Some(report) = report {
+                block["report"] = report;
+            }
+        }
+    }
+}
+
+/// The task and state a report's first line names, when it is one of `tasks`.
+fn report_head<'a>(text: &'a str, tasks: &[String]) -> Option<(&'a str, &'a str)> {
+    let head = text
+        .strip_prefix("[task ")?
+        .split('\n')
+        .next()?
+        .strip_suffix(']')?;
+    let (task, state) = head.rsplit_once(": ")?;
+    (matches!(state, "finished" | "failed" | "stopped") && tasks.iter().any(|known| known == task))
+        .then_some((task, state))
 }
 
 /// What the user wrote in a steering message: the wrapper's guidance for the model

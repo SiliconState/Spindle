@@ -118,7 +118,11 @@ spindle --dir ./host serve --port 8790
 
 Open the address, paste the pairing key, and the browser receives a revocable device
 token in an HTTP-only cookie. For programs, `spindle --dir ./host token new NAME` mints a
-bearer token for `/v1`.
+bearer token for `/v1`. If the app only runs remote commands, use
+`spindle --dir ./host token new NAME --runner`: it cannot read sessions or
+transcripts. The named run status and stop routes are in
+[API.md](API.md#routes); token handling is in
+[`serve/v1.rs`](../spindle/store/src/serve/v1.rs).
 
 The listener binds loopback only. To reach it from another device, put it behind an
 authenticated HTTPS reverse proxy and pass `--origin https://HOST`; with Cloudflare

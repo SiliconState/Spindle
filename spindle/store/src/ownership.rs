@@ -198,7 +198,8 @@ pub(crate) fn admit_allowed(db: &Connection, scope: &str) -> Result<()> {
 /// the host verifies them again, so confirmation only counts for the current epoch.
 /// A rewind also changes the epoch, which conservatively requires re-confirmation.
 fn confirmed(db: &Connection, service: &str) -> Result<bool> {
-    Ok(db.query_row(
+    Ok(crate::cached_row(
+        db,
         "SELECT EXISTS(SELECT 1 FROM service_confirmations s JOIN realm r ON r.id=1 WHERE s.scope=?1 AND s.epoch=r.epoch)",
         [service],
         |row| row.get(0),
@@ -275,7 +276,8 @@ pub(crate) fn validate_storage(db: &Connection) -> Result<()> {
         if node.kind == ScopeKind::Service && node.parent.is_none() {
             return Err(Error::Incompatible);
         }
-        let admitted: String = db.query_row(
+        let admitted: String = crate::cached_row(
+            db,
             "SELECT scope FROM admissions WHERE sequence=?1",
             [node.admission as i64],
             |row| crate::bounded_label(row, 0),
@@ -303,7 +305,8 @@ pub(crate) fn validate_storage(db: &Connection) -> Result<()> {
         {
             return Err(Error::Incompatible);
         }
-        let cancelled: bool = db.query_row(
+        let cancelled: bool = crate::cached_row(
+            db,
             "SELECT EXISTS(SELECT 1 FROM cancellations WHERE scope=?1)",
             [&node.scope],
             |row| row.get(0),
@@ -336,7 +339,7 @@ pub(crate) fn validate_storage(db: &Connection) -> Result<()> {
             return Err(Error::Incompatible);
         }
     }
-    let invalid: bool = db.query_row(
+    let invalid: bool = crate::cached_row(db,
         "SELECT EXISTS(SELECT 1 FROM service_confirmations s LEFT JOIN owned_scopes o ON o.scope=s.scope WHERE o.kind IS NOT 1 OR s.epoch<=0 OR s.epoch>(SELECT epoch FROM realm))
          OR EXISTS(SELECT 1 FROM owned_scopes o WHERE o.kind=1 AND NOT EXISTS(SELECT 1 FROM service_confirmations s WHERE s.scope=o.scope))
          OR EXISTS(SELECT 1 FROM dropped_admissions d LEFT JOIN admissions a ON a.sequence=d.admission WHERE a.sequence IS NULL OR a.kind=?1 OR d.epoch<a.admitted_epoch OR d.epoch>(SELECT epoch FROM realm) OR EXISTS(SELECT 1 FROM consumed c WHERE c.admission=d.admission))",
@@ -355,16 +358,22 @@ fn settled_obligations(db: &Connection, all: &[OwnedScope], node: &OwnedScope) -
     }) {
         return Ok(false);
     }
-    let wait_pending: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM owned_waits w JOIN owned_scopes t ON t.scope=w.target WHERE w.waiter=?1 AND t.state!=2)", [&node.scope], |row| row.get(0))?;
+    let wait_pending: bool = crate::cached_row(
+        db,
+        "SELECT EXISTS(SELECT 1 FROM owned_waits w JOIN owned_scopes t ON t.scope=w.target WHERE w.waiter=?1 AND t.state!=2)",
+        [&node.scope],
+        |row| row.get(0),
+    )?;
     if wait_pending {
         return Ok(false);
     }
-    let cancelled: bool = db.query_row(
+    let cancelled: bool = crate::cached_row(
+        db,
         "SELECT EXISTS(SELECT 1 FROM cancellations WHERE scope=?1)",
         [&node.scope],
         |row| row.get(0),
     )?;
-    let pending: bool = db.query_row(
+    let pending: bool = crate::cached_row(db,
         "SELECT EXISTS(SELECT 1 FROM intents i JOIN revisions r ON r.revision=i.revision LEFT JOIN attempts a ON a.effect=i.id LEFT JOIN applied_receipts p ON p.attempt=a.id WHERE r.scope=?1 AND p.attempt IS NULL AND (?2=0 OR a.id IS NOT NULL))
          OR EXISTS(SELECT 1 FROM image_executions e JOIN attempts a ON a.id=e.attempt JOIN intents i ON i.id=a.effect JOIN revisions r ON r.revision=i.revision WHERE r.scope=?1 AND e.state=0)",
         params![node.scope, cancelled], |row| row.get(0),
@@ -375,15 +384,14 @@ fn settled_obligations(db: &Connection, all: &[OwnedScope], node: &OwnedScope) -
     #[cfg(feature = "dext-turn")]
     if !cancelled {
         use dext_core::turn::Phase;
-        use dext_transcript::turn::TurnContinuation;
         let latest: Option<(String, Vec<u8>)> = {
             use rusqlite::OptionalExtension;
-            db.query_row("SELECT engine,continuation FROM revisions WHERE scope=?1 ORDER BY revision DESC LIMIT 1", [&node.scope], |row| Ok((crate::bounded_label(row, 0)?, crate::packed_blob(db, row, 1, crate::MAX_PAYLOAD)?))).optional()?
+            crate::cached_row(db, "SELECT engine,continuation FROM revisions WHERE scope=?1 ORDER BY revision DESC LIMIT 1", [&node.scope], |row| Ok((crate::bounded_label(row, 0)?, crate::packed_blob(db, row, 1, crate::MAX_PAYLOAD)?))).optional()?
         };
         if let Some((engine, bytes)) = latest
             && engine == crate::turn::ENGINE
             && !matches!(
-                TurnContinuation::restore(&bytes)
+                crate::turn::restored(&bytes)
                     .map_err(|_| Error::Incompatible)?
                     .control()
                     .phase(),
@@ -393,7 +401,8 @@ fn settled_obligations(db: &Connection, all: &[OwnedScope], node: &OwnedScope) -
             return Ok(false);
         }
     }
-    let unconsumed: bool = db.query_row(
+    let unconsumed: bool = crate::cached_row(
+        db,
         &format!(
             "SELECT EXISTS(SELECT 1 FROM admissions a WHERE a.scope=?1 AND a.kind!=?2 AND {})",
             crate::rewind::QUEUED
@@ -431,7 +440,8 @@ pub(crate) fn admit_owned_in_transaction(
     if all.len() >= MAX_SCOPES {
         return Err(Error::Exhausted);
     }
-    let has_history: bool = tx.query_row(
+    let has_history: bool = crate::cached_row(
+        tx,
         "SELECT EXISTS(SELECT 1 FROM admissions WHERE scope=?1)",
         [&command.scope],
         |row| row.get(0),
@@ -509,7 +519,7 @@ impl Store {
             let tx = self
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let epoch: u64 = tx.query_row("SELECT epoch FROM realm", [], |row| {
+            let epoch: u64 = crate::cached_row(&tx, "SELECT epoch FROM realm", [], |row| {
                 crate::nonnegative_id(row, 0)
             })?;
             if epoch != self.epoch {
@@ -562,7 +572,7 @@ impl Store {
             let tx = self
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let epoch: u64 = tx.query_row("SELECT epoch FROM realm", [], |row| {
+            let epoch: u64 = crate::cached_row(&tx, "SELECT epoch FROM realm", [], |row| {
                 crate::nonnegative_id(row, 0)
             })?;
             if epoch != self.epoch {
@@ -613,7 +623,7 @@ impl Store {
             let tx = self
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let epoch: u64 = tx.query_row("SELECT epoch FROM realm", [], |row| {
+            let epoch: u64 = crate::cached_row(&tx, "SELECT epoch FROM realm", [], |row| {
                 crate::nonnegative_id(row, 0)
             })?;
             if epoch != self.epoch {
@@ -640,7 +650,8 @@ impl Store {
                 return Err(Error::Conflict);
             }
             for target in descendants(&tx, scope)? {
-                tx.execute(
+                crate::cached_execute(
+                    &tx,
                     "UPDATE owned_scopes SET state=?2 WHERE scope=?1 AND state=?3",
                     params![target, to, from],
                 )?;
@@ -750,7 +761,7 @@ impl Store {
             let tx = self
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let epoch: u64 = tx.query_row("SELECT epoch FROM realm", [], |row| {
+            let epoch: u64 = crate::cached_row(&tx, "SELECT epoch FROM realm", [], |row| {
                 crate::nonnegative_id(row, 0)
             })?;
             if epoch != self.epoch {
@@ -794,31 +805,31 @@ impl Store {
             let tx = self
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let epoch: u64 = tx.query_row("SELECT epoch FROM realm", [], |row| {
+            let epoch: u64 = crate::cached_row(&tx, "SELECT epoch FROM realm", [], |row| {
                 crate::nonnegative_id(row, 0)
             })?;
             if epoch != self.epoch {
                 return Err(Error::Stale);
             }
             crate::rewind::ensure_open(&tx)?;
-            let kind: String = tx
-                .query_row(
-                    "SELECT kind FROM admissions WHERE sequence=?1",
-                    [sequence as i64],
-                    |row| crate::bounded_label(row, 0),
-                )
-                .optional()?
-                .ok_or(Error::Invalid)?;
+            let kind: String = crate::cached_row(
+                &tx,
+                "SELECT kind FROM admissions WHERE sequence=?1",
+                [sequence as i64],
+                |row| crate::bounded_label(row, 0),
+            )
+            .optional()?
+            .ok_or(Error::Invalid)?;
             if kind == crate::rewind::KIND {
                 return Err(Error::Invalid);
             }
-            let old: Option<String> = tx
-                .query_row(
-                    "SELECT command FROM dropped_admissions WHERE admission=?1",
-                    [sequence as i64],
-                    |row| crate::bounded_label(row, 0),
-                )
-                .optional()?;
+            let old: Option<String> = crate::cached_row(
+                &tx,
+                "SELECT command FROM dropped_admissions WHERE admission=?1",
+                [sequence as i64],
+                |row| crate::bounded_label(row, 0),
+            )
+            .optional()?;
             if let Some(old) = old {
                 return if old == command {
                     Ok(())
@@ -826,7 +837,8 @@ impl Store {
                     Err(Error::Conflict)
                 };
             }
-            let consumed: bool = tx.query_row(
+            let consumed: bool = crate::cached_row(
+                &tx,
                 "SELECT EXISTS(SELECT 1 FROM consumed WHERE admission=?1)",
                 [sequence as i64],
                 |row| row.get(0),

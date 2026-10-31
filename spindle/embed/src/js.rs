@@ -233,13 +233,15 @@ impl JsEmbedded {
 
     /// Session `dir` as a session bundle (bytes). Unless `keep`, the session moves: it
     /// closes here and its copy is sealed, continuing only where the bundle is imported.
-    /// `settings` (JSON object) change the bundle's copy only, for the host it goes to.
+    /// `settings` (JSON object) change the bundle's copy only, for the host it goes to;
+    /// `whole`: a copy's stores are checked record by record too, as a move's are.
     #[wasm_bindgen(js_name = exportSession)]
     pub fn export_session(
         &self,
         dir: &str,
         keep: bool,
         settings: Option<String>,
+        whole: Option<bool>,
     ) -> Result<Vec<u8>, JsValue> {
         let settings = settings
             .map(|text| serde_json::from_str(&text))
@@ -250,8 +252,21 @@ impl JsEmbedded {
                 )))
             })?;
         self.inner
-            .export_session(dir, keep, settings.as_ref())
+            .export_session_checked(dir, keep, settings.as_ref(), whole.unwrap_or(false))
             .map_err(faulted)
+    }
+
+    /// Checks a session bundle whole, as an import does (its framing and checksum, its
+    /// manifest, every path and every store), writing nothing: `{head, identity,
+    /// files}` (JSON).
+    #[wasm_bindgen(js_name = checkBundle)]
+    pub fn check_bundle(&self, bytes: &[u8]) -> Result<String, JsValue> {
+        let bundle = spindle_store::bundle::read(bytes).map_err(refused)?;
+        Ok(
+            serde_json::json!({"head": bundle.head, "identity": bundle.identity,
+            "files": bundle.files.len()})
+            .to_string(),
+        )
     }
 
     /// Imports a session bundle as session `dir` (nothing there yet) and opens it; its

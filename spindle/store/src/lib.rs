@@ -7,11 +7,16 @@ use std::path::Path;
 use std::time::Duration;
 
 const APP_ID: i64 = 0x53504e44;
-const SCHEMA: i64 = 19;
+const SCHEMA: i64 = 20;
 /// Older schemas that migrate in place on open: 14 kept every value uncompressed, 15
 /// compressed each value on its own; 16 added shared chunks, a validation watermark
-/// and recorded provider refusals; 17 adds app state and the open/crash record.
-const LEGACY_SCHEMAS: [i64; 5] = [14, 15, 16, 17, 18];
+/// and recorded provider refusals; 17 adds app state and the open/crash record; 20
+/// keeps objects deflated where that pays (`artifact::pack`).
+const LEGACY_SCHEMAS: [i64; 6] = [14, 15, 16, 17, 18, 19];
+/// The schema before this one. Stores, images and bundles of it are also read where a
+/// native open alone migrated older ones (from a connection, from an image, an import):
+/// each is brought to this schema in place as it opens.
+pub(crate) const PREVIOUS_SCHEMA: i64 = 19;
 /// Copy of a schema-14 store taken before migrating it, beside `authority.sqlite`.
 pub const LEGACY_BACKUP: &str = "authority.v14.sqlite";
 /// Tables schema 16 added; an older store gets them when it migrates.
@@ -85,6 +90,9 @@ pub mod reads;
 pub mod rewind;
 #[cfg(feature = "shape")]
 pub(crate) mod shape;
+/// Model spend as both hosts count it (`agent::cost` holds the native host's part).
+#[cfg(any(feature = "agent", feature = "embedded"))]
+pub(crate) mod spend;
 pub mod transition;
 #[cfg(feature = "dext-turn")]
 pub mod turn;
@@ -98,6 +106,11 @@ pub mod workspace;
 /// compressed (`codec`); this bounds their logical size and matches the engine's own
 /// checkpoint limit, so the store is never the tighter cap.
 pub const MAX_PAYLOAD: usize = 32 * 1024 * 1024;
+/// Prepared statements a connection keeps (`cached_row`): a step's working set.
+const STATEMENTS: usize = 64;
+/// The most of a write-ahead log SQLite keeps once a checkpoint has taken it in: after one
+/// large transaction (a migration, a big import) the log is truncated back to this.
+const WAL_KEPT: i64 = 16 * 1024 * 1024;
 /// Largest logical proposal record: its continuation and up to eight intent inputs.
 pub(crate) const MAX_CANONICAL: usize =
     (1 + transition::MAX_EFFECTS) * (MAX_PAYLOAD + 4) + (1 + 4 + transition::MAX_STATE) + 4096;
@@ -462,6 +475,10 @@ pub struct Store {
     /// Session-pack ledger records this handle has read or written.
     #[cfg(feature = "dext-strict-workspace")]
     pack_ledger: pack_runtime::Ledger,
+    /// The files a runner call runs over (its scope, base root and their objects),
+    /// checked once on this connection: a runner reads them one by one.
+    #[cfg(feature = "workspace-tools")]
+    runner_objects: Option<(String, String, std::collections::HashSet<String>)>,
 }
 
 fn valid_label(value: &str) -> bool {
@@ -544,8 +561,28 @@ fn validate(command: &Command) -> Result<()> {
     fits(command.payload.len())
 }
 
+/// `Connection::query_row` through the connection's statement cache: every step runs
+/// the same few dozen statements, and preparing one costs more than running it.
+pub(crate) fn cached_row<T>(
+    db: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    row: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    db.prepare_cached(sql)?.query_row(params, row)
+}
+
+/// `Connection::execute` through the statement cache (as `cached_row`).
+pub(crate) fn cached_execute(
+    db: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<usize> {
+    db.prepare_cached(sql)?.execute(params)
+}
+
 fn execute_one(db: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<()> {
-    if db.execute(sql, params)? != 1 {
+    if cached_execute(db, sql, params)? != 1 {
         return Err(Error::Incompatible);
     }
     Ok(())
@@ -698,6 +735,9 @@ fn validate_schema(db: &Connection, from: i64) -> Result<()> {
     let mut reference = Connection::open_in_memory()?;
     let tx = reference.transaction()?;
     initialize_realm(&tx)?;
+    if from < 20 {
+        tx.execute_batch("ALTER TABLE objects DROP COLUMN size;")?;
+    }
     if from < 19 {
         tx.execute_batch("DROP TABLE task_runs; DROP TABLE retry_delays; DROP TABLE app_details; DROP TABLE instance;")?;
     }
@@ -879,21 +919,43 @@ pub struct ImageFacts {
 /// unencrypted rollback-journal SQLite file of this build's application and schema,
 /// every page and record valid (as a full open checks them), with a real identity.
 pub fn check_image(image: &[u8]) -> Result<ImageFacts> {
+    checked_image(image, true)
+}
+
+/// `check_image` without checking every record again (its pages, schema and row types
+/// still): for an image this build just took of a store it owns and keeps using (a
+/// copy), which whoever imports it checks whole first. Checking every record is most of
+/// a long session's export.
+pub fn image_facts(image: &[u8]) -> Result<ImageFacts> {
+    checked_image(image, false)
+}
+
+fn checked_image(image: &[u8], whole: bool) -> Result<ImageFacts> {
     if image.len() < 100 || !image.starts_with(SQLITE_HEADER) || image[18..20] != [1, 1] {
         return Err(Error::Incompatible);
     }
     let mut db = Connection::open_in_memory()?;
-    db.deserialize_read_exact(rusqlite::MAIN_DB, image, image.len(), true)?;
+    // Writable: a previous schema's image is checked as the open will migrate it. The
+    // image itself is never changed (SQLite reads it into memory of its own).
+    db.deserialize_read_exact(rusqlite::MAIN_DB, image, image.len(), false)?;
     db.pragma_update(None, "trusted_schema", "OFF")?;
     let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
     let schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if app != APP_ID || schema != SCHEMA {
+    // An image this build took of its own store (`image_facts`) is always this schema;
+    // one from elsewhere may be the previous one, which the open migrates.
+    if app != APP_ID || (schema != SCHEMA && !(whole && schema == PREVIOUS_SCHEMA)) {
         return Err(Error::Incompatible);
     }
-    validate_schema(&db, SCHEMA)?;
+    validate_schema(&db, schema)?;
     check_pages(&db)?;
+    if schema != SCHEMA {
+        // Rows kept as they are are valid at this schema: only the column is needed.
+        artifact::upgrade(&db, false)?;
+    }
     validate_row_types(&db)?;
-    validate_all(&db, true)?;
+    if whole {
+        validate_all(&db, true)?;
+    }
     let head: i64 = db.query_row("SELECT revision FROM head WHERE id=1", [], |r| r.get(0))?;
     let identity: Vec<u8> =
         db.query_row("SELECT identity FROM instance WHERE id=1", [], |r| r.get(0))?;
@@ -986,7 +1048,7 @@ fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
     }
     drop(rows);
     drop(details);
-    artifact::validate_storage(db)?;
+    artifact::validate_storage(db, full)?;
     ownership::validate_storage(db)?;
     rewind::validate_storage(db)?;
     Ok(db.query_row(
@@ -1005,11 +1067,12 @@ const PACKED_COLUMNS: [(&str, &str, &str, usize); 5] = [
     ("receipts", "attempt", "result", MAX_PAYLOAD),
 ];
 
-/// Schema 14, 15 or 16 -> 17: re-encodes every large value in place (chunked and
-/// shared) when `from` is older than 16, adds the tables each later schema brought and
-/// validates every record, in one transaction, after copying the store to
-/// `backup_name(from)`. Values are only re-encoded, never changed, so the validation
-/// sees exactly the data the old schema held.
+/// An older schema -> this one: re-encodes every large value in place (chunked and
+/// shared) when `from` is older than 16, adds the tables each later schema brought,
+/// packs every object (`artifact::upgrade`) and validates every record, in one
+/// transaction, after copying the store to `backup_name(from)`. Values and objects are
+/// only re-encoded, never changed, so the validation sees exactly the data the old
+/// schema held.
 fn migrate_legacy(db: &mut Connection, root: &Path, from: i64) -> Result<()> {
     let backup = root.join(backup_name(from));
     let staged = root.join(format!("{}.new", backup_name(from)));
@@ -1047,8 +1110,11 @@ fn migrate_legacy(db: &mut Connection, root: &Path, from: i64) -> Result<()> {
     if from < 18 {
         tx.execute_batch(meta::TABLE)?;
     }
-    tx.execute_batch(TABLES_19)?;
-    initialize_identity(&tx)?;
+    if from < 19 {
+        tx.execute_batch(TABLES_19)?;
+        initialize_identity(&tx)?;
+    }
+    artifact::upgrade(&tx, true)?;
     // 16 already stores values packed; older schemas re-encode each one.
     let packed = if from < 16 { &PACKED_COLUMNS[..] } else { &[] };
     for (table, key, column, bound) in packed {
@@ -1084,12 +1150,10 @@ fn migrate_legacy(db: &mut Connection, root: &Path, from: i64) -> Result<()> {
         params![revision, receipt],
     )?;
     tx.commit()?;
-    // Hand the space the uncompressed values held back to the filesystem, once. Best
-    // effort: the migration is committed, and a full temp directory must not refuse it.
-    // A schema-16 store re-encoded nothing, so there is nothing to give back.
-    if from < 16 {
-        let _ = db.execute_batch("VACUUM");
-    }
+    // Hand the space the uncompressed values and objects held back to the filesystem,
+    // once. Best effort: the migration is committed, and a full temp directory must not
+    // refuse it.
+    let _ = db.execute_batch("VACUUM");
     Ok(())
 }
 
@@ -1339,6 +1403,7 @@ impl Store {
             validate_schema(&db, if legacy { schema } else { SCHEMA })?;
         }
         let mode: String = db.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
+        db.pragma_update(None, "journal_size_limit", WAL_KEPT)?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "foreign_keys", "ON")?;
         durable::full_flushes(&db)?;
@@ -1365,8 +1430,9 @@ impl Store {
     /// The host must retain exclusive ownership of this database for the returned
     /// handle's lifetime. Dropping `owner` releases that exclusion only after SQLite
     /// closes. This contract is not implemented by SQLite's no-lock WASI VFS.
-    /// Existing stores must already use the current schema; migration and backups
-    /// remain a native-path operation. Persistent VFS sync semantics are host-owned.
+    /// Existing stores must use the current schema or the one before
+    /// (`PREVIOUS_SCHEMA`, migrated in place); older migrations and backups remain a
+    /// native-path operation. Persistent VFS sync semantics are host-owned.
     pub fn from_connection(
         db: Connection,
         profile: ConnectionProfile,
@@ -1444,11 +1510,12 @@ impl Store {
                         ..
                     }
             );
-        if fresh != create || (!fresh && (app != APP_ID || schema != SCHEMA)) {
+        let previous = !fresh && schema == PREVIOUS_SCHEMA;
+        if fresh != create || (!fresh && (app != APP_ID || (schema != SCHEMA && !previous))) {
             return Err(Error::Incompatible);
         }
         if !fresh {
-            validate_schema(db, SCHEMA)?;
+            validate_schema(db, schema)?;
             check_pages(db)?;
         }
         let journal = match profile {
@@ -1464,6 +1531,7 @@ impl Store {
         };
         let mode: String =
             db.pragma_update_and_check(None, "journal_mode", journal, |r| r.get(0))?;
+        db.pragma_update(None, "journal_size_limit", WAL_KEPT)?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "foreign_keys", "ON")?;
         db.pragma_update(None, "temp_store", "MEMORY")?;
@@ -1480,11 +1548,39 @@ impl Store {
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
         }
+        if previous && image {
+            // `from_image` checked the image whole, and a store in memory goes away with
+            // its owner: its rows stay as they are (valid at this schema), only new ones
+            // are packed, so memory never holds every object rewritten twice.
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            artifact::upgrade(&tx, false)?;
+            tx.pragma_update(None, "user_version", SCHEMA)?;
+            tx.commit()?;
+        } else if previous {
+            // In place, in one transaction that checks every record before it commits,
+            // as a native migration does (without its copy: a store that fails stays as
+            // it was). The space packed objects give back is reused by later writes; a
+            // VACUUM would hold a second copy of the store in memory.
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            artifact::upgrade(&tx, true)?;
+            tx.pragma_update(None, "user_version", SCHEMA)?;
+            validate_row_types(&tx)?;
+            let (revision, receipt) = validate_all(&tx, true)?;
+            execute_one(
+                &tx,
+                "UPDATE validated SET revision=?1,receipt=?2 WHERE id=1",
+                params![revision, receipt],
+            )?;
+            tx.commit()?;
+        }
         Self::take_over(pending, None)
     }
 
     fn take_over(mut pending: OwnedConnection, root: Option<&Path>) -> Result<Self> {
         let db = &mut pending.db;
+        // Room for the statements of a step (`cached_row`), not for every statement:
+        // every store, opened natively or from a connection, takes over here.
+        db.set_prepared_statement_cache_capacity(STATEMENTS);
         let (epoch, crashes) = (|| -> Result<(u64, u64)> {
             validate_row_types(db)?;
             let realm_rows: i64 = db.query_row("SELECT count(*) FROM realm", [], |r| r.get(0))?;
@@ -1561,6 +1657,8 @@ impl Store {
             image_disclosure: image::DisclosureState::default(),
             #[cfg(feature = "dext-strict-workspace")]
             pack_ledger: pack_runtime::Ledger::default(),
+            #[cfg(feature = "workspace-tools")]
+            runner_objects: None,
         })
     }
 
@@ -1623,18 +1721,22 @@ impl Store {
         if !self.db.is_autocommit() {
             return Err(Error::Invalid);
         }
-        let mut image = self.db.serialize(rusqlite::MAIN_DB)?.to_vec();
+        let image = self.db.serialize(rusqlite::MAIN_DB)?;
         if image.len() < 100 || !image.starts_with(SQLITE_HEADER) {
             return Err(Error::Incompatible);
         }
         // File format versions 1/1: a rollback-journal database (2/2 is WAL, which an
-        // image never needs: it holds every committed page itself).
-        image[18] = 1;
-        image[19] = 1;
+        // image never needs: it holds every committed page itself). The copy is read
+        // straight from SQLite's serialization with those two bytes replaced, so the
+        // database is held at most twice here (an image is the whole store).
+        let header: &[u8] = &image[..18];
+        let rest: &[u8] = &image[20..];
+        let read = std::io::Read::chain(std::io::Read::chain(header, &[1u8, 1][..]), rest);
         // The copy's owner is not this one: it records a clean close, so whoever opens
         // the copy counts no crash for this owner, which is still open here.
         let mut copy = Connection::open_in_memory()?;
-        copy.deserialize_read_exact(rusqlite::MAIN_DB, image.as_slice(), image.len(), false)?;
+        copy.deserialize_read_exact(rusqlite::MAIN_DB, read, image.len(), false)?;
+        drop(image);
         copy.execute("UPDATE opens SET closed=1 WHERE id=1", [])?;
         for (key, value) in metadata {
             meta::put(&copy, key, value)?;
@@ -1687,6 +1789,45 @@ impl Store {
         }
         check_pages(&self.db)?;
         validate_all(&self.db, true).map(|_| ())
+    }
+
+    /// The store's size in pages: (page size in bytes, pages, of them free). The free
+    /// ones are what a compaction gives back (`compact_into`).
+    pub fn pages(&mut self) -> Result<(u64, u64, u64)> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let count = |pragma: &str| -> Result<u64> {
+            let value: i64 = self.db.pragma_query_value(None, pragma, |row| row.get(0))?;
+            u64::try_from(value).map_err(|_| Error::Invalid)
+        };
+        Ok((
+            count("page_size")?,
+            count("page_count")?,
+            count("freelist_count")?,
+        ))
+    }
+
+    /// Writes a compacted copy of the store to `target`, a file that is not there yet:
+    /// VACUUM INTO copies every page in use, in order, and leaves the free ones behind,
+    /// writing straight into `target` (no second copy is held in memory). SQLite does
+    /// not sync the copy: the caller makes it durable before it replaces anything.
+    pub fn compact_into(&mut self, target: &str) -> Result<()> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        self.db.execute("VACUUM INTO ?1", [target])?;
+        // Taken while this owner has the store open, the copy says so: it records the
+        // clean close this owner makes once it closes (as an image does), so opening the
+        // copy counts no crash.
+        self.db
+            .execute("ATTACH DATABASE ?1 AS compacted", [target])?;
+        let marked = self
+            .db
+            .execute("UPDATE compacted.opens SET closed=1 WHERE id=1", []);
+        self.db.execute("DETACH DATABASE compacted", [])?;
+        marked?;
+        Ok(())
     }
 
     /// Current realm lineage; every new admission must carry it.

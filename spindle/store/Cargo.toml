@@ -77,6 +77,10 @@ name = "embedded"
 required-features = ["cli", "embedded"]
 
 [[test]]
+name = "bench"
+required-features = ["embedded"]
+
+[[test]]
 name = "self_edit"
 required-features = ["cli"]
 

@@ -47,6 +47,7 @@ pub const FEATURES: &[&str] = &[
     "recover",
     "tasks",
     "session_transfer",
+    "capabilities",
 ];
 
 /// How long end of input waits for interrupted turns to wind down before exiting.
@@ -626,6 +627,10 @@ impl Server {
                     params.allow(&[])?;
                     now(Ok(info()))
                 }
+                "capabilities" => {
+                    params.allow(&[])?;
+                    now(Ok(capabilities()))
+                }
                 "providers" => {
                     params.allow(&[])?;
                     // Readiness may run credential commands: a helper thread answers.
@@ -1183,6 +1188,10 @@ impl Server {
             // Its owner is running it: nothing was left unfinished by a stopped one.
             status["wake"] = json!({"work": "running", "why": null});
             status["settings"] = settings_json(&settings);
+            let stopping = lock(&entry.shared).interrupt.load(Ordering::SeqCst);
+            let waiting_app = lock(&entry.desk.waiting).values().any(Option::is_none);
+            status["activity"] =
+                json!(crate::reads::activity(&status, true, stopping, waiting_app));
             Ok(status)
         })();
         Reply::Now(outcome)
@@ -1233,6 +1242,7 @@ fn status_of(actor: &mut Actor) -> Outcome {
     value["busy"] = json!(false);
     value["running"] = Value::Null;
     value["settings"] = settings_json(&settings);
+    value["activity"] = json!(crate::reads::activity(&value, false, false, false));
     Ok(value)
 }
 
@@ -1240,6 +1250,25 @@ fn merge(into: &mut Value, from: Value) {
     if let (Value::Object(into), Value::Object(from)) = (into, from) {
         into.extend(from);
     }
+}
+
+/// What this native host can run (`capabilities`), as the embedded package reports
+/// its own: every built-in tool in its sandbox (or unisolated where isolation allows),
+/// host directories, the toolchain, budgets and background tasks.
+fn capabilities() -> Value {
+    json!({
+        "host": "native",
+        "builtin_tools": ["all", "files", "none"],
+        "runners": ["sandbox"],
+        "sandbox": crate::agent::sandbox_available(),
+        "network": true,
+        "toolchain": true,
+        "sources": true,
+        "self_edit": true,
+        "budget": true,
+        "tasks": ["wait", "queue"],
+        "compaction": ["model", "digest"],
+    })
 }
 
 /// `info`: API version, transport features and this build.

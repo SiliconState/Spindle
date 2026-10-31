@@ -37,12 +37,10 @@ mod cost;
 mod host_tools;
 pub mod runner;
 pub mod tasks;
+pub use crate::spend::{Billing, Call, CallKind, ModelUsage, TurnUsage, UsageReport};
 pub use app_tools::{AppAnswer, AppCall, AppTool, AppTools, BuiltinTools};
 pub use catalog::{context_window, model_catalog, valid_efforts};
-pub use cost::{
-    Billing, Call, CallKind, ModelUsage, TurnUsage, UsageReport, admit_nested_spend,
-    annotate_snapshot, host_usage, recorded_usd, usage_report,
-};
+pub use cost::{admit_nested_spend, annotate_snapshot, host_usage, recorded_usd, usage_report};
 pub use host_tools::{
     SessionHost, annotate_display, display_of, drop_pending_settings, kind_of, pending_settings,
     queue_settings,
@@ -319,6 +317,17 @@ fn anthropic_subscription(route: &Route) -> bool {
     subscription_on(&NativeCredentials, route)
 }
 
+/// Whether a route sends through a subscription login now (ChatGPT, or a Claude login
+/// these credentials hold): what the shared spend ledger asks the native host.
+pub(crate) fn route_is_subscription(provider: &str, model: &str) -> bool {
+    match route(provider, Some(model)) {
+        Ok(route) => {
+            route.contract == RequestContract::ChatGptResponses || anthropic_subscription(&route)
+        }
+        Err(_) => false,
+    }
+}
+
 fn subscription_on(credentials: &dyn Credentials, route: &Route) -> bool {
     route.contract == RequestContract::AnthropicMessages
         && credentials
@@ -437,50 +446,7 @@ pub fn logins() -> Result<Vec<Login>> {
         .collect())
 }
 
-/// Model usage and cost: billed calls with their token buckets and the cost of those
-/// priced (`priced` of `calls`; `subscription` and `unpriced` are the rest), and
-/// requests counted beside them: `refused` (not billed) and `unknown` (sent with an
-/// unknown outcome: they may have been billed). See `usage_report`.
-#[derive(Clone, Debug, Default)]
-#[non_exhaustive]
-pub struct Tally {
-    pub calls: u64,
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_create: u64,
-    pub usd: f64,
-    pub priced: u64,
-    pub subscription: u64,
-    pub unpriced: u64,
-    pub refused: u64,
-    pub unknown: u64,
-}
-
-impl Tally {
-    /// The stable JSON form (docs/API.md, `usage`).
-    pub fn to_json(&self) -> Value {
-        json!({"calls": self.calls, "input": self.input, "output": self.output,
-            "cache_read": self.cache_read, "cache_create": self.cache_create,
-            "usd": self.usd, "priced": self.priced, "subscription": self.subscription,
-            "unpriced": self.unpriced, "refused": self.refused, "unknown": self.unknown})
-    }
-    fn plus(&self, other: &Tally) -> Tally {
-        Tally {
-            calls: self.calls + other.calls,
-            input: self.input + other.input,
-            output: self.output + other.output,
-            cache_read: self.cache_read + other.cache_read,
-            cache_create: self.cache_create + other.cache_create,
-            usd: self.usd + other.usd,
-            priced: self.priced + other.priced,
-            subscription: self.subscription + other.subscription,
-            unpriced: self.unpriced + other.unpriced,
-            refused: self.refused + other.refused,
-            unknown: self.unknown + other.unknown,
-        }
-    }
-}
+pub use crate::spend::Tally;
 
 /// The session's model usage and cost in total (parent replies, nested code-mode calls
 /// and compaction summaries); `usage_report` has the breakdowns.
@@ -1511,6 +1477,12 @@ fn open_bwrap() -> std::result::Result<StrictExecutor, String> {
         .map_err(|error| format!("bubblewrap is unusable: {error}"))
 }
 
+/// Whether this host can run commands in its sandbox (bubblewrap, proven once).
+pub fn sandbox_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| open_isolated().is_ok())
+}
+
 /// The bubblewrap runner, proven to work on this host by a trivial run.
 fn open_isolated() -> std::result::Result<StrictExecutor, String> {
     let runner = open_bwrap()?;
@@ -1966,7 +1938,7 @@ impl Session {
         if snapshot.revision == 0 {
             return Err("this session has no turns yet".into());
         }
-        let state = TurnContinuation::restore(&snapshot.continuation).map_err(turn_error)?;
+        let state = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
         Ok((snapshot.revision, state))
     }
 
@@ -2028,7 +2000,7 @@ impl Session {
         if snapshot.revision == 0 {
             return Ok(());
         }
-        let prior = TurnContinuation::restore(&snapshot.continuation).map_err(turn_error)?;
+        let prior = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
         match prior.control().phase() {
             Phase::Stopped(Stop::Complete) => Ok(()),
             Phase::Stopped(stop) => Err(format!(
@@ -2821,11 +2793,7 @@ impl Session {
         let answer = match answer {
             AppAnswer::Result {
                 content, failed, ..
-            } => Some(
-                json!({"content":content,"failed":failed})
-                    .to_string()
-                    .into_bytes(),
-            ),
+            } => Some(json!({"content":content,"failed":failed}).to_string()),
             _ => None,
         };
         let kept = self
@@ -2842,7 +2810,10 @@ impl Session {
             &self.dir,
             key,
             tasks::identity_input(input).to_string().as_bytes(),
-            answer.as_deref(),
+            match &answer {
+                Some(answer) => crate::meta::TaskEnd::Answered(answer.as_bytes()),
+                None => crate::meta::TaskEnd::Stopped(None),
+            },
         )
         .map_err(store_error)
     }
@@ -3141,7 +3112,7 @@ impl Session {
                 .store
                 .snapshot_at(SCOPE, target.revision)
                 .map_err(store_error)?;
-            let state = TurnContinuation::restore(&snapshot.continuation).map_err(turn_error)?;
+            let state = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
             let messages = state.transcript().map_err(turn_error)?.messages;
             let last = messages
                 .iter()
@@ -3176,22 +3147,18 @@ impl Session {
         }
     }
 
-    /// Workspace files with their sizes.
+    /// Workspace files with their sizes (from the rows alone: no file is read).
     pub fn files(&mut self) -> Result<Vec<(String, u64)>> {
-        let root = self.store.snapshot().map_err(store_error)?.workspace;
-        let mut out = vec![];
-        for entry in self.workspace_entries()? {
-            let size = match &root {
-                Some(root) => self
-                    .store
-                    .read_versioned_file(SCOPE, root, &entry.path)
-                    .map(|bytes| bytes.len())
-                    .unwrap_or_default() as u64,
-                None => 0,
-            };
-            out.push((entry.path, size));
-        }
-        Ok(out)
+        let Some(root) = self.store.snapshot().map_err(store_error)?.workspace else {
+            return Ok(vec![]);
+        };
+        let files = crate::view::ReadView::from_store(&self.store)
+            .files(&root)
+            .map_err(store_error)?;
+        Ok(files
+            .into_iter()
+            .map(|file| (file.entry.path, file.size))
+            .collect())
     }
 
     /// Read one workspace file.
@@ -3254,7 +3221,13 @@ impl Session {
         }
         let mut tasks = Vec::new();
         bundle_tasks(&self.dir, "", &mut files, &mut tasks)?;
-        let written = crate::bundle::write(files)?;
+        // A copy (the session stays here) is checked as far as the bundle records it; a
+        // move, whole, as it goes on only from the bundle.
+        let written = if keep {
+            crate::bundle::write_copy(files)?
+        } else {
+            crate::bundle::write(files)?
+        };
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]

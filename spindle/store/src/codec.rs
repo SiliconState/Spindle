@@ -43,10 +43,21 @@ const COPY: u8 = 1;
 const BLOCK: usize = 64;
 /// Shorter repeats stay literal: deflate's own 32 KiB window covers nearby ones.
 const MIN_COPY: usize = 128;
-const LEVEL: u8 = 6;
+/// Deflate's level. Each step packs the chunks its history and request changed, and
+/// packing is most of a step's own time: 3 packs about a third faster than 6 for about
+/// 3% more bytes. Any level reads back (rows packed at 6 by earlier builds included).
+const LEVEL: u8 = 3;
 const BASE: u64 = 0x0100_0000_01b3;
 /// Most bytes the process keeps of recent chunks (theirs and their bookkeeping's).
 const RECENT_BYTES: usize = 32 * 1024 * 1024;
+/// Fewest it keeps room for. The bound in between follows the values the open stores
+/// store and read (`Recent::bound`): what is kept beyond them is chunks of superseded
+/// steps, and in wasm memory that a process once used stays its own.
+const RECENT_LEAST: usize = 4 * 1024 * 1024;
+/// Stores and loads after which the largest values seen start over (`Recent::note`).
+const RECENT_WINDOW: u32 = 256;
+/// Most stores (connections) a window tells apart; more share the last one's room.
+const RECENT_STORES: usize = 64;
 /// What each kept chunk costs beyond its bytes (key, maps, vector headers).
 const RECENT_ENTRY: usize = 192;
 /// Most chunks found under one quick key (more, crafted to share one, are hashed).
@@ -69,6 +80,13 @@ struct Recent {
     by_bytes: HashMap<u64, Vec<[u8; 32]>>,
     bytes: usize,
     clock: u64,
+    /// The largest value each store (by its connection) stored or loaded in this window
+    /// of `RECENT_WINDOW` and the one before it, how many this window has seen, and the
+    /// bound they make (`bound`).
+    largest: HashMap<usize, usize>,
+    largest_before: HashMap<usize, usize>,
+    seen: u32,
+    room: usize,
 }
 
 struct Kept {
@@ -87,6 +105,40 @@ fn recent<T>(work: impl FnOnce(&mut Recent) -> T) -> T {
 }
 
 impl Recent {
+    /// A value of `length` bytes was stored or loaded by the store on connection
+    /// `store` (its address: sessions open at once each have their own).
+    fn note(&mut self, store: usize, length: usize) {
+        let key = match self.largest.contains_key(&store) || self.largest.len() < RECENT_STORES {
+            true => store,
+            false => usize::MAX,
+        };
+        let largest = self.largest.entry(key).or_default();
+        *largest = (*largest).max(length);
+        self.seen += 1;
+        if self.seen == RECENT_WINDOW {
+            self.largest_before = std::mem::take(&mut self.largest);
+            self.seen = 0;
+        }
+        let mut sum: usize = 0;
+        for (store, length) in &self.largest {
+            let before = self.largest_before.get(store).copied().unwrap_or(0);
+            sum = sum.saturating_add((*length).max(before));
+        }
+        for (store, length) in &self.largest_before {
+            if !self.largest.contains_key(store) {
+                sum = sum.saturating_add(*length);
+            }
+        }
+        self.room = sum.saturating_mul(4);
+    }
+
+    /// Room for the chunks of the open stores' steps: a step stores its history about
+    /// three times (continuation, proposal, request) and reads it back, so four times
+    /// each store's largest value, summed over the stores in use.
+    fn bound(&self) -> usize {
+        self.room.clamp(RECENT_LEAST, RECENT_BYTES)
+    }
+
     /// Appends a kept chunk's logical bytes to `out` when its row holds `packed`.
     fn read(&mut self, digest: &[u8], packed: &[u8], out: &mut Vec<u8>, bound: usize) -> bool {
         self.clock += 1;
@@ -142,13 +194,14 @@ impl Recent {
                 },
             );
         }
-        if self.bytes > RECENT_BYTES {
+        if self.bytes > self.bound() {
             self.shrink();
         }
     }
 
     /// Lets the least recently used chunks go, to three quarters of the bound.
     fn shrink(&mut self) {
+        let bound = self.bound();
         let mut ages: Vec<(u64, [u8; 32])> = self
             .chunks
             .iter()
@@ -156,7 +209,7 @@ impl Recent {
             .collect();
         ages.sort_unstable();
         for (_, digest) in ages {
-            if self.bytes <= RECENT_BYTES / 4 * 3 {
+            if self.bytes <= bound / 4 * 3 {
                 break;
             }
             let Some(kept) = self.chunks.remove(&digest) else {
@@ -316,6 +369,7 @@ pub fn store(db: &Connection, bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.len() <= INLINE {
         return Ok(pack(bytes));
     }
+    recent(|recent| recent.note(std::ptr::from_ref(db) as usize, bytes.len()));
     let mut out = Vec::with_capacity(9 + bytes.len() / 512);
     out.push(CHUNKED);
     out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
@@ -323,7 +377,8 @@ pub fn store(db: &Connection, bytes: &[u8]) -> Result<Vec<u8>> {
     for end in boundaries(bytes) {
         let chunk = &bytes[start..end];
         let digest = recent(|recent| recent.find(chunk)).unwrap_or_else(|| sha256(chunk));
-        let known: bool = db.query_row(
+        let known: bool = crate::cached_row(
+            db,
             "SELECT EXISTS(SELECT 1 FROM chunks WHERE digest=?1)",
             [&digest[..]],
             |row| row.get(0),
@@ -378,17 +433,18 @@ pub fn load(db: &Connection, stored: &[u8], bound: usize) -> Result<Vec<u8>> {
     {
         return Err(Error::Incompatible);
     }
+    recent(|recent| recent.note(std::ptr::from_ref(db) as usize, length));
     let mut out = Vec::with_capacity(length);
     for digest in rest[8..].as_chunks::<32>().0 {
         let digest = digest.as_slice();
-        let packed: Vec<u8> = db
-            .query_row(
-                "SELECT bytes FROM chunks WHERE digest=?1",
-                [digest],
-                |row| crate::bounded_blob(row, 0, stored_bound(CHUNK_MAX)),
-            )
-            .optional()?
-            .ok_or(Error::Incompatible)?;
+        let packed: Vec<u8> = crate::cached_row(
+            db,
+            "SELECT bytes FROM chunks WHERE digest=?1",
+            [digest],
+            |row| crate::bounded_blob(row, 0, stored_bound(CHUNK_MAX)),
+        )
+        .optional()?
+        .ok_or(Error::Incompatible)?;
         let bound = CHUNK_MAX.min(length - out.len());
         if recent(|recent| recent.read(digest, &packed, &mut out, bound)) {
             continue;
@@ -795,5 +851,46 @@ mod tests {
             LEVEL,
         ));
         assert!(unpack(&bomb, 1 << 30).is_err());
+    }
+
+    #[test]
+    fn recent_chunks_keep_room_for_the_values_in_use_only() {
+        // A recent store of its own: the process's one is shared with other tests.
+        let mut recent = Recent::default();
+        let keep = |recent: &mut Recent, seed: u64| {
+            let chunk = sample(seed, 16 * 1024);
+            recent.keep(sha256(&chunk), &chunk, None);
+        };
+        for seed in 0..1000 {
+            recent.note(1, 64 * 1024);
+            keep(&mut recent, seed);
+        }
+        assert_eq!(recent.bound(), RECENT_LEAST);
+        assert!(recent.bytes <= RECENT_LEAST, "{} bytes kept", recent.bytes);
+        // Values of 2 MiB in use: room for four times that, and no more.
+        recent.note(1, 2 * 1024 * 1024);
+        assert_eq!(recent.bound(), 8 * 1024 * 1024);
+        for seed in 1000..3000 {
+            keep(&mut recent, seed);
+        }
+        assert!(recent.bytes > RECENT_LEAST && recent.bytes <= 8 * 1024 * 1024);
+        // A second session of the same size: room for both.
+        recent.note(2, 2 * 1024 * 1024);
+        assert_eq!(recent.bound(), 16 * 1024 * 1024);
+        // Once two windows have passed without them, the room goes back down.
+        for _ in 0..2 * RECENT_WINDOW {
+            recent.note(1, 64 * 1024);
+        }
+        assert_eq!(recent.bound(), RECENT_LEAST);
+        keep(&mut recent, 3000);
+        assert!(recent.bytes <= RECENT_LEAST, "{} bytes kept", recent.bytes);
+        // However many stores there are, room is bounded, and so is the bookkeeping.
+        for store in 0..1000 {
+            recent.note(store, 1024 * 1024);
+        }
+        assert_eq!(recent.bound(), RECENT_BYTES);
+        assert!(recent.largest.len() <= RECENT_STORES + 1);
+        recent.note(1, usize::MAX / 8);
+        assert_eq!(recent.bound(), RECENT_BYTES);
     }
 }

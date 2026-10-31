@@ -3,7 +3,8 @@
 // Settings > Appearance selects through spindleTheme.set and spindleTheme.setTexture.
 (() => {
   const media = matchMedia('(prefers-color-scheme: dark)');
-  const colors = {paper: '#f6f2e9', light: '#f6f7f5', dark: '#111511'};
+  // The browser's bar takes the header's colour (--chrome), so the two read as one.
+  const colors = {paper: '#ece6d8', light: '#f0f0f0', dark: '#161c14'};
   const modes = ['paper','light','dark','system'];
   const textures = ['textured','plain'];
   let mode = 'paper';

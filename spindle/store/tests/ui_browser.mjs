@@ -17,6 +17,9 @@ test('real DOM mobile startup, sheets, viewer, history, commands and layout (off
     Object.defineProperty(globalThis,'localStorage',{value:{getItem:k=>stored.get(k),setItem:(k,v)=>stored.set(k,v)}});
     Object.defineProperty(globalThis,'crypto',{value:{randomUUID:()=>String(Math.random())}});
     globalThis.EventSource = class {close() {} addEventListener() {}};
+    // No host answers the preview check here: previews count as not contained (ui_app.mjs
+    // covers the contained path).
+    delete globalThis.RTCPeerConnection;
     globalThis.fetch = async (path,options={}) => {
       const data = options.body ? JSON.parse(options.body) : null;
       requests.push({path,data});
@@ -57,8 +60,13 @@ test('real DOM mobile startup, sheets, viewer, history, commands and layout (off
     check(!wide.length,'picker overflow '+wide);
     const done=document.getElementById('model-apply').getBoundingClientRect();
     check(done.bottom<=innerHeight+1,'picker action in reach '+JSON.stringify({inner:innerHeight,done:[done.top,done.bottom],sheet:[sheet.top,sheet.bottom],list:document.getElementById('model-list').getBoundingClientRect().height}));
-    check(document.getElementById('effort-choice').children.length===5,'efforts of the model: '+document.getElementById('effort-choice').children.length);
+    check(document.getElementById('effort-choice').children.length===4,'efforts of the model (its levels; auto is none chosen): '+document.getElementById('effort-choice').children.length);
     check(sheet.bottom>=innerHeight-1,'the picker is a bottom sheet '+JSON.stringify(sheet));
+    // Thread options open: the controls scroll and Done stays pinned in reach.
+    document.getElementById('picker-more').open=true;
+    const pinned=document.getElementById('model-apply').getBoundingClientRect(), controls=document.querySelector('.picker-controls');
+    check(pinned.bottom<=innerHeight+1 && pinned.top>=sheet.top && controls.scrollHeight>controls.clientHeight,'Done pinned with thread options open '+JSON.stringify({done:[pinned.top,pinned.bottom],scroll:[controls.scrollHeight,controls.clientHeight]}));
+    document.getElementById('picker-more').open=false;
     document.getElementById('model-dialog').close();
     await openThread('fixture');
     check(!document.getElementById('dock').hidden,'thread dock');
@@ -79,9 +87,14 @@ test('real DOM mobile startup, sheets, viewer, history, commands and layout (off
     document.getElementById('settings-dialog').close();
     // Files is the whole sheet; a file's viewer fills the screen; neither is held to a fixed split.
     await openFiles();
+    const heads=[...document.querySelectorAll('#file-list .tree-folder-head')];
+    check(heads.length===2 && heads.every(h=>h.getAttribute('aria-expanded')==='false') && !document.querySelector('#file-list [data-path]'),'folders start shut');
+    for(const head of heads) head.click();
+    check(document.querySelectorAll('#file-list [data-path]').length===31,'opened folders list their files');
+    check(!overflow().length,'file tree overflow '+overflow());
     const list=document.getElementById('file-list').getBoundingClientRect();
     check(list.height>innerHeight*0.6,'file list held short: '+list.height);
-    document.querySelector('#file-list button').click(); await new Promise(r=>setTimeout(r,200));
+    document.querySelector('#file-list button[data-path]').click(); await new Promise(r=>setTimeout(r,200));
     check(document.getElementById('viewer-dialog').open && !document.getElementById('viewer-back').hidden,'viewer over files');
     const frame=document.getElementById('file-html').getBoundingClientRect();
     check(frame.height>=innerHeight*0.7 && frame.bottom<=innerHeight+1,'viewer preview fills the screen: '+frame.height+' of '+innerHeight);

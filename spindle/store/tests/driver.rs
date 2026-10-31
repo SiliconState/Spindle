@@ -651,7 +651,13 @@ fn admitted_task_report_replays_before_a_newly_finished_earlier_task() {
             })
             .unwrap();
     }
-    spindle_store::meta::finish_task(&realm.0, "app:b", input, Some(answer)).unwrap();
+    spindle_store::meta::finish_task(
+        &realm.0,
+        "app:b",
+        input,
+        spindle_store::meta::TaskEnd::Answered(answer),
+    )
+    .unwrap();
     let action = spindle_store::turn::Action::TaskReport {
         task: "app:b".into(),
         text: "[task app:b: finished]\nanswer".into(),
@@ -668,7 +674,13 @@ fn admitted_task_report_replays_before_a_newly_finished_earlier_task() {
         })
         .unwrap();
     drop(store);
-    spindle_store::meta::finish_task(&realm.0, "app:a", input, Some(answer)).unwrap();
+    spindle_store::meta::finish_task(
+        &realm.0,
+        "app:a",
+        input,
+        spindle_store::meta::TaskEnd::Answered(answer),
+    )
+    .unwrap();
     let mut store = Store::open(&realm.0.join("store")).unwrap();
     let mut engine = driver(&facts);
     assert!(matches!(engine.resume(&mut store).unwrap(), Need::Continue));
@@ -689,6 +701,114 @@ fn admitted_task_report_replays_before_a_newly_finished_earlier_task() {
     let runs = store.task_runs().unwrap();
     assert!(runs[0].delivered.is_some());
     assert!(runs[1].delivered < runs[0].delivered);
+    store.check_integrity().unwrap();
+}
+
+#[test]
+fn a_stopped_task_reports_so_and_a_stale_admitted_report_is_dropped_once_it_goes_on() {
+    let realm = Realm::new();
+    std::fs::create_dir_all(&realm.0).unwrap();
+    let mut store = Store::open(&realm.0.join("store")).unwrap();
+    store.set_metadata("settings", &serde_json::to_vec(&json!({"provider":"fake", "model":"model", "builtin_tools":"none", "compaction":"digest"})).unwrap()).unwrap();
+    let facts = Arc::new(Facts::default());
+    let mut engine = driver(&facts);
+    start(&mut engine, &mut store);
+    let need = send(&mut engine, &mut store);
+    let outcome = record(&mut store, &need, vec![text("done")]);
+    deliver(&mut engine, &mut store, need, outcome);
+    finish(&mut engine, &mut store);
+    let snapshot = store.snapshot().unwrap();
+    let input = br#"{"prompt":"child"}"#;
+    store
+        .register_task(&spindle_store::meta::TaskRun {
+            task: "app:a".into(),
+            origin: None,
+            input: input.to_vec(),
+            base: snapshot.workspace.clone().unwrap(),
+            revision: snapshot.revision,
+            queued: true,
+            state: "running".into(),
+            answer: None,
+            delivered: None,
+            lease: None,
+        })
+        .unwrap();
+    // It stops without an answer, and a crash cuts its report off once admitted.
+    spindle_store::meta::finish_task(
+        &realm.0,
+        "app:a",
+        input,
+        spindle_store::meta::TaskEnd::Stopped(None),
+    )
+    .unwrap();
+    // Its worker's own end, after the stop, changes nothing: it stays as it was stopped.
+    spindle_store::meta::finish_task(
+        &realm.0,
+        "app:a",
+        input,
+        spindle_store::meta::TaskEnd::Answered(br#"{"content":"late","failed":false}"#),
+    )
+    .unwrap();
+    let runs = store.task_runs().unwrap();
+    assert_eq!(
+        (runs[0].state.as_str(), runs[0].answer.is_none()),
+        ("stopped", true)
+    );
+    let stopped = "[task app:a: stopped]\nIt stopped before it finished and gave no answer.";
+    let lineage = store.lineage().unwrap();
+    store
+        .admit(&spindle_store::Command {
+            scope: "operator".into(),
+            id: "task-report-app:a".into(),
+            lineage,
+            kind: spindle_store::turn::ENGINE.into(),
+            payload: spindle_store::turn::Action::TaskReport {
+                task: "app:a".into(),
+                text: stopped.into(),
+            }
+            .encode()
+            .unwrap(),
+        })
+        .unwrap();
+    drop(store);
+    // Before the session goes on, the task is started again: the admitted report says
+    // nothing true now. It is dropped, and the turn waits for the task instead.
+    let mut store = Store::open(&realm.0.join("store")).unwrap();
+    store.resume_task("app:a").unwrap();
+    let mut engine = driver(&facts);
+    assert!(matches!(engine.resume(&mut store).unwrap(), Need::TaskWait));
+    assert!(store.task_runs().unwrap()[0].delivered.is_none());
+    // It finishes this time: its answer is read in, under a command of its own.
+    drop(store);
+    spindle_store::meta::finish_task(
+        &realm.0,
+        "app:a",
+        input,
+        spindle_store::meta::TaskEnd::Answered(br#"{"content":"answer","failed":false}"#),
+    )
+    .unwrap();
+    let mut store = Store::open(&realm.0.join("store")).unwrap();
+    let mut engine = driver(&facts);
+    let mut need = engine.resume(&mut store).unwrap();
+    for _ in 0..40 {
+        match need {
+            Need::Continue => {}
+            Need::Send(sent) => {
+                let outcome = record(&mut store, &sent, vec![text("received")]);
+                deliver(&mut engine, &mut store, sent, outcome);
+            }
+            Need::Stopped(Stop::Complete) => break,
+            _ => panic!("unexpected task report need"),
+        }
+        need = engine.next(&mut store).unwrap();
+    }
+    assert!(store.task_runs().unwrap()[0].delivered.is_some());
+    assert!(
+        store
+            .admitted("operator", "task-report-app:a-2")
+            .unwrap()
+            .is_some()
+    );
     store.check_integrity().unwrap();
 }
 

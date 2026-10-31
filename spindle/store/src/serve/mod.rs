@@ -14,7 +14,6 @@ mod v1;
 pub use v1::token;
 
 use dext_core::turn::{Phase, Stop, TurnControl};
-use dext_transcript::turn::TurnContinuation;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -662,7 +661,7 @@ fn summarize(store: &Path) -> Result<&'static str> {
             .flatten();
         let phase = match header {
             Some(control) => control.phase(),
-            None => TurnContinuation::restore(&bytes)
+            None => spindle_store::turn::restored(&bytes)
                 .map_err(|_| spindle_store::Error::Incompatible)?
                 .control()
                 .phase(),
@@ -671,7 +670,7 @@ fn summarize(store: &Path) -> Result<&'static str> {
             Phase::Stopped(Stop::Complete) => "done",
             Phase::Stopped(Stop::Cancelled) => "stopped",
             Phase::ModelWait => {
-                let state = TurnContinuation::restore(&bytes)
+                let state = spindle_store::turn::restored(&bytes)
                     .map_err(|_| spindle_store::Error::Incompatible)?;
                 let mut recorded = false;
                 for effect in state
@@ -781,6 +780,11 @@ pub fn run(root: PathBuf, args: Vec<String>) -> Result<()> {
     let (host, listener) = started.map_err(|error| after_failed_start(&root, error))?;
     let _ = std::fs::remove_file(root.join(UPGRADE_MARKER));
     let host = Arc::new(host);
+    // A long-lived host: an isolated command starts from the workspace its session's
+    // last command left, writing only the files that may differ. What a host before
+    // this one left (stopped before it could drop it) is swept first.
+    let _ = dext_native::strict::sweep_abandoned_candidates();
+    dext_native::strict::keep_workspaces(true);
     if let Some(build) = std::env::current_exe()
         .ok()
         .and_then(|exe| spindle_store::upgrade::fingerprint(&exe).ok())
@@ -1054,12 +1058,10 @@ impl Host {
         view.read(|view| {
             let (_, root) = view.at(revision)?.ok_or(spindle_store::Error::Invalid)?;
             let root = root.ok_or(spindle_store::Error::Invalid)?;
-            let file = view
-                .files(&root)?
-                .into_iter()
-                .find(|f| f.entry.path == path)
+            let entry = view
+                .entry(&root, path)?
                 .ok_or(spindle_store::Error::Invalid)?;
-            view.object(&file.entry.object)
+            view.object(&entry.object)
         })
         .map_err(err)
     }
@@ -1416,7 +1418,7 @@ impl Host {
                 }
                 if self_edit
                     && (head == 0
-                        || TurnContinuation::restore(&bytes)
+                        || spindle_store::turn::restored(&bytes)
                             .map_err(err)?
                             .control()
                             .phase()
@@ -1995,6 +1997,8 @@ impl Host {
                 );
             }
             std::thread::sleep(Duration::from_secs(1));
+            // Kept workspaces live in scratch (often memory): give it back before going.
+            dext_native::strict::keep_workspaces(false);
             std::process::exit(75);
         }
     }
@@ -2260,7 +2264,9 @@ impl Host {
         view.read(|view| Ok(view.at(revision)?.and_then(|(_, root)| root)))
             .map_err(err)
     }
-    /// A static-site preview token for one revision of a thread (preview.rs).
+    /// A static-site preview token for one revision of a thread (preview.rs): its pages'
+    /// scripts run only as `scripts` lets them, on one page (its path) or every page
+    /// (`true`); GitHub access runs them too (every page, unless one is named).
     fn preview_grant(&self, id: &str, data: &Value) -> Result<Value> {
         let revision = data["revision"]
             .as_u64()
@@ -2275,9 +2281,37 @@ impl Host {
             Some(Value::String(mode)) if mode == "github" => true,
             Some(_) => return Err("preview network must be none or github".into()),
         };
-        let (token, lasts) = self.previews.mint(id, revision, github)?;
+        use preview::Scripts;
+        let scripts = match data.get("scripts") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) if github => Scripts::All,
+            None | Some(Value::Null) | Some(Value::Bool(false)) => Scripts::None,
+            Some(Value::Bool(true)) => Scripts::All,
+            Some(Value::String(page)) if spindle_store::workspace::valid_path(page) => {
+                Scripts::Page(page.clone())
+            }
+            Some(_) => {
+                return Err("preview scripts must be true, false or a page's path".into());
+            }
+        };
+        let told = match &scripts {
+            Scripts::None => json!(false),
+            Scripts::Page(page) => json!(page),
+            Scripts::All => json!(true),
+        };
+        // Its scripts run only where the browser keeps the page offline.
+        let contained = match data.get("contained") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => true,
+            Some(_) => return Err("preview contained must be true or false".into()),
+        };
+        let reach = preview::Reach {
+            scripts,
+            github,
+            contained,
+        };
+        let (token, lasts) = self.previews.mint(id, revision, reach)?;
         Ok(
-            json!({"token":token,"url":format!("{}{token}/", preview::PREFIX),"revision":revision,"expires_in":lasts.as_secs(),"network":if github { "github" } else { "none" }}),
+            json!({"token":token,"url":format!("{}{token}/", preview::PREFIX),"revision":revision,"expires_in":lasts.as_secs(),"network":if github { "github" } else { "none" },"scripts":told,"contained":contained}),
         )
     }
     fn is_dev(&self, id: &str) -> bool {
@@ -2383,7 +2417,7 @@ impl Host {
             let mut rejected = None;
             let mut follow_up = false;
             if revision > 0 {
-                let state = TurnContinuation::restore(&bytes).map_err(|_| spindle_store::Error::Incompatible)?;
+                let state = spindle_store::turn::restored(&bytes).map_err(|_| spindle_store::Error::Incompatible)?;
                 phase = format!("{:?}", state.control().phase());
                 complete = state.control().phase() == Phase::Stopped(Stop::Complete);
                 // A session pack's follow-up the host stopped before delivering: Continue.
@@ -2752,6 +2786,7 @@ impl Host {
         drop(lives);
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(500));
+            dext_native::strict::keep_workspaces(false);
             std::process::exit(75);
         });
         Ok(())
@@ -3147,6 +3182,13 @@ fn route(
     let Some(device) = device else {
         return Err(Refused(401, "Pair this device first".into()));
     };
+    // A runner token runs commands through /v1 and is no screen's credential.
+    if v1::runner_only(&device) {
+        return Err(Refused(
+            403,
+            "this token only runs commands (/v1/runner, /v1/run)".into(),
+        ));
+    }
     // The body is read only for a paired device (an upload can be 8 MiB).
     if request.method == "POST" {
         http::read_body(stream, &mut request).map_err(bad)?;
@@ -3470,13 +3512,38 @@ fn route(
                         .ok_or_else(|| bad("path required"))?,
                 )
                 .map_err(|e| Refused(404, e))?;
-            // render=1: an HTML file for the preview frame, under its own sandbox policy.
+            // render=1: an HTML file for the preview frame, under its own sandbox policy,
+            // its scripts (and meta refreshes) taken out as a preview token's are, and
+            // connecting to nothing.
             if request.query.get("render").map(String::as_str) == Some("1") {
+                // A page as a page; anything else (an SVG) as what it is, never as HTML.
+                let path = request.query.get("path").map(String::as_str).unwrap_or("");
+                let page = preview::mime(path).starts_with("text/html");
+                let text = if page {
+                    preview::bundle(
+                        &String::from_utf8_lossy(&text),
+                        path,
+                        "",
+                        |_| None,
+                        false,
+                        false,
+                    )
+                    .into_bytes()
+                } else {
+                    text
+                };
                 http::headers_with(
                     stream,
                     200,
-                    "text/html; charset=utf-8",
-                    &format!("Content-Disposition: inline\r\n{extra}"),
+                    if page {
+                        "text/html; charset=utf-8"
+                    } else {
+                        preview::mime(path)
+                    },
+                    &format!(
+                        "Content-Disposition: inline\r\nX-DNS-Prefetch-Control: off\r\nConnection-Allowlist: {}\r\n{extra}",
+                        http::NOWHERE
+                    ),
                     Some(text.len()),
                     http::PREVIEW_POLICY,
                 )
@@ -3915,6 +3982,7 @@ fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dext_transcript::turn::TurnContinuation;
     use std::io::Read;
     /// serve.lock is an flock on one open file description. A child that another test
     /// is forking holds a copy of it until exec closes it (O_CLOEXEC), so an immediate
@@ -4127,7 +4195,8 @@ mod tests {
                 ),
             )
         };
-        let body = format!("{{\"revision\":{revision}}}");
+        let quiet_body = format!("{{\"revision\":{revision}}}");
+        let body = format!("{{\"revision\":{revision},\"scripts\":true}}");
         let paired = format!("Origin: http://HOST\r\nX-Spindle: 1\r\nCookie: spindle={cookie}\r\n");
         // Minting is an ordinary command: a paired device and the same-origin header.
         assert_eq!(mint(&format!("Cookie: spindle={cookie}\r\n"), &body).0, 403);
@@ -4137,9 +4206,126 @@ mod tests {
         );
         assert_eq!(mint(&paired, "{\"revision\":0}").0, 400);
         assert_eq!(mint(&paired, "{\"revision\":99}").0, 400);
+        assert_eq!(
+            mint(
+                &paired,
+                &format!("{{\"revision\":{revision},\"scripts\":1}}")
+            )
+            .0,
+            400
+        );
+        // Without `scripts`, a page shows as it is without them: no script in it, and a
+        // sandbox that would not run one.
+        let (status, _, reply) = mint(&paired, &quiet_body);
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&reply));
+        let quiet: Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(quiet["scripts"], false);
+        let (status, head, bytes) = exchange(
+            &host,
+            &format!(
+                "GET {}site/index.html HTTP/1.1\r\nHost: HOST\r\nOrigin: null\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+                quiet["url"].as_str().unwrap()
+            ),
+        );
+        assert_eq!(status, 200, "{head}");
+        let page = String::from_utf8(bytes).unwrap();
+        assert!(
+            !page.contains("<script") && page.contains("<style>"),
+            "{page}"
+        );
+        assert!(
+            head.contains(
+                "Content-Security-Policy: sandbox; default-src 'none'; script-src 'none';"
+            ),
+            "{head}"
+        );
+        // Scripts let on one page run there only; a grant names a page of the revision.
+        assert_eq!(
+            mint(
+                &paired,
+                &format!("{{\"revision\":{revision},\"scripts\":\"../x.html\"}}")
+            )
+            .0,
+            400
+        );
+        let (status, _, reply) = mint(
+            &paired,
+            &format!("{{\"revision\":{revision},\"scripts\":\"site/index.html\"}}"),
+        );
+        assert_eq!(status, 200);
+        let one: Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(one["scripts"], "site/index.html");
+        let head_of = |path: &str| {
+            exchange(
+                &host,
+                &format!(
+                    "GET {}{path} HTTP/1.1\r\nHost: HOST\r\nOrigin: null\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+                    one["url"].as_str().unwrap()
+                ),
+            )
+            .1
+        };
+        let page = head_of("site/index.html");
+        assert!(
+            page.contains("Content-Security-Policy: sandbox allow-scripts"),
+            "{page}"
+        );
+        assert!(page.contains("X-DNS-Prefetch-Control: off"), "{page}");
+        let other = head_of("site/data.json");
+        assert!(
+            other.contains(
+                "Content-Security-Policy: sandbox; default-src 'none'; script-src 'none';"
+            ),
+            "{other}"
+        );
+        // Whatever runs, every response holds what it connects to to the token's own files
+        // (on the host and port each exchange listens on).
+        for head in [&page, &other] {
+            let allowed = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Connection-Allowlist: "))
+                .unwrap_or_default();
+            assert!(
+                allowed.starts_with("(\"http://127.0.0.1:")
+                    && allowed.ends_with(&format!("{}*\")", one["url"].as_str().unwrap())),
+                "{head}"
+            );
+        }
+        // The UI's question: whether this browser holds a preview to its allowlist.
+        let (status, head, bytes) = exchange(
+            &host,
+            "GET /api/preview/check HTTP/1.1\r\nHost: HOST\r\n\r\n",
+        );
+        assert_eq!(status, 200, "{head}");
+        assert!(
+            head.contains("Connection-Allowlist: ()")
+                && head.contains("Content-Security-Policy: sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; frame-ancestors http://127.0.0.1:"),
+            "{head}"
+        );
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains("spindleContained")
+        );
+        let (status, head, _) = exchange(
+            &host,
+            "GET /api/preview/0000/x.html HTTP/1.1\r\nHost: HOST\r\n\r\n",
+        );
+        assert_eq!(status, 404);
+        assert!(head.contains("Connection-Allowlist: ()"), "{head}");
+        // GitHub access runs scripts (every page, unless one is named).
+        let (_, _, reply) = mint(
+            &paired,
+            &format!("{{\"revision\":{revision},\"network\":\"github\",\"scripts\":false}}"),
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&reply).unwrap()["scripts"],
+            true
+        );
         let (status, _, reply) = mint(&paired, &body);
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&reply));
         let grant: Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(grant["scripts"], true);
         let token = grant["token"].as_str().unwrap().to_string();
         let url = grant["url"].as_str().unwrap().to_string();
         assert_eq!(url, format!("/api/preview/{token}/"));
@@ -4245,8 +4431,9 @@ mod tests {
             ),
         );
         assert_eq!(status, 403);
-        // The single-file preview (`render=1`, used for SVG) still works with the cookie.
-        let (status, head, _) = exchange(
+        // The single-file preview (`render=1`, used for SVG) still works with the cookie,
+        // its scripts taken out and in a sandbox that would not run one.
+        let (status, head, bytes) = exchange(
             &host,
             &format!(
                 "GET /api/sessions/s/file?revision={revision}&path=site/index.html&render=1 HTTP/1.1\r\nHost: HOST\r\nCookie: spindle={cookie}\r\n\r\n"
@@ -4254,9 +4441,21 @@ mod tests {
         );
         assert_eq!(status, 200);
         assert!(
-            head.contains("Content-Security-Policy: sandbox allow-scripts;"),
+            head.contains("Content-Security-Policy: sandbox; default-src 'none';")
+                && head.contains("script-src 'none'"),
             "{head}"
         );
+        assert!(!String::from_utf8_lossy(&bytes).contains("<script"));
+        assert!(head.contains("X-DNS-Prefetch-Control: off"), "{head}");
+        // Anything else is served as what it is, never as a page.
+        let (status, head, _) = exchange(
+            &host,
+            &format!(
+                "GET /api/sessions/s/file?revision={revision}&path=site/data.json&render=1 HTTP/1.1\r\nHost: HOST\r\nCookie: spindle={cookie}\r\n\r\n"
+            ),
+        );
+        assert_eq!(status, 200);
+        assert!(head.contains("Content-Type: application/json"), "{head}");
         assert!(!head.contains("api.github.com"));
         for invalid in [json!(true), json!("*"), json!(["https://api.github.com"])] {
             assert_eq!(

@@ -169,26 +169,33 @@ sequenceDiagram
     C->>H: prompt(text)
     H->>D: admit input
     D->>S: commit admission
-    loop until the turn ends
-        H->>D: next()
-        D->>S: read committed head
-        D-->>H: Need: model request (effect id, exact bytes)
-        H->>S: reserve attempt
-        H->>P: send request
-        P-->>H: streamed reply (live preview events to C)
-        H->>S: record receipt
-        H->>D: deliver(answer)
-        D->>S: commit revision (transcript + tool intents)
-        opt tool calls
-            D-->>H: Need: run tools
-            H->>H: run in sandbox / ask app / start task
-            H->>S: record receipts with new workspace tree
-            H->>D: deliver(results)
-            D->>S: commit revision
-        end
-    end
-    H-->>C: turn ended (status, events)
+    H->>D: next()
+    D->>S: read committed head
+    D-->>H: Need model request
+    H->>S: reserve attempt
+    H->>P: send request
+    P-->>H: reply stream
+    H->>S: record receipt
+    H->>D: deliver answer
+    D->>S: commit revision
+    D-->>H: Need tool calls
+    H->>H: run or ask app
+    H->>S: record tool receipts
+    H->>D: deliver results
+    D->>S: commit revision
+    H->>D: next()
+    D-->>H: Need model request
+    H->>S: reserve attempt
+    H->>P: next request
+    P-->>H: final reply
+    H->>S: record receipt
+    H->>D: deliver answer
+    D->>S: commit final step
+    H-->>C: turn ended
 ```
+
+A tool-using round is shown; the host repeats the request/result cycle until the
+driver ends the turn. Tool-free replies skip tool dispatch.
 
 The important boundaries:
 
@@ -214,7 +221,11 @@ effects itself:
   (`~/.dext`, or `DEXT_HOME`) for each fresh send; credentials are never written into a
   session.
 - **Commands** in the strict runner (bubblewrap on Linux where available; see
-  [tools.md](tools.md) for isolation modes and platform differences).
+  [tools.md](tools.md) for isolation modes and platform differences). Linux sealing
+  observes write-open events as well as stamps, so shared-mapping writes are kept.
+  The long-running serving host reuses a session's last sandbox workspace, replacing
+  changed inputs and removing leftovers against the committed tree before a run;
+  it is a bounded cache, never authority ([engine.md](engine.md#strict-command-runner-strict)).
 - **Background jobs, code mode, tasks and app tools** under the same reserve/record
   discipline.
 
@@ -231,7 +242,12 @@ in a Rust program.
 storage for Node (files through a VFS with fsync and lock files) and browsers (OPFS behind
 Web Locks). `EmbeddedClient` ([`clients/js/embedded.mjs`](../spindle/clients/js/embedded.mjs))
 speaks the same JSON-RPC protocol as `spindle api`, so an app can switch between the two.
-See [embedded.md](embedded.md).
+Both hosts price recorded requests, nested calls and summaries through
+[`spend.rs`](../spindle/store/src/spend.rs), and enforce `max_usd` before sending.
+Embedded background tasks keep their own work streams beside the parent and
+commit reports, including stopped reports, at its next boundary. `capabilities`
+reports the host's abilities; embedded `fit` proposes, but does not apply, settings
+changes for a session moved from another host. See [embedded.md](embedded.md).
 
 ### Spindle for Browser
 
@@ -292,8 +308,16 @@ and any session can be exported to a single-file bundle and imported elsewhere
 
 ## On disk
 
-A session is a directory. The authoritative state is its store; everything else is a
-mirror or an index that can be rebuilt or is bounded metadata.
+A session is a directory. Schema 20 packs workspace objects without changing their
+logical ids; schema 19 migrates in place. The authoritative state is its store;
+everything else is a mirror or index, bounded metadata, or a cache. The JSON
+checkpoint codec compares canonical output with input without keeping a
+second encoding; the outer `DTT1` restore still re-encodes its composite frame.
+Spindle reuses one exact-byte restore per thread for continuations at most 8 MiB;
+larger ones are restored afresh. Sources:
+[`lib.rs`](../spindle/store/src/lib.rs),
+[`checkpoint.rs`](../dext-engine/transcript/src/checkpoint.rs) and
+[`turn.rs`](../spindle/store/src/turn.rs).
 
 ```text
 SESSION/
@@ -341,6 +365,7 @@ effects a rewind cannot undo. See [SECURITY.md](../SECURITY.md).
 | [`spindle/store/src/bundle.rs`](../spindle/store/src/bundle.rs) | Session bundles for moving sessions |
 | [`spindle/store/src/driver.rs`](../spindle/store/src/driver.rs) | The portable turn driver |
 | [`spindle/store/src/shape.rs`](../spindle/store/src/shape.rs) | Pure request shaping |
+| [`spindle/store/src/spend.rs`](../spindle/store/src/spend.rs) | Shared ledger, pricing, usage forms and budget checks for both hosts |
 | [`spindle/store/src/agent.rs`](../spindle/store/src/agent.rs), [`agent/`](../spindle/store/src/agent) | Native session, tools, tasks, spend, remote runner |
 | [`spindle/store/src/code_mode.rs`](../spindle/store/src/code_mode.rs) | Code mode child-effect journal |
 | [`spindle/store/src/embedded/`](../spindle/store/src/embedded) | Embedded host and its storage |

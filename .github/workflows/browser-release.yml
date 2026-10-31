@@ -75,6 +75,18 @@ jobs:
           unzip -q "$RUNNER_TEMP/$ASSET" -d "$RUNNER_TEMP/spindle-browser"
           SPINDLE_BROWSER="$(command -v google-chrome)" \
             node chrome/tests/extension_real.mjs "$RUNNER_TEMP/spindle-browser" --scripted
+          # The focused checks on the same unpacked zip (previews, tasks, sends; a renewed
+          # engine giving its memory back), and what it says it is made of: this version,
+          # from sources with no changes.
+          SPINDLE_BROWSER="$(command -v google-chrome)" \
+            node chrome/tests/review_browser.mjs "$RUNNER_TEMP/spindle-browser"
+          node --expose-gc chrome/tests/engine_renew.mjs "$RUNNER_TEMP/spindle-browser/web"
+          node -e '
+            const build = require(process.argv[1]);
+            if (build.version !== process.env.VERSION) throw new Error(`build.json says ${build.version}`);
+            for (const part of ["spindle", "engine"]) if (!/^[0-9a-f]{12}$/.test(build[part])) throw new Error(`build.json ${part}: ${build[part]}`);
+            console.log(JSON.stringify(build));
+          ' "$RUNNER_TEMP/spindle-browser/build.json"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: ${{ runner.temp }}/${{ env.ASSET }}

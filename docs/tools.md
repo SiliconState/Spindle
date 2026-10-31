@@ -203,14 +203,18 @@ Each run goes through the [`StrictExecutor`](../dext-engine/native/src/strict.rs
    256 MiB of headroom, or the call fails with "the host's scratch space is full ...;
    nothing ran". Scratch space is `/tmp` on Unix and the per-user temp directory on
    Windows.
-3. It materializes a fresh private copy of the workspace. Files are created new, never
-   through a link, and symbolic links are created last.
+3. It materializes a private workspace. The serving host may reuse that session's
+   last sandbox candidate where content ids and stamps match, reconciling changed
+   files and removing leftovers first. Otherwise files are created new, never
+   through a link, with symbolic links last. See [engine.md](engine.md#strict-command-runner-strict).
 4. It launches the command in the sandbox or on the host ([Isolation](#isolation)). The
    command's working directory is the copy.
 5. It watches the deadline, the output size, and the copy's growth. The copy may grow to
    twice the tree limit, but never into the scratch headroom.
-6. It seals the result. Files whose inode, size, times and mode are unchanged are
-   reported unchanged and not read again. New and changed regular files, symbolic links
+6. It seals the result. A file whose inode, size, times and mode are unchanged can
+   be reported unchanged. On Linux, inotify also tracks input files opened for
+   writing, catching shared-mapping writes that leave tmpfs stamps unchanged; a
+   failed watch or overflow makes every input file suspect. New and changed regular files, symbolic links
    (never followed) and empty directories make up the new tree. Sockets, pipes and
    devices are not kept, and the output says so. Hard links are sealed as plain files.
    If the tree exceeds the workspace limits, none of the changes are kept.
@@ -565,20 +569,25 @@ with what has changed in the parent since the base, including earlier tasks of t
 step. If any path overlaps, none of the task's changes are adopted, the answer gains
 `[task file conflict: ...]`, and it is marked failed.
 
-A background task's call is answered at once with "Task ... started in the background;
-its answer will arrive as a queued update". Its files stay in the child session. When
-it finishes, its answer is delivered once as a queued update to the parent's running or
-next turn. A rewind marks queued tasks that are not yet delivered as abandoned.
+A background task's call is answered at once, saying the task started and will
+report as a queued update. Its files stay in the child session.
+When it ends, its retained answer, or a stopped report with the reason when it
+could not go on, is delivered to the parent's running or next turn. Delivery is
+committed once per lineage; a rewind before it makes the report readable again.
+Tasks created after a rewind's target become abandoned but remain in the store.
 
 ### Budget leases
 
-When the parent has `max_usd`, each task gets a lease. At registration, the lease is
+When the native parent has `max_usd`, each task gets a lease. At registration, the lease is
 the parent's cap, minus what the parent has spent, minus what other running tasks still
 hold, divided by `max_running`. Each time the task runs, its `max_usd` is set again to
 the smaller of that lease and what the parent has left, leaving out the task's own
 spend. A `settings.max_usd` in the call can lower it further
 ([`lease`](../spindle/store/src/agent/tasks.rs)). The task's spend counts against the
-parent's usage report.
+parent's usage report. Embedded tasks instead share their open task tree's spend
+and in-flight worst cases against the inherited or narrowed budget; embedded
+`usage` reports only the session itself. See
+[embedded.md](embedded.md#settings-and-limits).
 
 ### Cancellation and recovery
 
@@ -589,9 +598,14 @@ parent's next `continue` finds the same task and resumes it. A task stopped on i
 by marking it stopped, stays stopped until it is explicitly restarted. Sometimes a task
 cannot go on by itself, for example because a request in it has an unknown outcome. Its
 call is then left unanswered, with a message to settle the task in its own session
-before continuing the parent. The next `continue` asks again. An app can also start,
+before continuing the parent. This unanswered-call rule applies to foreground
+tasks. A background child that stops without an answer, including a provider failure,
+unknown send or worker crash, retains a stopped report so the parent goes on; its
+`answer` row may hold `{content, failed: true}` as the reason. Explicitly starting
+the same id again resumes it, and a new end reports again. An app can also start,
 wait for and stop tasks directly (`task_start`, `task_wait`, `task_stop`; see
-[API.md](API.md)).
+[API.md](API.md)). The embedded host also supports queued tasks; stopping a parent
+that only waits for them ends the wait while leaving the tasks running.
 
 ## Code mode
 
@@ -892,12 +906,16 @@ The other file tools and `read_output` are computed by the embedded store itself
 - **`runner: remote`.** A Spindle host runs the command in its sandbox.
   `GET /v1/runner` returns the host's identity (`helper`, `isolated`,
   `implementation`). `POST /v1/run` takes `{command, timeout_s, network, files:
-  [{path, base64, executable}], links, directories}`, with at most 48 MiB of file
+  [{path, base64, executable}], links, directories, run?}`, with at most 48 MiB of file
   bytes. It returns `{output, success, writes, deletes, links, directories, failure,
   helper}`, with changes measured against the files sent
   ([`runner.rs`](../spindle/store/src/agent/runner.rs)). Nothing a run leaves stays on
   that host. Both routes are authenticated like the rest of `/v1`, and they answer 503
-  on a host without a sandbox.
+  on a host without a sandbox. Prefer `token new NAME --runner`: it reaches only
+  discovery and runner routes, not sessions. `remoteRunner` names each run and
+  posts `/v1/run/ID/stop` when aborted; `GET /v1/run/ID` reports its state only to
+  the token that started it. Stop does not undo external effects. See
+  [API.md](API.md#routes).
 - **`runner: app`.** The app runs the command itself. Its runs count as unisolated
   unless the app declares a sandbox identity.
 

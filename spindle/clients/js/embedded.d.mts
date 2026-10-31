@@ -170,9 +170,10 @@ export interface SessionSettings {
   runner?: 'none' | 'remote' | 'app';
   /** `auto` (the default here), `required` (refuses runners that do not isolate) or `off`. */
   isolation?: 'auto' | 'required' | 'off';
-  /** What a session from a native host may hold, cleared here (no spend ledger, no host
-   * paths, no toolchain in an app). */
-  max_usd?: null;
+  /** A spending limit in US dollars (null: none), counted as a native host counts it. */
+  max_usd?: number | null;
+  /** What a session from a native host may hold, cleared here (no host paths, no
+   * toolchain in an app). */
   sources?: [];
   toolchain?: false;
   files?: FileParam[];
@@ -213,6 +214,9 @@ export declare class EmbeddedClient {
   create(dir: string, provider: string, settings?: SessionSettings): Promise<any>;
   open(dir: string): Promise<any>;
   closeSession(dir: string): Promise<{ session: string; closed: boolean }>;
+  /** Gives back the free pages of the session's stores (its tasks' too); sizes in bytes.
+   * An open session closes first; one with a turn or a background task running is refused. */
+  compactSession(dir: string): Promise<{ session: string; before: number; after: number; stores: number }>;
   prompt(dir: string, text: string, options?: { files?: FileParam[]; state?: Record<string, unknown>; expectedHead?: number }): Promise<TurnResult>;
   resume(dir: string, options?: { expectedHead?: number; until?: 'unknown' }): Promise<TurnResult>;
   retry(dir: string, options?: { expectedHead?: number }): Promise<TurnResult>;
@@ -227,6 +231,18 @@ export declare class EmbeddedClient {
   files(dir: string, revision?: number): Promise<{ head: number; revision: number; files: { path: string; size: number; digest: string; executable: boolean }[]; links: unknown[]; directories: string[] }>;
   read(dir: string, path: string, revision?: number): Promise<Uint8Array>;
   settings(dir: string, changes?: SessionSettings): Promise<any>;
+  /** The session's spend: totals, `turns` and `models`, as a native host's `usage`. */
+  usage(dir: string): Promise<any>;
+  /** The tasks the session started. */
+  tasks(dir: string): Promise<{ tasks: { task: string; state: string; queued: boolean; answer: { content: string; failed: boolean } | null; pending: boolean; delivered: boolean }[] }>;
+  /** A task as it stands now (nothing waits here). */
+  taskWait(dir: string, task: string): Promise<{ task: string; state: string; queued: boolean; answer: { content: string; failed: boolean } | null; pending: boolean; delivered: boolean }>;
+  /** Stops a background task where it is. */
+  taskStop(dir: string, task: string): Promise<{ task: string; stopping: boolean }>;
+  /** What this package can run: built-in tools, runners, budgets, task modes, ... */
+  capabilities(): Promise<{ host: 'embedded'; builtin_tools: string[]; runners: string[]; network: boolean; toolchain: boolean; sources: boolean; self_edit: boolean; budget: boolean; tasks: string[]; compaction: string[] }>;
+  /** What the session's settings must change to run here (an import carries it too). */
+  fit(dir: string, options?: { runner?: 'none' | 'remote' | 'app' }): Promise<{ changes: Record<string, unknown>; notes: { setting: string; from: unknown; to: unknown; why: string }[]; refused: { setting: string; why: string }[] }>;
   state(dir: string, revision?: number): Promise<{ head: number; revision: number; state: Record<string, unknown> }>;
   setState(dir: string, patch: Record<string, unknown>, options?: { expectedHead?: number }): Promise<{ session: string; revision?: number; queued?: number }>;
   recover(dir: string): Promise<{ head: number; phase: string; items: unknown[]; wake: { work: 'none' | 'ready' | 'blocked'; why: string | null } }>;
@@ -234,6 +250,8 @@ export declare class EmbeddedClient {
   /** The session as a session bundle; it moves (this copy sealed) unless `keep`.
    * `settings` change the bundle's copy only, for the host it goes to. */
   exportSession(dir: string, options?: { keep?: boolean; settings?: Record<string, unknown> }): Promise<Uint8Array>;
+  /** Checks a session bundle whole, as an import would, writing nothing. */
+  checkBundle(bytes: Uint8Array): { head: number; identity: string; files: number };
   /** Continues a bundled session as `dir` (nothing there yet). */
   importSession(dir: string, bytes: Uint8Array | ArrayBuffer): Promise<any>;
   close(): Promise<number>;

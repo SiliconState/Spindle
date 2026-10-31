@@ -1004,3 +1004,46 @@ fn background_job_exit_codes_and_lifetimes_are_reported() {
     }
     assert!(matches!(state, JobState::Ended(reason) if reason.contains("lifetime")));
 }
+
+/// A write through a shared mapping can leave every stamp field of a file as it was
+/// (tmpfs), so stamps alone would seal it unchanged and lose it; the run's opening of the
+/// file for writing tells. Thousands of other writes in the same directory (more than
+/// the kernel queues at once) neither hide it nor mark untouched files.
+#[test]
+fn writes_through_a_shared_mapping_are_kept_among_thousands_of_others() {
+    if !Path::new("/usr/bin/python3").exists() {
+        return;
+    }
+    let mut files = BTreeMap::new();
+    for (path, bytes) in [("a.txt", b"alpha".as_slice()), ("b.txt", b"beta")] {
+        files.insert(
+            path.to_string(),
+            FileValue {
+                bytes: bytes.to_vec(),
+                executable: false,
+            },
+        );
+    }
+    let script = "python3 -I -c 'import mmap,os\n\
+for i in range(20000):\n    open(\"made%05d\" % i, \"w\").close()\n\
+fd=os.open(\"a.txt\",os.O_RDWR)\nm=mmap.mmap(fd,0)\nm[0]\nm[0:5]=b\"ALPHA\"\nm.close()\nos.close(fd)'";
+    let output = executor()
+        .execute(
+            &files,
+            &["/bin/sh".into(), "-c".into(), script.into()],
+            Duration::from_secs(60),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(
+        output.success(),
+        "{}",
+        String::from_utf8_lossy(output.stderr())
+    );
+    assert_eq!(output.files()["a.txt"].bytes, b"ALPHA");
+    assert!(matches!(
+        output.entries()["b.txt"],
+        SealedEntry::Unchanged { .. }
+    ));
+    assert_eq!(output.files().len(), 20_002);
+}

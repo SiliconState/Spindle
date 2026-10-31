@@ -1,4 +1,5 @@
-// Provider secrets at rest: API keys and browser sign-ins. Each record in the 'keys'
+// Secrets at rest: providers' API keys and browser sign-ins, and the token of the user's
+// Spindle host (its URL stays readable in kv/host). Each record in the 'keys'
 // store is sealed with AES-GCM (256-bit) under the vault key, its provider bound in as
 // additional data, so no secret is plain text on disk and no record can be moved to
 // another provider. The vault key is one of two kinds:
@@ -18,6 +19,9 @@
 import { entriesOf, read, writeTogether } from './shared.mjs';
 
 const ROUNDS = 600_000;
+/** The record of the user's Spindle host's token: not a provider's (no provider ID has a
+ * colon), so no provider's secret takes its place and the panel lists it apart. */
+const HOST = ':host';
 const MIN_PASSPHRASE = 8;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -118,7 +122,12 @@ export async function state() {
   const kinds = {};
   const accounts = {};
   const ended = {};
+  let host = false;
   for (const [provider, record] of await entriesOf('keys')) {
+    if (provider === HOST) {
+      host = true;
+      continue;
+    }
     kinds[provider] = typeof record === 'string' ? 'key' : record?.kind ?? 'key';
     if (key && kinds[provider] === 'signin') {
       const held = await open(key, provider, record).catch(() => ({}));
@@ -126,7 +135,7 @@ export async function state() {
       if (held.ended) ended[provider] = true;
     }
   }
-  return { mode: kept.mode, locked: !key, kinds, accounts, ended };
+  return { mode: kept.mode, locked: !key, kinds, accounts, ended, host };
 }
 
 /** Refreshes in progress, by provider: one at a time each, outside the queue. */
@@ -173,6 +182,20 @@ export function keep(provider, secret) {
 
 export function forget(provider) {
   return exclusive(() => writeTogether([['keys', provider, undefined]]));
+}
+
+/** The host's token, or undefined (`locked` thrown while a passphrase vault is). */
+export async function hostToken() {
+  return (await secret(HOST))?.token;
+}
+
+/** Keeps the host's token sealed, `also` (writeTogether changes) in the same transaction. */
+export function keepHost(token, also = []) {
+  return exclusive(async () => writeTogether([['keys', HOST, await seal(await usable(), HOST, { kind: 'host', token })], ...also]));
+}
+
+export function forgetHost(also = []) {
+  return exclusive(() => writeTogether([['keys', HOST, undefined], ...also]));
 }
 
 /** Seals keys saved before records were sealed (an update from such a build). */

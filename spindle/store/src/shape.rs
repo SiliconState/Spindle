@@ -1243,7 +1243,7 @@ pub(crate) fn prepared_request(
     let config = &shape.config;
     let route = &shape.route;
     let effect = state.next_model_id().map_err(turn_error)?;
-    let transcript = state.transcript().map_err(turn_error)?;
+    let transcript = state.transcript_ref().map_err(turn_error)?;
     let body = request_body_for(
         route,
         &config.model,

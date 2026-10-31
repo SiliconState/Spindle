@@ -14,7 +14,8 @@
 //   - the message sent while it ran as a bubble of its own; "Latest" while scrolled up;
 //     Send as Stop while the turn runs; a copy button on the answer; short table cells
 //     on one line; the composer's chip without the provider;
-//   - the workspace: folders, new/edited badges, scratch files hidden until asked for, and
+//   - the workspace: folders shut until opened (saying what is new in them), new/edited
+//     badges, scratch files hidden until asked for, and
 //     its own page in the panel, a file open there with its preview, back and forth;
 //   - small labels (SPINDLE, timestamps, the groups' times) at WCAG AA contrast;
 //   - nothing on the panel's console.
@@ -207,7 +208,7 @@ await panel.files('#catalog-file', [catalogFile]);
 await panel.until(`spindlePanel.engine.catalog.providers.some((p) => p.id === 'scripted') && spindlePanel.engine.catalogSaved`, { what: 'the catalog' });
 await panel.eval(`document.querySelector('#settings-dialog').open || document.querySelector('#settings').click()`);
 const row = '.provider[data-provider="scripted"]';
-await panel.click(`${row} .provider-head button`);
+await panel.click(`${row} .provider-actions button`);
 await panel.type(`${row} input`, key);
 await panel.click(`${row} button.primary`);
 await panel.until(`document.querySelector('${row} .provider-state')?.textContent === 'key saved'`, { what: 'the key' });
@@ -291,7 +292,7 @@ for (const theme of THEMES) {
   say(`${name}: held mid-run`);
   await shot(`${name}-1-mid-run`);
   // A message while it runs: Send turns from Stop to "send to the running turn".
-  await panel.type('#prompt', 'Also note which ticker moved most.');
+  await panel.type('#prompt', 'Also note which ticker moved most, and say whether the move came from the page or from the table, with the size of the move in percent, so the report and the answer agree on it.');
   const steerMode = await panel.eval(`document.querySelector('#send').dataset.mode`);
   await panel.click('#send');
   await new Promise((done) => setTimeout(done, 400));
@@ -299,13 +300,15 @@ for (const theme of THEMES) {
   // A step running: its spinner and its time.
   await panel.until(`[...document.querySelectorAll('#history .tool.running')].some((c) => /sleep/.test(c.input?.command ?? '')) || null`, { timeout: 60_000, what: 'the sleep step running' });
   await new Promise((done) => setTimeout(done, 1600));
-  const running = await panel.eval(`(() => { const card = document.querySelector('#history .tool.running'); return { label: card.querySelector('.tool-label').textContent, time: card.querySelector('.tool-time').textContent, group: card.closest('.steps').querySelector('.group-label').textContent, spinning: getComputedStyle(card.querySelector('.tool-status')).animationName }; })()`);
+  const running = await panel.eval(`(() => { const card = document.querySelector('#history .tool.running'); return { label: card.querySelector('.tool-label').textContent, time: card.querySelector('.tool-time').textContent, group: card.closest('.steps').querySelector('.group-label').textContent, spinning: getComputedStyle(card.querySelector('.tool-icon svg')).animationName, phase: document.querySelector('#phase').textContent, elapsed: document.querySelector('#elapsed').textContent }; })()`);
   await shot(`${name}-2-step-running`);
   // Scrolled up while it runs: "Latest" shows.
   await panel.eval(`document.querySelector('#main').scrollTop = 0; document.querySelector('#main').dispatchEvent(new Event('scroll'))`);
   const jump = await panel.until(`!document.querySelector('#jump').hidden || null`, { timeout: 5000, what: 'Latest' }).catch(() => false);
   await shot(`${name}-3-scrolled-up`);
-  if (jump) await panel.click('#jump');
+  // Latest takes the conversation to its end (the turn may have ended meanwhile, and
+  // Latest with it).
+  if (jump && await panel.eval(`!document.querySelector('#jump').hidden`)) await panel.eval(`document.querySelector('#jump').click()`);
   say(`${name}: waiting for the end`);
   const state = await panel.until(`(() => { const s = spindlePanel.threads.get(${JSON.stringify(thread)})?.state; return s && s !== 'running' ? s : null; })()`, { timeout: 180_000, what: 'the turn to end' });
   const turnMs = Date.now() - turnStarted;
@@ -316,19 +319,21 @@ for (const theme of THEMES) {
     const cards = [...document.querySelectorAll('#history .tool')];
     return {
       steps: cards.length,
-      groups: groups.map((g) => ({ open: g.group.open, single: g.classList.contains('single'), label: g.querySelector('.group-label').textContent, time: g.querySelector('.group-time').textContent })),
+      groups: groups.map((g) => ({ open: g.group.open, single: g.classList.contains('single'), label: g.querySelector('.group-label').textContent, counts: [...g.querySelectorAll('.group-counts .count')].map((c) => c.getAttribute('aria-label')).join(', '), time: g.querySelector('.group-time').textContent })),
       failed: cards.filter((c) => c.classList.contains('failed')).map((c) => c.querySelector('.tool-label').textContent + ' = ' + c.querySelector('.tool-state').textContent),
       labels: cards.map((c) => c.querySelector('.tool-label').textContent),
       times: cards.filter((c) => c.querySelector('.tool-time').textContent).length,
       favicons: cards.filter((c) => c.querySelector('.tool-icon img.favicon, .tool-icon svg')).length,
+      pageTips: cards.filter((c) => c.querySelector('.tool-icon img.favicon')).map((c) => c.querySelector('summary').title),
       redBorder: cards.filter((c) => c.classList.contains('failed') && getComputedStyle(c).borderLeftColor === getComputedStyle(document.documentElement).getPropertyValue('--error').trim()).length,
-      steer: (() => { const node = document.querySelector('#history .message-wrap.steer'); if (!node) return null; const r = node.getBoundingClientRect(), box = document.querySelector('#history').getBoundingClientRect(); return { label: node.querySelector('.role-label').textContent, right: Math.round(box.right - r.right), left: Math.round(r.left - box.left) }; })(),
+      steer: (() => { const node = document.querySelector('#history .message-wrap.steer'); if (!node) return null; const r = node.querySelector('.message').getBoundingClientRect(), box = document.querySelector('#history').getBoundingClientRect(); return { label: node.querySelector('.role-label').textContent, right: Math.round(box.right - r.right), left: Math.round(r.left - box.left) }; })(),
       copyAnswer: Boolean([...document.querySelectorAll('#history .message-wrap.assistant')].at(-1)?.querySelector('.role-label .copy')),
       nowrap: [...document.querySelectorAll('#history .message.assistant td.nowrap')].map((td) => td.textContent),
       wrapped: [...document.querySelectorAll('#history .message.assistant td.nowrap')].filter((td) => td.getClientRects().length > 1 || td.scrollHeight > td.clientHeight + 4 && td.offsetHeight > 40).length,
       inputs: cards.filter((c) => c.querySelector('.tool-input pre.input') && c.querySelector('.tool-input .copy')).length,
-      tree: [...document.querySelectorAll('#history .workspace-card .file-row')].map((r) => (r.hidden ? '-' : '+') + r.dataset.path + (r.querySelector('.badge') ? ':' + r.querySelector('.badge').textContent : '')),
-      folders: [...document.querySelectorAll('#history .workspace-card .ws-folder-name')].map((f) => f.textContent.trim()),
+      tree: [...document.querySelectorAll('#history .workspace-card .file-row')].map((r) => (r.closest('[hidden]') ? '-' : '+') + r.dataset.path + (r.querySelector('.badge') ? ':' + r.querySelector('.badge').textContent : '')),
+      folders: [...document.querySelectorAll('#history .workspace-card .ws-folder-head')].map((h) => [h.querySelector('.ws-folder-name').textContent, h.getAttribute('aria-expanded'), ...[...h.querySelectorAll('.badge')].map((b) => b.textContent)].join(' ')),
+      cardHidden: document.querySelector('#history .workspace-card .ws-hidden')?.textContent ?? null,
       // Files the steps wrote: pages and Markdown in sight below their run, text files
       // inside it (under their step), one card a file.
       outside: [...document.querySelectorAll('#history > .steps > .file-card')].map((c) => c.dataset.path),
@@ -360,7 +365,7 @@ for (const theme of THEMES) {
   await panel.click('#history .workspace-card > summary');
   await panel.click('#history .workspace-card .ws-tools .link-like');
   await panel.until(`document.body.dataset.view === 'workspace' && document.querySelector('#file-list .file-row') || null`, { what: 'the workspace page' });
-  const page1 = await panel.eval(`({ rows: [...document.querySelectorAll('#file-list .file-row')].filter((r) => !r.hidden).map((r) => r.dataset.path), hiddenNote: document.querySelector('#file-list .ws-hidden')?.textContent ?? null, heading: document.querySelector('#ws-heading').textContent, back: document.querySelector('#home').getAttribute('aria-label') })`);
+  const page1 = await panel.eval(`({ rows: [...document.querySelectorAll('#file-list .file-row')].filter((r) => !r.hidden).map((r) => r.dataset.path), hiddenNote: document.querySelector('#file-list .ws-hidden')?.textContent ?? null, heading: document.querySelector('#ws-heading').textContent, back: document.querySelector('#ws-done').getAttribute('aria-label') })`);
   await shot(`${name}-8-workspace`);
   await shot(`${name}-8-workspace-620`, 620);
   await panel.click('#file-list .file-row[data-path="report.html"] .file-open');
@@ -373,7 +378,7 @@ for (const theme of THEMES) {
   const nextPath = await panel.eval(`document.querySelector('#ws-path').textContent`);
   await panel.eval(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
   const backToList = await panel.until(`!document.querySelector('#ws-list').hidden || null`, { timeout: 3000, what: 'the list again' }).catch(() => false);
-  await panel.click('#home');
+  await panel.click('#ws-done');
   const backHome = await panel.until(`document.body.dataset.view === 'thread' || null`, { timeout: 3000, what: 'the conversation again' }).catch(() => false);
 
   check(`${name}: 34 steps in groups, the running one open, earlier ones shut; Send is Stop while it runs; no stop in the bar; the chip without the provider`, () => {
@@ -390,25 +395,30 @@ for (const theme of THEMES) {
   });
   check(`${name}: a running step spins and counts its time, in the present tense; its group says which step it is`, () => {
     assert.match(running.label, /^Running a command|^Running sleep|^Running/, JSON.stringify(running));
-    assert.match(running.time, /^(\d+ms|\d(\.\d)?s)$/, JSON.stringify(running));
-    assert.match(running.group, /step \d+ of \d+/, JSON.stringify(running));
+    assert.match(running.time, /^\d+:\d\d$/, JSON.stringify(running));
+    assert.match(running.group, /^Step \d+ of \d+$/, JSON.stringify(running));
     assert.notEqual(running.spinning, 'none', JSON.stringify(running));
+    // The composer's top row: Working, and how long the turn has run.
+    assert.ok(running.phase === 'Working' && /^\d+:\d\d$/.test(running.elapsed), JSON.stringify(running));
   });
   check(`${name}: after the turn every group is shut with its count, failures and retries, its time within the turn's; labels in the past tense; times; browser steps with an icon; the command with a copy button`, () => {
     assert.ok(after.groups.length >= 3, JSON.stringify(after.groups));
     assert.ok(after.groups.every((g) => !g.open || g.single), JSON.stringify(after.groups));
-    assert.ok(after.groups.some((g) => /^Ran \d+ steps · \d+ failed · 1 retried$/.test(g.label)), JSON.stringify(after.groups));
+    assert.ok(after.groups.some((g) => /^Ran \d+ steps$/.test(g.label) && /^1 retried, \d+ failed$/.test(g.counts)), JSON.stringify(after.groups));
     assert.ok(after.groups.every((g) => g.single || /^Ran \d+ steps/.test(g.label)), JSON.stringify(after.groups));
     // The groups' times are time on the clock: together never more than the turn ran
     // (each shown time rounded, so a second of slack a group).
-    const shownMs = (text) => [...text.matchAll(/([\d.]+)(ms|s|m|h)\b/g)].reduce((sum, [, n, unit]) => sum + Number(n) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[unit], 0);
+    const shownMs = (text) => /^\d+(:\d\d)+$/.test(text) ? text.split(':').reduce((sum, part) => sum * 60 + Number(part), 0) * 1000
+      : [...text.matchAll(/([\d.]+)(ms|s)\b/g)].reduce((sum, [, n, unit]) => sum + Number(n) * { ms: 1, s: 1000 }[unit], 0);
     const groupsMs = after.groups.reduce((sum, g) => sum + shownMs(g.time), 0);
     assert.ok(groupsMs > 0 && groupsMs <= turnMs + 1000 * after.groups.length, `groups ${groupsMs} ms, turn ${turnMs} ms: ${JSON.stringify(after.groups)}`);
     assert.ok(after.failed.some((f) => /failed → retried ✓$/.test(f) && /build_report\.py/.test(f)), JSON.stringify(after.failed));
     assert.ok(after.failed.some((f) => / = failed$/.test(f)), JSON.stringify(after.failed));
-    for (const want of ['Listed open tabs', 'Read 127.0.0.1', 'Read the parts of 127.0.0.1', 'Typed into the “Search” field on 127.0.0.1', 'Clicked the “Go” button on 127.0.0.1', 'Ran build_report.py', 'Wrote report.html', 'Edited build_report.py', 'Read table.csv', 'Wrote notes.txt', 'Searched for “,”', 'Made folder out']) {
+    // Page steps without their page (the site's icon shows it, the address on hover).
+    for (const want of ['Listed open tabs', 'Read page', 'Read parts', 'Typed into “Search”', 'Clicked “Go”', 'Ran build_report.py', 'Wrote report.html', 'Edited build_report.py', 'Read table.csv', 'Wrote notes.txt', 'Searched for “,”', 'Made folder out']) {
       assert.ok(after.labels.includes(want), `no "${want}" in ${JSON.stringify(after.labels)}`);
     }
+    assert.ok(after.pageTips.length >= 4 && after.pageTips.every((tip) => /127\.0\.0\.1/.test(tip)), JSON.stringify(after.pageTips));
     assert.ok(after.times >= 30, `times on ${after.times} rows`);
     assert.ok(after.favicons >= 8, `icons on ${after.favicons} browser rows`);
     assert.equal(after.redBorder, 0, 'no red border on failed rows');
@@ -424,11 +434,13 @@ for (const theme of THEMES) {
     assert.equal(after.send, 'send');
   });
   check(`${name}: the workspace by folder, new files marked, scratch files hidden; its own page, a file open there with its preview, next, Escape, back`, () => {
-    assert.ok(after.folders.includes('data/') && after.folders.includes('out/'), JSON.stringify(after.folders));
+    // Folders shut (only the user opens one), each saying what the turn made in it; folders
+    // of scratch files only (out/status.txt, tests/) out of sight with them.
+    assert.deepEqual(after.folders, ['data false 1 new'], JSON.stringify(after.folders));
     assert.deepEqual(after.outside.sort(), ['report.html', 'summary.md'], JSON.stringify(after.outside));
     assert.deepEqual(after.inside.sort(), ['build_report.py', 'data/table.csv', 'notes.txt', 'tests/test_report.py'], JSON.stringify(after.inside));
-    assert.ok(after.tree.includes('+report.html:new') && after.tree.includes('+data/table.csv:new'), JSON.stringify(after.tree));
-    assert.ok(after.tree.includes('-notes.txt:new') && after.tree.includes('-build_report.py:new') && after.tree.some((r) => r.startsWith('-tests/')), JSON.stringify(after.tree));
+    assert.ok(after.tree.includes('+report.html:new') && after.tree.includes('+summary.md:new') && after.tree.every((r) => r.startsWith('+') && !r.includes('/')), JSON.stringify(after.tree));
+    assert.match(after.cardHidden ?? '', /^\d+ scratch files hidden/, JSON.stringify(after.cardHidden));
     assert.ok(page1.rows.includes('report.html') && !page1.rows.includes('notes.txt') && /scratch files? hidden/.test(page1.hiddenNote ?? ''), JSON.stringify(page1));
     assert.equal(page1.back, 'Back to the conversation');
     assert.match(filePage.path, /report\.html/);
@@ -441,6 +453,22 @@ for (const theme of THEMES) {
     assert.deepEqual(contrast, []);
   });
 }
+// A thread with a long message sent mid-run opens without a ResizeObserver loop (a page
+// error, not a console line), its bubble three lines and an arrow for the rest.
+const longThread = await panel.eval('spindlePanel.current');
+await panel.eval(`globalThis.pageErrors = []; addEventListener('error', (event) => pageErrors.push(event.message))`);
+for (const width of [620, 420, 380]) {
+  await panel.size(width, 900);
+  await panel.click('#home');
+  await panel.click(`#threads .thread-row[data-id="${longThread}"]`);
+  await panel.until(`document.querySelector('#history .message-wrap.steer') || null`, { what: 'the thread with its bubble' });
+  await new Promise((done) => setTimeout(done, 500));
+}
+const reopened = await panel.eval(`({ errors: pageErrors, arrow: Boolean(document.querySelector('#history .message-wrap.steer.long .steer-more')) })`);
+check('a thread with a long message sent mid-run reopens without a ResizeObserver loop; at 380px its bubble shows three lines and an arrow', () => {
+  assert.deepEqual(reopened.errors, []);
+  assert.ok(reopened.arrow, 'the long bubble has its arrow');
+});
 // Settings, Commands: both Linuxes' states (the wasm Linux's when the build carries it).
 await panel.click('#settings');
 await panel.eval(`document.querySelector('[data-fold="commands"]').open = true`);

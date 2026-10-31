@@ -5,11 +5,12 @@
 import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 
-export async function launch(binary, { profile, downloads, headless = true }) {
+/** Starts Chrome on `profile` (`args`: more of its flags, such as a net log). */
+export async function launch(binary, { profile, downloads, headless = true, args = [] }) {
   const child = spawn(binary, [
     ...(headless ? ['--headless=new'] : []),
     '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--window-size=1200,900',
-    '--remote-debugging-pipe', '--enable-unsafe-extension-debugging', `--user-data-dir=${profile}`, 'about:blank',
+    '--remote-debugging-pipe', '--enable-unsafe-extension-debugging', `--user-data-dir=${profile}`, ...args, 'about:blank',
   ], { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] });
   const [write, read] = [child.stdio[3], child.stdio[4]];
   const waiting = new Map();
@@ -176,6 +177,8 @@ export async function open(browser, url, { newWindow = false } = {}) {
     },
     /** Lays the page out at this size (a side panel's, say). */
     size: (width, height) => send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false }),
+    /** Lays the page out at its window's size again. */
+    unsize: () => send('Emulation.clearDeviceMetricsOverride'),
     activate: () => browser.send('Target.activateTarget', { targetId }),
     close: () => browser.send('Target.closeTarget', { targetId }),
   };

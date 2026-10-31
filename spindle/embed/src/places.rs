@@ -79,6 +79,84 @@ mod node {
         node::write_file(&format!("{store}/authority.sqlite"), image)
     }
 
+    /// Compacts the store at `database` (closed): `open` opens it with what keeps every
+    /// other owner out (`G`) until the copy has its name, even once the store is closed;
+    /// `open_copy` opens a file beside it as a store. The copy is written by VACUUM INTO,
+    /// synced (SQLite does not), opened alone and checked whole (every page and record,
+    /// its head the store's), and only then renamed over the store; a crash before the
+    /// rename leaves the store as it was (and a copy the next compaction removes), one
+    /// during it the copy or the store whole under the name. Returns the store's size
+    /// before and after, in bytes.
+    fn compact_store<G>(
+        database: &str,
+        open: impl FnOnce() -> spindle_store::Result<(Store, G)>,
+        open_copy: impl Fn(&str) -> spindle_store::Result<Store>,
+    ) -> spindle_store::Result<(u64, u64)> {
+        let copy = format!("{database}.compact");
+        let leftovers =
+            |path: &str| ["", "-wal", "-journal", ".lock"].map(|end| format!("{path}{end}"));
+        let (mut store, _held) = open()?;
+        // What a compaction cut short left (the store is ours now): never the store, as
+        // its swap is one rename.
+        for path in leftovers(&copy) {
+            node::remove_file(&path)?;
+        }
+        let (page, pages, free) = store.pages()?;
+        let before = page * pages;
+        if free == 0 {
+            return Ok((before, before));
+        }
+        let head = store.snapshot()?;
+        let written = store.compact_into(&copy);
+        // Closed before the copy is read: its log goes back into it and is removed.
+        drop(store);
+        let checked = written.and_then(|()| {
+            node::sync_file(&copy)?;
+            let mut copied = open_copy(&copy)?;
+            copied.check_integrity()?;
+            if copied.snapshot()? != head {
+                return Err(spindle_store::Error::Invalid);
+            }
+            let (page, pages, _) = copied.pages()?;
+            drop(copied);
+            // A store not closed cleanly keeps a log or journal that would be read into
+            // the copy once it has the name: no swap then.
+            if leftovers(database)[1..3]
+                .iter()
+                .any(|path| node::exists(path))
+                || leftovers(&copy)[1..].iter().any(|path| node::exists(path))
+            {
+                return Err(spindle_store::Error::Locked);
+            }
+            Ok(page * pages)
+        });
+        let after = match checked {
+            Ok(after) => after,
+            Err(error) => {
+                for path in leftovers(&copy) {
+                    let _ = node::remove_file(&path);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = node::rename(&copy, database) {
+            // Not renamed: the store is as it was, and the copy goes. (A rename the pool
+            // cut part way left the copy under the store's name: the same session either
+            // way, and no copy is left to remove.)
+            for path in leftovers(&copy) {
+                let _ = node::remove_file(&path);
+            }
+            return Err(error);
+        }
+        Ok((before, after))
+    }
+
+    /// A Node store's lock file shared by its store and whoever holds it past its close.
+    struct Held {
+        _owner: std::rc::Rc<node::NodeOwner>,
+    }
+    impl spindle_store::OwnerExclusion for Held {}
+
     fn fence_of(dir: &str) -> Option<String> {
         node::read_file(&format!("{dir}/store/{}", spindle_store::FENCE))
             .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
@@ -176,6 +254,28 @@ mod node {
         }
         fn holder(&self) -> Option<String> {
             fence_of(&self.dir)
+        }
+        fn compact(&self) -> spindle_store::Result<Option<(u64, u64)>> {
+            let database = self.database();
+            compact_store(
+                &database,
+                // Its lock file, held past the store's close until the copy has the name:
+                // no other owner opens the store meanwhile (and a sealed one is refused).
+                || {
+                    let owner = std::rc::Rc::new(node::NodeOwner::acquire(&database, &self.note)?);
+                    let store = node::open_owned(
+                        &database,
+                        self.journal,
+                        Initialization::Open,
+                        Held {
+                            _owner: owner.clone(),
+                        },
+                    )?;
+                    Ok((store, owner))
+                },
+                |copy| node::open(copy, self.journal, Initialization::Open, &self.note),
+            )
+            .map(Some)
         }
     }
 
@@ -366,6 +466,25 @@ mod node {
         }
         fn holder(&self) -> Option<String> {
             fence_of(&self.dir)
+        }
+        fn compact(&self) -> spindle_store::Result<Option<(u64, u64)>> {
+            let database = format!("{}/store/authority.sqlite", self.dir);
+            compact_store(
+                &database,
+                // The session's Web Lock is this place's while it lives.
+                || Ok((self.open(false)?, ())),
+                |copy| {
+                    node::open_owned(
+                        copy,
+                        self.journal,
+                        Initialization::Open,
+                        Shared {
+                            _lock: self.lock.clone(),
+                        },
+                    )
+                },
+            )
+            .map(Some)
         }
     }
 }

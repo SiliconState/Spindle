@@ -198,6 +198,17 @@ pub enum SealedEntry {
 pub trait RunHost {
     /// Writes the bytes of the input file `path` (declared in the tree).
     fn load(&mut self, path: &str, out: &mut dyn Write) -> std::io::Result<()>;
+    /// Names where this host's runs come from (a session's workspace), so an isolated
+    /// run may start from the workspace the last run of that place left instead of an
+    /// empty one: files are reused only where `content` says their bytes are the
+    /// input's and their stamps say nothing touched them since. None: always empty.
+    fn place(&self) -> Option<String> {
+        None
+    }
+    /// An id of the bytes of input file `path`: equal ids mean equal bytes.
+    fn content(&self, _path: &str) -> Option<String> {
+        None
+    }
     /// Answers one brokered request; only brokered runs call it.
     fn request(&mut self, _request: &[u8], _remaining: Duration, _cancel: &AtomicBool) -> Vec<u8> {
         b"{\"ok\":false,\"error\":\"no external code policy granted\"}".to_vec()
@@ -268,10 +279,13 @@ fn failure(
     )
 }
 
-/// Identity of a file as sealed: an unchanged stamp means unchanged bytes. The run
-/// cannot set a change time (Unix ctime, Windows ChangeTime) through the tools it
-/// uses, and a replaced file has a new identity (device and inode, or volume and file
-/// id), so restoring a modification time does not hide a write.
+/// Identity of a file as sealed: an unchanged stamp means unchanged bytes, except after
+/// a write through a shared mapping, which some filesystems (tmpfs) leave unstamped;
+/// on Linux `Writes` reports every file a run opened for writing, which seals it as
+/// changed whatever its stamp. The run cannot set a change time (Unix ctime, Windows
+/// ChangeTime) through the tools it uses, and a replaced file has a new identity
+/// (device and inode, or volume and file id), so restoring a modification time does not
+/// hide a write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Stamp {
     device: u64,
@@ -403,8 +417,10 @@ pub struct SealedOutput {
     entries: BTreeMap<String, SealedEntry>,
     stamps: BTreeMap<String, Stamp>,
     /// The locked, no longer writable candidate, kept so changed files are read one at
-    /// a time; removed when this output drops.
+    /// a time; removed when this output drops, or kept for the next run of its place.
     candidate: Option<Scratch>,
+    /// What the candidate holds for its place's next run (`KEPT`), if it is kept.
+    keep: Option<Kept>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     success: bool,
@@ -418,6 +434,14 @@ impl std::fmt::Debug for SealedOutput {
             .finish_non_exhaustive()
     }
 }
+impl Drop for SealedOutput {
+    fn drop(&mut self) {
+        if let (Some(scratch), Some(kept)) = (self.candidate.take(), self.keep.take()) {
+            kept.offer(scratch);
+        }
+    }
+}
+
 impl SealedOutput {
     /// Every regular file with its bytes, for runs given a `FileValue` map
     /// (`execute`, `execute_with`, `execute_brokered`). Tree runs leave it empty and use
@@ -1132,7 +1156,27 @@ impl StrictExecutor {
         }
         let scratch = Scratch::create()?;
         let workspace = scratch.workspace();
-        let baseline = materialize(&workspace, tree, host)?;
+        // An isolated run leaves no process behind, so the workspace it leaves can be
+        // the next one's start; a host run's could still be written to after it ends.
+        let place = if self.sandboxed() && KEEPING.load(Ordering::SeqCst) {
+            host.place()
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let reused = match place.as_deref().and_then(Kept::take) {
+            Some(kept) => reuse(&workspace, kept, tree, host)?,
+            None => None,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let reused = None;
+        let baseline = match reused {
+            Some(baseline) => baseline,
+            None => materialize(&workspace, tree, host)?,
+        };
+        // From here on, which input files the run opens for writing.
+        #[cfg(target_os = "linux")]
+        let writes = Writes::watch(&workspace, tree);
         let prepare = |error: std::io::Error| {
             failure(
                 std::io::ErrorKind::Other,
@@ -1424,8 +1468,20 @@ impl StrictExecutor {
                 ));
             }
         }
+        #[cfg(target_os = "linux")]
+        let written = writes.finish();
+        // Elsewhere only stamps tell (a write through a shared mapping may go unseen).
+        #[cfg(not(target_os = "linux"))]
+        let written = Some(std::collections::BTreeSet::new());
         let mut skipped = vec![];
-        let sealed = seal(&workspace, tree, &baseline, &self.limits, &mut skipped);
+        let sealed = seal(
+            &workspace,
+            tree,
+            &baseline,
+            written.as_ref(),
+            &self.limits,
+            &mut skipped,
+        );
         let mut stderr = stderr;
         if !skipped.is_empty() {
             let names: Vec<String> = skipped
@@ -1461,11 +1517,40 @@ impl StrictExecutor {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700))?;
         }
+        // What the next run of this place can start from: the input files it left
+        // untouched (their stamps are the materialized ones), and the bytes it holds.
+        let keep = place.map(|place| {
+            let mut files = BTreeMap::new();
+            let mut bytes = 0u64;
+            for (path, entry) in &entries {
+                match entry {
+                    SealedEntry::Unchanged { .. } => {
+                        if let Some(Input::File { size, .. }) = tree.get(path) {
+                            bytes = bytes.saturating_add(*size);
+                        }
+                        if let (Some(content), Some(stamp)) =
+                            (host.content(path), baseline.get(path))
+                        {
+                            files.insert(path.clone(), (content, *stamp));
+                        }
+                    }
+                    SealedEntry::File { size, .. } => bytes = bytes.saturating_add(*size),
+                    SealedEntry::Link(_) | SealedEntry::Directory => {}
+                }
+            }
+            Kept {
+                place,
+                scratch: None,
+                files,
+                bytes,
+            }
+        });
         Ok(SealedOutput {
             files: BTreeMap::new(),
             entries,
             stamps,
             candidate: Some(scratch),
+            keep,
             stdout,
             stderr,
             success: status.success(),
@@ -1907,6 +1992,17 @@ fn materialize(
     tree: &BTreeMap<String, Input>,
     host: &mut dyn RunHost,
 ) -> std::io::Result<BTreeMap<String, Stamp>> {
+    write_tree(workspace, tree, host, BTreeMap::new())
+}
+
+/// `materialize`, around the files a kept workspace already gave the candidate
+/// (`reused`, with their stamps): every other input is written as into an empty one.
+fn write_tree(
+    workspace: &Path,
+    tree: &BTreeMap<String, Input>,
+    host: &mut dyn RunHost,
+    reused: BTreeMap<String, Stamp>,
+) -> std::io::Result<BTreeMap<String, Stamp>> {
     let prepare = |error: std::io::Error| {
         failure(
             std::io::ErrorKind::Other,
@@ -1915,11 +2011,12 @@ fn materialize(
             &[],
         )
     };
-    let mut stamps = BTreeMap::new();
+    let mut stamps = reused;
     for (name, input) in tree {
         let path = workspace.join(name);
         match input {
             Input::Directory => std::fs::create_dir_all(&path).map_err(prepare)?,
+            Input::File { .. } if stamps.contains_key(name) => {}
             Input::File { size, executable } => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(prepare)?;
@@ -2001,9 +2098,189 @@ fn settle_clock(workspace: &Path, stamps: &BTreeMap<String, Stamp>) {
     let _ = std::fs::remove_file(&probe);
 }
 
+/// The input files a run opens for writing, as the kernel tells: an inotify watch on
+/// every directory holding an input file reports each close of a descriptor that was
+/// opened for writing. A write through a shared mapping can leave every stamp field as
+/// it was (tmpfs), but never without such a descriptor. A thread drains the events while
+/// the run goes on, so a run writing many files does not overflow the kernel's queue.
+#[cfg(target_os = "linux")]
+struct Writes {
+    stop: std::sync::Arc<AtomicBool>,
+    /// Written to when stopping, so the draining thread wakes at once.
+    wake: Option<std::fs::File>,
+    thread: Option<std::thread::JoinHandle<Option<std::collections::BTreeSet<String>>>>,
+}
+
+#[cfg(target_os = "linux")]
+type Drained = std::thread::JoinHandle<Option<std::collections::BTreeSet<String>>>;
+
+#[cfg(target_os = "linux")]
+impl Writes {
+    /// Watches `workspace`'s input directories (call before the run starts). A watch
+    /// that cannot be set leaves every file in doubt (`finish` answers None).
+    fn watch(workspace: &Path, tree: &BTreeMap<String, Input>) -> Self {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (wake, thread) = match Self::start(workspace, tree, stop.clone()) {
+            Ok((wake, thread)) => (Some(wake), Some(thread)),
+            Err(_) => (None, None),
+        };
+        Self { stop, wake, thread }
+    }
+
+    fn start(
+        workspace: &Path,
+        tree: &BTreeMap<String, Input>,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> std::io::Result<(std::fs::File, Drained)> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let files: std::collections::BTreeSet<String> = tree
+            .iter()
+            .filter(|(_, input)| matches!(input, Input::File { .. }))
+            .map(|(path, _)| path.clone())
+            .collect();
+        let mut directories = std::collections::BTreeSet::from([String::new()]);
+        for path in &files {
+            if let Some(at) = path.rfind('/') {
+                directories.insert(path[..at].to_string());
+            }
+        }
+        let mut watched = std::collections::HashMap::new();
+        for directory in directories {
+            let path = std::ffi::CString::new(workspace.join(&directory).as_os_str().as_bytes())
+                .map_err(|_| invalid("invalid workspace path"))?;
+            let watch = unsafe {
+                libc::inotify_add_watch(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    path.as_ptr(),
+                    libc::IN_CLOSE_WRITE | libc::IN_ONLYDIR | libc::IN_DONT_FOLLOW,
+                )
+            };
+            if watch < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            watched.insert(watch, directory);
+        }
+        let (woken, wake) = pipe()?;
+        let thread = std::thread::Builder::new()
+            .name("spindle-writes".into())
+            .spawn(move || drain_writes(&fd, &woken, &watched, &files, &stop))?;
+        Ok((wake, thread))
+    }
+
+    /// Stops watching (call once the run's processes are gone): the input files it
+    /// wrote, or None when some write may have gone unseen (no watch, an overflow).
+    fn finish(mut self) -> Option<std::collections::BTreeSet<String>> {
+        self.stop_thread()?.join().ok().flatten()
+    }
+
+    fn stop_thread(&mut self) -> Option<Drained> {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(mut wake) = self.wake.take() {
+            let _ = wake.write_all(b"x");
+        }
+        self.thread.take()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Writes {
+    fn drop(&mut self) {
+        if let Some(thread) = self.stop_thread() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Reads inotify events until `stop` (then once more, for what the run's last closes
+/// queued): the input files closed after being opened for writing. `woken` becomes
+/// readable when it is time to stop.
+#[cfg(target_os = "linux")]
+fn drain_writes(
+    fd: &std::os::fd::OwnedFd,
+    woken: &std::fs::File,
+    watched: &std::collections::HashMap<i32, String>,
+    files: &std::collections::BTreeSet<String>,
+    stop: &AtomicBool,
+) -> Option<std::collections::BTreeSet<String>> {
+    use std::os::fd::AsRawFd;
+    const HEADER: usize = 16;
+    let mut written = std::collections::BTreeSet::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let last = stop.load(Ordering::SeqCst);
+        loop {
+            let read =
+                unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                    break;
+                }
+                return None;
+            }
+            let events = &buffer[..read as usize];
+            if events.is_empty() {
+                break;
+            }
+            let mut at = 0;
+            while at + HEADER <= events.len() {
+                let word = |offset: usize| {
+                    u32::from_ne_bytes(events[at + offset..at + offset + 4].try_into().unwrap())
+                };
+                let (watch, mask, length) = (word(0) as i32, word(4), word(12) as usize);
+                let name = events.get(at + HEADER..at + HEADER + length)?;
+                at += HEADER + length;
+                if mask & libc::IN_Q_OVERFLOW != 0 {
+                    return None;
+                }
+                if mask & libc::IN_CLOSE_WRITE == 0 {
+                    continue;
+                }
+                let (Some(directory), Ok(name)) = (
+                    watched.get(&watch),
+                    std::str::from_utf8(name.split(|byte| *byte == 0).next().unwrap_or(&[])),
+                ) else {
+                    continue;
+                };
+                let path = if directory.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{directory}/{name}")
+                };
+                if files.contains(&path) {
+                    written.insert(path);
+                }
+            }
+        }
+        if last {
+            return Some(written);
+        }
+        // Until there are events or the run is over (`woken`).
+        let mut ready = [
+            libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: woken.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        unsafe { libc::poll(ready.as_mut_ptr(), 2, 1000) };
+    }
+}
+
 /// Seals the candidate: regular files (hard links are sealed as plain files), symbolic
 /// links (never followed) and empty directories. A file whose stamp still equals its
-/// materialized input's is reported unchanged and not read. Anything else (special
+/// materialized input's and that the run never opened for writing (`written`; None:
+/// any file may have been) is reported unchanged and not read. Anything else (special
 /// files, non-UTF-8 or overlong names, too many entries or bytes) is the reason the
 /// run's changes cannot be kept. Where the platform has no executable bit (Windows), a
 /// file keeps the bit it came in with.
@@ -2012,6 +2289,7 @@ fn seal(
     root: &Path,
     input: &BTreeMap<String, Input>,
     baseline: &BTreeMap<String, Stamp>,
+    written: Option<&std::collections::BTreeSet<String>>,
     limits: &TreeLimits,
     skipped: &mut Vec<String>,
 ) -> Result<(BTreeMap<String, SealedEntry>, BTreeMap<String, Stamp>), String> {
@@ -2129,7 +2407,10 @@ fn seal(
                     _ => None,
                 };
                 let entry = match came_in {
-                    Some(executable) if baseline.get(&path) == Some(&stamp) => {
+                    Some(executable)
+                        if baseline.get(&path) == Some(&stamp)
+                            && written.is_some_and(|written| !written.contains(&path)) =>
+                    {
                         SealedEntry::Unchanged { executable }
                     }
                     _ => {
@@ -3331,6 +3612,190 @@ impl Drop for Scratch {
         #[cfg(unix)]
         let _ = removed;
     }
+}
+
+/// Kept workspaces this process holds at most, and their files' bytes in all: the
+/// scratch volume (often memory) holds them between runs.
+const KEPT_PLACES: usize = 4;
+const KEPT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A finished isolated run's candidate, kept for the next run of its place: its
+/// scratch (still locked, so no sweep removes it while this process lives), the input
+/// files it still held untouched when sealed (`path -> (content, stamp)`), and the
+/// bytes of every file it holds.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct Kept {
+    place: String,
+    scratch: Option<Scratch>,
+    files: BTreeMap<String, (String, Stamp)>,
+    bytes: u64,
+}
+
+/// The kept workspaces, newest first.
+static KEPT: std::sync::Mutex<Vec<Kept>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether finished isolated runs keep their workspace (`keep_workspaces`).
+static KEEPING: AtomicBool = AtomicBool::new(false);
+
+/// Lets finished isolated runs keep their workspace for the next run of their place
+/// (`RunHost::place`), or (off) drops every kept one. Only a long-lived host should
+/// turn it on: what is kept lives as long as this process, and a process that ends
+/// without turning it off leaves scratch for `sweep_abandoned_candidates`. Off by
+/// default.
+pub fn keep_workspaces(on: bool) {
+    let gone = {
+        let mut kept = KEPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        KEEPING.store(on, Ordering::SeqCst);
+        if on {
+            vec![]
+        } else {
+            std::mem::take(&mut *kept)
+        }
+    };
+    drop(gone);
+}
+
+/// Drops the workspace kept for `place`, if any (its session went away).
+pub fn forget_workspace(place: &str) {
+    drop(Kept::take(place));
+}
+
+impl Kept {
+    /// Keeps `scratch` as this place's workspace, in place of an earlier one; the
+    /// oldest go past the bounds (outside the lock: removing a tree takes a while).
+    fn offer(mut self, scratch: Scratch) {
+        if self.bytes > KEPT_BYTES {
+            return;
+        }
+        self.scratch = Some(scratch);
+        let gone = {
+            let mut kept = KEPT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Under the lock, so turning keeping off never misses one offered meanwhile.
+            if !KEEPING.load(Ordering::SeqCst) {
+                drop(kept);
+                return;
+            }
+            let mut gone: Vec<Kept> = vec![];
+            if let Some(at) = kept.iter().position(|other| other.place == self.place) {
+                gone.push(kept.remove(at));
+            }
+            kept.insert(0, self);
+            while kept.len() > KEPT_PLACES
+                || kept.iter().map(|one| one.bytes).sum::<u64>() > KEPT_BYTES
+            {
+                gone.extend(kept.pop());
+            }
+            gone
+        };
+        drop(gone);
+    }
+
+    /// Takes the workspace kept for `place`, if any: one run uses it at a time.
+    fn take(place: &str) -> Option<Self> {
+        let mut kept = KEPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = kept.iter().position(|one| one.place == place)?;
+        Some(kept.remove(at))
+    }
+}
+
+/// Gives `workspace` (a new candidate's, still empty) the files of the workspace `kept`
+/// holds that `tree` will hold as they are (`salvage`), then writes the rest; the kept
+/// scratch goes with everything else in it. None when it cannot be used: `workspace` is
+/// then empty again for `materialize`. Load errors are returned as `materialize` returns
+/// them.
+#[cfg(target_os = "linux")]
+fn reuse(
+    workspace: &Path,
+    mut kept: Kept,
+    tree: &BTreeMap<String, Input>,
+    host: &mut dyn RunHost,
+) -> std::io::Result<Option<BTreeMap<String, Stamp>>> {
+    let Some(old) = kept.scratch.take() else {
+        return Ok(None);
+    };
+    let salvaged = salvage(&old.workspace(), workspace, tree, &*host, &kept.files);
+    drop(old);
+    match salvaged {
+        Ok(moved) => write_tree(workspace, tree, host, moved).map(Some),
+        Err(_) => {
+            remove_candidate(workspace)?;
+            private_dir(workspace)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Moves into `workspace` the files of the kept workspace `old` that `tree` will hold as
+/// they are: a regular file with no other link, the input's content id, executable bit
+/// and size, and the stamp it was sealed with (sealed unchanged: its run never opened it
+/// for writing, and nothing touched it since). Its directories are made afresh, so
+/// nothing a run set on one (mode, attributes, a default ACL) carries over; nothing in
+/// `old` is followed. Returns the moved files' stamps (a rename sets a new change time).
+#[cfg(target_os = "linux")]
+fn salvage(
+    old: &Path,
+    workspace: &Path,
+    tree: &BTreeMap<String, Input>,
+    host: &dyn RunHost,
+    known: &BTreeMap<String, (String, Stamp)>,
+) -> std::io::Result<BTreeMap<String, Stamp>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut moved = BTreeMap::new();
+    let mut made = std::collections::BTreeSet::new();
+    let mut pending = vec![String::new()];
+    let mut visited = 0usize;
+    while let Some(relative) = pending.pop() {
+        let directory = old.join(&relative);
+        owner_access(&directory, 0o700);
+        let listing = std::fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
+        for entry in listing {
+            visited += 1;
+            if visited > MAX_FILES.saturating_mul(4) {
+                return Err(invalid("a kept workspace holds too many entries"));
+            }
+            // A name no input has stays behind and goes with the old workspace.
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let path = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let (Some((content, sealed)), Some(Input::File { size, executable })) =
+                (known.get(&path), tree.get(&path))
+            else {
+                continue;
+            };
+            let same = metadata.is_file()
+                && metadata.nlink() == 1
+                && Stamp::of(&metadata) == *sealed
+                && metadata.len() == *size
+                && (metadata.mode() & 0o111 != 0) == *executable
+                && host.content(&path).as_deref() == Some(content.as_str());
+            if !same {
+                continue;
+            }
+            let target = workspace.join(&path);
+            if !relative.is_empty() && made.insert(relative.clone()) {
+                std::fs::create_dir_all(workspace.join(&relative))?;
+            }
+            std::fs::rename(entry.path(), &target)?;
+            moved.insert(path, Stamp::of(&std::fs::symlink_metadata(&target)?));
+        }
+    }
+    Ok(moved)
 }
 
 #[cfg(not(unix))]

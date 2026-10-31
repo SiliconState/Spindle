@@ -73,6 +73,7 @@ async function reopenAndAppTool(dir) {
   });
   const status = await c.status(dir);
   assert.ok(status.head > 0, 'the session reopens with its history');
+  assert.equal(status.activity, 'idle');
   await c.settings(dir, { tools: c.tools.definitions() });
   const result = await c.prompt(dir, 'find my notes');
   assert.equal(result.stopped.complete, true);
@@ -228,6 +229,9 @@ async function aKilledOwner() {
   assert.equal(fetch.seen.length, 0);
   const recover = await c.recover(dir);
   assert.equal(recover.wake.work, 'blocked');
+  const blocked = await c.status(dir);
+  assert.equal(blocked.activity, 'blocked', 'an unknown outcome waits for a person');
+  assert.deepEqual(blocked.wake, recover.wake);
   const retried = await c.retry(dir);
   assert.equal(retried.stopped.complete, true);
   assert.equal(fetch.seen.length, 1, 'retry sends it once');
@@ -286,6 +290,60 @@ async function aModelWrittenSummary() {
   await c.close();
 }
 
+/** A budget, counted from the store's own records as a native host counts them: a
+ * request whose worst case would not fit is not sent; raised between steps, the same
+ * request goes once; each counted call says what it cost; `usage` totals them. */
+async function aBudget() {
+  const dir = join(root, 'budget');
+  const priced = catalog();
+  // Dear enough that one request's worst case ($4.80 here) is over a small budget.
+  priced.providers[0].model_specs['fake-model'].pricing = { input_usd_per_mtok: 1000, output_usd_per_mtok: 1000, cache_read_usd_per_mtok: 0, cache_create_usd_per_mtok: 0 };
+  const fetch = scriptedFetch([text('within budget')]);
+  const c = client(fetch, { catalog: priced });
+  const events = [];
+  c.on('event', (event) => events.push(event));
+  await c.create(dir, 'fake', { max_usd: 0.5 });
+  assert.equal((await c.settings(dir)).max_usd, 0.5, 'a budget is kept here');
+  await assert.rejects(c.prompt(dir, 'hi'), /spending limit: .* could cost up to \$4\.80, so nothing was sent/);
+  assert.equal(fetch.seen.length, 0);
+  await c.settings(dir, { max_usd: 100 });
+  assert.equal((await c.resume(dir)).stopped.complete, true);
+  assert.equal(fetch.seen.length, 1, 'the refused request goes once it fits');
+  assert.deepEqual(events.filter((event) => event.type === 'cost'), [{ type: 'cost', billing: 'priced', usd: 0.015, turn: 0.015, total: 0.015 }]);
+  const usage = await c.call('usage', { dir });
+  assert.equal(usage.calls, 1);
+  assert.equal(usage.usd, 0.015);
+  assert.equal(usage.models[0].priced, 1);
+  await assert.rejects(c.settings(dir, { max_usd: -1 }), /non-negative/);
+  await c.close();
+}
+
+/** A task in the background: `task_start` with `report: 'queue'` answers at once, the
+ * task's own requests go out as work after that answer, and once it ends its answer
+ * is read to the session at the next turn. */
+async function aBackgroundTask() {
+  const dir = join(root, 'background');
+  const fetch = scriptedFetch([text('ready'), text('the background answer'), text('noted')]);
+  const c = client(fetch);
+  await c.create(dir, 'fake', { tasks: true });
+  await c.prompt(dir, 'hello');
+  const queued = await c.taskStart(dir, 'later', 'look around', { report: 'queue' });
+  assert.equal(queued.queued, true);
+  let task;
+  for (let tries = 0; tries < 200; tries++) {
+    task = await c.taskWait(dir, 'later');
+    if (task.state === 'finished') break;
+    await new Promise((done) => setTimeout(done, 10));
+  }
+  assert.equal(task.state, 'finished', JSON.stringify(task));
+  assert.match(task.answer.content, /^the background answer/);
+  assert.equal((await c.tasks(dir)).tasks.length, 1);
+  await c.prompt(dir, 'anything new?');
+  assert.ok(fetch.seen.slice(2).some((request) => request.body.includes('the background answer')), 'its answer is read to the session');
+  assert.equal((await c.taskStop(dir, 'later')).stopping, false);
+  await c.close();
+}
+
 async function aRemoteRunner() {
   const binary = process.env.SPINDLE_BIN;
   if (!binary) {
@@ -296,7 +354,8 @@ async function aRemoteRunner() {
   const env = { ...process.env, HOME: home, DEXT_HOME: join(home, '.dext') };
   fs.mkdirSync(env.DEXT_HOME, { recursive: true });
   const host = join(root, 'host');
-  const token = execFileSync(binary, ['--dir', host, 'token', 'new', 'runner'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  // A runner token: it runs commands and reaches nothing else of the host.
+  const token = execFileSync(binary, ['--dir', host, 'token', 'new', 'runner', '--runner'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   const serve = spawn(binary, ['--dir', host, 'serve', '--port', '0'], { env, stdio: ['ignore', 'pipe', 'ignore'] });
   try {
     const port = await new Promise((resolve) => serve.stdout.once('data', (text) => resolve(/127\.0\.0\.1:(\d+)/.exec(String(text))[1])));
@@ -307,6 +366,8 @@ async function aRemoteRunner() {
       return;
     }
     assert.equal(probe.status, 200);
+    const sessions = await fetch(`http://127.0.0.1:${port}/v1/sessions`, { headers: { authorization: `Bearer ${token}` } });
+    assert.equal(sessions.status, 403, 'a runner token reads no sessions');
     const runner = remoteRunner({ url: `http://127.0.0.1:${port}`, token });
     const dir = join(root, 'remote');
     const c = client(scriptedFetch([
@@ -321,6 +382,30 @@ async function aRemoteRunner() {
     assert.equal(new TextDecoder().decode(await c.read(dir, 'out.txt')), 'FROM THE APP');
     await assert.rejects(c.read(dir, 'in.txt'), (error) => error.kind === 'not_found', 'the run removed it');
     await c.close();
+
+    // Stop ends the wait and the host's command with it.
+    const named = [];
+    const watched = remoteRunner({
+      url: `http://127.0.0.1:${port}`, token,
+      fetch: (url, init) => {
+        if (String(url).endsWith('/v1/run')) named.push(JSON.parse(init.body).run);
+        return fetch(url, init);
+      },
+    });
+    const stop = new AbortController();
+    const started = Date.now();
+    const waiting = watched.run({ command: 'sleep 30', timeoutS: 60, network: false, files: [], links: [], directories: [], read: () => new Uint8Array(), signal: stop.signal });
+    const state = async () => (await (await fetch(`http://127.0.0.1:${port}/v1/run/${named[0]}`, { headers: { authorization: `Bearer ${token}` } })).json()).state;
+    while (!named.length || (await state()) !== 'running') {
+      assert.ok(Date.now() - started < 20_000, 'the run started');
+      await new Promise((done) => setTimeout(done, 50));
+    }
+    stop.abort();
+    await assert.rejects(waiting, (error) => error.name === 'AbortError');
+    let ended;
+    while ((ended = await state()) !== 'stopped' && Date.now() - started < 20_000) await new Promise((done) => setTimeout(done, 50));
+    assert.equal(ended, 'stopped', 'the host stopped the command');
+    assert.ok(Date.now() - started < 20_000, 'stopped, not run out');
   } finally {
     serve.kill();
   }
@@ -335,6 +420,8 @@ try {
   await aKilledOwner();
   await readItNowAndStop();
   await aModelWrittenSummary();
+  await aBudget();
+  await aBackgroundTask();
   await aRemoteRunner();
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
@@ -343,6 +430,6 @@ console.log(
   'node-session passed: wasm package via EmbeddedClient against a scripted model (file tools, ' +
     'credentials kept out of the store, app tool with files/state, app runner, app and remote runners at once (a declared sandbox isolates), Spindle calls from a script journaled and replayed (http() only where a grant allows), reopen, second ' +
     'owner refused, killed owner: unknown kept and sent once by retry, read-it-now cut, stop, ' +
-    'compaction by a model-written summary, ' +
-    'remote runner on spindle serve when SPINDLE_BIN is set)',
+    'compaction by a model-written summary, a budget (refused unsent, raised, sent once, costed, usage), a background task (queued, driven after its answer, reported next turn), ' +
+    'remote runner on spindle serve with a runner token, and Stop stopping its command, when SPINDLE_BIN is set)',
 );

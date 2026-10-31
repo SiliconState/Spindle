@@ -423,6 +423,55 @@ fn retained_root_closure_and_digest_are_verified_on_reopen() {
     }
 }
 
+/// A reopen checks the files written since the last open (and hashes only those);
+/// files an earlier open verified are left to their reads, which still refuse damage.
+#[test]
+fn reopen_checks_the_files_written_since_the_last_open() {
+    for damaged_new in [false, true] {
+        let realm = Realm::new();
+        let mut store = Store::open(&realm.0).unwrap();
+        let first = admission(&mut store, "one");
+        let stage = stage(&mut store);
+        let old = store.put_object(&stage, b"old file").unwrap();
+        let root = store
+            .stage_file_map(&stage, &[file("old.txt", &old)])
+            .unwrap();
+        let proposed = proposal(&mut store, first, Some(root), b"one");
+        store.commit_proposal(&proposed).unwrap();
+        drop(store);
+        // This open validates the first revision and its file.
+        let mut store = Store::open(&realm.0).unwrap();
+        let second = admission(&mut store, "two");
+        let later = Stage {
+            id: "later".into(),
+            scope: "operator".into(),
+            owner_epoch: store.epoch(),
+        };
+        store.begin_stage(&later).unwrap();
+        let new = store.put_object(&later, b"new file").unwrap();
+        let root = store
+            .stage_file_map(&later, &[file("old.txt", &old), file("new.txt", &new)])
+            .unwrap();
+        let proposed = proposal(&mut store, second, Some(root), b"two");
+        store.commit_proposal(&proposed).unwrap();
+        drop(store);
+        let db = rusqlite::Connection::open(realm.0.join("authority.sqlite")).unwrap();
+        let damaged = if damaged_new { &new } else { &old };
+        db.execute("UPDATE objects SET bytes=X'00' WHERE digest=?1", [damaged])
+            .unwrap();
+        drop(db);
+        if damaged_new {
+            assert!(Store::open(&realm.0).is_err());
+        } else {
+            let mut store = Store::open(&realm.0).unwrap();
+            assert!(matches!(
+                store.read_object("operator", &old),
+                Err(Error::Incompatible)
+            ));
+        }
+    }
+}
+
 /// Trees that profile v1 can hold keep its encoding (and so their root digests); links,
 /// empty directories and Linux names use v2. Both reopen, and links are only text.
 #[test]

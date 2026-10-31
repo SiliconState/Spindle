@@ -63,13 +63,25 @@ export function remoteRunner({ url, token, fetch = globalThis.fetch }) {
     },
     async run({ command, timeoutS, network, files, links, directories, read, signal }) {
       const upload = files.map((file) => ({ path: file.path, base64: bytesToBase64(read(file.object)), executable: file.executable }));
-      const response = await fetch(`${base}/v1/run`, {
-        method: 'POST', headers, signal,
-        body: JSON.stringify({ command, timeout_s: timeoutS, network, files: upload, links, directories }),
-      });
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok) return { output: '', success: false, failure: refusal(body) || `the runner answered HTTP ${response.status}` };
-      return body;
+      // The run's name: a Stop ends this wait and tells the host to stop the command
+      // (a host that predates /v1/run/ID/stop says 404, and the command runs out its
+      // time there). Whether it stopped is the host's to tell: GET /v1/run/ID.
+      const run = crypto.randomUUID();
+      const stop = () => {
+        fetch(`${base}/v1/run/${run}/stop`, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(10_000) }).catch(() => {});
+      };
+      signal?.addEventListener('abort', stop, { once: true });
+      try {
+        const response = await fetch(`${base}/v1/run`, {
+          method: 'POST', headers, signal,
+          body: JSON.stringify({ command, timeout_s: timeoutS, network, files: upload, links, directories, run }),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) return { output: '', success: false, failure: refusal(body) || `the runner answered HTTP ${response.status}` };
+        return body;
+      } finally {
+        signal?.removeEventListener('abort', stop);
+      }
     },
   };
 }
@@ -639,6 +651,10 @@ export class EmbeddedClient extends Emitter {
     await this.#opfs?.releasing.get(dir);
     return result;
   }
+  /** Gives back the free pages of the session's stores (its tasks' too): `{before,
+   * after, stores}`, sizes in bytes. An open session closes first (as `closeSession`);
+   * one with a turn or a background task running is refused. */
+  compactSession(dir) { return this.call('compact', { dir: this.#dir(dir) }); }
   prompt(dir, text, { files, state, expectedHead } = {}) {
     return this.call('prompt', { dir: this.#dir(dir), text, ...(files && { files }), ...(state && { state }), ...(expectedHead != null && { expected_head: expectedHead }) });
   }
@@ -666,11 +682,26 @@ export class EmbeddedClient extends Emitter {
     return reply.encoding === 'utf8' ? new TextEncoder().encode(reply.content) : base64ToBytes(reply.content);
   }
   settings(dir, changes = {}) { return this.call('settings', { dir: this.#dir(dir), ...changes }); }
+  /** The session's spend: totals, `turns` and `models`, as a native host's `usage`. */
+  usage(dir) { return this.call('usage', { dir: this.#dir(dir) }); }
+  /** What this package can run: built-in tools, runners, budgets, task modes, ... */
+  capabilities() { return this.call('capabilities'); }
+  /** What the session's settings must change to run here: `{changes, notes, refused}`
+   * (`changes` is one `settings` call; `runner`: where commands go when the session
+   * names none of this app's runners, 'app' unless said). An import carries it too. */
+  fit(dir, { runner } = {}) { return this.call('fit', { dir: this.#dir(dir), ...(runner && { runner }) }); }
   state(dir, revision) { return this.call('state', { dir: this.#dir(dir), revision }); }
   setState(dir, patch, { expectedHead } = {}) {
     return this.call('state_set', { dir: this.#dir(dir), patch, ...(expectedHead != null && { expected_head: expectedHead }) });
   }
   recover(dir) { return this.call('recover', { dir: this.#dir(dir) }); }
+  /** The tasks the session started: `{tasks: [{task, state, queued, answer, pending, delivered}]}`. */
+  tasks(dir) { return this.call('tasks', { dir: this.#dir(dir) }); }
+  /** A task as it stands now (`task` its name or label; nothing waits here: an app
+   * hears of its work and events as they come). */
+  taskWait(dir, task) { return this.call('task_wait', { dir: this.#dir(dir), task }); }
+  /** Stops a background task where it is (`{task, stopping}`; false: it was not running). */
+  taskStop(dir, task) { return this.call('task_stop', { dir: this.#dir(dir), task }); }
   taskStart(dir, task, prompt, { model, effort, files, settings, report = 'wait', expectedHead } = {}) {
     return this.call('task_start', { dir: this.#dir(dir), task, prompt, report, ...(model && { model }), ...(effort && { effort }), ...(files && { files }), ...(settings && { settings }), ...(expectedHead != null && { expected_head: expectedHead }) });
   }
@@ -680,18 +711,29 @@ export class EmbeddedClient extends Emitter {
    * copy is sealed, so it continues only where the bundle is imported (here, in
    * another app, or a native host's `import_session`). `settings` change the bundle's
    * copy only, for the host it goes to (a native host's own, such as `builtin_tools:
-   * 'all'`, included); the session keeps its own. */
-  async exportSession(dir, { keep = false, settings } = {}) {
+   * 'all'`, included); the session keeps its own. A copy's stores are checked as far as
+   * the bundle records them (an import checks them whole), unless `whole`: a copy the
+   * app may need to go back to, a backup, is checked record by record, as a move is. */
+  async exportSession(dir, { keep = false, settings, whole = false } = {}) {
     dir = this.#dir(dir);
     if (this.#closed) throw new SpindleError('closed', this.#closed);
     if (this.#opfs) await this.#own(dir);
     try {
-      return this.#embedded.exportSession(dir, Boolean(keep), settings ? JSON.stringify(settings) : undefined);
+      return this.#embedded.exportSession(dir, Boolean(keep), settings ? JSON.stringify(settings) : undefined, Boolean(whole));
     } catch (error) {
       throw new SpindleError(error.code || 'failed', error.message);
     }
   }
 
+  /** Checks a session bundle whole, as `importSession` would (framing, checksum,
+   * manifest, every store), writing nothing: `{head, identity, files}`. */
+  checkBundle(bytes) {
+    try {
+      return JSON.parse(this.#embedded.checkBundle(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)));
+    } catch (error) {
+      throw new SpindleError(error.code || 'invalid', error.message ?? String(error));
+    }
+  }
   /** Continues a bundled session (from `exportSession` or a native `export_session`) as
    * `dir` (nothing there yet); resolves with its status, plus `imported`. */
   async importSession(dir, bytes) {

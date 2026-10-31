@@ -31,10 +31,13 @@ function database() {
   return opening;
 }
 
-async function run(store, mode, work) {
+/** `durability`: 'strict' for a write something is removed on the strength of (the
+ * transaction completes once it is on disk); Chrome's default, relaxed, may complete
+ * before that. */
+async function run(store, mode, work, durability = null) {
   const db = await database();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, mode);
+    const tx = durability ? db.transaction(store, mode, { durability }) : db.transaction(store, mode);
     const request = work(tx.objectStore(store));
     tx.oncomplete = () => resolve(request.result);
     tx.onerror = tx.onabort = () => reject(tx.error);
@@ -43,7 +46,14 @@ async function run(store, mode, work) {
 
 export const read = (store, key) => run(store, 'readonly', (s) => s.get(key));
 export const write = (store, key, value) => run(store, 'readwrite', (s) => s.put(value, key));
+/** `write`, on disk once it resolves: for what a copy elsewhere is removed on the
+ * strength of. Its commit also makes every earlier write to this database durable (they
+ * go to disk through one log before it). */
+export const writeDurably = (store, key, value) => run(store, 'readwrite', (s) => s.put(value, key), 'strict');
 export const remove = (store, key) => run(store, 'readwrite', (s) => s.delete(key));
+/** `remove`, on disk once it resolves: for a record whose return after a crash would
+ * undo work done since (a finished reset's). */
+export const removeDurably = (store, key) => run(store, 'readwrite', (s) => s.delete(key), 'strict');
 export const keysOf = (store) => run(store, 'readonly', (s) => s.getAllKeys());
 export const valuesOf = (store) => run(store, 'readonly', (s) => s.getAll());
 /** A store's records as [key, value] pairs, read in one transaction. */
@@ -103,6 +113,18 @@ export async function update(store, key, change) {
     tx.oncomplete = () => resolve(next);
     tx.onerror = tx.onabort = () => reject(tx.error);
   });
+}
+
+/** What the user let a page a thread made do in its previews (`{version, scripts,
+ * web}`: `web` lets it reach the web, `scripts` lets it run where previews cannot be
+ * contained; null: nothing yet), kept per thread and path and gone with the thread. It
+ * holds for the version it was made for only: page.mjs `pageOf` checks. */
+export async function previewChoice(thread, path) {
+  return (await read('kv', `preview:${thread}:${path}`).catch(() => null)) ?? null;
+}
+
+export function keepPreviewChoice(thread, path, version, { scripts = false, web = false }) {
+  return write('kv', `preview:${thread}:${path}`, { version, scripts: Boolean(scripts || web), web: Boolean(web) });
 }
 
 /** The host permission pattern for a catalog provider (its base URL's origin). */

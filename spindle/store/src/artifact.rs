@@ -2,10 +2,22 @@
 //! receipt or rewound task reaches them (directly or through a workspace manifest),
 //! while a host stage pins them, or while a strict receipt names them as retained
 //! output; `Store::collect_garbage` removes the rest (see there).
+//!
+//! Schema 20 keeps an object deflated where that pays (`pack`): its row then holds the
+//! deflated bytes and `size`, the object's own length; `size` is NULL where the row
+//! holds the object as it is. Digests, sizes and every comparison stay on the object's
+//! own bytes, and a listing reads sizes from the rows alone, so only a file that is
+//! read is ever inflated.
 
 use crate::{Error, Result, Store, valid_label};
+use miniz_oxide::inflate::TINFLStatus;
+use miniz_oxide::inflate::core::{
+    DecompressorOxide, decompress, inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 
 /// Largest object: one workspace file (or manifest), output artifact or image.
 pub const MAX_OBJECT: usize = 64 * 1024 * 1024;
@@ -123,10 +135,11 @@ pub(crate) fn reference_bytes(
     scope: &str,
     reference: &ObjectReference,
 ) -> Result<Vec<u8>> {
-    let bytes: Option<Vec<u8>> = db.query_row(
-        "SELECT o.bytes FROM objects o WHERE o.digest=?1 AND EXISTS(SELECT 1 FROM staging_pins p JOIN artifact_stages s ON p.stage=s.id WHERE p.digest=o.digest AND s.scope=?2)",
-        params![reference.digest, scope], |row| crate::bounded_blob(row, 0, MAX_OBJECT),
-    ).optional()?;
+    let bytes: Option<Vec<u8>> = db
+        .query_row(STORED_IN_SCOPE, params![reference.digest, scope], |row| {
+            object_at(row, 0)
+        })
+        .optional()?;
     let bytes = bytes.ok_or(Error::Invalid)?;
     if object_digest(&bytes) != reference.digest {
         return Err(Error::Incompatible);
@@ -147,7 +160,7 @@ pub struct Stage {
 pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(
         "CREATE TABLE artifact_stages(id TEXT PRIMARY KEY, scope TEXT NOT NULL, owner_epoch INTEGER NOT NULL);
-         CREATE TABLE objects(digest TEXT PRIMARY KEY, bytes BLOB NOT NULL);
+         CREATE TABLE objects(digest TEXT PRIMARY KEY, bytes BLOB NOT NULL, size INTEGER CHECK(size>0));
          CREATE TABLE staging_pins(stage TEXT NOT NULL REFERENCES artifact_stages(id), digest TEXT NOT NULL REFERENCES objects(digest), PRIMARY KEY(stage,digest));
          CREATE TABLE image_provenance(scope TEXT NOT NULL, digest TEXT NOT NULL REFERENCES objects(digest), worker TEXT NOT NULL, source TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, owner_epoch INTEGER NOT NULL, PRIMARY KEY(scope,digest,worker,source));",
     )?;
@@ -166,6 +179,121 @@ pub fn object_digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Objects this long or longer are kept deflated where that saves an eighth or more;
+/// shorter ones (most of a package's small files) stay as they are.
+const PACK_FROM: usize = 1024;
+/// A longer object is tried on its first 64 KiB before all of it, so an archive or a
+/// picture (compressed already) stays as it is without deflating the whole of it.
+const SAMPLE: usize = 64 * 1024;
+/// Deflate's level. A command can write a whole tree at once (a package install), and
+/// 1 packs about three times faster than 3 for about a tenth more bytes.
+const LEVEL: u8 = 1;
+
+/// An object's row: its stored bytes and `size` (`object_at` reads them).
+pub(crate) const STORED: &str = "SELECT bytes,size FROM objects WHERE digest=?1";
+/// An object's length, from its row alone (never its bytes).
+#[cfg(feature = "dext-turn")]
+pub(crate) const SIZE: &str = "SELECT coalesce(size,length(bytes)) FROM objects WHERE digest=?1";
+/// `STORED`, for an object a stage of scope `?2` pins.
+pub(crate) const STORED_IN_SCOPE: &str = "SELECT o.bytes,o.size FROM objects o WHERE o.digest=?1 AND EXISTS(SELECT 1 FROM staging_pins p JOIN artifact_stages s ON p.stage=s.id WHERE p.digest=o.digest AND s.scope=?2)";
+
+/// How a row keeps `bytes`: deflated with their length as `size`, or as they are with
+/// none. A pure function of the bytes (fixed level, pinned deflate).
+pub(crate) fn pack(bytes: &[u8]) -> (Cow<'_, [u8]>, Option<i64>) {
+    let pays = |packed: &[u8], of: usize| packed.len() <= of - of / 8;
+    if bytes.len() < PACK_FROM
+        || (bytes.len() > SAMPLE
+            && !pays(
+                &miniz_oxide::deflate::compress_to_vec(&bytes[..SAMPLE], LEVEL),
+                SAMPLE,
+            ))
+    {
+        return (Cow::Borrowed(bytes), None);
+    }
+    let packed = miniz_oxide::deflate::compress_to_vec(bytes, LEVEL);
+    if pays(&packed, bytes.len()) {
+        (Cow::Owned(packed), Some(bytes.len() as i64))
+    } else {
+        (Cow::Borrowed(bytes), None)
+    }
+}
+
+/// An object's bytes from its row's `stored` bytes and `size`: inflated into exactly
+/// `size` bytes (never more allocated), refused (`Incompatible`) when the stream is
+/// malformed, holds more or fewer, or `size` could not have been packed.
+pub(crate) fn unpack(stored: &[u8], size: Option<i64>) -> Result<Vec<u8>> {
+    let Some(size) = size else {
+        return Ok(stored.to_vec());
+    };
+    let size = usize::try_from(size)
+        .ok()
+        .filter(|size| *size > stored.len() && *size <= MAX_OBJECT)
+        .ok_or(Error::Incompatible)?;
+    let mut out = vec![0; size];
+    let mut state = Box::<DecompressorOxide>::default();
+    let (status, read, written) = decompress(
+        &mut state,
+        stored,
+        &mut out,
+        0,
+        TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+    );
+    if status != TINFLStatus::Done || read != stored.len() || written != size {
+        return Err(Error::Incompatible);
+    }
+    Ok(out)
+}
+
+/// The object a row holds in columns `at` (stored bytes) and `at + 1` (`size`); a
+/// malformed one reads as an invalid query, as other bounded columns do.
+pub(crate) fn object_at(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Vec<u8>> {
+    let size: Option<i64> = row.get(at + 1)?;
+    match row.get_ref(at)? {
+        ValueRef::Blob(stored) if stored.len() <= MAX_OBJECT => {
+            unpack(stored, size).map_err(|_| rusqlite::Error::InvalidQuery)
+        }
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+/// `object_at`, refused unless its bytes hash to the digest in column `digest`.
+#[cfg(feature = "workspace-tools")]
+pub(crate) fn checked_at(
+    row: &rusqlite::Row<'_>,
+    digest: usize,
+    at: usize,
+) -> rusqlite::Result<Vec<u8>> {
+    let bytes = object_at(row, at)?;
+    match row.get_ref(digest)? {
+        ValueRef::Text(expected) if expected == object_digest(&bytes).as_bytes() => Ok(bytes),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+/// Schema 20's objects: the `size` column, then (`pack_rows`) every row kept as `pack`
+/// keeps it. Rows left as they are stay valid (NULL `size`), so checking an older image
+/// only adds the column.
+pub(crate) fn upgrade(tx: &Connection, pack_rows: bool) -> Result<()> {
+    tx.execute_batch("ALTER TABLE objects ADD COLUMN size INTEGER CHECK(size>0)")?;
+    if !pack_rows {
+        return Ok(());
+    }
+    // Row ids first (8 bytes each, however many objects), then one object at a time.
+    let rows = tx
+        .prepare("SELECT rowid FROM objects WHERE length(bytes)>=?1")?
+        .query_map([PACK_FROM as i64], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut read = tx.prepare("SELECT bytes FROM objects WHERE rowid=?1")?;
+    let mut write = tx.prepare("UPDATE objects SET bytes=?1,size=?2 WHERE rowid=?3")?;
+    for row in rows {
+        let bytes = read.query_row([row], |row| crate::bounded_blob(row, 0, MAX_OBJECT))?;
+        if let (Cow::Owned(packed), Some(size)) = pack(&bytes) {
+            write.execute(params![packed, size, row])?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -173,7 +301,10 @@ pub(crate) fn valid_digest(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-pub(crate) fn validate_storage(db: &Connection) -> Result<()> {
+/// The artifact tables' caps and shapes; in `full`, every object against its digest
+/// too. An open leaves that to the reads: every object is checked against its digest
+/// when it is read, so a long store's open never inflates and hashes all of them.
+pub(crate) fn validate_storage(db: &Connection, full: bool) -> Result<()> {
     let (count, bytes): (i64, i64) = db.query_row(
         "SELECT count(*),coalesce(sum(length(bytes)),0) FROM objects",
         [],
@@ -184,7 +315,7 @@ pub(crate) fn validate_storage(db: &Connection) -> Result<()> {
     let provenance: i64 =
         db.query_row("SELECT count(*) FROM image_provenance", [], |r| r.get(0))?;
     let invalid: i64 = db.query_row(
-        "SELECT (SELECT count(*) FROM objects WHERE length(bytes)>?1)
+        "SELECT (SELECT count(*) FROM objects WHERE typeof(size) NOT IN ('null','integer') OR length(bytes)>?1 OR size<=length(bytes) OR size>?1 OR length(digest)!=64 OR digest GLOB '*[^0-9a-f]*')
          + (SELECT count(*) FROM artifact_stages WHERE owner_epoch<=0 OR owner_epoch>(SELECT epoch FROM realm WHERE id=1) OR length(id) NOT BETWEEN 1 AND 128 OR length(scope) NOT BETWEEN 1 AND 128 OR NOT EXISTS(SELECT 1 FROM admissions a WHERE a.scope=artifact_stages.scope))
          + (SELECT count(*) FROM objects o WHERE NOT EXISTS(SELECT 1 FROM staging_pins p WHERE p.digest=o.digest))
          + (SELECT count(*) FROM image_provenance v WHERE length(v.digest)!=64 OR length(v.worker)!=64 OR length(v.source)!=64 OR v.width NOT BETWEEN 1 AND 1568 OR v.height NOT BETWEEN 1 AND 1568 OR v.owner_epoch<=0 OR v.owner_epoch>(SELECT epoch FROM realm WHERE id=1) OR NOT EXISTS(SELECT 1 FROM staging_pins p JOIN artifact_stages s ON p.stage=s.id WHERE p.digest=v.digest AND s.scope=v.scope))", [MAX_OBJECT as i64], |r| r.get(0),
@@ -212,11 +343,14 @@ pub(crate) fn validate_storage(db: &Connection) -> Result<()> {
             return Err(Error::Incompatible);
         }
     }
-    let mut query = db.prepare("SELECT digest,bytes FROM objects")?;
+    if !full {
+        return Ok(());
+    }
+    let mut query = db.prepare("SELECT digest,bytes,size FROM objects")?;
     let mut rows = query.query([])?;
     while let Some(row) = rows.next()? {
         let expected: String = row.get(0)?;
-        let bytes: Vec<u8> = crate::bounded_blob(row, 1, MAX_OBJECT)?;
+        let bytes: Vec<u8> = object_at(row, 1)?;
         if !valid_digest(&expected) || object_digest(&bytes) != expected {
             return Err(Error::Incompatible);
         }
@@ -306,7 +440,8 @@ fn count_usage(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Pins `id` for `stage`, storing its bytes first unless already stored, within caps.
+/// Pins `id` for `stage`, storing its bytes first (packed) unless already stored,
+/// within caps.
 fn insert_pinned(
     tx: &Connection,
     stage: &Stage,
@@ -314,17 +449,22 @@ fn insert_pinned(
     bytes: &[u8],
     stored: bool,
 ) -> Result<()> {
+    let row = (!stored).then(|| pack(bytes));
     let room = Room {
         pins: 1,
         objects: i64::from(!stored),
-        bytes: if stored { 0 } else { bytes.len() as i64 },
+        bytes: row.as_ref().map_or(0, |(kept, _)| kept.len() as i64),
         ..Room::default()
     };
     if !usage(tx)?.fits(room) {
         return Err(Error::Exhausted);
     }
-    if !stored {
-        crate::execute_one(tx, "INSERT INTO objects VALUES(?1,?2)", params![id, bytes])?;
+    if let Some((kept, size)) = row {
+        crate::execute_one(
+            tx,
+            "INSERT INTO objects VALUES(?1,?2,?3)",
+            params![id, kept, size],
+        )?;
     }
     crate::execute_one(
         tx,
@@ -352,13 +492,13 @@ pub(crate) fn child_stage(parent: &str, id: u64) -> String {
 #[cfg(feature = "workspace-tools")]
 fn resolved_journals(db: &Connection) -> Result<Vec<(String, String, Option<String>)>> {
     let mut query = db.prepare(
-        "SELECT s.id,s.scope,o.bytes FROM artifact_stages s JOIN staging_pins p ON p.stage=s.id JOIN objects o ON o.digest=p.digest WHERE substr(s.id,1,5)='code-'",
+        "SELECT s.id,s.scope,o.bytes,o.size,o.digest FROM artifact_stages s JOIN staging_pins p ON p.stage=s.id JOIN objects o ON o.digest=p.digest WHERE substr(s.id,1,5)='code-'",
     )?;
     let rows = query.query_map([], |r| {
         Ok((
             crate::bounded_label(r, 0)?,
             crate::bounded_label(r, 1)?,
-            crate::bounded_blob(r, 2, MAX_OBJECT)?,
+            checked_at(r, 4, 2)?,
         ))
     })?;
     let mut journals = Vec::new();
@@ -416,9 +556,9 @@ pub(crate) fn keep_spend(
         let mut records: Vec<Value> = Vec::new();
         {
             let mut query = db.prepare_cached(
-                "SELECT o.bytes FROM staging_pins p JOIN objects o ON o.digest=p.digest WHERE p.stage=?1",
+                "SELECT o.bytes,o.size,o.digest FROM staging_pins p JOIN objects o ON o.digest=p.digest WHERE p.stage=?1",
             )?;
-            let rows = query.query_map([stage], |r| crate::bounded_blob(r, 0, MAX_OBJECT))?;
+            let rows = query.query_map([stage], |r| checked_at(r, 2, 0))?;
             for bytes in rows {
                 if let Ok(record) = serde_json::from_slice(&bytes?) {
                     records.push(record);
@@ -455,8 +595,9 @@ pub(crate) fn keep_spend(
         }
         let digest = object_digest(&bytes);
         let spend = spend_stage(parent);
-        db.prepare_cached("INSERT OR IGNORE INTO objects VALUES(?1,?2)")?
-            .execute(params![digest, bytes])?;
+        let (stored, size) = pack(&bytes);
+        db.prepare_cached("INSERT OR IGNORE INTO objects VALUES(?1,?2,?3)")?
+            .execute(params![digest, stored, size])?;
         db.prepare_cached("INSERT OR IGNORE INTO artifact_stages VALUES(?1,?2,?3)")?
             .execute(params![spend, scope, epoch])?;
         db.prepare_cached("INSERT OR IGNORE INTO staging_pins VALUES(?1,?2)")?
@@ -746,10 +887,10 @@ impl Store {
             return Err(Error::Invalid);
         }
         let result = (|| -> Result<Vec<u8>> {
-            let bytes: Option<Vec<u8>> = self.db.query_row(
-                "SELECT o.bytes FROM objects o WHERE o.digest=?1 AND EXISTS(SELECT 1 FROM staging_pins p JOIN artifact_stages s ON p.stage=s.id WHERE p.digest=o.digest AND s.scope=?2)",
-                params![id,scope], |r| crate::bounded_blob(r, 0, MAX_OBJECT),
-            ).optional()?;
+            let bytes: Option<Vec<u8>> = self
+                .db
+                .query_row(STORED_IN_SCOPE, params![id, scope], |r| object_at(r, 0))
+                .optional()?;
             let bytes = bytes.ok_or(Error::Invalid)?;
             if bytes.len() > MAX_OBJECT || object_digest(&bytes) != id {
                 return Err(Error::Incompatible);
@@ -884,8 +1025,8 @@ impl Store {
             };
             live(root)?;
             let manifest: Option<Vec<u8>> = tx
-                .prepare_cached("SELECT bytes FROM objects WHERE digest=?1")?
-                .query_row([root], |r| crate::bounded_blob(r, 0, MAX_OBJECT))
+                .prepare_cached("SELECT bytes,size,digest FROM objects WHERE digest=?1")?
+                .query_row([root], |r| checked_at(r, 2, 0))
                 .optional()?;
             // A root's manifest is checked whenever it is adopted; one that does not
             // decode means a damaged store, where nothing is collected (its files
@@ -973,5 +1114,60 @@ impl Store {
             self.paused = true;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn objects_pack_where_it_pays_and_unpack_whole() {
+        let text = b"def main():\n    print('spindle')\n".repeat(400);
+        let (stored, size) = pack(&text);
+        assert_eq!(size, Some(text.len() as i64));
+        assert!(stored.len() * 10 < text.len());
+        assert_eq!(unpack(&stored, size).unwrap(), text);
+        // Deterministic: the same bytes are always kept the same way.
+        assert_eq!(pack(&text).0, stored);
+        // Small objects, and bytes deflate cannot shrink by an eighth, stay as they are.
+        let small = b"x".repeat(PACK_FROM - 1);
+        assert_eq!(pack(&small), (Cow::Borrowed(small.as_slice()), None));
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let noise: Vec<u8> = (0..3 * SAMPLE)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        assert_eq!(pack(&noise).1, None);
+        // A compressed head (an archive's) is not deflated at all, whatever follows.
+        let mut archive = noise[..SAMPLE].to_vec();
+        archive.extend(b"a".repeat(SAMPLE * 4));
+        assert_eq!(pack(&archive).1, None);
+        assert_eq!(unpack(&noise, None).unwrap(), noise);
+    }
+
+    #[test]
+    fn malformed_rows_are_refused_before_any_large_allocation() {
+        let text = b"spindle ".repeat(1024);
+        let (stored, size) = pack(&text);
+        let size = size.unwrap();
+        for (bytes, size) in [
+            (stored.to_vec(), size + 1),
+            (stored.to_vec(), size - 1),
+            (stored[..stored.len() - 1].to_vec(), size),
+            ([stored.as_ref(), b"tail"].concat(), size),
+            (stored.to_vec(), stored.len() as i64),
+            (stored.to_vec(), MAX_OBJECT as i64 + 1),
+            (stored.to_vec(), -1),
+        ] {
+            assert!(matches!(
+                unpack(&bytes, Some(size)),
+                Err(Error::Incompatible)
+            ));
+        }
     }
 }

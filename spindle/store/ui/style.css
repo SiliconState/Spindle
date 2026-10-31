@@ -3,7 +3,10 @@
    sheets' dialogs. New: #title-button (thread menu), #model-chip (#chip-provider #chip-model
    #chip-effort), #pending-settings, #model-dialog, #thread-dialog, #viewer-dialog, .display-card,
    .change-card, .turn-changes, .path-link, .md. Newer: #gauge, #attention, #attend-dialog, #menu-note,
-   .change-row/.diff-link (a turn's ledger), .meta.jobs, #shelf-section, #file-view-shelf. Moved: #files is the Files row of the thread menu
+   .change-row/.diff-link (a turn's ledger), .meta.jobs, #shelf-section, #file-view-shelf. Newest: #spend #spend-bar
+   (header spend), #filter-box (the list's search), .thread-group/.thread-mark/.thread-more (the list), .steps
+   (a run of tool cards), .steer (a message sent while running); #stop is the composer's Stop in Send's place.
+   Moved: #files is the Files row of the thread menu
    (no longer a header button); #rename-form, #settings-budget, #delete and #settings-usage moved
    from Settings into #thread-dialog. Removed: #new / #new-dialog (the thread list's composer starts
    threads), #model-form, #thread-settings, #dev-actions, #promote, #update-source (self-edit is
@@ -12,19 +15,31 @@
 :root, dialog, #toast {
   color-scheme: light;
   --page: #f6f2e9;
-  --surface: #fbf8f1;
+  --chrome: #ece6d8;
+  --surface: #fcfaf4;
   --soft: #f1ece1;
   --input: #fdfbf6;
   --ink: #26291f;
-  --muted: #6a6f60;
+  --ink-2: #45483d;
+  --muted: #595d50;
   --line: #cfc9b8;
+  --edge: #ddd6c6;
+  --hair: #e9e3d6;
+  --track: #d9d2c2;
   --rule: #b9b29e;
-  --accent: #3f5b2f;
-  --accent-soft: #e9ecdc;
+  --accent: #3e5a2b;
+  --accent-soft: #e6ead8;
   --on-accent: #fbf8f1;
+  --steer: #e8e2d3;
+  --danger: #a3321f;
+  --on-danger: #ffffff;
+  --warn: #7f4500;
+  --warn-ink: #5a3300;
+  --warn-bg: #f9ecd3;
+  --warn-line: #dfbf8a;
   --terminal: #efeadf;
   --code: #334a2a;
-  --error: #8f3a28;
+  --error: #96331f;
   --error-line: #c49a86;
   --shadow: #30271418;
   --grain: #2a21141a;
@@ -34,33 +49,53 @@
   --blue: #2a5c8f;
   --mark: #e9d27e;
 }
-/* Light: Paper's inks on neutral white and grey, without the warm tint. */
+/* Light: white and neutral greys, no paper: none of the warm tint and only a faint grain. */
 :root[data-theme="light"], :root[data-theme="light"] dialog, :root[data-theme="light"] #toast {
-  --page: #f6f7f5;
+  --page: #fafafa;
+  --chrome: #f0f0f0;
   --surface: #ffffff;
-  --soft: #eef0ec;
+  --soft: #f3f3f3;
   --input: #ffffff;
-  --ink: #1f231d;
-  --muted: #5a6056;
-  --line: #d6dad2;
-  --rule: #b9beb4;
-  --accent-soft: #e7eedf;
+  --ink: #1a1a1a;
+  --ink-2: #474747;
+  --muted: #5c5c5c;
+  --line: #d4d4d4;
+  --edge: #e3e3e3;
+  --hair: #eeeeee;
+  --track: #d9d9d9;
+  --rule: #b5b5b5;
+  --accent-soft: #e8eee1;
   --on-accent: #ffffff;
-  --terminal: #f0f2ee;
-  --shadow: #1a201814;
-  --grain: #1a20180f;
+  --terminal: #f4f4f4;
+  --shadow: #0000001a;
+  --grain: #0000000a;
   --mark: #f2e08f;
+  --steer: #ececec;
+  --warn-bg: #fdf2dd;
+  --warn-line: #e6c68c;
 }
 :root[data-theme="dark"], :root[data-theme="dark"] dialog, :root[data-theme="dark"] #toast {
   color-scheme: dark;
   --page: #111511;
+  --chrome: #161c14;
   --surface: #171d15;
   --soft: #1c241a;
   --input: #141a12;
   --ink: #dfe4d6;
-  --muted: #9aa78a;
-  --line: #34412b;
+  --ink-2: #c3cab8;
+  --muted: #a4b194;
+  --line: #3a4730;
+  --edge: #2b3524;
+  --hair: #232c1e;
+  --track: #2f3a28;
   --rule: #46553a;
+  --steer: #232b1e;
+  --danger: #b4442e;
+  --on-danger: #ffffff;
+  --warn: #f0c27a;
+  --warn-ink: #f5dcb0;
+  --warn-bg: #2a2213;
+  --warn-line: #6d5427;
   --accent: #b9e07f;
   --accent-soft: #233019;
   --on-accent: #16200d;
@@ -104,55 +139,110 @@ button.danger { color: var(--error); border-color: var(--error-line); }
 .eyebrow { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
 h1, h2, p { margin: 0; }
 h2 { font-size: 24px; font-weight: 600; line-height: 1.2; letter-spacing: -.01em; }
-header { display: flex; align-items: center; gap: 12px; padding: calc(10px + env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) 10px max(14px, env(safe-area-inset-left)); border-bottom: 1px solid var(--rule); background: var(--page); flex-shrink: 0; }
-.brand { font-size: 22px; font-weight: 600; line-height: 1; border: 0; background: transparent; padding: 0; min-width: 44px; flex-shrink: 0; text-align: left; white-space: nowrap; }
+/* The header: the mark and Settings on the thread list; back, the thread's name (its menu)
+   with its model under it, and what it spent, in a thread. */
+header { display: flex; align-items: center; gap: 4px; padding: env(safe-area-inset-top) max(4px, env(safe-area-inset-right)) 0 max(4px, env(safe-area-inset-left)); min-height: calc(52px + env(safe-area-inset-top)); background: var(--chrome); flex-shrink: 0; }
+.icon { display: block; flex-shrink: 0; }
+.brand { display: inline-flex; align-items: center; justify-content: center; font-size: 17px; font-weight: 700; line-height: 1; border: 0; background: transparent; padding: 0; min-width: 44px; min-height: 44px; flex-shrink: 0; white-space: nowrap; color: var(--ink); }
 .brand-dot { color: var(--accent); }
-/* Inside a thread the mark is also the way back to the list. */
-body[data-view="thread"] .brand::before { content: "‹"; color: var(--muted); margin-right: 2px; }
-.heading { min-width: 0; flex: 1; position: relative; min-height: 44px; display: flex; flex-direction: column; justify-content: center; }
+.brand .icon-back { display: none; }
+/* Inside a thread the mark gives way to the way back to the list. */
+body[data-view="thread"] .brand .brand-mark { display: none; }
+body[data-view="thread"] .brand .icon-back { display: block; }
+.heading { min-width: 0; flex: 1; position: relative; min-height: 44px; display: flex; flex-direction: column; justify-content: center; padding-left: 4px; }
 /* Inside a thread the whole title block opens the thread menu. */
 #title-button { position: absolute; inset: 0; width: 100%; min-height: 0; padding: 0; border: 0; background: transparent; }
 #title-button:hover { background: transparent; }
-body[data-view="thread"] #title::after { content: " ▾"; color: var(--muted); font-weight: 400; }
+.title-line { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.title-line .icon-caret { display: none; color: var(--ink-2); }
+body[data-view="thread"] .title-line .icon-caret { display: block; }
 body[data-view="thread"] .heading:hover h1 { color: var(--accent); }
-h1 { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+h1 { font-size: 15px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .heading p { font-size: 11px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* Connected is a quiet dot; any other state spells itself out. */
-#connection { font-size: 11px; color: var(--error); max-width: 96px; text-align: right; line-height: 1.3; flex-shrink: 0; }
-#connection::before { content: "● "; color: var(--error); }
-#connection[data-ok="true"] { font-size: 0; }
-#connection[data-ok="true"]::before { content: "●"; font-size: 10px; color: var(--accent); }
-#settings { font-size: 18px; min-width: 44px; min-height: 44px; padding: 0; }
-main { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior-y: contain; padding: 24px 16px 32px; }
-#welcome { max-width: 560px; margin: 0 auto; }
-#intro { margin: 4vh 0 28px; }
+.heading p:empty { display: none; }
+/* Connected is a quiet square; any other state spells itself out. */
+#connection { font-size: 11px; color: var(--error); max-width: 96px; text-align: right; line-height: 1.3; flex-shrink: 0; padding-right: 4px; }
+#connection::before { content: "■ "; color: var(--error); }
+#connection[data-ok="true"] { font-size: 0; padding: 0 6px; }
+#connection[data-ok="true"]::before { content: "■"; font-size: 8px; color: var(--accent); }
+#settings { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; padding: 0; border: 0; background: transparent; color: var(--ink); }
+#settings:hover { color: var(--accent); }
+/* What the open thread spent (its limit, a tap away in the thread menu), and under the
+   header a 2px bar of it against the limit: a rule when there is none. */
+#spend { min-height: 44px; padding: 0 10px; border: 0; background: transparent; font-size: 13px; font-weight: 700; color: var(--ink); flex-shrink: 0; }
+#spend:hover { color: var(--accent); }
+#spend.over { color: var(--error); }
+#spend-bar { height: 2px; background: var(--track); flex-shrink: 0; display: flex; }
+#spend-bar i { display: block; width: 0; height: 2px; background: var(--accent); transition: width .3s; }
+#spend-bar.over i { background: var(--danger); }
+body:not([data-view="thread"]) #spend-bar { display: none; }
+main { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior-y: contain; padding: 16px 14px 28px; }
+body[data-view="home"] main { padding: 0 0 24px; }
+#welcome { max-width: 640px; margin: 0 auto; }
+#intro { margin: 4vh 16px 28px; }
 #intro h2 { font-size: clamp(26px, 6.5vw, 36px); margin: 16px 0; }
 #intro p:not(.eyebrow) { color: var(--muted); font-size: 14px; line-height: 1.7; }
-#welcome #filter { margin-top: 0; }
-#sessions { display: grid; gap: 0; margin-top: 16px; border-top: 1px solid var(--rule); }
+/* The thread list: a search, then threads by what they need (Running, Needs you, Today,
+   Earlier), each with its state as a shape as well as a colour. */
+.search { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 12px; background: var(--surface); border: 1px solid var(--track); color: var(--muted); }
+.search:focus-within { border-color: var(--accent); }
+.search input { flex: 1; min-width: 0; border: 0; background: transparent; padding: 0; min-height: 42px; font-size: 16px; color: var(--ink); outline: none; }
+#filter-box { margin: 14px 14px 2px; }
+#filter { width: 100%; }
+#sessions { display: flex; flex-direction: column; }
 #sessions:empty { display: none; }
-#sessions .note { padding: 16px 4px; }
-#filter { width: 100%; margin-top: 12px; padding: 10px 12px; }
-.session-row { display: flex; align-items: stretch; border-bottom: 1px solid var(--line); }
-.session { flex: 1; min-width: 0; text-align: left; padding: 14px 4px; display: block; border: 0; background: transparent; }
-.session-row .remove { border: 0; background: transparent; color: var(--muted); width: 44px; padding: 0; font-size: 18px; flex-shrink: 0; }
-.session-row .remove:hover { color: var(--error); }
-.session:hover { background: var(--soft); }
-.session strong { display: block; font-weight: 600; font-size: 14px; overflow-wrap: anywhere; }
-.session small { color: var(--muted); display: block; font-size: 11px; margin-top: 4px; letter-spacing: .08em; }
+#sessions .note { padding: 16px; }
+.thread-group { margin: 0; padding: 16px 16px 6px; font-size: 11px; font-weight: 500; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.session-row { display: flex; align-items: center; border-top: 1px solid var(--edge); background: var(--surface); }
+.session-row.last { border-bottom: 1px solid var(--edge); }
+.session-row.needs { background: var(--warn-bg); border-color: var(--warn-line); }
+.session { flex: 1; min-width: 0; text-align: left; padding: 12px 4px 12px 14px; display: flex; align-items: flex-start; gap: 10px; border: 0; background: transparent; min-height: 64px; }
+.session:hover { background: transparent; }
+.session-row:hover, .session-row:focus-within { background: var(--chrome); }
+.session-row.needs:hover, .session-row.needs:focus-within { background: var(--warn-bg); }
+.thread-mark { width: 16px; height: 20px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.thread-mark .dot { width: 8px; height: 8px; background: var(--ink); }
+.session-row.running .thread-mark { color: var(--accent); }
+.session-row.needs .thread-mark { color: var(--warn); }
+.thread-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.thread-top { display: flex; align-items: baseline; gap: 8px; }
+.session strong { flex: 1; min-width: 0; font-weight: 500; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-row.running strong, .session-row.needs strong, .session-row.unread strong { font-weight: 700; }
+.thread-time { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.session-row.needs .thread-time { color: var(--warn-ink); }
+.session small { color: var(--muted); display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-row.running small { color: var(--accent); }
+.session-row.needs small { color: var(--warn); font-weight: 600; }
+.session-row.unread small { color: var(--ink); }
+.thread-more { display: inline-flex; align-items: center; justify-content: center; width: 44px; min-height: 44px; padding: 0; margin-right: 4px; border: 0; background: transparent; color: var(--ink-2); flex-shrink: 0; }
+.thread-more:hover { color: var(--accent); }
 #thread { max-width: 860px; margin: auto; }
-article { margin-bottom: 24px; overflow-wrap: anywhere; }
-.message { line-height: 1.7; white-space: pre-wrap; font-size: 14px; }
-.message.user { padding: 12px 14px; background: var(--accent-soft); border-left: 3px solid var(--accent); }
+article { margin-bottom: 18px; overflow-wrap: anywhere; }
+.message { line-height: 1.65; white-space: pre-wrap; font-size: 14px; }
+.message.user > div { padding: 10px 12px; background: var(--accent-soft); border-left: 3px solid var(--accent); }
 .message.assistant { padding: 0 2px; }
+/* What the operator sent while a turn ran: a bubble at the right, checked once the run read
+   it; a long one shows three lines until tapped. */
+.message.steer { display: flex; flex-direction: column; align-items: flex-end; }
+.message.steer .role-label { display: flex; align-items: center; gap: 6px; }
+.message.steer .role-label .icon { color: var(--accent); }
+.message.steer > div { position: relative; max-width: 88%; padding: 10px 12px; background: var(--steer); border-left: 0; }
+/* Clipped at its padding box: the inset under the third line is a border in the bubble's own
+   colour, so no part of a fourth line shows in it. */
+.message.steer:not(.whole) > div { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; padding-bottom: 0; border-bottom: 10px solid var(--steer); }
+.message.steer.long > div { padding-right: 34px; cursor: pointer; }
+.message.steer .steer-arrow { position: absolute; right: 10px; bottom: 12px; color: var(--ink-2); }
+.message.steer.whole .steer-arrow { transform: rotate(180deg); }
 /* A message waiting for the running turn: drawn, not yet read. */
-#queued .message.user { background: transparent; border: 1px dashed var(--accent); border-left: 3px solid var(--accent); }
+#queued .message.user > div { background: transparent; border: 1px dashed var(--accent); border-left: 3px solid var(--accent); }
+/* Waiting to be read, a bubble is whole and dashed (filled and checked once read). */
+#queued .message.steer > div { display: block; padding: 10px 12px; border: 1px dashed var(--accent); }
 #queued .queued-row { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin: -12px 0 24px; }
 #queued .queued-row .meta { font-size: 11px; color: var(--muted); }
-.role-label { display: block; font-size: 10px; letter-spacing: .14em; color: var(--muted); margin-bottom: 8px; }
+.role-label { display: block; font-size: 10px; letter-spacing: .12em; color: var(--muted); margin-bottom: 6px; }
 .notice { font-size: 12px; color: var(--muted); border-left: 2px solid var(--accent); padding: 8px 12px; margin: 12px 0; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 /* Why an idle thread is waiting, at the end of the conversation. */
-.notice.state { font-size: 13px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-left: 3px solid var(--accent); padding: 12px 14px; margin-top: 20px; }
+.notice.state { font-size: 13px; color: var(--ink); background: var(--surface); border: 1px solid var(--edge); border-left: 3px solid var(--accent); padding: 12px 14px; margin-top: 16px; }
 .notice.state.warning { border-color: var(--error-line); border-left-color: var(--error); }
 /* Code fences in messages wrap like every other code block: a long line never
    forces a sideways scroll, and a wrapped line reads as one continuation. */
@@ -163,16 +253,34 @@ article { margin-bottom: 24px; overflow-wrap: anywhere; }
 .meta.turn-cost { text-align: right; margin-top: 6px; }
 .nested { font-size: 11px; color: var(--accent); margin: 6px 0; padding-left: 4px; }
 .warning { border-color: var(--error-line); color: var(--error); }
-.tool-card { border: 1px solid var(--line); background: var(--surface); margin: 14px 0; overflow: hidden; }
+/* Steps: a tool card is one row (an icon for its kind, what it ran, one quiet line of what
+   came back); a run of them folds into one "Ran N steps" row until opened. */
+.tool-card { border: 1px solid var(--edge); background: var(--surface); margin: 12px 0; overflow: hidden; }
 .tool-card.preview { border-style: dashed; border-color: var(--accent); }
 .tool-card.failed { border-color: var(--error-line); }
-.tool-card summary { list-style: none; display: flex; align-items: center; gap: 10px; cursor: pointer; padding: 12px 14px; min-height: 48px; touch-action: manipulation; }
+.tool-card summary { list-style: none; display: flex; align-items: center; gap: 10px; cursor: pointer; padding: 6px 12px; min-height: 48px; touch-action: manipulation; }
 .tool-card summary::-webkit-details-marker { display: none; }
-.tool-icon { color: var(--accent); font-size: 13px; width: 28px; flex-shrink: 0; }
+.tool-card[open] > summary { background: var(--page); }
+.tool-icon { display: inline-flex; align-items: center; justify-content: center; color: var(--muted); width: 16px; flex-shrink: 0; }
+.tool-card.failed .tool-icon { color: var(--error); }
+.tool-card.preview .tool-icon { color: var(--accent); }
 .tool-title { font-size: 13px; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .badge { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); flex-shrink: 0; }
 .preview .badge { color: var(--accent); }
-.tool-body { border-top: 1px solid var(--line); padding: 12px; }
+.tool-body { border-top: 1px solid var(--hair); padding: 12px; background: var(--page); }
+.steps { margin: 12px 0; border: 1px solid var(--edge); background: var(--surface); }
+.steps > summary { list-style: none; display: flex; align-items: center; gap: 10px; cursor: pointer; padding: 0 12px; min-height: 48px; font-size: 14px; touch-action: manipulation; }
+.steps > summary::-webkit-details-marker { display: none; }
+.steps[open] > summary { border-bottom: 1px solid var(--hair); }
+.steps-status { display: inline-flex; color: var(--accent); flex-shrink: 0; }
+.steps.has-failed .steps-status { color: var(--error); }
+.steps-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.steps-count { display: inline-flex; align-items: center; gap: 3px; font-size: 12px; color: var(--error); flex-shrink: 0; }
+.steps-chevron { display: inline-flex; color: var(--muted); flex-shrink: 0; transition: transform .12s; }
+.steps[open] > summary .steps-chevron { transform: rotate(90deg); }
+.steps > .tool-card { margin: 0; border: 0; border-top: 1px solid var(--hair); }
+.steps > .tool-card:first-of-type { border-top: 0; }
+.steps > .tool-card.failed .tool-title { color: var(--error); }
 /* Commands, code and shell output share one rule: wrap, and break a token that is
    longer than the card (a path, hash or URL) instead of widening it. */
 .tool-body pre, .terminal, #file-content { font-size: 12px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; tab-size: 4; overflow: auto; margin: 0; max-height: 48dvh; -webkit-overflow-scrolling: touch; }
@@ -190,32 +298,41 @@ article { margin-bottom: 24px; overflow-wrap: anywhere; }
 .tool-result-label { margin: 12px 0 8px; color: var(--muted); font-size: 10px; letter-spacing: .1em; }
 .tool-card.failed .badge { color: var(--error); }
 /* iOS reports a ~34px home-indicator inset and keeps it while the keyboard is open; only clear the indicator itself, and drop it entirely above the keyboard. */
-#dock { position: relative; border-top: 1px solid var(--rule); background: var(--page); padding: 6px max(10px, env(safe-area-inset-right)) max(6px, calc(env(safe-area-inset-bottom) - 22px)) max(10px, env(safe-area-inset-left)); flex-shrink: 0; }
+/* The composer: one box, its status row (revision, state, model, the action that applies
+   now) over the message; fused strips above it say what waits for the next turn. */
+#dock { position: relative; background: var(--page); padding: 6px max(8px, env(safe-area-inset-right)) max(8px, calc(env(safe-area-inset-bottom) - 22px)) max(8px, env(safe-area-inset-left)); flex-shrink: 0; }
 body.keyboard #dock { padding-bottom: 4px; }
 #dock > * { max-width: 860px; margin-left: auto; margin-right: auto; }
 /* One row for revision, status and the single action that applies now. */
 /* Compact status row by request (half the old 44px); each control's tap target, the status text included, extends 22px upward into the scroll area (44px total), never down into the composer. */
-#bar { display: flex; align-items: stretch; height: 23px; min-height: 23px; border: 1px solid var(--rule); border-bottom: 0; background: var(--surface); }
-#bar button { position: relative; min-height: 0; height: 100%; font-size: 11px; line-height: 1; padding: 0 10px; border: 0; border-left: 1px solid var(--line); background: transparent; white-space: nowrap; flex-shrink: 0; }
+#bar { display: flex; align-items: stretch; height: 26px; min-height: 26px; border: 1px solid var(--line); border-bottom: 1px solid var(--hair); background: var(--surface); }
+#bar button { position: relative; min-height: 0; height: 100%; font-size: 11px; line-height: 1; padding: 0 10px; border: 0; border-left: 1px solid var(--hair); background: transparent; white-space: nowrap; flex-shrink: 0; }
 #bar button::before { content: ""; position: absolute; left: 0; right: 0; top: -22px; bottom: 0; }
 #bar button.primary { background: var(--ink); color: var(--page); }
 #bar button.danger { color: var(--error); }
-#bar #hist-chip { border-left: 0; color: var(--accent); font-weight: 600; padding: 0 10px; }
+#bar #hist-chip { border-left: 0; border-right: 1px solid var(--hair); color: var(--accent); font-weight: 600; padding: 0 10px; }
 #bar #hist-prev, #bar #hist-next { width: 32px; padding: 0; font-size: 14px; }
 #bar #hist-prev { border-left: 0; }
 /* The status text clips inside its span, so the button itself keeps the upward tap zone. */
-#bar #phase { flex: 1 1 auto; min-width: 0; text-align: left; color: var(--muted); }
+#bar #phase { flex: 1 1 auto; min-width: 0; text-align: left; color: var(--muted); border-left: 0; }
 #phase-text { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#bar[data-mode="busy"] #phase { color: var(--accent); }
+/* A run in progress: a pulsing square before what it does. */
+#bar[data-mode="busy"] #phase { color: var(--ink); }
+#bar[data-mode="busy"] #phase-text::before { content: ""; display: inline-block; width: 6px; height: 6px; margin: 0 7px 1px 0; background: var(--accent); vertical-align: middle; animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
 #bar[data-mode="stopped"] { border-left: 3px solid var(--error); }
 #bar[data-mode="stopped"] #phase { color: var(--error); }
 #bar[data-mode="history"] { background: var(--accent-soft); border-color: var(--accent); }
-#composer { display: flex; align-items: flex-end; gap: 0; border: 1px solid var(--rule); background: var(--input); }
+#composer { display: flex; align-items: flex-end; gap: 0; border: 1px solid var(--line); border-top: 0; background: var(--surface); }
 textarea, input, select { border: 1px solid var(--rule); background: var(--input); border-radius: 0; color: var(--ink); padding: 12px; min-width: 0; font-size: 16px; }
 textarea { resize: none; line-height: 1.4; }
 #prompt { flex: 1; height: 45px; min-height: 45px; max-height: 140px; overflow-y: hidden; border: 0; background: transparent; outline: none; font-size: 16px; line-height: 21px; padding: 12px; }
 #prompt.scrollable { overflow-y: auto; }
-#send { width: 46px; min-height: 45px; flex-shrink: 0; font-size: 20px; padding: 0; border: 0; border-left: 1px solid var(--rule); align-self: stretch; }
+#send, #composer #stop { width: 44px; min-height: 45px; flex-shrink: 0; padding: 0; border: 0; align-self: stretch; display: inline-flex; align-items: center; justify-content: center; }
+/* Stop in Send's place while a run goes and nothing is written: a red square. */
+#composer #stop { background: var(--danger); color: var(--on-danger); border: 0; }
+#composer #stop::after { content: ""; width: 12px; height: 12px; background: var(--on-danger); }
+#composer #stop:hover { filter: brightness(1.1); }
 /* The single pill in the UI: back to the newest content. It rides just above the dock (and above the status row's upward tap zone), however tall the composer grows. */
 #jump { position: absolute; bottom: calc(100% + 30px); left: 50%; transform: translateX(-50%); z-index: 2; border-radius: 999px; border-color: var(--ink); font-size: 12px; background: var(--page); box-shadow: 0 3px 20px var(--shadow); white-space: nowrap; }
 dialog, #toast { font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace; font-size: 14px; font-style: normal; font-weight: 400; line-height: 1.55; letter-spacing: normal; word-spacing: normal; text-transform: none; text-align: left; text-indent: 0; text-shadow: none; direction: ltr; writing-mode: horizontal-tb; visibility: visible; pointer-events: auto; cursor: auto; user-select: text; -webkit-text-fill-color: currentcolor; -webkit-text-security: none; opacity: 1; transform: none; filter: none; clip-path: none; mix-blend-mode: normal; }
@@ -230,12 +347,24 @@ dialog .check input { width: 18px; height: 18px; accent-color: var(--accent); }
 dialog small { font-size: 11px; color: var(--muted); flex-basis: 100%; margin-left: 26px; }
 .close { float: right; border: 0; background: transparent; font-size: 22px; margin: -12px -12px 0 0; }
 .sheet { max-width: 860px; }
-.sheet-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
-.sheet-head h2 { margin: 6px 0 0; }
-.sheet-head button { font-size: 24px; border: 0; background: transparent; }
+.sheet-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 16px; }
+.sheet-head h2 { margin: 4px 0 0; font-size: 19px; }
+.sheet-head button { display: inline-flex; align-items: center; justify-content: center; border: 0; background: transparent; padding: 0; color: var(--ink); }
+.sheet-head button:hover { color: var(--accent); }
+/* A page (Settings, Files, History): back at the left of its title. */
+.sheet-head.page-head { justify-content: flex-start; }
+.sheet-head.page-head h2 { margin: 0; font-size: 16px; }
+.sheet-head.page-head .eyebrow { font-size: 10px; letter-spacing: .1em; }
 #file-list { display: grid; gap: 0; border-top: 1px solid var(--line); }
 #file-list button { text-align: left; font-size: 12px; overflow-wrap: anywhere; display: flex; justify-content: space-between; gap: 12px; border: 0; border-bottom: 1px solid var(--line); background: transparent; padding: 10px 4px; }
 #file-list small { margin: 0; flex-basis: auto; white-space: nowrap; }
+/* A folder is one row, shut until tapped; what it holds is drawn then, a step in. */
+#file-list .tree-folder-head { width: 100%; align-items: center; }
+.tree-folder-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.tree-folder-name::before { content: ''; flex: none; width: 5px; height: 5px; margin: 0 2px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(-45deg); transition: transform .12s ease; }
+.tree-folder-head[aria-expanded="true"] .tree-folder-name::before { transform: rotate(45deg); }
+.tree-folder-files { display: grid; margin-left: 8px; padding-left: 8px; border-left: 1px solid var(--line); }
+#file-list .tree-more { color: var(--accent); justify-content: flex-start; }
 #file-content { padding: 14px; background: var(--terminal); border: 1px solid var(--line); }
 #history-list { display: grid; gap: 0; border-top: 1px solid var(--line); max-height: 55dvh; overflow: auto; }
 .history-row { display: flex; gap: 12px; text-align: left; border: 0; border-bottom: 1px solid var(--line); background: transparent; padding: 12px 4px; font-size: 13px; align-items: baseline; }
@@ -245,7 +374,7 @@ dialog small { font-size: 11px; color: var(--muted); flex-basis: 100%; margin-le
 .history-row .mark { color: var(--accent); font-weight: 600; }
 .history-row:not(.target) span:nth-child(2) { color: var(--muted); }
 /* Sheets keep their title and close button visible while the body scrolls. */
-.sheet-head { position: sticky; top: -26px; z-index: 2; background: var(--surface); padding: 6px 0; border-bottom: 1px solid var(--line); }
+.sheet-head { position: sticky; top: -26px; z-index: 2; background: var(--surface); padding: 6px 0; border-bottom: 1px solid var(--hair); }
 .sheet-head button { min-width: 44px; min-height: 44px; }
 /* History actions stay reachable below a long step list. */
 #history-dialog .confirm-actions { position: sticky; bottom: -26px; background: var(--surface); padding: 10px 0; margin-top: 0; border-top: 1px solid var(--line); }
@@ -259,10 +388,15 @@ section.settings-section:first-of-type { border-top: 0; padding-top: 0; }
 #appearance-section .appearance-label { margin: 18px 0 0; }
 #appearance-section .appearance-label:first-of-type { margin-top: 4px; }
 .segmented button.active, #theme-choice button.active { background: var(--ink); color: var(--page); border-color: var(--ink); position: relative; }
+/* Auto effort: the level the model takes by default, outlined. */
+.segmented button.auto { outline: 2px dashed var(--accent); outline-offset: -5px; }
+/* The line under the effort levels: which one is the model's own, and a way back to it. */
+.effort-default { display: flex; flex-wrap: wrap; align-items: center; gap: 0 10px; margin: 4px 0 0; }
+.effort-default .link-like { min-height: 44px; font-size: 12px; }
+.link-like { display: inline; border: 0; background: transparent; padding: 0; min-height: 0; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; font-size: inherit; letter-spacing: inherit; text-transform: none; cursor: pointer; }
 .inline { display: flex; align-items: flex-end; gap: 8px; }
 .inline label { flex: 1; margin-top: 0; }
 .inline button { min-height: 46px; }
-#delete.wide { justify-content: center; }
 dl.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; margin: 4px 0 0; font-size: 12px; }
 dl.facts dt { color: var(--muted); }
 dl.facts dd { margin: 0; overflow-wrap: anywhere; }
@@ -277,8 +411,9 @@ dl.facts dd { margin: 0; overflow-wrap: anywhere; }
 /* Collapsed groups: the host skin in Settings, rarer options of a new thread. */
 details.settings-section > summary, details.more > summary { list-style: none; cursor: pointer; min-height: 44px; display: flex; align-items: center; justify-content: space-between; }
 details.settings-section > summary::-webkit-details-marker, details.more > summary::-webkit-details-marker { display: none; }
-details.settings-section > summary::after, details.more > summary::after { content: "+"; font-size: 16px; color: var(--muted); letter-spacing: 0; }
-details[open].settings-section > summary::after, details[open].more > summary::after { content: "−"; }
+/* Folding rows end in a chevron: right while shut, down while open. */
+details.settings-section > summary::after, details.more > summary::after { content: ""; flex-shrink: 0; width: 7px; height: 7px; margin: 0 4px 0 6px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(-45deg); transition: transform .12s; }
+details[open].settings-section > summary::after, details[open].more > summary::after { transform: rotate(45deg); }
 details.settings-section { padding-bottom: 6px; }
 details[open].settings-section { padding-bottom: 22px; }
 details.more { margin-top: 18px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
@@ -303,6 +438,9 @@ details.more label:first-of-type { margin-top: 4px; }
   dialog.sheet { position: fixed; inset: 0; margin: 0; max-width: none; width: 100%; height: 100dvh; max-height: 100dvh; border: 0; padding: 0 14px calc(20px + env(safe-area-inset-bottom)); }
   /* The sticky head covers the status-bar inset itself (once), so nothing scrolls under it. */
   dialog.sheet .sheet-head { top: 0; padding-top: calc(10px + env(safe-area-inset-top)); margin: 0 0 14px; }
+  /* A page (Settings, Files, History) heads like the app: back, its title, on the chrome. */
+  dialog.sheet .sheet-head.page-head { padding-top: calc(4px + env(safe-area-inset-top)); padding-bottom: 4px; margin: 0 -14px 12px; padding-left: 4px; padding-right: 4px; background: var(--chrome); border-bottom-color: var(--track); }
+  dialog.sheet .sheet-head.page-head button { min-width: 44px; }
   #history-dialog .confirm-actions { bottom: calc(-20px - env(safe-area-inset-bottom)); padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
   #history-list { max-height: none; }
   .history-row { min-height: 48px; padding: 12px 4px; }
@@ -317,9 +455,6 @@ details.more label:first-of-type { margin-top: 4px; }
 #banner-text { flex: 1 1 200px; }
 #banner-actions { display: flex; gap: 8px; }
 #banner button { min-height: 44px; font-size: 12px; padding: 6px 12px; }
-/* Thread list status line; states that need the operator stand out. */
-.session-row[data-state="needs attention"] small, .session-row[data-state="missing"] small, .session-row[data-state="unreadable"] small { color: var(--error); }
-.session-row[data-state="running"] small, .session-row[data-state="stopping"] small, .session-row[data-state="reply saved"] small { color: var(--accent); }
 /* Search within the open thread. */
 #findbar { position: sticky; top: -24px; z-index: 3; display: flex; align-items: stretch; margin: -24px 0 16px; border: 1px solid var(--rule); background: var(--surface); }
 #find-text { flex: 1; min-width: 0; border: 0; background: transparent; font-size: 16px; padding: 8px 10px; }
@@ -347,8 +482,9 @@ details.more label:first-of-type { margin-top: 4px; }
 .device-row button { min-height: 44px; font-size: 12px; padding: 6px 12px; }
 @media (min-width: 800px) { #findbar { top: -34px; margin-top: -34px; } }
 /* Composer attachments: square chips whose workspace path stays editable, framed with the status row and composer as one column. */
-#attachments:not([hidden]) { border: 1px solid var(--rule); border-bottom: 0; background: var(--surface); padding: 6px; }
-#attach { width: 44px; min-height: 45px; flex-shrink: 0; font-size: 20px; padding: 0; border: 0; border-right: 1px solid var(--rule); background: transparent; align-self: stretch; }
+#attachments:not([hidden]) { border: 1px solid var(--line); border-top: 0; border-bottom: 1px solid var(--hair); background: var(--surface); padding: 6px; }
+#attach { width: 44px; min-height: 45px; flex-shrink: 0; padding: 0; border: 0; background: transparent; align-self: stretch; display: inline-flex; align-items: center; justify-content: center; color: var(--ink-2); }
+#attach:hover { color: var(--accent); }
 #attachments { display: flex; flex-wrap: wrap; gap: 6px; max-height: 30dvh; overflow-y: auto; }
 .chip { display: flex; align-items: center; max-width: 100%; border: 1px solid var(--rule); background: var(--surface); }
 .chip { flex: 1 1 220px; }
@@ -359,12 +495,19 @@ details.more label:first-of-type { margin-top: 4px; }
 .chip.failed { border-color: var(--error-line); }
 .chip.failed small { color: var(--error); }
 /* Settings > Providers: sign-in state per provider and the sign-in form. */
-#logins { display: grid; border-top: 1px solid var(--line); margin-top: 8px; }
-.login-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
-.login-row span { flex: 1 1 140px; overflow-wrap: anywhere; }
-.login-row small { flex-basis: auto; margin: 0; }
-.login-row small.ok { color: var(--accent); }
-.login-row button { min-height: 44px; padding: 6px 12px; font-size: 12px; }
+/* Sign-ins: a row each, a filled square signed in, a hollow one not; icons to sign in
+   (again) and out. */
+#logins { display: grid; border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge); margin-top: 8px; background: var(--surface); }
+.login-row { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 0 0 0 4px; font-size: 13px; }
+.login-row + .login-row { border-top: 1px solid var(--hair); }
+.login-mark { width: 8px; height: 8px; flex-shrink: 0; border: 1.5px solid var(--muted); }
+.login-row.ok .login-mark { background: var(--accent); border-color: var(--accent); }
+.login-row span.login-name { flex: 0 1 auto; min-width: 0; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.login-row:not(.ok) span.login-name { font-weight: 400; color: var(--ink-2); }
+.login-row small { flex: 1 1 auto; min-width: 0; margin: 0; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.login-row small.ok { color: var(--muted); }
+.login-row button { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; padding: 0; border: 0; background: transparent; color: var(--accent); flex-shrink: 0; }
+.login-row button.danger { color: var(--error); }
 #login-form { margin-top: 12px; padding: 12px; border: 1px solid var(--rule); background: var(--soft); }
 #login-message { overflow-wrap: anywhere; }
 #login-message a { color: var(--accent); }
@@ -385,7 +528,7 @@ details.more label:first-of-type { margin-top: 4px; }
 /* The model chip in the status row: model · effort; the provider only when the name does not say it. */
 /* The status text yields space first, then the provider, then the model name; the effort stays. */
 #bar #phase { flex: 1 1 0; min-width: 40px; }
-#bar #model-chip { flex: 0 1 auto; min-width: 0; max-width: 62%; display: flex; align-items: center; gap: 0; color: var(--ink); padding: 0 8px 0 10px; }
+#bar #model-chip { flex: 0 1 auto; min-width: 0; max-width: 62%; display: flex; align-items: center; gap: 0; color: var(--ink-2); padding: 0 8px 0 10px; }
 #chip-provider { color: var(--muted); margin-right: 5px; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #chip-provider:empty { display: none; }
 #chip-model { flex: 0 1 auto; min-width: 3ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -393,14 +536,14 @@ details.more label:first-of-type { margin-top: 4px; }
 #bar[data-actions="2"] #model-chip, #bar[data-actions="3"] #model-chip { max-width: 34%; }
 #chip-effort { color: var(--accent); flex-shrink: 0; white-space: nowrap; }
 #chip-effort::before { content: " · "; color: var(--muted); white-space: pre; }
-#model-chip[data-network="true"] #chip-effort::after { content: " · net"; color: var(--error); }
-#model-chip[data-toolchain="true"] #chip-effort::after { content: " · rust"; color: var(--muted); }
-#model-chip[data-network="true"][data-toolchain="true"] #chip-effort::after { content: " · net · rust"; color: var(--error); }
-#model-chip::after { content: "▾"; color: var(--muted); margin-left: 5px; flex-shrink: 0; }
+/* A globe when commands reach the network, a wrench with the Rust toolchain. */
+#model-chip .chip-net, #model-chip .chip-rust { display: none; margin-left: 6px; color: var(--ink-2); }
+#model-chip[data-network="true"] .chip-net, #model-chip[data-toolchain="true"] .chip-rust { display: block; }
+#model-chip .chip-caret { margin-left: 5px; color: var(--muted); }
 #bar[data-mode="home"] #phase { color: var(--muted); }
 #bar[data-mode="home"] #model-chip { border-left: 1px solid var(--line); }
 /* Settings that wait for the next turn, just above the status row. */
-#pending-settings { position: relative; display: block; width: 100%; min-height: 26px; padding: 4px 10px; text-align: left; font-size: 11px; line-height: 1.4; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--rule); border-bottom: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#pending-settings { position: relative; display: block; width: 100%; min-height: 26px; padding: 4px 10px; text-align: left; font-size: 11px; line-height: 1.4; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--line); border-bottom: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #pending-settings::before { content: ""; position: absolute; left: 0; right: 0; top: -18px; bottom: 0; }
 #pending-settings::after { content: "  change ›"; color: var(--muted); }
 /* Bottom sheets (model picker, thread menu): anchored to the bottom on a phone. */
@@ -408,7 +551,7 @@ dialog.bottom { max-width: 560px; }
 dialog.bottom[open] { animation: rise .18s ease-out; }
 @keyframes rise { from { transform: translateY(28px); opacity: .4; } }
 .sheet-foot { position: sticky; bottom: -26px; z-index: 2; background: var(--surface); border-top: 1px solid var(--line); margin-top: 12px; padding: 8px 0 0; }
-#model-dialog .sheet-foot { position: static; }
+#model-dialog .sheet-foot { bottom: 0; }
 .sheet-foot .wide { margin-top: 8px; justify-content: center; }
 .sheet-foot .note:empty { display: none; }
 @media (max-width: 550px) {
@@ -424,9 +567,14 @@ dialog.bottom[open] { animation: rise .18s ease-out; }
 dialog#model-dialog[open] { display: flex; flex-direction: column; overflow: hidden; height: min(88dvh, 760px); }
 #model-dialog .sheet-head { position: static; flex-shrink: 0; }
 #model-search { width: 100%; margin: 0 0 6px; flex-shrink: 0; }
-#model-list { flex: 1 1 auto; min-height: 96px; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; border-bottom: 1px solid var(--line); }
-.picker-controls { flex-shrink: 0; }
-.picker-toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; margin-top: 12px; }
+#model-list { flex: 1 1 0; min-height: 96px; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; border-bottom: 1px solid var(--line); }
+/* The list gives up its room first; if the controls still don't fit (a short screen, or
+   Thread options open), they scroll under a pinned Done. */
+.picker-controls { flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; margin: 0 -4px; padding: 0 4px; }
+/* Network and the toolchain: one box, a switch each that says On or Off. */
+.picker-toggles { display: grid; margin-top: 12px; border: 1px solid var(--track); background: var(--surface); }
+.picker-toggles label.toggle { padding: 6px 10px 6px 12px; min-height: 48px; }
+.picker-toggles label.toggle + label.toggle { border-top: 1px solid var(--hair); }
 #effort-note { text-transform: none; letter-spacing: .02em; }
 .provider-group { border-top: 1px solid var(--line); padding: 4px 0 6px; }
 .provider-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 40px; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
@@ -444,9 +592,15 @@ dialog .model-meta, dialog .tag, dialog .toggle small, dialog .menu small, dialo
 .model-check { width: 18px; text-align: center; color: var(--accent); font-weight: 700; flex-shrink: 0; }
 .picker-section { padding: 12px 0 0; }
 .picker-section .eyebrow { margin: 0; }
-dialog label.toggle { flex-direction: row; align-items: flex-start; gap: 10px; margin: 0; text-transform: none; letter-spacing: 0; font-size: 14px; color: var(--ink); min-height: 44px; cursor: pointer; }
-dialog label.toggle input { width: 22px; height: 22px; margin: 1px 0 0; flex-shrink: 0; accent-color: var(--accent); }
-.toggle small { display: block; font-size: 11px; color: var(--muted); line-height: 1.5; margin-top: 2px; }
+dialog label.toggle { position: relative; flex-direction: row; align-items: center; gap: 10px; margin: 0; text-transform: none; letter-spacing: 0; font-size: 14px; font-weight: 700; color: var(--ink); min-height: 52px; cursor: pointer; }
+dialog label.toggle > span { flex: 1; min-width: 0; }
+dialog label.toggle input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+/* The switch: its word, then a square track (a hollow knob at the left, Off; filled, On). */
+dialog label.toggle::after { content: "Off"; flex-shrink: 0; height: 20px; line-height: 20px; padding-right: 44px; font-size: 11px; font-weight: 700; color: var(--muted); background: linear-gradient(var(--muted), var(--muted)) right 19px center / 14px 14px no-repeat, linear-gradient(var(--surface), var(--surface)) right 2px center / 32px 16px no-repeat, linear-gradient(var(--muted), var(--muted)) right 0 center / 36px 20px no-repeat; }
+dialog label.toggle:has(input:checked)::after { content: "On"; color: var(--accent); background: linear-gradient(var(--on-accent), var(--on-accent)) right 3px center / 14px 14px no-repeat, linear-gradient(var(--accent), var(--accent)) right 0 center / 36px 20px no-repeat; }
+dialog label.toggle:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
+dialog label.toggle:has(input:disabled) { opacity: .5; cursor: default; }
+.toggle small { display: block; font-size: 11px; font-weight: 400; color: var(--muted); line-height: 1.45; margin-top: 2px; }
 /* Thread menu. */
 /* The menu's title is the thread's name, editable in place. */
 .menu-title { flex: 1; min-width: 0; }
@@ -467,16 +621,19 @@ dialog .title-form input:focus { outline: none; border-bottom: 2px solid var(--a
 .menu button:not(:has(small))::after { margin-left: auto; }
 .menu button:hover { background: var(--soft); }
 #menu-change { color: var(--accent); }
-#delete.wide { justify-content: center; margin-top: 20px; }
+#delete.wide { justify-content: flex-start; gap: 8px; margin-top: 16px; border: 0; background: transparent; padding: 0 4px; font-weight: 700; }
+#delete.wide:hover { text-decoration: underline; text-underline-offset: 3px; }
 /* Host sheet: each section folds and says its state. */
 .sheet-head + .host-section { border-top: 0; }
 .host-section { padding: 0; }
 details.settings-section.host-section { padding: 0; }
 details[open].settings-section.host-section { padding-bottom: 20px; }
-details.host-section > summary { gap: 12px; min-height: 52px; font-size: 14px; color: var(--ink); }
+details.host-section > summary { gap: 12px; min-height: 52px; font-size: 14px; font-weight: 700; color: var(--ink); }
+details.host-section { border-top: 0; border-bottom: 1px solid var(--edge); }
+details.host-section > summary small { font-weight: 400; }
 #skin-settings.settings-section { padding: 0 0 4px; border-top: 0; }
 .host-section > summary span { flex: 1; }
-.host-section > summary small { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 58%; }
+.host-section > summary small { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 58%; }
 details[open].host-section { padding-bottom: 20px; }
 .host-section > .note { margin: 8px 0 10px; }
 #skin-settings { margin-top: 16px; }
@@ -606,7 +763,7 @@ dialog .md table { font-size: 12.5px; }
 
 /* The composer's flag for what waits for the next turn: fused to the bar, like the
    pending-settings strip above it. */
-#attention { position: relative; display: block; width: 100%; min-height: 26px; padding: 4px 10px; text-align: left; font-size: 11px; line-height: 1.4; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--rule); border-bottom: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#attention { position: relative; display: block; width: 100%; min-height: 26px; padding: 4px 10px; text-align: left; font-size: 11px; line-height: 1.4; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--line); border-bottom: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #attention::before { content: ""; position: absolute; left: 0; right: 0; top: -18px; bottom: 0; }
 
 /* A turn's ledger: the file, and its diff at that revision. */
@@ -626,3 +783,13 @@ button.diff-link { flex-shrink: 0; min-width: 30px; min-height: 30px; padding: 0
 .change-failure { margin: 8px 0; }
 .change-failure summary { color: var(--red); cursor: pointer; min-height: 32px; }
 .change-failure pre { max-height: 40vh; overflow: auto; }
+
+/* The spinner of a running thread or step. */
+.icon-spinner { animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+/* A thread row's actions, under it while its ⋯ is open. */
+.row-actions { display: flex; justify-content: flex-end; padding: 0 8px; background: var(--chrome); border-top: 1px solid var(--hair); }
+.row-actions button { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; border: 0; background: transparent; padding: 0 8px; font-size: 13px; font-weight: 700; }
+/* A notice with an action (Undo) sits above the composer, dark, in a thumb's reach. */
+#toast.actionable { inset: auto 14px calc(var(--dock-h, 110px) + 10px); display: flex; align-items: center; gap: 12px; background: var(--ink); color: var(--page); border: 0; padding: 4px 4px 4px 14px; font-size: 13px; }
+.toast-action { min-height: 44px; padding: 0 16px; margin-left: auto; border: 1px solid var(--muted); background: transparent; color: var(--page); font-weight: 700; flex-shrink: 0; }

@@ -12,7 +12,8 @@ pub(crate) fn record_receipt(
     workspace: Option<&str>,
 ) -> Result<()> {
     crate::fits(result.len())?;
-    let exists: bool = tx.query_row(
+    let exists: bool = crate::cached_row(
+        tx,
         "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1)",
         [attempt],
         |r| r.get(0),
@@ -21,7 +22,8 @@ pub(crate) fn record_receipt(
         return Err(Error::Invalid);
     }
     // A refused attempt's outcome is already known: it can never also have a result.
-    let refused: bool = tx.query_row(
+    let refused: bool = crate::cached_row(
+        tx,
         "SELECT EXISTS(SELECT 1 FROM attempt_failures WHERE attempt=?1)",
         [attempt],
         |r| r.get(0),
@@ -29,18 +31,18 @@ pub(crate) fn record_receipt(
     if refused {
         return Err(Error::Conflict);
     }
-    let old: Option<(Vec<u8>, Option<String>)> = tx
-        .query_row(
-            "SELECT result,workspace FROM receipts WHERE attempt=?1",
-            [attempt],
-            |r| {
-                Ok((
-                    crate::packed_blob(tx, r, 0, MAX_PAYLOAD)?,
-                    crate::optional_digest(r, 1)?,
-                ))
-            },
-        )
-        .optional()?;
+    let old: Option<(Vec<u8>, Option<String>)> = crate::cached_row(
+        tx,
+        "SELECT result,workspace FROM receipts WHERE attempt=?1",
+        [attempt],
+        |r| {
+            Ok((
+                crate::packed_blob(tx, r, 0, MAX_PAYLOAD)?,
+                crate::optional_digest(r, 1)?,
+            ))
+        },
+    )
+    .optional()?;
     if let Some((old, root)) = old {
         return if old == result && root.as_deref() == workspace {
             Ok(())
@@ -49,7 +51,12 @@ pub(crate) fn record_receipt(
         };
     }
     if let Some(root) = workspace {
-        let scope: String = tx.query_row("SELECT r.scope FROM attempts a JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE a.id=?1", [attempt], |r| r.get(0))?;
+        let scope: String = crate::cached_row(
+            tx,
+            "SELECT r.scope FROM attempts a JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE a.id=?1",
+            [attempt],
+            |r| r.get(0),
+        )?;
         crate::workspace::validate_root(tx, &scope, root)?;
     }
     crate::execute_one(
@@ -102,7 +109,7 @@ impl Store {
             return Err(Error::Invalid);
         }
         let result = (|| -> Result<_> {
-            let state: Option<u64> = self.db.query_row(
+            let state: Option<u64> = crate::cached_row(&self.db,
                 "SELECT e.state FROM image_executions e JOIN attempts a ON a.id=e.attempt JOIN intents i ON i.id=a.effect JOIN revisions r ON r.revision=i.revision WHERE e.attempt=?1 AND r.scope=?2",
                 params![attempt, scope], |row| crate::nonnegative_id(row, 0),
             ).optional()?;
@@ -142,17 +149,18 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let epoch: i64 = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
+        let epoch: i64 =
+            crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
         if epoch != self.epoch as i64 {
             return Err(Error::Stale);
         }
-        let old: Option<(String, u64)> = tx
-            .query_row(
-                "SELECT command_id,epoch FROM cancellations WHERE scope=?1",
-                [scope],
-                |r| Ok((crate::bounded_label(r, 0)?, crate::nonnegative_id(r, 1)?)),
-            )
-            .optional()?;
+        let old: Option<(String, u64)> = crate::cached_row(
+            &tx,
+            "SELECT command_id,epoch FROM cancellations WHERE scope=?1",
+            [scope],
+            |r| Ok((crate::bounded_label(r, 0)?, crate::nonnegative_id(r, 1)?)),
+        )
+        .optional()?;
         if let Some((old_id, old_epoch)) = old {
             if old_epoch == 0 || old_epoch > self.epoch {
                 return Err(Error::Incompatible);
@@ -163,7 +171,8 @@ impl Store {
                 Err(Error::Conflict)
             };
         }
-        let exists: bool = tx.query_row(
+        let exists: bool = crate::cached_row(
+            &tx,
             "SELECT EXISTS(SELECT 1 FROM admissions WHERE scope=?1)",
             [scope],
             |r| r.get(0),
@@ -172,7 +181,8 @@ impl Store {
             return Err(Error::Invalid);
         }
         for target in crate::ownership::descendants(&tx, scope)? {
-            let old: bool = tx.query_row(
+            let old: bool = crate::cached_row(
+                &tx,
                 "SELECT EXISTS(SELECT 1 FROM cancellations WHERE scope=?1)",
                 [&target],
                 |row| row.get(0),
@@ -184,7 +194,8 @@ impl Store {
                     params![target, command_id, epoch],
                 )?;
             }
-            let active: bool = tx.query_row(
+            let active: bool = crate::cached_row(
+                &tx,
                 "SELECT EXISTS(SELECT 1 FROM owned_scopes WHERE scope=?1 AND state IN (0,3))",
                 [&target],
                 |row| row.get(0),
@@ -228,11 +239,17 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let epoch: i64 = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
+        let epoch: i64 =
+            crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
         if epoch != self.epoch as i64 || attempt.owner_epoch != self.epoch {
             return Err(Error::Stale);
         }
-        let cancelled: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM intents i JOIN revisions r ON i.revision=r.revision JOIN cancellations c ON c.scope=r.scope WHERE i.id=?1)", [&attempt.effect], |r| r.get(0))?;
+        let cancelled: bool = crate::cached_row(
+            &tx,
+            "SELECT EXISTS(SELECT 1 FROM intents i JOIN revisions r ON i.revision=r.revision JOIN cancellations c ON c.scope=r.scope WHERE i.id=?1)",
+            [&attempt.effect],
+            |r| r.get(0),
+        )?;
         if cancelled {
             return Err(Error::Cancelled);
         }
@@ -241,10 +258,20 @@ impl Store {
         if crate::rewind::superseded(&tx, &attempt.effect)? {
             return Err(Error::Conflict);
         }
-        let existing: Option<(String, i64, String, String)> = tx.query_row(
+        let existing: Option<(String, i64, String, String)> = crate::cached_row(
+            &tx,
             "SELECT effect,owner_epoch,implementation,grant_reference FROM attempts WHERE id=?1",
-            [&attempt.id], |r| Ok((crate::bounded_label(r, 0)?,r.get(1)?,crate::bounded_label(r, 2)?,crate::bounded_label(r, 3)?)),
-        ).optional()?;
+            [&attempt.id],
+            |r| {
+                Ok((
+                    crate::bounded_label(r, 0)?,
+                    r.get(1)?,
+                    crate::bounded_label(r, 2)?,
+                    crate::bounded_label(r, 3)?,
+                ))
+            },
+        )
+        .optional()?;
         if let Some((effect, epoch, implementation, grant)) = existing {
             return if effect == attempt.effect
                 && epoch == attempt.owner_epoch as i64
@@ -256,7 +283,8 @@ impl Store {
                 Err(Error::Conflict)
             };
         }
-        let intent: bool = tx.query_row(
+        let intent: bool = crate::cached_row(
+            &tx,
             "SELECT EXISTS(SELECT 1 FROM intents WHERE id=?1)",
             [&attempt.effect],
             |r| r.get(0),
@@ -264,13 +292,15 @@ impl Store {
         if !intent {
             return Err(Error::Invalid);
         }
-        let scope: String = tx.query_row(
+        let scope: String = crate::cached_row(
+            &tx,
             "SELECT r.scope FROM intents i JOIN revisions r ON r.revision=i.revision WHERE i.id=?1",
             [&attempt.effect],
             |row| crate::bounded_label(row, 0),
         )?;
         crate::ownership::admit_allowed(&tx, &scope)?;
-        let reserved: bool = tx.query_row(
+        let reserved: bool = crate::cached_row(
+            &tx,
             "SELECT EXISTS(SELECT 1 FROM attempts WHERE effect=?1)",
             [&attempt.effect],
             |r| r.get(0),
@@ -322,7 +352,8 @@ impl Store {
             let tx = self
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let open: bool = tx.query_row(
+            let open: bool = crate::cached_row(
+                &tx,
                 "SELECT EXISTS(SELECT 1 FROM attempts a WHERE a.id=?1 AND NOT EXISTS(SELECT 1 FROM receipts q WHERE q.attempt=a.id))",
                 [attempt],
                 |r| r.get(0),
@@ -330,15 +361,20 @@ impl Store {
             if !open {
                 return Err(Error::Conflict);
             }
-            tx.execute(
+            crate::cached_execute(
+                &tx,
                 "INSERT OR REPLACE INTO attempt_failures VALUES(?1,?2,?3)",
                 params![attempt, status, &detail[..end]],
             )?;
             if let Some(delay) = retry_after {
                 let millis = i64::try_from(delay.as_millis()).map_err(|_| Error::Invalid)?;
-                tx.execute("INSERT INTO retry_delays VALUES(?1,?2) ON CONFLICT(attempt) DO UPDATE SET millis=excluded.millis", params![attempt, millis])?;
+                crate::cached_execute(
+                    &tx,
+                    "INSERT INTO retry_delays VALUES(?1,?2) ON CONFLICT(attempt) DO UPDATE SET millis=excluded.millis",
+                    params![attempt, millis],
+                )?;
             } else {
-                tx.execute("DELETE FROM retry_delays WHERE attempt=?1", [attempt])?;
+                crate::cached_execute(&tx, "DELETE FROM retry_delays WHERE attempt=?1", [attempt])?;
             }
             tx.commit()?;
             Ok(())
@@ -431,7 +467,8 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let epoch: i64 = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
+        let epoch: i64 =
+            crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
         if epoch != self.epoch as i64 {
             return Err(Error::Stale);
         }

@@ -358,6 +358,54 @@ export function pathParts(text, known) {
   return parts.length ? parts : [{text}];
 }
 
+// Files as folders a list opens one at a time: each folder {name, path, paths, files,
+// folders, count, marks}, `count` the files beneath it and `marks` how many of those
+// `mark(file)` names each way, in the order new, edited, changed, deleted ({new: 2}; ''
+// names none). Files come before folders, each in name order (numbers by value:
+// file2 before file10), and a folder holding nothing but one folder shares its row (name
+// "lib/python3.14", path the inner one's; `paths` every folder the row stands for, outer
+// first). `order` is every file in that order, open or shut.
+export function fileTree(files, mark = () => '') {
+  const compare = new Intl.Collator(undefined, {numeric: true}).compare;
+  const ranks = ['new', 'edited', 'changed', 'deleted'];
+  const rank = kind => (ranks.includes(kind) ? ranks.indexOf(kind) : ranks.length);
+  const folder = (name, path) => ({name, path, paths: [path], files: [], folders: [], count: 0, marks: {}, named: new Map()});
+  const root = folder('', ''), order = [];
+  for (const file of files) {
+    const parts = file.path.split('/');
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      let next = node.named.get(parts[i]);
+      if (!next) node.named.set(parts[i], next = folder(parts[i], node.path ? `${node.path}/${parts[i]}` : parts[i]));
+      node = next;
+    }
+    node.files.push(file);
+  }
+  const finish = node => {
+    node.files.sort((a, b) => compare(a.path, b.path));
+    for (const file of node.files) {
+      order.push(file);
+      const kind = mark(file);
+      if (kind) node.marks[kind] = (node.marks[kind] || 0) + 1;
+    }
+    node.count = node.files.length;
+    node.folders = [...node.named.values()].sort((a, b) => compare(a.name, b.name)).map(inner => {
+      finish(inner);
+      node.count += inner.count;
+      for (const [kind, n] of Object.entries(inner.marks)) node.marks[kind] = (node.marks[kind] || 0) + n;
+      while (!inner.files.length && inner.folders.length === 1) {
+        const [only] = inner.folders;
+        inner = {...only, name: `${inner.name}/${only.name}`, paths: [...inner.paths, ...only.paths]};
+      }
+      return inner;
+    });
+    node.marks = Object.fromEntries(Object.entries(node.marks).sort(([a], [b]) => rank(a) - rank(b)));
+    delete node.named;
+    return node;
+  };
+  return {...finish(root), order};
+}
+
 // One quiet line for a collapsed tool card: what came back, without opening it.
 export function resultSummary(call, result) {
   if (!result) return '';

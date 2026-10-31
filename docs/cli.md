@@ -313,7 +313,7 @@ uses it to prove that a candidate can start a host. Everything about the host is
 ### `token`
 
 ```text
-spindle --dir HOST token new NAME | list | revoke NAME
+spindle --dir HOST token new NAME [--runner] | list | revoke NAME
 ```
 
 Named bearer tokens for the host's `/v1` HTTP API ([API.md](API.md)). `HOST` is the host
@@ -321,12 +321,20 @@ directory and the commands work while the host runs.
 
 | Subcommand | Effect |
 | --- | --- |
-| `new NAME` | Creates a token and prints it once on standard output (a note goes to standard error). `NAME` is 1–40 letters, digits, `-`, `_` or `.`; at most 16 tokens exist at once. If `HOST` has no host yet, it is created as `serve` would create it. |
-| `list` | Each token's name, when it was created and when it was last used. |
+| `new NAME [--runner]` | Creates a token and prints it once on standard output (a note goes to standard error). `NAME` is 1–40 letters, digits, `-`, `_` or `.`, not starting with `-`; at most 16 tokens exist at once. `--runner` must follow the name. If `HOST` has no host yet, it is created as `serve` would create it. |
+| `list` | Each token's name, creation and last-use time; restricted tokens are marked `(runner)`. |
 | `revoke NAME` | Deletes the token. |
 
 Only the token's SHA-256 is stored. Tokens are listed beside paired browsers in the
-host's Settings and can be revoked there too; new pairings never evict them.
+host's Settings and can be revoked there too; new pairings never evict them. A name
+can hold only one token, of either kind.
+
+`--runner` grants only `GET /v1`, `/v1/runner`, `/v1/run` and a named run's status
+and stop routes. Other API routes return `403 forbidden`; putting it in a cookie
+does not grant the phone UI's `/api` access. Use it for an embedded app's remote
+command runner, not a full host token. Remote runs may carry a `run` id, with
+`GET /v1/run/ID` and `POST /v1/run/ID/stop`; see [API.md](API.md#routes) and the
+implementation in [`serve/v1.rs`](../spindle/store/src/serve/v1.rs).
 
 ## JSON-RPC over stdio
 

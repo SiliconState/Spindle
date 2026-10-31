@@ -29,58 +29,67 @@ error messages. At most about 1,500 words.";
 pub(crate) const SUMMARY_STAGE: &str = "summary-";
 
 /// The dropped part of a compaction as text for the model to summarize, newest kept
-/// when it is longer than `max`.
+/// when it is longer than `max`. Built from the newest message back, so what is
+/// formatted is the part kept and at most one message more, however long the dropped
+/// history is.
 pub(crate) fn summary_source(dropped: &[Message], prompt: Option<usize>, max: usize) -> String {
-    let mut entries = vec![];
-    for (index, message) in dropped.iter().enumerate() {
-        if Some(index) == prompt {
-            entries
-                .push("[The user's current request is kept verbatim after this summary.]".into());
-            continue;
-        }
-        for block in &message.content {
-            match block {
-                Block::Text { text } if text.starts_with(COMPACTED) => entries.push(format!(
-                    "Summary of the part before this:\n{}",
-                    folded(text)
-                )),
-                Block::Text { text } if message.role == "user" => {
-                    entries.push(format!("User: {}", clip(text, 8 * 1024)))
-                }
-                Block::Text { text } | Block::PartialStream { text } if !text.trim().is_empty() => {
-                    entries.push(format!("Assistant: {}", clip(text, 4 * 1024)))
-                }
-                Block::ToolUse { name, input, .. } => entries.push(format!(
-                    "Tool call: {}",
-                    clip(&describe_call(name, input), 1024)
-                )),
-                Block::ToolResult {
-                    content, is_error, ..
-                } => entries.push(format!(
-                    "{}: {}",
-                    if *is_error == Some(true) {
-                        "Failed"
-                    } else {
-                        "Result"
-                    },
-                    clip(content, 2 * 1024)
-                )),
-                _ => {}
-            }
-        }
-    }
     let mut kept = vec![];
     let mut size = 0;
-    for entry in entries.iter().rev() {
-        size += entry.len() + 1;
-        if size > max {
-            kept.push("(older history omitted)".to_string());
-            break;
+    'messages: for (index, message) in dropped.iter().enumerate().rev() {
+        for entry in summary_entries(message, Some(index) == prompt)
+            .into_iter()
+            .rev()
+        {
+            size += entry.len() + 1;
+            if size > max {
+                kept.push("(older history omitted)".to_string());
+                break 'messages;
+            }
+            kept.push(entry);
         }
-        kept.push(entry.clone());
     }
     kept.reverse();
     kept.join("\n")
+}
+
+/// One dropped message's lines of the summary source (`prompt`: the user's current
+/// request, which is kept verbatim after the summary).
+fn summary_entries(message: &Message, prompt: bool) -> Vec<String> {
+    if prompt {
+        return vec!["[The user's current request is kept verbatim after this summary.]".into()];
+    }
+    let mut entries = vec![];
+    for block in &message.content {
+        match block {
+            Block::Text { text } if text.starts_with(COMPACTED) => entries.push(format!(
+                "Summary of the part before this:\n{}",
+                folded(text)
+            )),
+            Block::Text { text } if message.role == "user" => {
+                entries.push(format!("User: {}", clip(text, 8 * 1024)))
+            }
+            Block::Text { text } | Block::PartialStream { text } if !text.trim().is_empty() => {
+                entries.push(format!("Assistant: {}", clip(text, 4 * 1024)))
+            }
+            Block::ToolUse { name, input, .. } => entries.push(format!(
+                "Tool call: {}",
+                clip(&describe_call(name, input), 1024)
+            )),
+            Block::ToolResult {
+                content, is_error, ..
+            } => entries.push(format!(
+                "{}: {}",
+                if *is_error == Some(true) {
+                    "Failed"
+                } else {
+                    "Result"
+                },
+                clip(content, 2 * 1024)
+            )),
+            _ => {}
+        }
+    }
+    entries
 }
 
 /// The summary request of a compaction's dropped part, as a nested `model()` call takes
@@ -220,6 +229,75 @@ impl Store {
                 data.remove("text");
             }
             saved(self, &result);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The source as it was built before: every entry formatted, then the newest kept.
+    fn whole_then_newest(dropped: &[Message], prompt: Option<usize>, max: usize) -> String {
+        let entries: Vec<String> = dropped
+            .iter()
+            .enumerate()
+            .flat_map(|(index, message)| summary_entries(message, Some(index) == prompt))
+            .collect();
+        let mut kept = vec![];
+        let mut size = 0;
+        for entry in entries.iter().rev() {
+            size += entry.len() + 1;
+            if size > max {
+                kept.push("(older history omitted)".to_string());
+                break;
+            }
+            kept.push(entry.clone());
+        }
+        kept.reverse();
+        kept.join("\n")
+    }
+
+    #[test]
+    fn the_source_is_built_newest_first_with_the_same_text() {
+        let text = |role: &str, text: String| Message {
+            role: role.into(),
+            content: vec![Block::Text { text }],
+        };
+        let mut dropped = vec![];
+        for turn in 0..40 {
+            dropped.push(text(
+                "user",
+                format!("ask {turn} {}", "u".repeat(turn * 97)),
+            ));
+            let mut answer = text(
+                "assistant",
+                format!("answer {turn} {}", "a".repeat(turn * 211)),
+            );
+            answer.content.push(Block::ToolUse {
+                id: format!("t{turn}"),
+                name: "bash".into(),
+                input: json!({"command": format!("echo {turn}")}),
+            });
+            dropped.push(answer);
+            dropped.push(Message {
+                role: "user".into(),
+                content: vec![Block::ToolResult {
+                    tool_use_id: format!("t{turn}"),
+                    content: "r".repeat(turn * 151),
+                    is_error: (turn % 3 == 0).then_some(true),
+                    metadata: Default::default(),
+                }],
+            });
+        }
+        for prompt in [None, Some(0), Some(57), Some(dropped.len() - 3)] {
+            for max in [0, 1, 40, 1000, 4096, 50_000, 200_000, usize::MAX] {
+                assert_eq!(
+                    summary_source(&dropped, prompt, max),
+                    whole_then_newest(&dropped, prompt, max),
+                    "prompt {prompt:?}, max {max}"
+                );
+            }
         }
     }
 }

@@ -22,11 +22,10 @@ fn check(key: &str, bytes: Option<&[u8]>) -> Result<()> {
 
 pub(crate) fn get(db: &Connection, key: &str) -> Result<Option<Vec<u8>>> {
     check(key, None)?;
-    let stored = db
-        .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
-            crate::bounded_blob(row, 0, codec::stored_bound(MAX_VALUE))
-        })
-        .optional()?;
+    let stored = crate::cached_row(db, "SELECT value FROM meta WHERE key=?1", [key], |row| {
+        crate::bounded_blob(row, 0, codec::stored_bound(MAX_VALUE))
+    })
+    .optional()?;
     stored
         .map(|bytes| codec::unpack(&bytes, MAX_VALUE))
         .transpose()
@@ -34,7 +33,8 @@ pub(crate) fn get(db: &Connection, key: &str) -> Result<Option<Vec<u8>>> {
 
 pub(crate) fn put(db: &Connection, key: &str, bytes: &[u8]) -> Result<()> {
     check(key, Some(bytes))?;
-    if db.execute(
+    if crate::cached_execute(
+        db,
         "INSERT INTO meta VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![key, codec::pack(bytes)],
     )? != 1
@@ -45,7 +45,12 @@ pub(crate) fn put(db: &Connection, key: &str, bytes: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn validate(db: &Connection) -> Result<()> {
-    let invalid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key NOT IN ('settings','pending_settings','output_limits','usage'))", [], |row| row.get(0))?;
+    let invalid: bool = crate::cached_row(
+        db,
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key NOT IN ('settings','pending_settings','output_limits','usage'))",
+        [],
+        |row| row.get(0),
+    )?;
     if invalid {
         return Err(Error::Incompatible);
     }
@@ -81,9 +86,10 @@ impl Store {
             let tx = self
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let epoch: u64 = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |row| {
-                crate::nonnegative_id(row, 0)
-            })?;
+            let epoch: u64 =
+                crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |row| {
+                    crate::nonnegative_id(row, 0)
+                })?;
             if epoch != self.epoch {
                 return Err(Error::Stale);
             }
@@ -103,7 +109,7 @@ impl Store {
 
 pub(crate) fn call_id(db: &Connection, effect: &str) -> Result<String> {
     let identity: Vec<u8> =
-        db.query_row("SELECT identity FROM instance WHERE id=1", [], |row| {
+        crate::cached_row(db, "SELECT identity FROM instance WHERE id=1", [], |row| {
             crate::bounded_blob(row, 0, 16)
         })?;
     if identity.len() != 16 {
@@ -174,7 +180,7 @@ impl Store {
             let tx = self
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let epoch = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |row| {
+            let epoch = crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |row| {
                 crate::nonnegative_id(row, 0)
             })?;
             if epoch != self.epoch {
@@ -182,7 +188,9 @@ impl Store {
             }
             crate::execute_one(
                 &tx,
-                "UPDATE task_runs SET state='running' WHERE task=?1 AND state='stopped'",
+                // Its report that it stopped was read already (or never was), and why it
+                // stopped no longer holds: once it ends again, it reports again.
+                "UPDATE task_runs SET state='running',answer=NULL,delivered=NULL WHERE task=?1 AND state='stopped'",
                 [task],
             )?;
             tx.commit()?;
@@ -195,6 +203,27 @@ impl Store {
             self.paused = true;
         }
         result
+    }
+
+    /// A background task's end, kept in its row (as `finish_task` keeps it for a
+    /// native one). The driver reads its report to the session: its answer, or that it
+    /// stopped (and why, when it says).
+    pub fn finish_task_run(&mut self, task: &str, input: &[u8], end: TaskEnd<'_>) -> Result<()> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let epoch: u64 = crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |row| {
+            crate::nonnegative_id(row, 0)
+        })?;
+        if epoch != self.epoch {
+            return Err(Error::Stale);
+        }
+        end_task(&tx, task, input, end)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn register_task(&mut self, run: &TaskRun) -> Result<()> {
@@ -213,7 +242,7 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let epoch: u64 = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |row| {
+        let epoch: u64 = crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |row| {
             crate::nonnegative_id(row, 0)
         })?;
         if epoch != self.epoch {
@@ -237,7 +266,8 @@ impl Store {
         if tasks_on(&tx)?.len() >= 4096 {
             return Err(Error::Exhausted);
         }
-        tx.execute(
+        crate::cached_execute(
+            &tx,
             "INSERT INTO task_runs VALUES(?1,?2,?3,?4,?5,?6,'running',NULL,NULL,?7)",
             params![
                 run.task,
@@ -265,30 +295,55 @@ pub fn task_runs(dir: &Path) -> Result<Vec<TaskRun>> {
     tasks_on(&db)
 }
 
-pub fn finish_task(dir: &Path, task: &str, input: &[u8], answer: Option<&[u8]>) -> Result<()> {
+pub fn finish_task(dir: &Path, task: &str, input: &[u8], end: TaskEnd<'_>) -> Result<()> {
+    let mut db = connection(dir, true)?.ok_or(Error::Invalid)?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    end_task(&tx, task, input, end)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// How a task ended, as its row keeps it.
+#[derive(Clone, Copy, Debug)]
+pub enum TaskEnd<'a> {
+    /// Its turn reached its end: its answer (`{content, failed}`); it is finished.
+    Answered(&'a [u8]),
+    /// It stopped without an answer: by a person, with its session, or because it could
+    /// not go on, then saying why (`{content, failed: true}`, `turn::stopped_why`). Its
+    /// session hears so; started again by the same id, it goes on from where it was.
+    Stopped(Option<&'a [u8]>),
+}
+
+/// Keeps a running task's end in its row. One stopped meanwhile (by a person, perhaps in
+/// another process) stays as they left it: its worker's own end, after, changes nothing,
+/// and the session hears what the person did.
+fn end_task(tx: &Connection, task: &str, input: &[u8], end: TaskEnd<'_>) -> Result<()> {
+    let (state, answer) = match end {
+        TaskEnd::Answered(answer) => ("finished", Some(answer)),
+        TaskEnd::Stopped(why) => ("stopped", why),
+    };
     if answer.is_some_and(|answer| answer.len() > crate::MAX_PAYLOAD) {
         return Err(Error::Exhausted);
     }
-    let mut db = connection(dir, true)?.ok_or(Error::Invalid)?;
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if tx.execute(
-        "UPDATE task_runs SET state=?1,answer=?2 WHERE task=?3 AND input=?4 AND state IN ('running','stopped')",
-        params![
-            if answer.is_some() {
-                "finished"
-            } else {
-                "stopped"
-            },
-            answer,
-            task,
-            input
-        ],
-    )? != 1
-    {
-        return Err(Error::Conflict);
+    let changed = crate::cached_execute(
+        tx,
+        "UPDATE task_runs SET state=?1,answer=?2 WHERE task=?3 AND input=?4 AND state='running'",
+        params![state, answer, task, input],
+    )?;
+    if changed == 1 {
+        return Ok(());
     }
-    tx.commit()?;
-    Ok(())
+    let stopped: bool = crate::cached_row(
+        tx,
+        "SELECT EXISTS(SELECT 1 FROM task_runs WHERE task=?1 AND input=?2 AND state='stopped')",
+        params![task, input],
+        |row| row.get(0),
+    )?;
+    if stopped {
+        Ok(())
+    } else {
+        Err(Error::Conflict)
+    }
 }
 
 pub(crate) fn validate_tasks(db: &Connection) -> Result<()> {
@@ -319,7 +374,12 @@ pub(crate) fn validate_tasks(db: &Connection) -> Result<()> {
                 crate::turn::task_report_text(&run.task, answer)?;
             }
             if let Some(delivered) = run.delivered {
-                let payload: Vec<u8> = db.query_row("SELECT a.payload FROM consumed c JOIN admissions a ON a.sequence=c.admission WHERE c.revision=?1", [delivered as i64], |row| crate::packed_blob(db,row,0,crate::MAX_PAYLOAD))?;
+                let payload: Vec<u8> = crate::cached_row(
+                    db,
+                    "SELECT a.payload FROM consumed c JOIN admissions a ON a.sequence=c.admission WHERE c.revision=?1",
+                    [delivered as i64],
+                    |row| crate::packed_blob(db, row, 0, crate::MAX_PAYLOAD),
+                )?;
                 if !matches!(crate::turn::Action::decode(&payload)?, crate::turn::Action::TaskReport { task, .. } if task==run.task)
                 {
                     return Err(Error::Incompatible);
@@ -351,6 +411,16 @@ pub(crate) fn connection(dir: &Path, write: bool) -> Result<Option<Connection>> 
         #[cfg(not(unix))]
         Ok(_) => {}
     }
+    // A store the package holds (or a session that moved elsewhere) is written by no
+    // other host, as no other host opens it: its owner may have closed it only for a
+    // moment (a compaction swapping a copy in). A native owner's fence is coordinated by
+    // the flock its writers take.
+    if write
+        && crate::fence_note(&dir.join("store"))
+            .is_some_and(|note| !note.starts_with(crate::NATIVE_FENCE))
+    {
+        return Err(Error::Locked);
+    }
     let flags = if write {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
@@ -368,7 +438,7 @@ pub(crate) fn connection(dir: &Path, write: bool) -> Result<Option<Connection>> 
     if [14, 15, 16, 17].contains(&schema) {
         return Ok(None);
     }
-    if schema != crate::SCHEMA && schema != 18 {
+    if ![18, 19, crate::SCHEMA].contains(&schema) {
         return Err(Error::Incompatible);
     }
     if write {

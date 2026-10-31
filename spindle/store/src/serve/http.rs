@@ -15,15 +15,20 @@ pub(super) struct Request {
 }
 
 /// Reads the request head (the body is read by `read_body`, once the request has
-/// been authorized), with per-read timeouts.
+/// been authorized) within an overall deadline of 10 s, however a client spaces its
+/// bytes: until its head is read, a connection (one of the host's 48) has passed no check.
 pub(super) fn read(stream: &mut TcpStream) -> Result<Request, String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;
-    parse(stream)
+    read_head(stream, Duration::from_secs(10))
+}
+
+fn read_head(stream: &mut TcpStream, total: Duration) -> Result<Request, String> {
+    parse(
+        stream,
+        until(Instant::now() + total, "request head too slow"),
+    )
 }
 
 /// Reads the rest of the body within an overall deadline: 10 s, or 2 minutes for an
@@ -34,16 +39,28 @@ pub(super) fn read_body(stream: &mut TcpStream, request: &mut Request) -> Result
     } else {
         Duration::from_secs(10)
     };
-    let deadline = Instant::now() + total;
-    finish(stream, request, |stream| {
+    finish(
+        stream,
+        request,
+        until(Instant::now() + total, "request body too slow"),
+    )
+}
+
+/// Before each read: a timeout for what is left until `deadline` (at most 10 s for one
+/// read), or `slow` once nothing is.
+fn until(
+    deadline: Instant,
+    slow: &'static str,
+) -> impl FnMut(&mut TcpStream) -> Result<(), String> {
+    move |stream| {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err("request body too slow".into());
+            return Err(slow.into());
         }
         stream
             .set_read_timeout(Some(left.min(Duration::from_secs(10))))
             .map_err(|e| e.to_string())
-    })
+    }
 }
 
 fn finish<S: Read>(
@@ -84,10 +101,14 @@ fn app_data(path: &str) -> bool {
 /// Reads up to the end of the head in chunks, with the same limits: 16 KiB of headers,
 /// 64 KiB of body (8 MiB for an attachment upload or an app's data), no GET body. Bytes past the head
 /// are the start of the body (never more than its declared length).
-fn parse(stream: &mut impl Read) -> Result<Request, String> {
+fn parse<S: Read>(
+    stream: &mut S,
+    mut before_read: impl FnMut(&mut S) -> Result<(), String>,
+) -> Result<Request, String> {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     let end = loop {
+        before_read(stream)?;
         let count = match stream.read(&mut chunk) {
             Ok(0) => return Err("incomplete request".into()),
             Ok(count) => count,
@@ -211,10 +232,11 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
 /// itself (HTML previews, which carry their own sandboxing policy).
 const PAGE_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; manifest-src 'self'; worker-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
-/// A workspace HTML file shown in the preview frame: its own inline styles and scripts
-/// run, in a sandbox with an opaque origin (no cookies, storage or host API), with no
-/// network and nothing loaded from anywhere but itself.
-pub(super) const PREVIEW_POLICY: &str = "sandbox allow-scripts; default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; font-src data:; frame-ancestors 'self'; base-uri 'none'; form-action 'none'";
+/// A workspace file shown alone in the preview frame (`render=1`: an SVG, or a page when
+/// no preview link can be had): its inline styles show and nothing runs, in a sandbox
+/// with an opaque origin (no cookies, storage or host API), with no network and nothing
+/// loaded from anywhere but itself.
+pub(super) const PREVIEW_POLICY: &str = "sandbox; default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src data:; font-src data:; frame-ancestors 'self'; base-uri 'none'; form-action 'none'";
 
 pub(super) fn headers(
     stream: &mut TcpStream,
@@ -237,10 +259,14 @@ pub(super) fn headers_with(
     head(stream, status, mime, extra, length, policy, "same-origin")
 }
 
-/// A static-site preview's headers (`preview.rs`): its own sandboxing policy, and
-/// readable by the opaque origin of the sandboxed document that asked for it (module
-/// scripts, fonts and fetches are CORS requests from `null`). The token in the path is
-/// the authority; no credentials are involved.
+/// A Connection-Allowlist that names nothing: a page under it (in Chrome 152 and later)
+/// connects to nothing at all, WebRTC, resource hints and navigations included.
+pub(super) const NOWHERE: &str = "()";
+
+/// A static-site preview's headers (`preview.rs`): its own sandboxing policy, what it may
+/// connect to (`allowlist`), and readable by the opaque origin of the sandboxed document
+/// that asked for it (module scripts, fonts and fetches are CORS requests from `null`).
+/// The token in the path is the authority; no credentials are involved.
 pub(super) fn preview_headers(
     stream: &mut TcpStream,
     status: u16,
@@ -248,8 +274,13 @@ pub(super) fn preview_headers(
     extra: &str,
     length: Option<usize>,
     policy: &str,
+    allowlist: &str,
 ) -> std::io::Result<()> {
-    let extra = format!("Access-Control-Allow-Origin: *\r\n{extra}");
+    // No name looked up ahead of a fetch: a preconnect hint reaches its host even in a
+    // sandbox without scripts (where the allowlist does not hold).
+    let extra = format!(
+        "Access-Control-Allow-Origin: *\r\nX-DNS-Prefetch-Control: off\r\nConnection-Allowlist: {allowlist}\r\n{extra}"
+    );
     head(stream, status, mime, &extra, length, policy, "cross-origin")
 }
 
@@ -302,7 +333,7 @@ pub(super) fn respond(
 mod tests {
     use super::*;
     fn request(mut bytes: &[u8]) -> Result<Request, String> {
-        let mut request = parse(&mut bytes)?;
+        let mut request = parse(&mut bytes, |_| Ok(()))?;
         finish(&mut bytes, &mut request, |_| Ok(()))?;
         Ok(request)
     }
@@ -343,7 +374,7 @@ mod tests {
         }
         let raw = b"POST /api/x?a=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}NEXT";
         let mut trickle = Trickle(raw);
-        let mut slow = parse(&mut trickle).unwrap();
+        let mut slow = parse(&mut trickle, |_| Ok(())).unwrap();
         finish(&mut trickle, &mut slow, |_| Ok(())).unwrap();
         for parsed in [slow, request(raw).unwrap()] {
             assert_eq!(parsed.path, "/api/x");
@@ -362,8 +393,60 @@ mod tests {
             "short body"
         );
         // The head alone allocates nothing for a large declared body.
-        let head = parse(&mut &b"POST /api/sessions/s/upload HTTP/1.1\r\nHost: x\r\nContent-Length: 8388608\r\n\r\nab"[..]).unwrap();
+        let head = parse(&mut &b"POST /api/sessions/s/upload HTTP/1.1\r\nHost: x\r\nContent-Length: 8388608\r\n\r\nab"[..], |_| Ok(())).unwrap();
         assert_eq!(head.body, b"ab");
         assert!(head.body.capacity() < 64 * 1024);
+    }
+    /// A head trickled a byte at a time, each well inside the per-read timeout, still ends
+    /// at the overall deadline (refused as too slow, or as incomplete when the last read
+    /// times out at it); a head sent whole within it is read.
+    #[test]
+    fn a_slow_head_ends_at_its_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut slow = TcpStream::connect(addr).unwrap();
+            slow.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nX-Slow: ")
+                .unwrap();
+            // Until the host gives up (a write then fails), or 5 s at most.
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(50));
+                if slow.write_all(b"a").is_err() {
+                    break;
+                }
+            }
+            let mut whole = TcpStream::connect(addr).unwrap();
+            whole
+                .write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            whole
+        });
+        let (mut slow, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let refused = read_head(&mut slow, Duration::from_millis(400));
+        let took = started.elapsed();
+        let why = refused.err();
+        assert!(
+            matches!(
+                why.as_deref(),
+                Some("request head too slow" | "incomplete request")
+            ),
+            "{why:?}"
+        );
+        // At about the deadline (a timer may fire a little early), long before the trickle
+        // would have ended.
+        assert!(
+            took >= Duration::from_millis(350) && took < Duration::from_secs(3),
+            "{took:?}"
+        );
+        drop(slow);
+        let (mut whole, _) = listener.accept().unwrap();
+        assert_eq!(
+            read_head(&mut whole, Duration::from_millis(400))
+                .unwrap()
+                .path,
+            "/ok"
+        );
+        client.join().unwrap();
     }
 }

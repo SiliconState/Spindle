@@ -18,7 +18,7 @@ use crate::driver::{
     ModelFailure, ModelNeed, ModelSent, Need, Retry, RunCall, Runner, Settings, Start, StartState,
     SummaryJournal, SummaryNeed, ToolNeed, ToolRan,
 };
-use crate::meta::TaskRun;
+use crate::meta::{TaskEnd, TaskRun};
 use crate::workspace::Tree;
 use crate::{Error, ModelError, Store};
 use dext_core::turn::{Phase, Stop};
@@ -30,8 +30,8 @@ use dext_transcript::checkpoint::NativeResponse;
 use dext_transcript::turn::{Effect, TurnContinuation};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub type Result<T> = std::result::Result<T, String>;
 const SCOPE: &str = "operator";
@@ -70,10 +70,7 @@ pub fn host_helper() -> [u8; 32] {
 
 /// A task's short name: as the native host names its directory.
 pub fn task_key(call: &str) -> String {
-    Sha256::digest(call.as_bytes())[..10]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::reads::task_name(call)
 }
 
 /// Where a host's script call numbers start: at random (kept below 2^52, so a number
@@ -93,8 +90,8 @@ fn turn_error(error: dext_transcript::continuation::Error) -> String {
 }
 
 /// Settings the embedded package can honor, checked when they are set and before a
-/// turn: no sandbox (file tools only, `bash` through a runner), no host paths, and no
-/// spend ledger. Every setting it cannot honor is named, with its fix, so one
+/// turn: no sandbox (file tools only, `bash` through a runner) and no host paths. Every
+/// setting it cannot honor is named, with its fix, so one
 /// `settings` call can change them all (a session made by a native host usually holds
 /// several).
 pub fn check_settings(settings: &Settings) -> Result<()> {
@@ -114,16 +111,105 @@ pub fn check_settings(settings: &Settings) -> Result<()> {
     if settings.self_edit {
         problems.push("`self_edit` is a native host's own: this session runs only there");
     }
-    if settings.max_usd.is_some() {
-        problems.push(
-            "`max_usd` needs the native host's spend ledger: set it to null and enforce a \
-             budget in the app",
-        );
-    }
     match problems.is_empty() {
         true => Ok(()),
         false => Err(problems.join("; ")),
     }
+}
+
+/// What `settings` must change to run in the package (`fit`): `{changes, notes,
+/// refused}`. `changes` is one `settings` call that makes them run here (empty when
+/// they do); `notes` says, setting by setting, what changes or carries over and why
+/// (`{setting, from, to, why}`); `refused` names what no setting here can do. `runner`
+/// is where the app would have commands run when the session names no runner of
+/// this app's.
+pub fn fit(settings: &Settings, runner: Runner) -> Value {
+    let mut changes = serde_json::Map::new();
+    let mut notes = vec![];
+    let mut note = |setting: &str, from: Value, to: Value, why: &str| {
+        notes.push(json!({"setting": setting, "from": from, "to": to, "why": why}));
+    };
+    let mut tools = settings.builtin_tools;
+    if tools == BuiltinTools::All {
+        tools = BuiltinTools::Files;
+        changes.insert("builtin_tools".into(), json!("files"));
+        note(
+            "builtin_tools",
+            json!("all"),
+            json!("files"),
+            "this app has no command sandbox of its own: \
+            the file tools, and bash through a runner",
+        );
+    }
+    let mut runs = settings.runner;
+    if tools == BuiltinTools::Files && runs == Runner::None && runner != Runner::None {
+        runs = runner;
+        changes.insert("runner".into(), json!(runner.as_str()));
+        note(
+            "runner",
+            json!("none"),
+            json!(runner.as_str()),
+            "bash runs through one of this app's runners",
+        );
+    }
+    if settings.network && runs != Runner::None {
+        note(
+            "network",
+            json!(true),
+            json!(true),
+            "commands keep their network",
+        );
+    }
+    if settings.toolchain {
+        changes.insert("toolchain".into(), json!(false));
+        note(
+            "toolchain",
+            json!(true),
+            json!(false),
+            "the Rust toolchain needs a native Spindle host",
+        );
+    }
+    if !settings.sources.is_empty() {
+        changes.insert("sources".into(), json!([]));
+        note(
+            "sources",
+            json!(settings.sources),
+            json!([]),
+            "host directories are not this app's to mount",
+        );
+    }
+    if let Some(max) = settings.max_usd {
+        note(
+            "max_usd",
+            json!(max),
+            json!(max),
+            "the budget carries over: spend is counted here as on a host",
+        );
+    }
+    let refused: Vec<Value> = settings
+        .self_edit
+        .then(|| json!({"setting": "self_edit", "why": "a self-edit session runs only on its native host"}))
+        .into_iter()
+        .collect();
+    json!({"changes": changes, "notes": notes, "refused": refused})
+}
+
+/// What this package can run (`capabilities`), for an app to compare a session's
+/// settings with before it continues one (`fit` says what to change).
+pub fn capabilities(remote: bool) -> Value {
+    json!({
+        "host": "embedded",
+        "builtin_tools": ["files", "none"],
+        // bash runs through a runner: the app's own, or a Spindle host's sandbox.
+        "runners": if remote { json!(["app", "remote"]) } else { json!(["app"]) },
+        "network": true,
+        "toolchain": false,
+        "sources": false,
+        "self_edit": false,
+        "budget": true,
+        "tasks": ["wait", "queue"],
+        "compaction": ["model", "digest"],
+    })
 }
 
 /// What the app does next for a session, then answers with `Host::deliver` (`chunk`
@@ -241,6 +327,9 @@ enum Waiting {
     Tasks(Box<Batch>),
     /// A task the app started (`task_start`): its child session runs to its end.
     Started(Box<Started>),
+    /// A finished turn's background tasks still run: it takes their reports once they
+    /// end (`background_moved`), as a native host waits for them.
+    Background,
 }
 
 /// A compaction summary asked of the session's model (`compaction: model`), as the
@@ -309,6 +398,38 @@ struct Started {
     base: Workspace,
 }
 
+/// A task running in the background (`task_start` with `report: queue`, or a `task`
+/// call with `background`): this session goes on meanwhile. Its end is kept in its
+/// `task_runs` row (`run`), and the driver reads its report to this session (its
+/// answer, or that it stopped) at its next request.
+struct Background {
+    run: String,
+    input: Value,
+    base: Workspace,
+    child: Box<Host>,
+}
+
+/// How a background task's session ended.
+enum Ended {
+    /// Its turn reached its end: it answers.
+    Done,
+    /// Stopped where it was: it has no answer.
+    Stopped,
+    /// It could not go on (why): it stops saying so, so its session hears why (and
+    /// started again, it goes on from there).
+    Failed(String),
+}
+
+impl Ended {
+    fn of(progress: Result<Progress>) -> Self {
+        match progress {
+            Ok(Progress::Done) => Self::Done,
+            Ok(_) => Self::Stopped,
+            Err(why) => Self::Failed(why),
+        }
+    }
+}
+
 /// A batch of task calls (one model step's), running as child sessions.
 struct Batch {
     base: Workspace,
@@ -349,6 +470,11 @@ pub struct Host {
     cancelled: Vec<(String, u64)>,
     /// What an app-started task answered (`task_start`), once its turn ended.
     started: Option<Value>,
+    /// Tasks running in the background.
+    background: Vec<Background>,
+    /// Work background tasks need, for the app whatever this session's own turn does
+    /// (`take_works`).
+    works: Vec<(String, u64, Work)>,
     /// The store was moved aside and could not be opened again: this host no longer
     /// holds the session (the app opens it again).
     detached: bool,
@@ -363,7 +489,14 @@ impl Host {
         depth: usize,
         parent: Option<(Arc<Events>, String)>,
     ) -> Self {
-        let facts = Arc::new(Facts { catalog, depth });
+        let facts = Arc::new(Facts {
+            catalog,
+            depth,
+            spend: Default::default(),
+            budget: Default::default(),
+            pool: Default::default(),
+            member: Mutex::new(label.clone()),
+        });
         let queue = Arc::new(Queue::default());
         let events = Arc::new(Events {
             relay: parent,
@@ -388,6 +521,8 @@ impl Host {
             runner: None,
             cancelled: vec![],
             started: None,
+            background: Vec::new(),
+            works: Vec::new(),
             detached: false,
         }
     }
@@ -403,7 +538,7 @@ impl Host {
         catalog: Arc<Catalog>,
     ) -> Result<Self> {
         let mut host = Self::create_at(storage, settings, files, catalog, 0, None)?;
-        host.label = label.into();
+        host.set_label(label.into());
         Ok(host)
     }
 
@@ -426,6 +561,7 @@ impl Host {
             .keep_sidecar(SETTINGS_SIDECAR, &bytes)
             .map_err(store_error)?;
         let mut host = Self::assemble(storage.label(), store, storage, catalog, depth, parent);
+        host.settings()?;
         host.initial_files = Some(files);
         Ok(host)
     }
@@ -433,7 +569,7 @@ impl Host {
     /// Opens the session `label` in `storage`, finishing a rewind its last owner began.
     pub fn open(label: &str, storage: Box<dyn Storage>, catalog: Arc<Catalog>) -> Result<Self> {
         let mut host = Self::open_at(storage, catalog, 0, None)?;
-        host.label = label.into();
+        host.set_label(label.into());
         Ok(host)
     }
 
@@ -468,6 +604,12 @@ impl Host {
                 .map_err(store_error)?;
         }
         Ok(())
+    }
+
+    /// Names the session (in work, events and errors, and in its task tree's spend pool).
+    fn set_label(&mut self, label: String) {
+        *lock(&self.facts.member) = label.clone();
+        self.label = label;
     }
 
     /// The session's name in work, events and errors.
@@ -555,7 +697,10 @@ impl Host {
             .map_err(store_error)?
             .ok_or("session settings are missing")?;
         let value = serde_json::from_slice(&bytes).map_err(|_| "stored settings are not JSON")?;
-        Settings::from_json(&value)
+        let settings = Settings::from_json(&value)?;
+        // The driver's budget check reads it from here, not the store, each request.
+        *lock(&self.facts.budget) = settings.max_usd;
+        Ok(settings)
     }
 
     /// Saves new settings between turns.
@@ -563,7 +708,16 @@ impl Host {
         if self.running.is_some() {
             return Err("a turn is running; settings change between turns".into());
         }
-        self.ensure_idle()?;
+        // A budget alone changes at any step (a request it refused is sent once it
+        // fits); it shapes no request. Anything else changes between turns.
+        let budget_only = {
+            let mut now = self.settings()?;
+            now.max_usd = settings.max_usd;
+            now.to_json()? == settings.to_json()?
+        };
+        if !budget_only {
+            self.ensure_idle()?;
+        }
         check_settings(&settings)?;
         self.facts
             .catalog
@@ -572,6 +726,7 @@ impl Host {
         self.store
             .set_metadata("settings", &bytes)
             .map_err(store_error)?;
+        *lock(&self.facts.budget) = settings.max_usd;
         self.storage
             .keep_sidecar(SETTINGS_SIDECAR, &bytes)
             .map_err(store_error)
@@ -595,6 +750,15 @@ impl Host {
         let (_, state) = self.head()?;
         let execution = state.execution().to_string();
         let catalog = self.facts.catalog.clone();
+        // Under a budget a script's nested model calls fit beside what this session and
+        // its task tree spent, as a native host admits them.
+        let budget = match *lock(&self.facts.budget) {
+            Some(max) => Some((
+                max,
+                self.facts.spent(&self.store, false)?.budget_spent() + self.facts.others_spent(),
+            )),
+            None => None,
+        };
         let Some((_, Waiting::Run(run))) = &mut self.waiting else {
             unreachable!("checked above");
         };
@@ -605,6 +769,7 @@ impl Host {
             model: &settings.model,
             session: &execution,
             http,
+            budget,
         };
         let plan = match self.store.code_plan(
             &run.request,
@@ -784,6 +949,9 @@ impl Host {
     /// Works this session (or its tasks) stopped waiting for: the app ends them.
     pub fn take_cancelled(&mut self) -> Vec<(String, u64)> {
         let mut cancelled = std::mem::take(&mut self.cancelled);
+        for task in &mut self.background {
+            cancelled.extend(task.child.take_cancelled());
+        }
         match &mut self.waiting {
             Some((_, Waiting::Tasks(batch))) => {
                 for call in &mut batch.calls {
@@ -813,7 +981,7 @@ impl Host {
         if snapshot.revision == 0 {
             return Err("this session has no turns yet".into());
         }
-        let state = TurnContinuation::restore(&snapshot.continuation).map_err(turn_error)?;
+        let state = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
         Ok((snapshot.revision, state))
     }
 
@@ -822,7 +990,7 @@ impl Host {
         if snapshot.revision == 0 {
             return Ok(());
         }
-        let prior = TurnContinuation::restore(&snapshot.continuation).map_err(turn_error)?;
+        let prior = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
         match prior.control().phase() {
             Phase::Stopped(Stop::Complete) => Ok(()),
             Phase::Stopped(stop) => Err(format!(
@@ -871,6 +1039,10 @@ impl Host {
         // State changes sent too late for the turn's last step are kept now, each a
         // step of its own (or refused with `state_refused`).
         let _ = self.driver.step(&mut self.store).commit_queued_state();
+        // What the turn counted (under a budget) is kept with the session.
+        let _ = self.facts.keep_spent(&self.store);
+        // A rewind abandoned these: they end with it.
+        self.drop_abandoned_background();
         let head = self.store.snapshot().map(|s| s.revision).unwrap_or(0);
         Finished {
             head,
@@ -990,6 +1162,11 @@ impl Host {
             .map(|key| self.store.metadata(key).map(|bytes| (key, bytes)))
             .collect::<crate::Result<Vec<_>>>()
             .map_err(store_error)?;
+        // Requests of the old store whose outcome is unknown may have been billed: they
+        // stay counted (at their worst case) in the fresh one, as a native host keeps
+        // them.
+        let set_aside = crate::spend::aside_calls(&mut self.view(), Some(self.facts.catalog_ref()))
+            .unwrap_or_default();
         let old = std::mem::replace(&mut self.store, memory_store().map_err(store_error)?);
         let (fresh, aside) = match self.storage.set_aside(old) {
             Ok(kept) => kept,
@@ -1009,6 +1186,7 @@ impl Host {
                 self.store.set_metadata(key, &bytes).map_err(store_error)?;
             }
         }
+        self.facts.keep_aside(&self.store, &aside, set_aside)?;
         self.emit(Event::RetryingFirst {
             path: std::path::Path::new(&aside),
         });
@@ -1137,8 +1315,10 @@ impl Host {
 
     /// Asks the running turn to stop at its next safe point. What it waits on now
     /// ends: a request or command is cut off (recorded as not completed, never run
-    /// again), a backoff or an app call ends, and tasks are stopped. Refused when
-    /// nothing runs; otherwise returns where the turn stands (its error is the turn's).
+    /// again), a backoff or an app call ends, and the tasks it runs are stopped. A
+    /// finished turn waiting only for its background tasks just ends: they go on, and
+    /// report at the session's next turn. Refused when nothing runs; otherwise returns
+    /// where the turn stands (its error is the turn's).
     pub fn stop(&mut self) -> Result<Result<Progress>> {
         if self.running.is_none() {
             return Err("nothing is running in this session".into());
@@ -1183,6 +1363,8 @@ impl Host {
                 }
                 self.tasks_done(*batch)
             }
+            // The turn had finished (it ends as such); its background tasks go on.
+            Waiting::Background => self.report_stop().map(|()| Progress::Done),
             Waiting::Started(mut started) => {
                 let _ = started.child.stop();
                 started.child.finish();
@@ -1263,9 +1445,9 @@ impl Host {
                     Nested::Parked(progress) => return Ok(progress),
                 },
                 Need::TaskWait => {
-                    return Err(
-                        "this session waits for background tasks, which this app cannot run".into(),
-                    );
+                    self.next_work += 1;
+                    self.waiting = Some((self.next_work, Waiting::Background));
+                    return Ok(Progress::Waiting(vec![]));
                 }
                 Need::Send(need) => return self.send(need),
                 Need::Wait(backoff) => {
@@ -1812,9 +1994,24 @@ impl Host {
         ) else {
             return self.summary_done(*wait, None);
         };
+        // Under a budget a summary that might not fit is not asked for (the digest
+        // stands in), as a native host decides; its worst case is kept with it.
+        let worst =
+            crate::spend::journal_request_worst(Some(self.facts.catalog_ref()), &wait.prepared);
+        let budget = *lock(&self.facts.budget);
+        if let Some(max) = budget {
+            let fits = worst.is_some_and(|worst| {
+                self.facts.spent(&self.store, false).is_ok_and(|report| {
+                    report.budget_spent() + self.facts.others_spent() + worst <= max
+                })
+            });
+            if !fits {
+                return self.summary_done(*wait, None);
+            }
+        }
         let reserved = self.head().is_ok_and(|(_, state)| {
             self.store
-                .summary_reserve(&wait.journal, &state, &wait.prepared, None)
+                .summary_reserve(&wait.journal, &state, &wait.prepared, worst)
                 .is_ok()
         });
         if !reserved {
@@ -1857,9 +2054,9 @@ impl Host {
     }
 
     /// Where a summary request ended: the reply of one that was sent (None: nothing was)
-    /// recorded as the native host records it and its usage reported once (the package
-    /// keeps no spend ledger, so no `cost`), then the compaction made with its text or,
-    /// failing that, the digest, and the loop goes on.
+    /// recorded as the native host records it, its usage reported once and (under a
+    /// budget) what it cost, then the compaction made with its text or, failing that,
+    /// the digest, and the loop goes on.
     fn summary_done(&mut self, wait: SummaryWait, reply: Option<Value>) -> Result<Progress> {
         let SummaryWait {
             need,
@@ -1871,6 +2068,15 @@ impl Host {
             self.store.summary_record(&journal, &reply);
             if let Some((input, output)) = driver::summary_usage(&reply) {
                 self.emit(Event::Usage { input, output });
+                let counted = driver::Counted::Summary(&need.compact.command);
+                if let Some(cost) = driver::Env::counted(&*self.facts, &self.store, counted) {
+                    self.emit(Event::Cost {
+                        usd: cost.usd,
+                        turn: cost.turn,
+                        total: cost.total,
+                        billing: &cost.billing,
+                    });
+                }
             }
             driver::summary_text(&reply)
         });
@@ -2165,6 +2371,41 @@ impl Host {
                 child: None,
                 result: None,
             };
+            // In the background: registered, started beside this session, and answered
+            // at once; its own answer is read to this session once it ends.
+            if call.need.call.input["background"] == true {
+                let refused = self.task_refusal(&call.need.call.input, &settings);
+                let started = match refused {
+                    Some(why) => Err(why),
+                    None => self.register_task_run(
+                        &call.need.id,
+                        &call.need.call.input,
+                        base_revision,
+                        true,
+                        Some(call.need.id.clone()),
+                    ),
+                }
+                .and_then(|revision| {
+                    let record = self.task_run(&call.need.id)?;
+                    let running = self.background.iter().any(|task| task.run == call.need.id);
+                    if record.state == "finished" || running {
+                        return Ok(());
+                    }
+                    if record.state == "stopped" {
+                        self.store.resume_task(&call.need.id).map_err(store_error)?;
+                    }
+                    self.start_background(&call.need.id, &call.need.call.input, revision, &settings)
+                });
+                let label = format!("{}#{}", self.label, task_key(&call.need.id));
+                call.result = Some(started.and_then(|()| {
+                    AppAnswer::from_json(&json!({"content": format!(
+                        "Task {label} started in the background; its answer will arrive as a queued update"
+                    )}))
+                    .map_err(|error| error.to_string())
+                }));
+                calls.push(call);
+                continue;
+            }
             if matches!(call.reservation, Some(AppReservation::Reserved { .. })) {
                 match self.start_child(&call.need.id, &call.need.call.input, &base, &settings) {
                     Ok(child) => call.child = Some(Box::new(child)),
@@ -2275,7 +2516,26 @@ impl Host {
                 .map_err(store_error)?;
         }
         child.runner = self.runner;
-        child.label = format!("{}#{key}", self.label);
+        // Its spend counts against this session's budget, with this session's own and
+        // its other tasks': the pool has this session's spend before the task starts.
+        if lock(&self.facts.budget).is_some() {
+            self.facts.spent(&self.store, false)?;
+        }
+        *lock(&child.facts.pool) = lock(&self.facts.pool).clone();
+        child.set_label(format!("{}#{key}", self.label));
+        // Its budget is this session's (narrowed by its input's), whatever its own
+        // store kept from an earlier run, as a native host leases it before each run.
+        let lease = match (settings.max_usd, input["settings"]["max_usd"].as_f64()) {
+            (Some(max), Some(narrower)) => Some(max.min(narrower)),
+            (max, narrower) => max.or(narrower),
+        };
+        let mut kept = child.settings()?;
+        if kept.max_usd != lease {
+            kept.max_usd = lease;
+            child.set_settings(kept)?;
+        }
+        // Its own background tasks left running go on with it.
+        child.resume_background();
         self.events
             .push(json!({"type": "nested", "label": format!("task {key}: started")}));
         Ok(child)
@@ -2320,12 +2580,7 @@ impl Host {
         self.ensure_idle()?;
         self.begin("task")?;
         let settings = self.settings()?;
-        if self.facts.depth >= settings.task_policy.max_depth {
-            return Err("this session reached its configured task depth limit".into());
-        }
-        if let Some(why) =
-            task_tool::model_refusal(&settings.task_policy.models, &settings.model, input)
-        {
+        if let Some(why) = self.task_refusal(input, &settings) {
             return Err(why);
         }
         let head = self.store.snapshot().map_err(store_error)?.revision;
@@ -2345,6 +2600,348 @@ impl Host {
         self.after_child(&label, progress)
     }
 
+    /// Background tasks this session left running (its app closed, or stopped,
+    /// meanwhile) go on where they are, as a native host restarts them when a session
+    /// opens; their work goes out with `take_works`. One that cannot is said, and the
+    /// rest go on.
+    pub fn resume_background(&mut self) {
+        let runs = match self.store.task_runs() {
+            Ok(runs) => runs,
+            Err(error) => {
+                return self.events.push(json!({"type": "nested",
+                "label": format!("background tasks could not be read ({error:?})")}));
+            }
+        };
+        for run in runs {
+            if !run.queued
+                || run.state != "running"
+                || self.background.iter().any(|task| task.run == run.task)
+            {
+                continue;
+            }
+            let resumed = serde_json::from_slice::<Value>(&run.input)
+                .map_err(|_| "its retained input is not JSON".to_string())
+                .and_then(|input| {
+                    let settings = self.settings()?;
+                    self.start_background(&run.task, &input, run.revision, &settings)
+                });
+            if let Err(why) = resumed {
+                // Kept stopped, saying why (start_background did, or here for unreadable
+                // input).
+                let said = crate::turn::stopped_why(&why);
+                let _ = self.store.finish_task_run(
+                    &run.task,
+                    &run.input,
+                    TaskEnd::Stopped(Some(said.as_bytes())),
+                );
+                let key = task_key(&run.task);
+                self.events.push(json!({"type": "nested",
+                    "label": format!("task {key}: not resumed in the background ({why})")}));
+            }
+        }
+    }
+
+    /// Work background tasks need (the app does it as any other), this session's and
+    /// its running tasks' own background tasks' too.
+    pub fn take_works(&mut self) -> Vec<(String, u64, Work)> {
+        let mut works = std::mem::take(&mut self.works);
+        for task in &mut self.background {
+            works.extend(task.child.take_works());
+        }
+        match &mut self.waiting {
+            Some((_, Waiting::Tasks(batch))) => {
+                for call in &mut batch.calls {
+                    if let Some(child) = &mut call.child {
+                        works.extend(child.take_works());
+                    }
+                }
+            }
+            Some((_, Waiting::Started(started))) => works.extend(started.child.take_works()),
+            _ => {}
+        }
+        works
+    }
+
+    /// After a background task ended: a turn parked for its background tasks goes on
+    /// (the driver reads the task's report, or parks it again while others run).
+    fn background_moved(&mut self) -> Result<Progress> {
+        if matches!(self.waiting, Some((_, Waiting::Background))) {
+            self.waiting = None;
+            return self.advance(None);
+        }
+        Ok(Progress::Waiting(vec![]))
+    }
+
+    /// What refuses task `input` here before anything is kept for it: the depth limit,
+    /// the tasks' model policy, a model its provider does not have, an unknown effort.
+    fn task_refusal(&self, input: &Value, settings: &Settings) -> Option<String> {
+        if self.facts.depth >= settings.task_policy.max_depth {
+            return Some("this session reached its configured task depth limit".into());
+        }
+        if let Some(why) =
+            task_tool::model_refusal(&settings.task_policy.models, &settings.model, input)
+        {
+            return Some(why);
+        }
+        if let Some(model) = input["model"]
+            .as_str()
+            .or(input["settings"]["model"].as_str())
+            .filter(|model| !model.trim().is_empty())
+            && let Err(why) = self.facts.catalog.route(&settings.provider, Some(model))
+        {
+            return Some(why);
+        }
+        if let Some(effort) = input["effort"]
+            .as_str()
+            .or(input["settings"]["effort"].as_str())
+            && driver::Effort::parse(effort).is_none()
+        {
+            return Some(format!("`{effort}` is not an effort"));
+        }
+        None
+    }
+
+    /// Starts task `run` (registered, `queued`) in the background over the workspace
+    /// at `revision`; the work its first steps need goes out with `take_works`. A task
+    /// that ends at once is kept ended; one that cannot start, stopped saying why (the
+    /// error says it too; starting it again tries again).
+    fn start_background(
+        &mut self,
+        run: &str,
+        input: &Value,
+        revision: u64,
+        settings: &Settings,
+    ) -> Result<()> {
+        let started = self
+            .workspace_at(revision)
+            .and_then(|base| Ok((self.start_child(run, input, &base, settings)?, base)));
+        let (mut child, base) = match started {
+            Ok(started) => started,
+            Err(why) => {
+                // Kept stopped, not running with nothing behind it.
+                let identity = task_tool::identity(input).to_string();
+                let said = crate::turn::stopped_why(&why);
+                let _ = self.store.finish_task_run(
+                    run,
+                    identity.as_bytes(),
+                    TaskEnd::Stopped(Some(said.as_bytes())),
+                );
+                return Err(why);
+            }
+        };
+        let progress = child.run_task(input, &base);
+        let task = Background {
+            run: run.to_string(),
+            input: input.clone(),
+            base,
+            child: Box::new(child),
+        };
+        match progress {
+            Ok(Progress::Waiting(works)) => {
+                self.works.extend(works);
+                self.background.push(task);
+            }
+            ended => self.background_ended(task, Ended::of(ended)),
+        }
+        Ok(())
+    }
+
+    /// A background task ended (`ended`): its answer, or that it stopped without one
+    /// (saying why, when it could not go on), kept in its row.
+    fn background_ended(&mut self, mut task: Background, ended: Ended) {
+        task.child.finish();
+        self.cancelled.extend(task.child.take_cancelled());
+        let ended = match ended {
+            Ended::Done => match task.child.task_answer(&task.input, &task.base) {
+                Ok(AppAnswer::Result {
+                    content, failed, ..
+                }) => Ok(Some(
+                    json!({"content": content, "failed": failed}).to_string(),
+                )),
+                Ok(_) => Ok(None),
+                Err(why) => Err(why),
+            },
+            Ended::Stopped => Ok(None),
+            Ended::Failed(why) => Err(why),
+        };
+        let why = ended
+            .as_ref()
+            .err()
+            .map(|why| crate::turn::stopped_why(why));
+        let end = match (&ended, &why) {
+            (Ok(Some(answer)), _) => TaskEnd::Answered(answer.as_bytes()),
+            (_, why) => TaskEnd::Stopped(why.as_deref().map(str::as_bytes)),
+        };
+        let identity = task_tool::identity(&task.input).to_string();
+        let kept = self
+            .store
+            .finish_task_run(&task.run, identity.as_bytes(), end);
+        let key = task_key(&task.run);
+        let said = match (&kept, &ended) {
+            (Err(error), _) => format!("task {key}: its end could not be kept ({error:?})"),
+            (Ok(()), Err(why)) => format!("task {key}: could not go on in the background ({why})"),
+            (Ok(()), Ok(Some(_))) => format!("task {key}: finished in the background"),
+            (Ok(()), Ok(None)) => format!("task {key}: stopped in the background"),
+        };
+        self.events.push(json!({"type": "nested", "label": said}));
+    }
+
+    /// Starts the app's task `task` in the background (`task_start` with `report:
+    /// queue`): `{task, queued}` at once (its work goes out with `take_works`). Its
+    /// answer is read to this session at its next request (`tasks` and `task_wait`
+    /// tell it meanwhile).
+    pub fn queue_task(&mut self, task: &str, input: &Value) -> Result<Value> {
+        if let Some(reason) = task_tool::refusal(input) {
+            return Err(reason);
+        }
+        let settings = self.settings()?;
+        if let Some(why) = self.task_refusal(input, &settings) {
+            return Err(why);
+        }
+        let head = self.store.snapshot().map_err(store_error)?.revision;
+        let key = format!("app:{task}");
+        let revision = self.register_task_run(&key, input, head, true, None)?;
+        let label = format!("{}#{}", self.label, task_key(&key));
+        if !self.background.iter().any(|task| task.child.label == label) {
+            match self.task_run(&key)?.state.as_str() {
+                "finished" => {}
+                "stopped" => {
+                    self.store.resume_task(&key).map_err(store_error)?;
+                    self.start_background(&key, input, revision, &settings)?;
+                }
+                _ => self.start_background(&key, input, revision, &settings)?,
+            }
+        }
+        Ok(json!({"task": label, "queued": true}))
+    }
+
+    fn task_run(&self, key: &str) -> Result<crate::meta::TaskRun> {
+        self.store
+            .task_runs()
+            .map_err(store_error)?
+            .into_iter()
+            .find(|run| run.task == key)
+            .ok_or_else(|| "no such task".to_string())
+    }
+
+    /// The tasks this session started: `{tasks: [{task, state, queued, answer,
+    /// pending, delivered, prompt}]}` (`pending`: its session runs here in the
+    /// background now; `delivered`: its answer was read to this session; `prompt`: the
+    /// first line of what it was asked, at most 80 characters, to name it by).
+    pub fn task_list(&self) -> Result<Value> {
+        let tasks: Vec<Value> = self
+            .store
+            .task_runs()
+            .map_err(store_error)?
+            .into_iter()
+            .map(|run| self.task_json(&run))
+            .collect();
+        Ok(json!({ "tasks": tasks }))
+    }
+
+    fn task_json(&self, run: &crate::meta::TaskRun) -> Value {
+        let label = format!("{}#{}", self.label, task_key(&run.task));
+        let answer = run
+            .answer
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+        let running = self.background.iter().any(|task| task.child.label == label);
+        let prompt: String = serde_json::from_slice::<Value>(&run.input)
+            .ok()
+            .and_then(|input| input["prompt"].as_str().map(String::from))
+            .unwrap_or_default()
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take(80)
+            .collect();
+        json!({"task": label, "state": run.state, "queued": run.queued, "answer": answer,
+            "pending": running, "delivered": run.delivered.is_some(), "prompt": prompt})
+    }
+
+    /// Task `task` (the app's name, or a label `tasks` gave) as it stands now, without
+    /// waiting (`task_wait`: an app waits on events, not on this call).
+    pub fn task_wait(&self, task: &str) -> Result<Value> {
+        let key = self.task_key_of(task)?;
+        Ok(self.task_json(&self.task_run(&key)?))
+    }
+
+    /// Stops background task `task`: its session ends where it is, kept `stopped`
+    /// (`task_start` with `report: queue` again takes it on). False: it was not running.
+    pub fn stop_task(&mut self, task: &str) -> Result<(bool, Result<Progress>)> {
+        let key = self.task_key_of(task)?;
+        let label = format!("{}#{}", self.label, task_key(&key));
+        let Some(index) = self
+            .background
+            .iter()
+            .position(|task| task.child.label == label)
+        else {
+            return Ok((false, Ok(Progress::Waiting(vec![]))));
+        };
+        let mut task = self.background.remove(index);
+        // Cut off where it is, as a session's own stop cuts it (what it waited on is
+        // recorded as stopped, so taking it up again goes on from there).
+        if task.child.running().is_some() {
+            let _ = task.child.stop();
+        }
+        self.background_ended(task, Ended::Stopped);
+        Ok((true, self.background_moved()))
+    }
+
+    /// Background tasks of this session a rewind abandoned (their rows say so) end
+    /// here: their sessions stop, and nothing is kept of their end.
+    fn drop_abandoned_background(&mut self) {
+        if self.background.is_empty() {
+            return;
+        }
+        let Ok(runs) = self.store.task_runs() else {
+            return;
+        };
+        let abandoned: Vec<String> = runs
+            .into_iter()
+            .filter(|run| run.state == "abandoned")
+            .map(|run| run.task)
+            .collect();
+        let mut kept = vec![];
+        for mut task in std::mem::take(&mut self.background) {
+            if !abandoned.contains(&task.run) {
+                kept.push(task);
+                continue;
+            }
+            if task.child.running().is_some() {
+                let _ = task.child.stop();
+            }
+            task.child.finish();
+            self.cancelled.extend(task.child.take_cancelled());
+            let key = task_key(&task.run);
+            self.events.push(json!({"type": "nested",
+                "label": format!("task {key}: ended with the rewind that abandoned it")}));
+        }
+        self.background = kept;
+    }
+
+    /// How many of this session's tasks run in the background now.
+    pub fn background_count(&self) -> usize {
+        self.background.len()
+    }
+
+    /// A task's registered key from the app's name or a label `tasks` gave.
+    fn task_key_of(&self, task: &str) -> Result<String> {
+        let runs = self.store.task_runs().map_err(store_error)?;
+        let wanted = task.rsplit('#').next().unwrap_or(task);
+        runs.into_iter()
+            .map(|run| run.task)
+            .find(|key| key == &format!("app:{task}") || task_key(key) == wanted || key == task)
+            .ok_or_else(|| format!("no task `{task}`"))
+    }
+
+    /// Whether a task of this session runs in the background.
+    pub fn background_running(&self) -> bool {
+        !self.background.is_empty()
+    }
+
     /// What the app-started task answered: `{task, answer, failed, state}`.
     pub fn take_started(&mut self) -> Option<Value> {
         self.started.take()
@@ -2355,6 +2952,20 @@ impl Host {
     /// store, so a later start under the same id must repeat that input, and runs over
     /// the same base. Returns the base revision.
     fn register_app_task(&mut self, key: &str, input: &Value, head: u64) -> Result<u64> {
+        self.register_task_run(key, input, head, false, None)
+    }
+
+    /// Registers task `key` (`queued`: in the background; `origin`: the call that
+    /// started it, None for the app's), or finds it registered with the same input
+    /// and policy. Returns its base revision.
+    fn register_task_run(
+        &mut self,
+        key: &str,
+        input: &Value,
+        head: u64,
+        queued: bool,
+        origin: Option<String>,
+    ) -> Result<u64> {
         let identity = task_tool::identity(input).to_string().into_bytes();
         if let Some(record) = self
             .store
@@ -2364,8 +2975,8 @@ impl Host {
             .find(|run| run.task == key)
         {
             if record.input != identity
-                || record.queued
-                || record.origin.is_some()
+                || record.queued != queued
+                || record.origin != origin
                 || record.state == "abandoned"
             {
                 return Err(
@@ -2399,11 +3010,11 @@ impl Host {
         self.store
             .register_task(&TaskRun {
                 task: key.into(),
-                origin: None,
+                origin,
                 input: identity,
                 base,
                 revision: head,
-                queued: false,
+                queued,
                 state: "running".into(),
                 answer: None,
                 delivered: None,
@@ -2552,6 +3163,13 @@ impl Host {
     /// so a task's own tasks finish into it, never past it.
     fn child_toward(&mut self, label: &str) -> Option<&mut Host> {
         let name = self.child_label(label)?;
+        if let Some(index) = self
+            .background
+            .iter()
+            .position(|task| task.child.label == name)
+        {
+            return Some(&mut self.background[index].child);
+        }
         match &mut self.waiting {
             Some((_, Waiting::Tasks(batch))) => batch
                 .calls
@@ -2567,6 +3185,24 @@ impl Host {
     /// After a task's operation moved: a finished task gives its answer, and once all
     /// tasks of the batch have, their answers are recorded and this session goes on.
     fn after_child(&mut self, label: &str, progress: Result<Progress>) -> Result<Progress> {
+        if let Some(name) = self.child_label(label)
+            && let Some(index) = self
+                .background
+                .iter()
+                .position(|task| task.child.label == name)
+        {
+            match progress {
+                Ok(Progress::Waiting(works)) => self.works.extend(works),
+                Ok(Progress::Streaming) => return Ok(Progress::Streaming),
+                ended => {
+                    let task = self.background.remove(index);
+                    self.background_ended(task, Ended::of(ended));
+                    return self.background_moved();
+                }
+            }
+            // This session's own work goes on as it was; the task's goes out apart.
+            return Ok(Progress::Waiting(vec![]));
+        }
         if let Some((_, Waiting::Started(_))) = &self.waiting {
             if matches!(progress, Ok(Progress::Waiting(_) | Progress::Streaming)) {
                 return progress;
@@ -2634,7 +3270,12 @@ impl Host {
             return self.child_toward(label)?.accepts(label, work, answer);
         }
         let (id, waiting) = self.waiting.as_ref()?;
-        if *id != work || matches!(waiting, Waiting::Tasks(_) | Waiting::Started(_)) {
+        if *id != work
+            || matches!(
+                waiting,
+                Waiting::Tasks(_) | Waiting::Started(_) | Waiting::Background
+            )
+        {
             return None;
         }
         Some(matches!(
@@ -2837,7 +3478,52 @@ impl Host {
         value["busy"] = json!(self.running.is_some());
         value["running"] = json!(self.running);
         value["settings"] = crate::protocol::settings_json(&settings);
+        value["wake"] = match self.running {
+            Some(_) => json!({"work": "running", "why": null}),
+            None => self.wake(&value, report.unresolved_attempts.is_empty()),
+        };
+        value["background"] = json!(self.background.len());
+        value["activity"] = json!(crate::reads::activity(
+            &value,
+            self.running.is_some(),
+            self.queue.interrupt.load(Ordering::SeqCst),
+            self.waiting_app_call().is_some(),
+        ));
+        if matches!(self.waiting, Some((_, Waiting::Background))) && value["activity"] != "stopping"
+        {
+            value["activity"] = json!("waiting_tasks");
+        } else if self.running.is_none()
+            && !self.background.is_empty()
+            && value["activity"] == "idle"
+        {
+            value["activity"] = json!("background");
+        }
         Ok(value)
+    }
+
+    /// The session's spend (`usage`): the totals, by turn and by model, from the same
+    /// ledger a native host keeps (calls counted here are undated).
+    pub fn usage(&self) -> Result<Value> {
+        let report = self.facts.spent(&self.store, true)?;
+        let mut value = report.totals_json();
+        let full = report.to_json();
+        value["turns"] = full["turns"].clone();
+        value["models"] = full["models"].clone();
+        Ok(value)
+    }
+
+    /// What the session needs between turns (`wake` of its status and recovery): nothing
+    /// once stopped, `continue` while its head waits, and a person first while an
+    /// outcome is unknown (continue settles it from the store, never sending it again).
+    pub fn wake(&self, head: &Value, known: bool) -> Value {
+        if head["phase"] == "empty" || head["phase"] == "stopped" {
+            json!({"work": "none", "why": null})
+        } else if known {
+            json!({"work": "ready", "why": null})
+        } else {
+            json!({"work": "blocked",
+                "why": "an outcome is unknown: continue settles it from the store, never sends it again"})
+        }
     }
 }
 

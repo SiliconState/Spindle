@@ -526,9 +526,16 @@ fn a_session_runs_over_stdio_with_events_reads_and_interruption() {
         (status["busy"].clone(), status["phase"].clone()),
         (json!(false), json!("stopped"))
     );
+    let capabilities = api.ok("capabilities", json!({}));
+    assert_eq!(
+        (capabilities["host"].clone(), capabilities["budget"].clone()),
+        (json!("native"), json!(true))
+    );
+    assert_eq!(capabilities["tasks"], json!(["wait", "queue"]));
     assert_eq!(status["stop"], "complete");
     assert_eq!(status["head"], head);
     assert_eq!(status["unresolved"], 0);
+    assert_eq!(status["activity"], "idle");
     assert_eq!(status["prompts"], 1);
     let read = api.ok("read", json!({"dir": dir, "path": "hello.txt"}));
     assert_eq!(
@@ -600,6 +607,13 @@ fn a_session_runs_over_stdio_with_events_reads_and_interruption() {
     assert!(
         busy["unresolved"].is_null(),
         "store counts are only known when idle"
+    );
+    assert!(
+        matches!(
+            busy["activity"].as_str(),
+            Some("model" | "tools" | "running")
+        ),
+        "{busy}"
     );
     api.ok("history", json!({"dir": dir}));
     assert_eq!(
@@ -1401,7 +1415,7 @@ fn model_background_tasks_are_waited_reported_once_and_never_adopt_files() {
 }
 
 #[test]
-fn a_stopped_background_task_blocks_wake_and_explicit_restart_recovers_it() {
+fn a_stopped_background_task_reports_so_and_a_restart_reports_again() {
     let port = fake_provider();
     let root = scratch("background-stop");
     let dir = root.join("work");
@@ -1420,22 +1434,51 @@ fn a_stopped_background_task_blocks_wake_and_explicit_restart_recovers_it() {
     api.ok("task_stop", json!({"dir":dir,"task":"nap"}));
     let waited = api.ok("task_wait", json!({"dir":dir,"task":"nap","timeout_s":10}));
     assert_eq!(waited["state"], "stopped", "{waited}");
+    // Nothing waits for a person: continuing tells the session it stopped.
     let report = api.ok("recover", json!({"dir":dir}));
-    assert_eq!(report["wake"]["work"], "blocked", "{report}");
-    let resumed = api.call("continue", json!({"dir":dir}));
-    assert!(
-        resumed["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("stopped without an answer"),
-        "{resumed}"
+    assert_eq!(report["wake"]["work"], "ready", "{report}");
+    api.ok("continue", json!({"dir":dir}));
+    let history = api.ok("history", json!({"dir":dir})).to_string();
+    assert_eq!(
+        history.matches("[task app:nap: stopped]").count(),
+        1,
+        "{history}"
     );
+    assert_eq!(
+        api.ok("recover", json!({"dir":dir}))["wake"]["work"],
+        "none"
+    );
+    // Started again by the same id it goes on, and its answer reports too.
     api.ok("task_start", params);
     assert_eq!(
         api.ok("task_wait", json!({"dir":dir,"task":"nap","timeout_s":10}))["state"],
         "finished"
     );
     api.ok("continue", json!({"dir":dir}));
+    let history = api.ok("history", json!({"dir":dir})).to_string();
+    assert_eq!(
+        history.matches("[task app:nap: stopped]").count(),
+        1,
+        "{history}"
+    );
+    assert_eq!(
+        history.matches("[task app:nap: finished]").count(),
+        1,
+        "{history}"
+    );
+    let reports: Vec<Value> = api.ok("history", json!({"dir":dir}))["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .filter_map(|block| block.get("report").cloned())
+        .collect();
+    assert_eq!(
+        reports.len(),
+        2,
+        "both reports are marked as the task's: {reports:?}"
+    );
+    assert_eq!(reports[1]["state"], "finished", "{reports:?}");
     assert_eq!(
         api.ok("recover", json!({"dir":dir}))["wake"]["work"],
         "none"

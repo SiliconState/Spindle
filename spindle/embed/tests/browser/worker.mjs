@@ -52,6 +52,24 @@ const actions = {
     const status = await open().importSession(dir, bytes);
     return { head: status.head, imported: status.imported };
   },
+  // A session with free pages (made under Node beside the page, when it could be):
+  // imported into OPFS, then compacted there, and still the same session.
+  async compact({ dir }) {
+    const found = await self.fetch(new URL('./fragmented.spindle', import.meta.url)).catch(() => null);
+    if (!found?.ok) return { skipped: true };
+    const c = open();
+    const imported = await c.importSession(dir, new Uint8Array(await found.arrayBuffer()));
+    const before = await c.files(dir);
+    const compacted = await c.compactSession(dir);
+    const status = await c.status(dir);
+    const files = await c.files(dir);
+    const again = await c.compactSession(dir);
+    return {
+      importedHead: imported.head, head: status.head, before: compacted.before, after: compacted.after, stores: compacted.stores,
+      sameFiles: JSON.stringify(before.files) === JSON.stringify(files.files), againBefore: again.before, againAfter: again.after,
+      text: new TextDecoder().decode(await c.read(dir, 'notes.md')),
+    };
+  },
   // The pool by itself: it grows past its opening count, removes a tree, and a later
   // opening finds every slot a grow added (with the files they hold).
   async pool({ phase }) {

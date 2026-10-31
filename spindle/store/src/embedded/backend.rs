@@ -34,10 +34,33 @@ pub const FEATURES: &[&str] = &[
     "recover",
     "tasks",
     "runner",
+    // `usage`, and budgets (`max_usd`) kept from the same ledger as the native host's.
+    "usage",
+    // `capabilities`, and `fit`: what a session's settings must change to run here.
+    "capabilities",
     "code_bridge",
     // `authorize` work names claims of the key its headers carry (`{account}`).
     "key_claims",
 ];
+
+/// The `work` frame for work `id` of session `label` (a task's app call named as its
+/// `app_tool` event names it: `tasks/<key>/` before the call, per level).
+fn work_frame(label: &str, id: u64, work: Work) -> Value {
+    let work = match work {
+        Work::App { call, timeout_s } => Work::App {
+            call: label
+                .split('#')
+                .skip(1)
+                .map(|key| format!("tasks/{key}/"))
+                .collect::<String>()
+                + &call,
+            timeout_s,
+        },
+        work => work,
+    };
+    json!({"jsonrpc": "2.0", "method": "work",
+        "params": {"session": label, "id": id, "work": work_json(work)}})
+}
 
 /// Where sessions live: the storage for a `dir`, and whether one is there.
 pub trait Places {
@@ -278,15 +301,14 @@ fn apply_settings(
         settings.compaction =
             Compaction::parse(mode).ok_or_else(|| bad("`compaction` must be model or digest"))?;
     }
-    // Null clears a native session's budget; none can be set here (no spend ledger).
+    // A budget in dollars, kept as the native host keeps it (null: none).
     match params.0.get("max_usd") {
         None => {}
         Some(Value::Null) => settings.max_usd = None,
-        Some(_) => {
-            return Err(bad(
-                "`max_usd` needs the native host's spend ledger; enforce a budget in the app",
-            ));
-        }
+        Some(value) => match value.as_f64() {
+            Some(max) if max.is_finite() && max >= 0.0 => settings.max_usd = Some(max),
+            _ => return Err(bad("`max_usd` must be a non-negative number or null")),
+        },
     }
     if let Some(runner) = params.str("runner")? {
         settings.runner =
@@ -481,6 +503,10 @@ impl Embedded {
         for event in session.host.take_events() {
             self.send(event_frame(dir, &request, event));
         }
+        // Background tasks' work, whatever this session's own turn does.
+        for (label, id, work) in session.host.take_works() {
+            self.send(work_frame(&label, id, work));
+        }
         for (label, id) in session.host.take_cancelled() {
             self.send(json!({"jsonrpc": "2.0", "method": "work_cancel",
                 "params": {"session": label, "id": id}}));
@@ -488,21 +514,7 @@ impl Embedded {
         let ended = match progress {
             Ok(Progress::Waiting(works)) => {
                 for (label, id, work) in works {
-                    // A task's app call is named as its `app_tool` event names it.
-                    let work = match work {
-                        Work::App { call, timeout_s } => Work::App {
-                            call: label
-                                .split('#')
-                                .skip(1)
-                                .map(|key| format!("tasks/{key}/"))
-                                .collect::<String>()
-                                + &call,
-                            timeout_s,
-                        },
-                        work => work,
-                    };
-                    self.send(json!({"jsonrpc": "2.0", "method": "work",
-                        "params": {"session": label, "id": id, "work": work_json(work)}}));
+                    self.send(work_frame(&label, id, work));
                 }
                 return;
             }
@@ -678,6 +690,9 @@ impl Embedded {
                 }
             }
             session.request = Some(id.clone().unwrap_or(Value::Null));
+            // Background tasks it left running (its app closed meanwhile) go on as a turn
+            // starts, not on a read: their work goes out with this call's.
+            session.host.resume_background();
             match op {
                 TurnOp::Prompt { text, files, state } => session.host.prompt(&text, files, state),
                 TurnOp::Continue { until_unknown } => session.host.resume(until_unknown),
@@ -688,8 +703,15 @@ impl Embedded {
                     input,
                     report,
                 } => {
-                    if report != "wait" {
-                        Err("tasks here run to their end (`report: wait`)".to_string())
+                    if report == "queue" {
+                        // Answered at once; the task's work goes out apart.
+                        session.request = None;
+                        let queued = session.host.queue_task(&task, &input);
+                        drop(sessions);
+                        self.progressed(&dir, Ok(Progress::Waiting(vec![])));
+                        return Ok(Reply::Now(queued.map_err(failed)));
+                    } else if report != "wait" {
+                        Err("`report` must be wait or queue".to_string())
                     } else {
                         let progress = session.host.start_task(&task, &input);
                         session.task = Some(task);
@@ -723,6 +745,19 @@ impl Embedded {
         keep: bool,
         settings: Option<&Value>,
     ) -> Result<Vec<u8>, Fault> {
+        self.export_session_checked(dir, keep, settings, false)
+    }
+
+    /// `export_session`, with every store of a copy checked record by record first, as a
+    /// move's always are (`whole`): a copy the app may need to go back to (a backup kept
+    /// before it replaces the session) should not be found damaged only then.
+    pub fn export_session_checked(
+        &self,
+        dir: &str,
+        keep: bool,
+        settings: Option<&Value>,
+        whole: bool,
+    ) -> Result<Vec<u8>, Fault> {
         self.open_session(dir)?;
         let mut sessions = self.sessions.borrow_mut();
         let session = sessions.get_mut(dir).expect("opened above");
@@ -730,6 +765,12 @@ impl Embedded {
             return Err(busy(format!(
                 "a {running} is running in this session; wait for it or stop it"
             )));
+        }
+        if session.host.background_running() {
+            return Err(busy(
+                "a background task of this session is running; wait for it or stop it (`task_stop`)"
+                    .to_string(),
+            ));
         }
         let copied = match settings {
             None => None,
@@ -767,7 +808,14 @@ impl Embedded {
             Some(_) => return Err(bad("`settings` must be an object of settings")),
         };
         let (files, opened) = session.host.bundle_files(copied.as_ref()).map_err(failed)?;
-        let written = crate::bundle::write(files).map_err(failed)?;
+        // A copy (the session stays here) is checked as far as the bundle records it; a
+        // move, whole, as it goes on only from the bundle.
+        let written = if keep && !whole {
+            crate::bundle::write_copy(files)
+        } else {
+            crate::bundle::write(files)
+        }
+        .map_err(failed)?;
         if !keep {
             let note = format!(
                 "exported at head {} by an app's embedded Spindle",
@@ -783,6 +831,58 @@ impl Embedded {
             sessions.remove(dir);
         }
         Ok(written.bytes)
+    }
+
+    /// Gives back the free pages of the session in `dir`: its store's and its tasks'
+    /// (`Storage::compact`). An open session closes first, as `close` closes one; one
+    /// with a turn or a background task running is refused. `before` and `after` are
+    /// the stores' sizes in bytes.
+    fn compact(&self, dir: &str) -> Outcome {
+        if dir.contains('#') {
+            return Err(bad("`dir` names a session, not one of its tasks"));
+        }
+        if !self.places.exists(dir) {
+            if !self.sessions.borrow().contains_key(dir) {
+                return Err(not_found(format!("no session in {dir}")));
+            }
+            // A session kept nowhere on disk (memory) has nothing to give back, and
+            // closing it there would end it: it stays as it is.
+            return Ok(json!({"session": dir, "before": 0, "after": 0, "stores": 0}));
+        }
+        // The place first: it holds the session's lock (a browser's Web Lock) while an
+        // open session lets go of its stores.
+        let storage = self.places.storage(dir).map_err(bad)?;
+        {
+            let mut sessions = self.sessions.borrow_mut();
+            if let Some(session) = sessions.get(dir) {
+                if let Some(running) = session.host.running() {
+                    return Err(busy(format!("a {running} is running; stop it first")));
+                }
+                if session.host.background_running() {
+                    return Err(busy(
+                        "a background task of this session is running; wait for it or stop it (`task_stop`)",
+                    ));
+                }
+                sessions.remove(dir);
+            }
+        }
+        fn each(place: &dyn Storage, sizes: &mut (u64, u64, u64)) -> Result<(), Fault> {
+            if let Some((before, after)) = place
+                .compact()
+                .map_err(|error| failed(crate::driver::store_error(error)))?
+            {
+                sizes.0 += before;
+                sizes.1 += after;
+                sizes.2 += 1;
+            }
+            for key in place.tasks() {
+                each(place.child(&key).as_ref(), sizes)?;
+            }
+            Ok(())
+        }
+        let mut sizes = (0, 0, 0);
+        each(storage.as_ref(), &mut sizes)?;
+        Ok(json!({"session": dir, "before": sizes.0, "after": sizes.1, "stores": sizes.2}))
     }
 
     /// Imports a session bundle as session `dir` (nothing there yet): the bundle is
@@ -837,12 +937,19 @@ impl Embedded {
         let mut status = self.status_of(dir)?;
         status["imported"] = json!({"head": bundle.head, "identity": bundle.identity,
             "files": bundle.files.len()});
+        // What its settings must change to run here, for the app to show before it
+        // continues the session (nothing is changed by the import itself).
+        let settings = self.with_host(dir, |host| host.settings().map_err(failed))?;
+        status["fit"] = host::fit(&settings, Runner::App);
         Ok(status)
     }
 
     fn recover(&self, dir: &str) -> Outcome {
         self.with_host(dir, |host| {
-            let report = host.store().reconciliation().map_err(|e| failed(format!("{e:?}")))?;
+            let report = host
+                .store()
+                .reconciliation()
+                .map_err(|e| failed(format!("{e:?}")))?;
             let mut head = crate::reads::head_on(&mut host.view()).map_err(failed)?;
             let items: Vec<Value> = report
                 .unresolved_attempts
@@ -852,17 +959,12 @@ impl Embedded {
                         "next": "continue"})
                 })
                 .collect();
-            let work = if head["phase"] == "empty" || head["phase"] == "stopped" {
-                json!({"work": "none", "why": null})
-            } else if items.is_empty() {
-                json!({"work": "ready", "why": null})
-            } else {
-                json!({"work": "blocked",
-                    "why": "an outcome is unknown: continue settles it from the store, never sends it again"})
-            };
+            let work = host.wake(&head, items.is_empty());
             head["wake"] = work.clone();
-            Ok(json!({"head": head["head"], "phase": head["phase"], "items": items,
-                "wake": work}))
+            Ok(
+                json!({"head": head["head"], "phase": head["phase"], "items": items,
+                "wake": work}),
+            )
         })
     }
 }
@@ -884,6 +986,47 @@ impl Backend for Embedded {
                         "build": "embedded",
                     })))
                 }
+                "tasks" => {
+                    params.allow(&["dir"])?;
+                    let dir = Self::dir(&params)?;
+                    now(self.with_host(&dir, |host| host.task_list().map_err(failed)))
+                }
+                "task_wait" => {
+                    params.allow(&["dir", "task", "timeout_s"])?;
+                    let dir = Self::dir(&params)?;
+                    let task = params.required("task")?;
+                    now(self.with_host(&dir, |host| host.task_wait(task).map_err(failed)))
+                }
+                "task_stop" => {
+                    params.allow(&["dir", "task"])?;
+                    let dir = Self::dir(&params)?;
+                    let task = params.required("task")?;
+                    let stopped = self.with_host(&dir, |host| host.stop_task(task).map_err(failed));
+                    match stopped {
+                        // A turn parked for its background tasks goes on (or ends) now.
+                        Ok((stopping, progress)) => {
+                            self.progressed(&dir, progress);
+                            now(Ok(json!({"task": task, "stopping": stopping})))
+                        }
+                        Err(fault) => now(Err(fault)),
+                    }
+                }
+                "capabilities" => {
+                    params.allow(&[])?;
+                    now(Ok(host::capabilities(self.runner.borrow().is_some())))
+                }
+                "fit" => {
+                    params.allow(&["dir", "runner"])?;
+                    let dir = Self::dir(&params)?;
+                    let runner = match params.str("runner")? {
+                        None => Runner::App,
+                        Some(name) => Runner::parse(name)
+                            .ok_or_else(|| bad("`runner` must be none, remote or app"))?,
+                    };
+                    now(self.with_host(&dir, |host| {
+                        Ok(host::fit(&host.settings().map_err(failed)?, runner))
+                    }))
+                }
                 "providers" => {
                     params.allow(&[])?;
                     now(Ok(json!({"providers": self.catalog.providers_json()})))
@@ -895,7 +1038,8 @@ impl Backend for Embedded {
                         .iter()
                         .map(|(dir, session)| {
                             let running = session.host.running();
-                            json!({"session": dir, "busy": running.is_some(), "running": running})
+                            json!({"session": dir, "busy": running.is_some(), "running": running,
+                                "background": session.host.background_running()})
                         })
                         .collect();
                     now(Ok(json!({"sessions": list})))
@@ -915,11 +1059,20 @@ impl Backend for Embedded {
                             if let Some(running) = session.host.running() {
                                 return Err(busy(format!("a {running} is running; stop it first")));
                             }
+                            if session.host.background_running() {
+                                return Err(busy(
+                                    "a background task of this session is running; wait for it or stop it (`task_stop`)",
+                                ));
+                            }
                             sessions.remove(&dir);
                             true
                         }
                     };
                     now(Ok(json!({"session": dir, "closed": closed})))
+                }
+                "compact" => {
+                    params.allow(&["dir"])?;
+                    now(self.compact(&Self::dir(&params)?))
                 }
                 "prompt" | "continue" | "retry" | "rewind" | "task_start" => {
                     self.start(method, params, id)?
@@ -1144,6 +1297,11 @@ impl Backend for Embedded {
                         }
                         Ok(crate::protocol::settings_json(&settings))
                     }))
+                }
+                "usage" => {
+                    params.allow(&["dir"])?;
+                    let dir = Self::dir(&params)?;
+                    now(self.with_host(&dir, |host| host.usage().map_err(failed)))
                 }
                 "recover" => {
                     params.allow(&["dir"])?;

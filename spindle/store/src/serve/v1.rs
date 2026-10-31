@@ -34,6 +34,8 @@ const FEATURES: &[&str] = &[
     "usage",
     "preview",
     "preview_github",
+    "preview_scripts",
+    "preview_contained",
     "models",
     "self_edit",
     "display",
@@ -43,6 +45,8 @@ const FEATURES: &[&str] = &[
     "recover",
     "tasks",
     "runner",
+    "run_stop",
+    "runner_tokens",
 ];
 /// Command kinds v1 admits (`/api` also has the self-edit `promote`, `rollback` and
 /// `update`).
@@ -76,6 +80,16 @@ const MOVED: &str = "session changed; refresh before submitting";
 const IDLE: &str = "no unstopped worker is running";
 /// Named API tokens are device rows whose id starts with this.
 const TOKEN_PREFIX: &str = "api:";
+/// A runner token's id: `api:run:NAME` (a name has no colon). It runs commands
+/// (`/v1/runner`, `/v1/run`) and reaches nothing else: no session, no transcript.
+const RUNNER_PREFIX: &str = "api:run:";
+/// How long a run's end is told after it ended; the most runs running at once, and the
+/// most ended ones kept to tell (the oldest go first).
+const RUN_KEPT: Duration = Duration::from_secs(600);
+/// How long a stop that came before its run is kept for the run (`Runs`).
+const EARLY_STOP: Duration = Duration::from_secs(60);
+const MAX_RUNS: usize = 256;
+const MAX_ENDED: usize = 1024;
 const MAX_TOKENS: i64 = 16;
 /// Bounds of the stable event ring (the UI's has the same).
 const MAX_EVENTS: usize = 1024;
@@ -217,6 +231,113 @@ fn runner() -> std::result::Result<&'static agent::runner::Runner, String> {
         .map_err(Clone::clone)
 }
 
+/// Remote runs a client named (`POST /v1/run` with `run`), by the device that started
+/// each and its ID: the interrupt the run checks while it runs, and how it ended
+/// (`stopped`: a stop came before it ended) for `RUN_KEPT` after; and stops that came
+/// before their run did (a client's stop can overtake its run's upload), for
+/// `EARLY_STOP`: a run that starts under one starts stopped.
+#[derive(Default)]
+struct Runs(
+    std::collections::HashMap<(String, String), RunState>,
+    std::collections::HashMap<(String, String), Instant>,
+);
+struct RunState {
+    interrupt: Arc<std::sync::atomic::AtomicBool>,
+    ended: Option<(&'static str, Instant)>,
+}
+
+fn runs() -> MutexGuard<'static, Runs> {
+    static RUNS: std::sync::LazyLock<std::sync::Mutex<Runs>> =
+        std::sync::LazyLock::new(Default::default);
+    lock(&RUNS)
+}
+
+impl Runs {
+    fn prune(&mut self) {
+        self.1.retain(|_, at| at.elapsed() < EARLY_STOP);
+        self.0
+            .retain(|_, run| run.ended.is_none_or(|(_, at)| at.elapsed() < RUN_KEPT));
+        let mut ended: Vec<Instant> = self
+            .0
+            .values()
+            .filter_map(|run| run.ended.map(|(_, at)| at))
+            .collect();
+        if ended.len() > MAX_ENDED {
+            ended.sort_unstable();
+            let keep_from = ended[ended.len() - MAX_ENDED];
+            self.0
+                .retain(|_, run| run.ended.is_none_or(|(_, at)| at >= keep_from));
+        }
+    }
+    fn running(&self) -> usize {
+        self.0.values().filter(|run| run.ended.is_none()).count()
+    }
+    /// `{run, state}`: `running`, `stopping` (stopped, not yet ended), `stopped` or
+    /// `finished`; None for a run this device never started (or ended long ago).
+    fn state(&mut self, device: &str, id: &str) -> Option<Value> {
+        self.prune();
+        let run = self.0.get(&(device.to_string(), id.to_string()))?;
+        let state = match run.ended {
+            Some((how, _)) => how,
+            None if run.interrupt.load(std::sync::atomic::Ordering::SeqCst) => "stopping",
+            None => "running",
+        };
+        Some(json!({"run": id, "state": state}))
+    }
+}
+
+/// Marks a named run ended when its request ends, however it ends.
+struct RunEnd(Option<((String, String), Arc<std::sync::atomic::AtomicBool>)>);
+impl Drop for RunEnd {
+    fn drop(&mut self) {
+        let Some((key, interrupt)) = self.0.take() else {
+            return;
+        };
+        if let Some(run) = runs().0.get_mut(&key) {
+            let how = if interrupt.load(std::sync::atomic::Ordering::SeqCst) {
+                "stopped"
+            } else {
+                "finished"
+            };
+            run.ended = Some((how, Instant::now()));
+        }
+    }
+}
+
+/// A run's ID: 1-128 letters, digits, `-`, `_` or `.` (a UUID fits).
+fn run_id(value: &Value) -> std::result::Result<Option<String>, Failure> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(id)
+            if (1..=128).contains(&id.len())
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) =>
+        {
+            Ok(Some(id.clone()))
+        }
+        _ => Err(bad("`run` must be 1-128 letters, digits, `-`, `_` or `.`")),
+    }
+}
+
+/// Whether `device` is a runner token (`RUNNER_PREFIX`).
+pub(super) fn runner_only(device: &str) -> bool {
+    device.starts_with(RUNNER_PREFIX)
+}
+
+/// The routes a runner token reaches: discovery and the runner's own.
+fn runner_route(method: &str, path: &str) -> bool {
+    let parts: Vec<&str> = path.trim_end_matches('/').split('/').skip(2).collect();
+    matches!(
+        (method, parts.as_slice()),
+        ("GET", [])
+            | ("GET", ["runner"])
+            | ("POST", ["run"])
+            | ("GET", ["run", _])
+            | ("POST", ["run", _, "stop"])
+    )
+}
+
 /// Serves one v1 request. Every outcome is written here in the v1 envelope.
 pub(super) fn route(
     host: &Arc<Host>,
@@ -228,6 +349,14 @@ pub(super) fn route(
 ) -> std::result::Result<(), Refused> {
     let answer = (|| -> Answer {
         let device = authenticate(host, &request, extra, public, origin)?;
+        // Refused before its body is read.
+        if runner_only(&device) && !runner_route(&request.method, &request.path) {
+            return Err(Failure::new(
+                403,
+                "forbidden",
+                "this token only runs commands (/v1/runner, /v1/run)",
+            ));
+        }
         if request.method == "POST" {
             http::read_body(stream, &mut request).map_err(bad)?;
         }
@@ -346,10 +475,80 @@ fn dispatch(
             let runner = runner().map_err(|why| Failure::new(503, "unavailable", &why))?;
             let body: Value =
                 serde_json::from_slice(&request.body).map_err(|_| bad("the body is not JSON"))?;
-            let result = runner
-                .run(&body, &std::sync::atomic::AtomicBool::new(false))
-                .map_err(|why| bad(&why))?;
-            send(stream, 200, &result, extra)
+            // A named run can be asked about and stopped while it runs (below).
+            let named = run_id(&body["run"])?.map(|id| (device.to_string(), id));
+            let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if let Some(key) = &named {
+                let mut runs = runs();
+                runs.prune();
+                if runs.0.contains_key(key) {
+                    return Err(Failure::new(
+                        409,
+                        "conflict",
+                        "a run with that `run` was started already",
+                    ));
+                }
+                if runs.running() >= MAX_RUNS {
+                    return Err(Failure::new(
+                        503,
+                        "busy",
+                        "too many runs at once; try again soon",
+                    ));
+                }
+                if runs.1.remove(key).is_some() {
+                    interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                runs.0.insert(
+                    key.clone(),
+                    RunState {
+                        interrupt: interrupt.clone(),
+                        ended: None,
+                    },
+                );
+            }
+            let ended = RunEnd(named.map(|key| (key, interrupt.clone())));
+            let result = runner.run(&body, &interrupt);
+            drop(ended);
+            send(stream, 200, &result.map_err(|why| bad(&why))?, extra)
+        }
+        ("GET", ["run", id]) => {
+            let state = runs().state(device, id);
+            match state {
+                Some(state) => send(stream, 200, &state, extra),
+                None => Err(missing(
+                    "no such run of this token's (or it ended long ago)",
+                )),
+            }
+        }
+        // Stops a run's command. Its answer goes, if the client still waits for it, to
+        // the run's own request; this one says whether the run had ended.
+        ("POST", ["run", id, "stop"]) => {
+            let state = {
+                let mut runs = runs();
+                let key = (device.to_string(), id.to_string());
+                match runs.0.get(&key) {
+                    Some(run) if run.ended.is_none() => {
+                        run.interrupt
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Some(_) => {}
+                    // Not started yet (or long ended): one that starts soon is stopped.
+                    None if run_id(&json!(id)).is_ok() => {
+                        runs.prune();
+                        if runs.1.len() < MAX_ENDED {
+                            runs.1.insert(key, Instant::now());
+                        }
+                    }
+                    None => {}
+                }
+                runs.state(device, id)
+            };
+            match state {
+                Some(state) => send(stream, 200, &state, extra),
+                None => Err(missing(
+                    "no such run of this token's yet (one started under this ID within a minute starts stopped), or it ended long ago",
+                )),
+            }
         }
         ("GET", ["providers"]) => {
             let providers = api::providers_json().map_err(internal)?;
@@ -1037,15 +1236,18 @@ fn events(
     Ok(())
 }
 
-/// `spindle --dir HOST token new NAME | list | revoke NAME`: named API tokens for the
-/// host's HTTP API. A token is a device row (its SHA-256 only) with id `api:NAME`; it
-/// is printed once, works as `Authorization: Bearer TOKEN`, is never evicted by new
+/// `spindle --dir HOST token new NAME [--runner] | list | revoke NAME`: named API tokens
+/// for the host's HTTP API. A token is a device row (its SHA-256 only) with id
+/// `api:NAME` (`api:run:NAME` with `--runner`: it reaches only the remote runner); it is
+/// printed once, works as `Authorization: Bearer TOKEN`, is never evicted by new
 /// pairings, and shows (and can be revoked) under Settings > Host like any screen.
 pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
-    const USAGE: &str = "usage: spindle --dir HOST token new NAME | list | revoke NAME";
+    const USAGE: &str = "usage: spindle --dir HOST token new NAME [--runner] | list | revoke NAME";
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Not starting with `-`: `token new --runner` names no token, it misses the name.
     let name_ok = |name: &str| {
         !name.is_empty()
+            && !name.starts_with('-')
             && name.len() <= 40
             && name
                 .bytes()
@@ -1062,7 +1264,8 @@ pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
     let db = Connection::open(root.join("host.sqlite")).map_err(err)?;
     db.busy_timeout(Duration::from_secs(5)).map_err(err)?;
     match args.as_slice() {
-        ["new", name] if name_ok(name) => {
+        ["new", name, rest @ ..] if name_ok(name) && (rest.is_empty() || rest == ["--runner"]) => {
+            let runner = !rest.is_empty();
             let count: i64 = db
                 .query_row(
                     "SELECT count(*) FROM devices WHERE id LIKE 'api:%'",
@@ -1073,14 +1276,31 @@ pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
             if count >= MAX_TOKENS {
                 return Err(format!("at most {MAX_TOKENS} API tokens; revoke one first"));
             }
+            // One name, one token, whichever its kind.
+            let taken: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM devices WHERE id IN (?1,?2)",
+                    [
+                        format!("{TOKEN_PREFIX}{name}"),
+                        format!("{RUNNER_PREFIX}{name}"),
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(err)?;
+            if taken != 0 {
+                return Err(format!("a token named `{name}` exists; revoke it first"));
+            }
             let token = random()?;
             let now = now_ms() as i64;
             let added = db.execute(
                 "INSERT OR IGNORE INTO devices VALUES(?1,?2,?3,?4,?4,?4)",
                 params![
-                    format!("{TOKEN_PREFIX}{name}"),
+                    format!(
+                        "{}{name}",
+                        if runner { RUNNER_PREFIX } else { TOKEN_PREFIX }
+                    ),
                     hash(token.as_bytes()),
-                    format!("API token {name}"),
+                    format!("{} token {name}", if runner { "Runner" } else { "API" }),
                     now
                 ],
             );
@@ -1089,7 +1309,12 @@ pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
             }
             println!("{token}");
             eprintln!(
-                "API token `{name}` created. It is shown only this once; send it as `Authorization: Bearer TOKEN`."
+                "{} `{name}` created. It is shown only this once; send it as `Authorization: Bearer TOKEN`.",
+                if runner {
+                    "Runner token (/v1/runner and /v1/run only)"
+                } else {
+                    "API token"
+                }
             );
             Ok(())
         }
@@ -1117,9 +1342,12 @@ pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
             };
             for row in rows {
                 let (id, created, seen) = row.map_err(err)?;
+                let name = match id.strip_prefix(RUNNER_PREFIX) {
+                    Some(name) => format!("{name} (runner)"),
+                    None => id[TOKEN_PREFIX.len()..].to_string(),
+                };
                 println!(
-                    "{:<40} created {:<10} last used {}",
-                    &id[TOKEN_PREFIX.len()..],
+                    "{name:<40} created {:<10} last used {}",
                     since(created),
                     since(seen)
                 );
@@ -1129,18 +1357,24 @@ pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
         ["revoke", name] => {
             let removed = db
                 .execute(
-                    "DELETE FROM devices WHERE id=?1",
-                    [format!("{TOKEN_PREFIX}{name}")],
+                    "DELETE FROM devices WHERE id IN (?1,?2)",
+                    [
+                        format!("{TOKEN_PREFIX}{name}"),
+                        format!("{RUNNER_PREFIX}{name}"),
+                    ],
                 )
                 .map_err(err)?;
-            if removed == 1 {
-                println!("Revoked API token `{name}`.");
+            if removed != 0 {
+                println!("Revoked token `{name}`.");
                 Ok(())
             } else {
-                Err(format!("no API token named `{name}`"))
+                Err(format!("no token named `{name}`"))
             }
         }
-        ["new", _] => Err("a token name is 1–40 letters, digits, `-`, `_` or `.`".into()),
+        ["new", _, ..] => Err(
+            "a token name is 1–40 letters, digits, `-`, `_` or `.`, not starting with `-`; the only option is `--runner`, after the name"
+                .into(),
+        ),
         _ => Err(USAGE.into()),
     }
 }
@@ -1367,6 +1601,167 @@ mod tests {
         assert!(!host.paired("api:ci"));
         assert!(token(root.clone(), vec!["revoke".into(), "ci".into()]).is_err());
         drop(host);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_runner_token_reaches_the_runner_and_nothing_else() {
+        let (root, host) = temp_host_for_tests("v1-runner-token");
+        token(
+            root.clone(),
+            vec!["new".into(), "box".into(), "--runner".into()],
+        )
+        .unwrap();
+        assert!(
+            token(root.clone(), vec!["new".into(), "box".into()]).is_err(),
+            "one name, one token"
+        );
+        assert!(token(root.clone(), vec!["new".into(), "x".into(), "--all".into()]).is_err());
+        assert!(host.paired("api:run:box"));
+        // A known token in the same row shape, to call with.
+        let runner = "runner-token-for-tests";
+        lock(&host.db)
+            .execute(
+                "UPDATE devices SET hash=?1 WHERE id='api:run:box'",
+                [super::super::hash(runner.as_bytes())],
+            )
+            .unwrap();
+        thread(&host);
+        assert_eq!(get(&host, "/v1", runner).0, 200);
+        assert_ne!(get(&host, "/v1/runner", runner).0, 403);
+        for path in [
+            "/v1/sessions",
+            "/v1/sessions/s",
+            "/v1/usage",
+            "/v1/providers",
+        ] {
+            let (status, body) = get(&host, path, runner);
+            assert_eq!(
+                (status, body["code"].clone()),
+                (403, json!("forbidden")),
+                "{path}"
+            );
+        }
+        let (status, _) = post(&host, "/v1/commands", runner, &json!({"kind": "say"}));
+        assert_eq!(status, 403);
+        // Nor is it a screen's cookie.
+        let (status, _, _) = call(
+            &host,
+            &format!(
+                "GET /api/sessions HTTP/1.1\r\nHost: HOST\r\nCookie: spindle={runner}\r\n\r\n"
+            ),
+        );
+        assert_eq!(status, 403);
+        token(root.clone(), vec!["list".into()]).unwrap();
+        token(root.clone(), vec!["revoke".into(), "box".into()]).unwrap();
+        assert!(!host.paired("api:run:box"));
+        assert_eq!(get(&host, "/v1/runner", runner).0, 401);
+        drop(host);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_run_is_told_and_stopped_by_its_token_only() {
+        let (root, host) = temp_host_for_tests("v1-run-stop");
+        let (_, device) = host.pair("Linux · Firefox").unwrap();
+        let (_, other) = host.pair("Linux · Chrome").unwrap();
+        let (status, _) = post(
+            &host,
+            "/v1/run",
+            &device,
+            &json!({"command": "true", "run": "bad id"}),
+        );
+        assert!(status == 400 || status == 503, "{status}");
+        if get(&host, "/v1/runner", &device).0 == 503 {
+            // No sandbox here: nothing runs (the runner test says so too).
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let started = std::time::Instant::now();
+        let running = {
+            let (host, device) = (host.clone(), device.clone());
+            std::thread::spawn(move || {
+                post(
+                    &host,
+                    "/v1/run",
+                    &device,
+                    &json!({"command": "sleep 30", "timeout_s": 60, "run": "r1"}),
+                )
+            })
+        };
+        let mut state = Value::Null;
+        for _ in 0..100 {
+            state = get(&host, "/v1/run/r1", &device).1;
+            if state["state"] == "running" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(state, json!({"run": "r1", "state": "running"}));
+        assert_eq!(
+            get(&host, "/v1/run/r1", &other).0,
+            404,
+            "another token's run is not there"
+        );
+        assert_eq!(post(&host, "/v1/run/r1/stop", &other, &json!({})).0, 404);
+        let (status, _) = post(
+            &host,
+            "/v1/run",
+            &device,
+            &json!({"command": "true", "run": "r1"}),
+        );
+        assert_eq!(status, 409, "a run's ID is its own");
+        let (status, stopping) = post(&host, "/v1/run/r1/stop", &device, &json!({}));
+        assert_eq!(
+            (status, stopping["state"].clone()),
+            (200, json!("stopping"))
+        );
+        let (status, result) = running.join().unwrap();
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result["success"], false, "{result}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "stopped, not timed out"
+        );
+        assert_eq!(get(&host, "/v1/run/r1", &device).1["state"], "stopped");
+        let (_, done) = post(
+            &host,
+            "/v1/run",
+            &device,
+            &json!({"command": "true", "run": "r2"}),
+        );
+        assert_eq!(done["success"], true, "{done}");
+        assert_eq!(get(&host, "/v1/run/r2", &device).1["state"], "finished");
+        assert_eq!(
+            post(&host, "/v1/run/r2/stop", &device, &json!({})).1["state"],
+            "finished"
+        );
+        // A stop that overtakes its run: the run starts stopped.
+        assert_eq!(post(&host, "/v1/run/r3/stop", &device, &json!({})).0, 404);
+        let started = std::time::Instant::now();
+        let (status, result) = post(
+            &host,
+            "/v1/run",
+            &device,
+            &json!({"command": "sleep 30", "timeout_s": 60, "run": "r3"}),
+        );
+        assert_eq!(
+            (status, result["success"].clone()),
+            (200, json!(false)),
+            "{result}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(get(&host, "/v1/run/r3", &device).1["state"], "stopped");
+        // Another token's stop stops none of this one's.
+        assert_eq!(post(&host, "/v1/run/r4/stop", &other, &json!({})).0, 404);
+        let (_, done) = post(
+            &host,
+            "/v1/run",
+            &device,
+            &json!({"command": "true", "run": "r4"}),
+        );
+        assert_eq!(done["success"], true, "{done}");
         let _ = std::fs::remove_dir_all(root);
     }
 

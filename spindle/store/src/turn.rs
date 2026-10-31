@@ -272,17 +272,50 @@ impl Action {
     }
 }
 
+/// What a background task's report reads to its session: a finished one's answer
+/// (`{content, failed}`), or, for one `stopped` without an answer, that it stopped, and
+/// why when its row says (`answer` then holds the reason, as `{content, failed: true}`).
+/// Its session goes on either way, rather than waiting for a person.
+pub fn task_report_of(task: &str, stopped: bool, answer: Option<&[u8]>) -> Result<String> {
+    if !stopped {
+        return task_report_text(task, answer.ok_or(Error::Invalid)?);
+    }
+    let said = "It stopped before it finished and gave no answer.";
+    match answer {
+        None => Ok(format!("[task {task}: stopped]\n{said}")),
+        Some(why) => bounded(
+            format!("[task {task}: stopped]\n{said} Why: "),
+            content_of(why)?,
+        ),
+    }
+}
+
+/// The reason a task stopped (`why`) as its row keeps it (`task_report_of`).
+pub fn stopped_why(why: &str) -> String {
+    serde_json::json!({"content": why, "failed": true}).to_string()
+}
+
 pub fn task_report_text(task: &str, answer: &[u8]) -> Result<String> {
-    let answer: serde_json::Value = serde_json::from_slice(answer).map_err(|_| Error::Invalid)?;
-    let content = answer["content"].as_str().ok_or(Error::Invalid)?;
+    let failed = serde_json::from_slice::<serde_json::Value>(answer).map_err(|_| Error::Invalid)?["failed"]
+        == true;
     let prefix = format!(
         "[task {task}: {}]\n",
-        if answer["failed"] == true {
-            "failed"
-        } else {
-            "finished"
-        }
+        if failed { "failed" } else { "finished" }
     );
+    bounded(prefix, content_of(answer)?)
+}
+
+/// A kept answer's `content`.
+fn content_of(answer: &[u8]) -> Result<String> {
+    let answer: serde_json::Value = serde_json::from_slice(answer).map_err(|_| Error::Invalid)?;
+    answer["content"]
+        .as_str()
+        .map(String::from)
+        .ok_or(Error::Invalid)
+}
+
+/// `prefix` and as much of `content` as keeps a report within 64 KiB.
+fn bounded(prefix: String, content: String) -> Result<String> {
     let limit = (64 * 1024usize).saturating_sub(prefix.len());
     let mut end = content.len().min(limit);
     while !content.is_char_boundary(end) {
@@ -292,7 +325,43 @@ pub fn task_report_text(task: &str, answer: &[u8]) -> Result<String> {
 }
 
 fn state(bytes: &[u8]) -> Result<TurnContinuation> {
-    TurnContinuation::restore(bytes).map_err(|_| Error::Invalid)
+    restored(bytes).map_err(|_| Error::Invalid)
+}
+
+/// `TurnContinuation::restore`, remembered by the exact bytes. One step restores its
+/// head several times (the broker, the driver and the host each read it), and a restore
+/// encodes the whole history again to prove the bytes canonical. A restore depends on
+/// its bytes alone, so the last one it gave is kept here (per thread) and a match hands
+/// out a copy: the value a restore of those bytes gives, without the decoding. (One:
+/// the head is what is read again; a second kept no more steps from decoding.)
+pub fn restored(
+    bytes: &[u8],
+) -> std::result::Result<TurnContinuation, dext_transcript::continuation::Error> {
+    use std::cell::RefCell;
+    const KEPT: usize = 1;
+    // A larger continuation is restored each time rather than held twice more.
+    const MAX_KEPT: usize = 8 * 1024 * 1024;
+    thread_local! {
+        static STATES: RefCell<Vec<(Vec<u8>, TurnContinuation)>> = const { RefCell::new(Vec::new()) };
+    }
+    let hit = STATES.with_borrow_mut(|kept| {
+        let at = kept.iter().position(|(key, _)| key.as_slice() == bytes)?;
+        let entry = kept.remove(at);
+        let state = entry.1.clone();
+        kept.insert(0, entry);
+        Some(state)
+    });
+    if let Some(state) = hit {
+        return Ok(state);
+    }
+    let state = TurnContinuation::restore(bytes)?;
+    if bytes.len() <= MAX_KEPT {
+        STATES.with_borrow_mut(|kept| {
+            kept.truncate(KEPT - 1);
+            kept.insert(0, (bytes.to_vec(), state.clone()));
+        });
+    }
+    Ok(state)
 }
 fn ready_request(bytes: &[u8]) -> Result<ModelWait<Vec<u8>>> {
     let wait = ModelWait::restore(bytes).map_err(|_| Error::Invalid)?;
@@ -302,7 +371,8 @@ fn ready_request(bytes: &[u8]) -> Result<ModelWait<Vec<u8>>> {
     Ok(wait)
 }
 fn snapshot(db: &Connection, proposal: &Proposal) -> Result<(String, String, Vec<u8>)> {
-    Ok(db.query_row(
+    Ok(crate::cached_row(
+        db,
         "SELECT scope,engine,continuation FROM revisions WHERE revision=?1",
         [proposal.expected_revision as i64],
         |row| {
@@ -379,8 +449,8 @@ fn matches_proposal(
 }
 
 fn next_turn_prefix_matches(prior: &TurnContinuation, initial: &TurnContinuation) -> Result<bool> {
-    let prior = prior.transcript().map_err(|_| Error::Invalid)?;
-    let initial = initial.transcript().map_err(|_| Error::Invalid)?;
+    let prior = prior.transcript_ref().map_err(|_| Error::Invalid)?;
+    let initial = initial.transcript_ref().map_err(|_| Error::Invalid)?;
     if initial.route_binding != prior.route_binding
         || initial.messages.len() != prior.messages.len() + 1
     {
@@ -434,8 +504,7 @@ impl Store {
             return Err(Error::Invalid);
         };
         self.commit_bound_proposal(proposal, None, |transaction| {
-            let (id, kind, payload): (String, String, Vec<u8>) = transaction
-                .query_row(
+            let (id, kind, payload): (String, String, Vec<u8>) = crate::cached_row(transaction,
                     "SELECT command_id,kind,payload FROM admissions WHERE sequence=?1 AND scope=?2",
                     params![sequence as i64, proposal.scope],
                     |row| {
@@ -511,7 +580,7 @@ impl Store {
                 return Err(Error::Invalid);
             }
             if let Action::Guard { effect } | Action::Refuse { effect, .. } = &action {
-                let reserved: bool = transaction.query_row(
+                let reserved: bool = crate::cached_row(transaction,
                     "SELECT EXISTS(SELECT 1 FROM attempts WHERE effect=?1)",
                     [effect],
                     |row| row.get(0),
@@ -532,8 +601,11 @@ impl Store {
                 Action::Followup { text } => before.followup(text),
                 Action::Steer { text } => before.steer(text),
                 Action::TaskReport { task, text } => {
-                    let answer: Vec<u8> = transaction.query_row("SELECT answer FROM task_runs WHERE task=?1 AND queued=1 AND state='finished' AND delivered IS NULL", [&task], |row| crate::bounded_blob(row, 0, MAX_PAYLOAD))?;
-                    let expected = task_report_text(&task, &answer)?;
+                    let (state, answer): (String, Option<Vec<u8>>) = crate::cached_row(transaction, "SELECT state,answer FROM task_runs WHERE task=?1 AND queued=1 AND state IN ('finished','stopped') AND delivered IS NULL", [&task], |row| Ok((crate::bounded_label(row, 0)?, match row.get_ref(1)? {
+                        rusqlite::types::ValueRef::Null => None,
+                        _ => Some(crate::bounded_blob(row, 1, MAX_PAYLOAD)?),
+                    })))?;
+                    let expected = task_report_of(&task, state == "stopped", answer.as_deref())?;
                     if text != expected { return Err(Error::Conflict); }
                     before.task_report(text)
                 }
@@ -634,7 +706,7 @@ impl Store {
     ) -> Result<u64> {
         self.commit_checked_receipt_proposal(proposal, binding, |transaction| {
             if let Some(helper) = approved_helper {
-                let record: Option<(String, String, String)> = transaction.query_row(
+                let record: Option<(String, String, String)> = crate::cached_row(transaction,
                     "SELECT base,root,helper FROM strict_receipts WHERE attempt=?1", [&binding.attempt.id],
                     |row| Ok((crate::bounded_label(row, 0)?, crate::bounded_label(row, 1)?, crate::bounded_label(row, 2)?)),
                 ).optional()?;
@@ -696,14 +768,14 @@ impl Store {
             let tx = self
                 .db
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let current: u64 = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |row| {
-                crate::nonnegative_id(row, 0)
-            })?;
+            let current: u64 =
+                crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |row| {
+                    crate::nonnegative_id(row, 0)
+                })?;
             if current != epoch {
                 return Err(Error::Stale);
             }
-            let (effect, parent): (String, String) = tx
-                .query_row(
+            let (effect, parent): (String, String) = crate::cached_row(&tx,
                     "SELECT i.id,r.scope FROM attempts a JOIN intents i ON a.effect=i.id JOIN revisions r ON r.revision=i.revision WHERE a.id=?1",
                     [attempt],
                     |row| Ok((crate::bounded_label(row, 0)?, crate::bounded_label(row, 1)?)),
@@ -721,7 +793,8 @@ impl Store {
             }
             let head = |scope: &str| -> Result<TurnContinuation> {
                 let revision = crate::transition::scope_revision(&tx, scope)?;
-                let (engine, bytes): (String, Vec<u8>) = tx.query_row(
+                let (engine, bytes): (String, Vec<u8>) = crate::cached_row(
+                    &tx,
                     "SELECT engine,continuation FROM revisions WHERE revision=?1 AND scope=?2",
                     params![revision as i64, scope],
                     |row| {

@@ -18,6 +18,7 @@ class Node {
   replaceChildren(...nodes) {this.children = [...nodes];}
   setAttribute(k, v) {this[k] = v;}
   removeAttribute(k) {delete this[k];}
+  remove() {this.removed = true;}
   focus() {}
   click() {if(!this.disabled) return this.onclick?.({preventDefault() {}});}
   showModal() {if(this.open) throw Error('dialog already open'); this.open = true;}
@@ -33,17 +34,22 @@ class Node {
   descendants() {return this.children.filter(n => n instanceof Node).flatMap(n => [n,...n.descendants()]);}
 }
 const textOf = (node) => [node.textContent || '', ...(node.children || []).map(n => n instanceof Node ? textOf(n) : n?.textContent || '')].join(' ');
+// The Files sheet: folders start shut; these open every one, then find a row by its path.
+const openFolders = list => {for(let shut; (shut = list.descendants().filter(n => n.className === 'tree-folder-head' && n['aria-expanded'] === 'false')).length;) for(const head of shut) head.onclick();};
+const fileRow = (a, path) => {openFolders(a.nodes.get('file-list')); return a.nodes.get('file-list').descendants().find(n => n.dataset.path === path);};
 const state = (more = {}) => ({head: 10, revision: 10, busy: false, complete: true, phase: 'Stopped(Complete)', stop: null, messages: [], files: [], steps: [{revision: 1}, {revision: 10}], ...more});
 const response = (value, status = 200) => ({ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(value)});
-async function app(custom = () => undefined, hash = '') {
+async function app(custom = () => undefined, hash = '', globals = {}) {
   const nodes = new Map([...html.matchAll(/id="([^"]+)"/g)].map(m => [m[1], new Node()]));
   for(const id of ['theme-choice']) for(const mode of ['paper','light','dark','system']) {const button = new Node('button'); button.dataset.mode = mode; nodes.get(id).append(button);}
   for(const mode of ['model','digest']) {const button = new Node('button'); button.dataset.mode = mode; nodes.get('compaction-choice').append(button);}
   const storage = new Map(), calls = [], streams = [], events = {}, timers = [];
   const context = createContext({
-    console, intent, ...text, Terminal: class {write() {}}, TextEncoder, TextDecoder, Uint8Array, CSS: {escape: x => x}, crypto: {randomUUID: (() => {let n = 0; return () => `req-${++n}`;})()},
+    ...globals, console, intent, ...text, Terminal: class {write() {}}, TextEncoder, TextDecoder, Uint8Array, URL, CSS: {escape: x => x}, crypto: {randomUUID: (() => {let n = 0; return () => `req-${++n}`;})()},
+    // Enough of a parser for a page's script sources.
+    DOMParser: class {parseFromString(html) {const sources = [...String(html).matchAll(/<script[^>]*\ssrc="([^"]+)"/g)].map(found => found[1]); return {querySelectorAll: () => sources.map(src => ({getAttribute: () => src}))};}},
     atob: s => Buffer.from(s, 'base64').toString('binary'),
-    document: {body: new Node('body'), getElementById: id => nodes.get(id), createElement: tag => new Node(tag), createTextNode: text => ({textContent: text}), createDocumentFragment: () => new Node(), querySelectorAll: () => [], addEventListener: (name, fn) => events[name] = fn, hidden: false},
+    document: {body: new Node('body'), getElementById: id => nodes.get(id), createElement: tag => new Node(tag), createElementNS: (ns, tag) => new Node(tag), createTextNode: text => ({textContent: text}), createDocumentFragment: () => new Node(), querySelectorAll: () => [], addEventListener: (name, fn) => events[name] = fn, hidden: false},
     location: {hash, reload() {}}, navigator: {clipboard: {writeText: async () => {}}},
     localStorage: {getItem: k => storage.get(k), setItem: (k,v) => storage.set(k,v)},
     requestAnimationFrame: () => 1, clearTimeout() {}, setTimeout: fn => {timers.push(fn); return timers.length;}, setInterval: () => 1,
@@ -66,8 +72,8 @@ async function app(custom = () => undefined, hash = '') {
       throw Error(`unexpected request ${path}`);
     },
   });
-  context.window = {addEventListener: (name, fn) => events[name] = fn};
-  runInContext(source + '\nglobalThis.subject = {openThread, home, command, recoverThread, runIntent, render, backToLive, connect, recover, loadSessions, openPicker, openViewer, get snapshot(){return snapshot;}, get selected(){return selected;}, get historical(){return historical;}, get catalog(){return catalog;}};', context);
+  context.window = {addEventListener: (name, fn) => events[name] = fn, removeEventListener: (name, fn) => {if(events[name] === fn) delete events[name];}};
+  runInContext(source + '\nglobalThis.subject = {openThread, home, command, recoverThread, runIntent, render, backToLive, connect, recover, loadSessions, openPicker, openViewer, finishDelete, get snapshot(){return snapshot;}, get selected(){return selected;}, get historical(){return historical;}, get catalog(){return catalog;}};', context);
   const flush = async () => {for(let i = 0; i < 25; i++) await Promise.resolve();};
   await flush();
   return {subject: context.subject, nodes, storage, calls, streams, events, timers, context, flush, confirm: async () => {await nodes.get('confirm-form').onsubmit({preventDefault() {}}); await flush();}};
@@ -256,11 +262,14 @@ test('host skin is staged, reviewed through the shared confirmation, then applie
   assert.deepEqual(a.calls.filter(c => c.path === '/api/skin' && c.data).at(-1).data, {action:'stage',session:'a',revision:10});
 });
 
-test('typed reasoning command saves effort; the chip shows model and what is sent, the title what it cost', async () => {
+test('typed reasoning command saves effort; the chip shows model and what is sent, the header what it cost', async () => {
   const a = await app(path => path.endsWith('/snapshot') ? response(state({provider:'glm',model:'glm-5.3',effort:'default',reasoning:{label:'extended thinking, 16384-token budget (high)',short:'think 16K'},usage:{calls:2,input:10,output:5,usd:0.0123,priced:2}})) : undefined);
   await a.subject.openThread('a');
-  assert.equal(a.nodes.get('subtitle').textContent, '$0.012');
+  // The model under the title; what it spent, a button at the right (to the thread menu).
+  assert.equal(a.nodes.get('subtitle').textContent, 'glm · glm-5.3');
   assert.match(a.nodes.get('subtitle').title, /16384-token budget/);
+  assert.equal(a.nodes.get('spend').textContent, '$0.012'); assert.equal(a.nodes.get('spend').hidden, false);
+  assert.equal(a.nodes.get('spend').onclick, a.nodes.get('title-button').onclick, 'the spend opens the thread menu, where the limit is');
   assert.equal(a.nodes.get('chip-model').textContent, 'glm-5.3');
   assert.equal(a.nodes.get('chip-effort').textContent, 'think 16K', 'auto effort shows what the route sends');
   assert.equal(a.nodes.get('chip-provider').textContent, '', 'the model name already says glm');
@@ -349,9 +358,14 @@ test('an expired Cloudflare sign-in offers Sign in again instead of Reconnecting
 test('the thread list shows status and reports runs that ended since it last looked', async () => {
   const sessions = [{id:'a',name:'Alpha',status:{state:'needs attention',at:Date.now() - 120000}},{id:'b',name:'Beta',status:{state:'done',at:Date.now()}}];
   const a = await app(path => path === '/api/sessions' ? response({sessions,providers:[]}) : undefined);
-  const rows = a.nodes.get('sessions').children;
-  assert.match(textOf(rows[0]), /NEEDS ATTENTION · 2m ago/);
-  assert.equal(rows[0].dataset.state, 'needs attention');
+  // By what they need: a heading, then its rows (a shape for the state, what it is doing,
+  // how long ago, and ⋯ for its actions).
+  const list = a.nodes.get('sessions').children;
+  assert.deepEqual(list.map(n => n.tagName === 'h2' ? `# ${n.textContent}` : n.dataset.state), ['# Needs you', 'needs attention', '# Today', 'done']);
+  const rows = list.filter(n => n.tagName !== 'h2');
+  assert.match(textOf(rows[0]), /Alpha 2m .*Needs you: open it to see why/);
+  assert.equal(rows[0].className, 'session-row last needs');
+  assert.equal(rows[0].children[1]['aria-label'], 'More actions for Alpha');
   a.storage.set('thread-status', JSON.stringify({b:'running'}));
   await a.subject.home(); await a.flush();
   assert.match(a.nodes.get('toast').textContent, /Finished: Beta: done/);
@@ -382,7 +396,7 @@ test('files mark what a revision changed and show a unified diff against the one
   });
   await a.subject.openThread('a'); await a.nodes.get('files').click(); await a.flush();
   const list = a.nodes.get('file-list').children.map(textOf);
-  assert.match(list[0], /changed/); assert.doesNotMatch(list[1], /changed/); assert.match(list[2], /gone\.txt.*deleted/);
+  assert.match(list[0], /a\.txt.*changed/); assert.match(list[1], /gone\.txt.*deleted/, 'a deleted file stays where it was'); assert.doesNotMatch(list[2], /changed/);
   a.nodes.get('file-list').children[0].onclick(); await a.flush();
   a.nodes.get('file-view-diff').onclick(); await a.flush();
   const rows = a.nodes.get('file-content').children;
@@ -390,9 +404,32 @@ test('files mark what a revision changed and show a unified diff against the one
   assert.match(a.nodes.get('file-view-meta').textContent, /a\.txt · r9 → r10/);
   // A deleted file opens straight on what it lost; nothing complains it is missing.
   a.nodes.get('viewer-back').onclick(); a.nodes.get('toast').textContent = '';
-  await a.nodes.get('file-list').children[2].onclick(); await a.flush();
+  await a.nodes.get('file-list').children[1].onclick(); await a.flush();
   assert.deepEqual(a.nodes.get('file-content').children.map(r => r.textContent), ['Deleted at r10.\n','@@ -1,1 +0,0 @@\n','-bye\n']);
   assert.equal(a.nodes.get('toast').textContent, '');
+});
+
+test('folders start shut and say what they hold and what changed; they stay as the user left them', async () => {
+  const files = [{path:'src/a.rs',digest:'a2',size:4},{path:'src/lib/b.rs',digest:'b',size:4},{path:'docs/x.md',digest:'x',size:4},
+    ...Array.from({length: 3}, (_, i) => ({path:`.venv/lib/python3.14/site-packages/pip-26.2.2.dist-info/F${i}`,digest:`v${i}`,size:1}))];
+  const a = await app(path => {
+    if(path.endsWith('/snapshot')) return response(state({files}));
+    if(path.startsWith('/api/sessions/a/files?revision=9')) return response({revision:9,files:[{path:'src/a.rs',digest:'a1',size:4},{path:'docs/x.md',digest:'x',size:4},{path:'src/old.rs',digest:'o',size:4}]});
+  });
+  await a.subject.openThread('a'); await a.nodes.get('files').click(); await a.flush();
+  const list = a.nodes.get('file-list'), heads = () => list.descendants().filter(n => n.className === 'tree-folder-head');
+  assert.deepEqual(heads().map(h => [h.dataset.folder, h['aria-expanded']]), [['.venv/lib/python3.14/site-packages/pip-26.2.2.dist-info','false'],['docs','false'],['src','false']], 'shut, never opened for the user; a lone folder chain is one row');
+  assert.equal(heads()[0].children[0].textContent, '.venv/lib/python3.14/site-packages/pip-26.2.2.dist-info');
+  const src = heads()[2].children[1];
+  assert.equal(src.className, 'changed'); assert.equal(src.textContent, '2 files · 1 new · 1 changed · 1 deleted', 'changes are findable without opening, always in that order');
+  assert.equal(heads()[1].children[1].textContent, '1 file'); assert(!heads()[1].children[1].className, 'a folder without changes is quiet');
+  assert.equal(list.descendants().filter(n => n.dataset.path).length, 0, 'nothing inside a shut folder is drawn');
+  heads()[2].onclick();
+  const inside = list.children[2].children[1];
+  assert.deepEqual(inside.children.map(n => n.dataset.path ?? n.children[0].dataset.folder), ['src/a.rs','src/old.rs','src/lib']);
+  assert.match(textOf(inside.children[1]), /old\.rs.*deleted/);
+  a.nodes.get('files-dialog').close(); await a.nodes.get('files').click(); await a.flush();
+  assert.deepEqual(heads().map(h => [h.dataset.folder, h['aria-expanded']]).slice(1), [['docs','false'],['src','true'],['src/lib','false']], 'opened again, the sheet keeps what was open (and only that)');
 });
 
 test('a page renders as a site through a preview link of its revision; SVG and images as pictures, text as text', async () => {
@@ -406,7 +443,7 @@ test('a page renders as a site through a preview link of its revision; SVG and i
     if(path.startsWith('/api/sessions/a/file?')) return {ok:true,status:200,text: async () => '<p>x</p>'};
   });
   await a.subject.openThread('a'); await a.nodes.get('files').click(); await a.flush();
-  const open = index => a.nodes.get('file-list').children[index].onclick();
+  const open = index => fileRow(a, ['site/my page.html','logo.svg','notes.txt'][index]).onclick();
   await open(0); await a.flush();
   assert(a.nodes.get('viewer-dialog').open && a.nodes.get('files-dialog').open, 'the viewer opens over the list');
   assert.equal(a.nodes.get('file-html').src, `${base}site/my%20page.html`, 'path segments are encoded');
@@ -454,7 +491,7 @@ test('GitHub preview access needs confirmation, is isolated from normal links an
   await a.confirm();
   assert.equal(a.nodes.get('file-html').src,'/github/site/index.html');
   assert.equal(a.nodes.get('file-open').href,'/github/site/index.html');
-  assert.deepEqual(a.calls.filter(c => c.path.endsWith('/preview')).map(c => c.data),[{revision:10},{revision:10,network:'github'}]);
+  assert.deepEqual(a.calls.filter(c => c.path.endsWith('/preview')).map(c => c.data),[{revision:10},{revision:10,network:'github',scripts:'site/index.html'}]);
   control.onclick(); await a.flush();
   assert.equal(a.nodes.get('file-html').src,'/isolated/site/index.html');
   control.onclick();
@@ -465,6 +502,74 @@ test('GitHub preview access needs confirmation, is isolated from normal links an
   a.nodes.get('viewer-close').onclick();
   await a.subject.openViewer('a',10,'site/index.html');
   assert.equal(a.nodes.get('file-html').src,'/isolated/site/index.html');
+});
+
+test('a page previews without its scripts until they are let run, for that version of it', async () => {
+  let digest = 'js1', page = 'page1', fetched = 'd1', notes = 'n1';
+  const a = await app((path,data) => {
+    if(path.startsWith('/api/sessions/a/files?')) return response({revision:10,files:[{path:'site/index.html',digest:page,size:1},{path:'site/app.js',digest,size:1},{path:'site/data.json',digest:fetched,size:1},{path:'site/notes.md',digest:notes,size:1}]});
+    if(path.startsWith('/api/sessions/a/file?')) return {ok:true,status:200,text: async () => path.includes('app.js') ? "fetch('data.json')" : '<script src="app.js"></script>'};
+    if(path === '/api/sessions/a/preview') return response({url:data.scripts ? '/scripted/' : '/quiet/',expires_in:1800});
+  });
+  await a.subject.openThread('a');
+  await a.subject.openViewer('a',10,'site/index.html'); await a.flush();
+  assert.equal(a.nodes.get('file-html').src,'/quiet/site/index.html','scripts off at first');
+  const scripts = a.nodes.get('file-view-scripts');
+  assert.equal(scripts.hidden,false); assert.equal(scripts.textContent,'Run scripts');
+  scripts.onclick(); for(let n = 0; n < 6; n++) await a.flush();
+  assert.equal(a.nodes.get('file-html').src,'/scripted/site/index.html');
+  assert.equal(scripts.textContent,'Stop scripts');
+  assert.deepEqual(a.calls.filter(c => c.path.endsWith('/preview')).map(c => c.data).at(-1),{revision:10,scripts:'site/index.html'},'scripts for this page only');
+  // Opened again: this version runs without asking.
+  a.nodes.get('viewer-close').onclick();
+  await a.subject.openViewer('a',10,'site/index.html'); await a.flush();
+  assert.equal(a.nodes.get('file-html').src,'/scripted/site/index.html','kept for this version');
+  // A changed script file, or a changed page, is another version: it asks again.
+  a.nodes.get('viewer-close').onclick(); digest = 'js2';
+  await a.subject.openViewer('a',11,'site/index.html'); for(let n = 0; n < 6; n++) await a.flush();
+  assert.equal(a.nodes.get('file-html').src,'/quiet/site/index.html','a new script waits for the user again');
+  a.nodes.get('viewer-close').onclick(); digest = 'js1'; page = 'page2';
+  await a.subject.openViewer('a',12,'site/index.html'); for(let n = 0; n < 6; n++) await a.flush();
+  assert.equal(a.nodes.get('file-html').src,'/quiet/site/index.html','a new page waits for the user again');
+  // A file its script names (what it fetches) is part of the version; one it never names is not.
+  page = 'page1'; notes = 'n2';
+  a.nodes.get('viewer-close').onclick();
+  await a.subject.openViewer('a',13,'site/index.html'); for(let n = 0; n < 6; n++) await a.flush();
+  assert.equal(a.nodes.get('file-html').src,'/scripted/site/index.html','an unnamed file changing asks nothing');
+  fetched = 'd2';
+  a.nodes.get('viewer-close').onclick();
+  await a.subject.openViewer('a',14,'site/index.html'); for(let n = 0; n < 6; n++) await a.flush();
+  assert.equal(a.nodes.get('file-html').src,'/quiet/site/index.html','the data its script fetches changing asks again');
+  // Stop: back to the page without them, kept so.
+  digest = 'js1';
+  a.nodes.get('viewer-close').onclick();
+  await a.subject.openViewer('a',10,'site/index.html'); await a.flush();
+  a.nodes.get('file-view-scripts').onclick(); for(let n = 0; n < 6; n++) await a.flush();
+  assert.equal(a.nodes.get('file-html').src,'/quiet/site/index.html');
+});
+
+test('where previews are contained, a page runs as it shows, under a grant that holds it to that', async () => {
+  const a = await app((path,data) => {
+    if(path.startsWith('/api/sessions/a/files?')) return response({revision:10,files:[{path:'site/index.html',digest:'p',size:1}]});
+    if(path === '/api/sessions/a/preview') return response({url:data.contained ? '/held/' : '/quiet/',expires_in:1800});
+  }, '', {RTCPeerConnection: function() {}});
+  await a.subject.openThread('a');
+  const opening = a.subject.openViewer('a',10,'site/index.html'); await a.flush();
+  // The host's check page says whether this browser keeps a running page offline.
+  const check = a.context.document.body.children.find(n => n.tagName === 'iframe');
+  assert.equal(check.src,'/api/preview/check'); assert.equal(check.hidden,true);
+  a.events.message({source: check.contentWindow, data: {spindleContained: true}});
+  await opening; await a.flush();
+  assert.equal(check.removed,true);
+  assert.equal(a.nodes.get('file-html').src,'/held/site/index.html','it runs, unasked');
+  assert.equal(a.nodes.get('file-view-scripts').hidden,true,'nothing to let');
+  assert.deepEqual(a.calls.filter(c => c.path.endsWith('/preview')).map(c => c.data),[{revision:10,scripts:true,contained:true}]);
+  // Asked once; one grant runs every page of the revision.
+  a.nodes.get('viewer-close').onclick();
+  await a.subject.openViewer('a',10,'other.html'); await a.flush();
+  assert.equal(a.nodes.get('file-html').src,'/held/other.html');
+  assert.equal(a.calls.filter(c => c.path.endsWith('/preview')).length,1);
+  assert.equal(a.context.document.body.children.filter(n => n.tagName === 'iframe').length,1);
 });
 
 test('Files is a full-height list until a file opens; the viewer then fills the screen', async () => {
@@ -479,11 +584,17 @@ test('Files is a full-height list until a file opens; the viewer then fills the 
   await a.nodes.get('files').click(); await a.flush();
   assert.equal(a.nodes.get('thread-dialog').open, false); assert(a.nodes.get('files-dialog').open);
   assert.equal(a.nodes.get('viewer-dialog').open, false, 'only the list until a file is chosen');
-  assert.equal(a.nodes.get('file-list').children.length, 14);
+  const list = a.nodes.get('file-list'), head = () => list.children[0].children[0];
+  assert.equal(list.children.length, 1); assert.equal(head()['aria-expanded'], 'false', 'a folder starts shut');
+  assert.match(textOf(head()), /src.*14 files/);
+  head().onclick(); assert.equal(head()['aria-expanded'], 'true'); assert.equal(list.children[0].children[1].children.length, 14, 'opened, it lists its files');
   assert.equal(a.nodes.get('file-filter').hidden, false, 'a long list can be filtered');
   a.nodes.get('file-filter').value = 'file1'; a.nodes.get('file-filter').oninput();
-  assert.deepEqual(a.nodes.get('file-list').children.filter(row => !row.hidden).map(row => row.dataset.path), ['src/file1.rs','src/file10.rs','src/file11.rs','src/file12.rs','src/file13.rs']);
-  await a.nodes.get('file-list').children[1].onclick(); await a.flush();
+  assert.deepEqual(list.children.map(row => row.dataset.path), ['src/file1.rs','src/file10.rs','src/file11.rs','src/file12.rs','src/file13.rs'], 'a filter lists the matching paths');
+  a.nodes.get('file-filter').value = ''; a.nodes.get('file-filter').oninput();
+  assert.equal(head()['aria-expanded'], 'true', 'cleared, the folders are as they were');
+  a.nodes.get('file-filter').value = 'file1'; a.nodes.get('file-filter').oninput();
+  await list.children[0].onclick(); await a.flush();
   assert(a.nodes.get('viewer-dialog').open); assert.equal(a.nodes.get('viewer-back').hidden, false, 'a way back to all files');
   assert.equal(a.nodes.get('file-view-name').textContent, 'file1.rs'); assert.match(a.nodes.get('file-view-meta').textContent, /^src\/ · r10$/);
   assert.equal(a.nodes.get('file-content').textContent, 'fn main() {}\n');
@@ -623,9 +734,13 @@ test('providers list sign-in state; web sign-in links the URL and the pasted cod
   });
   await a.nodes.get('settings').onclick(); await a.flush();
   const rows = a.nodes.get('logins').children;
-  assert.deepEqual(rows.map(r => r.children[1].textContent),['not signed in','signed in','no sign-in needed']);
-  assert.equal(rows[2].children.length,2,'nothing to sign in to');
-  rows[0].children[2].onclick(); assert.equal(a.nodes.get('login-form').hidden,false);
+  // A row: its mark, name and state, then icons (each named) to sign in, again, or out.
+  assert.deepEqual(rows.map(r => r.children[2].textContent),['not signed in','signed in','no sign-in needed']);
+  assert.deepEqual(rows.map(r => r.className),['login-row','login-row ok','login-row'],'a filled square for a sign-in held; none needed is not one');
+  assert.equal(rows[2].children.length,3,'nothing to sign in to');
+  assert.deepEqual(rows[1].children.slice(3).map(b => b['aria-label']),['Sign in to GLM again','Sign out of GLM']);
+  assert.equal(rows[0].children[3]['aria-label'],'Sign in to ChatGPT');
+  rows[0].children[3].onclick(); assert.equal(a.nodes.get('login-form').hidden,false);
   await a.nodes.get('login-start').onclick(); await a.flush();
   const link = a.nodes.get('login-message').children.find(n => n.tagName === 'a');
   assert.equal(link.href,'https://auth.example.com/authorize?x=1'); assert.equal(link.rel,'noopener noreferrer');
@@ -635,7 +750,7 @@ test('providers list sign-in state; web sign-in links the URL and the pasted cod
   assert.equal(a.calls.filter(c => c.path === '/api/login').at(-1).data.credential,'https://localhost/callback?code=SECRET-CODE');
   assert.equal(step,2); assert.equal(a.nodes.get('login-form').hidden,true); assert.equal(a.nodes.get('login-credential').value,'');
   assert(![...a.storage.values()].some(v => String(v).includes('SECRET-CODE')),'the credential never reaches local storage');
-  a.nodes.get('logins').children[1].children[2].onclick(); assert(a.nodes.get('confirm-dialog').open); await a.confirm();
+  a.nodes.get('logins').children[1].children[4].onclick(); assert(a.nodes.get('confirm-dialog').open); await a.confirm();
   assert.deepEqual(a.calls.filter(c => c.path === '/api/logout').at(-1).data,{provider:'glm'});
 });
 
@@ -643,7 +758,7 @@ test('usage, compaction and a provider refusal are shown where they matter', asy
   const usage = {calls:3,input:120000,output:4500,cache_read:80000,cache_create:0,usd:0.4213,priced:3};
   const a = await app(path => path.endsWith('/snapshot') ? response(state({provider:'glm',model:'glm-5.3',usage,compaction:'digest'})) : undefined);
   await a.subject.openThread('a');
-  assert.equal(a.nodes.get('subtitle').textContent,'$0.421');
+  assert.equal(a.nodes.get('spend').textContent,'$0.421');
   a.nodes.get('title-button').onclick();
   assert.equal(a.nodes.get('settings-usage').textContent,'Spent 3 calls · 120K in · 4.5K out · 80K cached · $0.421');
   const [model, digest] = a.nodes.get('compaction-choice').children;
@@ -674,9 +789,10 @@ test('each turn, the thread, the thread list and the host show spend; the budget
     if(path.endsWith('/snapshot')) return response(snapshot);
     if(path.startsWith('/api/usage?tz=')) return response({today:{usd:0.05},month:{usd:1.5},all:{usd:12.25,unknown:2},threads:[]});
   });
-  assert.match(textOf(a.nodes.get('sessions').children[0]), /DONE · .* · \$0\.052/);
+  assert.match(textOf(a.nodes.get('sessions').children.find(n => n.className?.startsWith('session-row'))), /Alpha .* Finished · \$0\.052/);
   await a.subject.openThread('a');
-  assert.equal(a.nodes.get('subtitle').textContent, '$0.052 of $5.00', 'the title line carries what the thread cost');
+  assert.equal(a.nodes.get('spend').textContent, '$0.052', 'the header carries what the thread cost');
+  assert.equal(a.nodes.get('spend')['aria-label'], 'Spent $0.052 of $5.00. Usage and limit');
   const labels = a.nodes.get('history').children.filter(n => n.className === 'meta turn-cost').map(n => n.textContent);
   assert.deepEqual(labels, ['$0.012 · 1 call', '$0.040 · 3 calls · 1 may have been billed'], 'each prompt carries its turn\'s cost');
   await a.subject.home(); await a.nodes.get('settings').onclick(); await a.flush();
@@ -945,12 +1061,19 @@ test('the model chip opens one sheet: providers with their models, only the effo
   assert.equal(active.dataset.model, 'glm-5.3');
   assert.match(textOf(active), /\$1\.40 \/ \$4\.40 per Mtok · 200K context/);
   assert.match(textOf(rowsOf(a).find(r => r.dataset.model === 'gpt-5.6')), /subscription · 1\.1M context.*image/);
-  assert.deepEqual(effortsShown(a), ['default','off','low','medium','high','max']);
+  // The levels the model takes; auto is no button of its own: the model's default level is
+  // outlined while none is chosen, and the line under them names it.
+  assert.deepEqual(effortsShown(a), ['off','low','medium','high','max']);
+  assert.equal(a.nodes.get('effort-choice').children.find(b => b.className === 'active').dataset.effort, 'max');
+  assert.match(textOf(a.nodes.get('effort-default')), /High is this model's default\./);
+  assert.equal(a.nodes.get('effort-default').children.find(n => n.className === 'link-like')?.textContent, 'Use the default', 'a chosen level can go back to auto');
   assert.equal(a.nodes.get('model-apply').textContent, 'Done', 'nothing changed yet');
   // A model with fewer levels: an effort it does not take falls back to auto.
   rowsOf(a).find(r => r.dataset.model === 'glm-5.2').onclick();
-  assert.deepEqual(effortsShown(a), ['default','off','high']);
-  assert.equal(a.nodes.get('effort-choice').children.find(b => b.className === 'active').dataset.effort, 'default');
+  assert.deepEqual(effortsShown(a), ['off','high']);
+  assert.equal(a.nodes.get('effort-choice').children.find(b => b.className === 'active'), undefined, 'none chosen: auto');
+  assert.equal(a.nodes.get('effort-choice').children.find(b => b.className === 'auto').dataset.effort, 'high', 'the level auto takes, outlined');
+  assert.match(textOf(a.nodes.get('effort-default')), /High is this model's default; none chosen\./);
   assert.match(a.nodes.get('model-note').textContent, /^Next turn: glm-5\.2 · auto effort$/);
   a.nodes.get('effort-choice').children.find(b => b.dataset.effort === 'high').onclick();
   a.nodes.get('picker-network').checked = true; a.nodes.get('picker-network').onchange();
@@ -1013,7 +1136,7 @@ test('without the host catalog the picker still offers each provider\'s model an
   await a.nodes.get('model-chip').onclick(); await a.flush();
   assert(a.subject.catalog.fallback);
   assert.deepEqual(rowsOf(a).map(r => [r.dataset.provider, r.dataset.model]), [['glm','demo']]);
-  assert.deepEqual(effortsShown(a), ['default','off','low','medium','high','xhigh','max']);
+  assert.deepEqual(effortsShown(a), ['off','low','medium','high','xhigh','max']);
 });
 
 test('typed settings: model, network, toolchain, budget and compaction go through the settings command', async () => {
@@ -1217,4 +1340,50 @@ test('workspace paths in replies, prompts and tool results open the file viewer 
   // Tool cards say what came back, collapsed.
   const subs = a.nodes.get('history').descendants().filter(n => n.className === 'tool-sub').map(n => n.textContent);
   assert.deepEqual(subs, ['/workspace/tests/upload.rs:7: sleep(50)', '+1 −1', '2 lines']);
+});
+
+test('steps fold into one row, Stop takes Send\'s place, a steered message is a checked bubble, and a delete waits a moment for Undo', async () => {
+  const calls = [1,2,3].map(n => ({type:'tool_use', id:`c${n}`, name:'bash', input:{command:`echo ${n}`}}));
+  const results = [1,2,3].map(n => ({type:'tool_result', tool_use_id:`c${n}`, content: n === 2 ? 'boom' : 'ok', is_error: n === 2}));
+  const messages = [{role:'assistant',content:[{type:'text',text:'Checking.'},...calls]},{role:'user',content:[...results,{type:'text',text:'x',steer:'also this'}]}];
+  const a = await app(path => path.endsWith('/snapshot') ? response(state({messages})) : undefined);
+  await a.subject.openThread('a');
+  // Three calls in a row: one folding row, its failure counted; the cards inside it.
+  const group = a.nodes.get('history').children.find(n => n.className === 'steps');
+  assert(group, 'a run of steps is one group');
+  assert.deepEqual(group.children.slice(1).map(c => c.dataset.call), ['c1','c2','c3']);
+  assert.match(textOf(group.children[0]), /Ran 3 steps/);
+  assert.equal(group.children[0].children.find(n => n.className === 'steps-count')?.['aria-label'], '1 failed');
+  assert.equal(group.open, false, 'folded until opened');
+  // What was sent while it ran: a bubble, checked once read.
+  const steered = a.nodes.get('history').children.find(n => n.children?.[0]?.textContent === 'YOU · WHILE RUNNING');
+  assert.equal(steered.children[0].children.find(n => n.tagName === 'svg')?.['aria-label'], 'Read by the running turn');
+  // While a run goes, Stop is in Send's place until something is written.
+  a.subject.render(state({busy:true, complete:false}));
+  assert.equal(a.nodes.get('stop').hidden, false); assert.equal(a.nodes.get('send').hidden, true);
+  a.nodes.get('prompt').value = 'steer it'; a.nodes.get('prompt').oninput();
+  assert.equal(a.nodes.get('stop').hidden, true); assert.equal(a.nodes.get('send').hidden, false);
+  a.nodes.get('prompt').value = ''; a.nodes.get('prompt').oninput();
+  // Delete from a row's ⋯: off the list at once, Undo brings it back; nothing is sent until
+  // the moment passes.
+  await a.subject.home(); await a.flush();
+  const rows = () => a.nodes.get('sessions').children.filter(n => typeof n.className === 'string' && n.className.startsWith('session-row'));
+  const named = () => rows().map(r => textOf(r).includes('Alpha') ? 'Alpha' : 'Beta');
+  assert.deepEqual(named(), ['Alpha','Beta']);
+  const deleting = () => {rows()[0].children[1].onclick({stopPropagation() {}}); a.nodes.get('sessions').children.find(n => n.className === 'row-actions').children[0].onclick();};
+  deleting();
+  assert.deepEqual(named(), ['Beta']); assert.match(a.nodes.get('toast').textContent, /Deleted “Alpha”/);
+  const undo = a.nodes.get('toast').children.find(n => n.className === 'toast-action');
+  assert.equal(undo.textContent, 'Undo');
+  undo.onclick({stopPropagation() {}});
+  assert.deepEqual(named(), ['Alpha','Beta']);
+  assert(!a.calls.some(c => c.data?.kind === 'delete'), 'nothing sent before the moment passes');
+  // Going back into it (the browser's Back, say) keeps it too.
+  deleting(); await a.subject.openThread('a'); await a.subject.home(); await a.flush();
+  assert.deepEqual(named(), ['Alpha','Beta']); a.subject.finishDelete();
+  assert(!a.calls.some(c => c.data?.kind === 'delete'), 'reopened, it was kept');
+  deleting(); a.subject.finishDelete(); await a.flush();
+  const sent = a.calls.filter(c => c.data?.kind === 'delete');
+  assert.deepEqual(sent.map(c => c.data.session), ['a']);
+  assert(!('expected_revision' in sent[0].data), 'a delete names no revision of another thread');
 });

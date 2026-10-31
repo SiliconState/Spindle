@@ -35,9 +35,30 @@ pub(crate) struct Bridge<'a> {
     pub session: &'a str,
     /// The app's HTTP grants (a code policy's `http` list).
     pub http: &'a Value,
+    /// The session's budget and what it (and its task tree) spent, when it has one.
+    pub budget: Option<(f64, f64)>,
 }
 
 impl CodeHost for Bridge<'_> {
+    /// Under a budget, new nested model calls fit at their worst case beside what was
+    /// spent, or none is sent (as a native host admits them).
+    fn admit_spend(&mut self, prepared: &[&Value], _journal: &[&Value]) -> Result<(), String> {
+        let Some((max, spent)) = self.budget else {
+            return Ok(());
+        };
+        let cost = crate::spend::nested_worst(Some(self.catalog.provider_catalog()), prepared)
+            .map_err(|(provider, model)| crate::spend::unpriced_text(&provider, &model, max))?;
+        if spent + cost > max {
+            return Err(format!(
+                "spending limit: this thread has spent {} of its {} budget and the new nested call(s) could cost up to {}; nothing was sent",
+                crate::spend::dollars(spent),
+                crate::spend::dollars(max),
+                crate::spend::dollars(cost)
+            ));
+        }
+        Ok(())
+    }
+
     fn discover(&mut self, method: &str, input: &Value) -> Result<Value, String> {
         if method == "describe" {
             let name = input["name"].as_str().ok_or("tool name required")?;

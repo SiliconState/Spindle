@@ -14,7 +14,7 @@ use crate::agent::{self, Finding, Result, Settings, Status, Target};
 use crate::view::View;
 use dext_core::turn::{Phase, Stop};
 use dext_transcript::Block;
-use dext_transcript::turn::{Effect, TurnContinuation};
+use dext_transcript::turn::Effect;
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -172,11 +172,12 @@ fn recovery_with(dir: &Path, probe: bool) -> Result<Value> {
         let task_runs = view.task_runs()?;
         let mut items = vec![];
         let inputs = view.queued_inputs()?;
-        for (id, payload) in inputs.iter().take(256) {
+        for (_, id, payload) in inputs.iter().take(256) {
             let action = crate::turn::Action::decode(payload)?;
             let (kind, next, why) = match action {
                 crate::turn::Action::Start { .. } => ("prompt", "prompt", "a prompt was admitted but not committed; resubmit it with its original files and state"),
                 crate::turn::Action::Steer { .. } => ("steer", "continue", "a steering update was admitted; continue commits the retained update"),
+                crate::turn::Action::TaskReport { .. } => ("transition", "continue", "a task's report was admitted; continue commits it (or, its task having moved on since, drops it for the report as the task stands)"),
                 _ => ("transition", "continue", "a local transition was admitted; continue replays its retained action"),
             };
             items.push(json!({"kind":kind,"id":id,"outcome":"known","next":next,"why":why}));
@@ -187,7 +188,7 @@ fn recovery_with(dir: &Path, probe: bool) -> Result<Value> {
         if head == 0 {
             return Ok((head, None, crashes, queued, items, task_runs));
         }
-        let Ok(state) = TurnContinuation::restore(&continuation) else {
+        let Ok(state) = crate::turn::restored(&continuation) else {
             return Err(crate::Error::Incompatible);
         };
         for effect in state
@@ -301,7 +302,7 @@ fn recovery_with(dir: &Path, probe: bool) -> Result<Value> {
         let mut unknown = false;
         let (outcome, next, why) = match run.state.as_str() {
             "finished" => ("recorded", "continue", "its saved answer is waiting to be delivered to the parent".to_string()),
-            "stopped" => ("blocked", "settle", "its worker stopped without an answer; inspect its session and explicitly start the same task again".to_string()),
+            "stopped" => ("recorded", "continue", "it stopped without an answer; continue tells the parent so, and why when it says (starting the same task again takes it up instead)".to_string()),
             _ => {
                 let input = serde_json::from_slice::<Value>(&run.input).map_err(|_| "invalid retained task input".to_string());
                 let recovery = input.and_then(|input| agent::tasks::validate_input(dir, &run.task, &input)).and_then(|()| report_of(&child, probe));

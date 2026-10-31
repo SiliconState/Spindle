@@ -1,7 +1,8 @@
-// Spindle's service worker: the toolbar button opens the panel, and it does the page
-// tools' work for the engine (the engine's document cannot reach tabs). Reading needs
-// page reading on; acting needs page actions on as well (chrome.debugger: clicks, keys
-// and typing reach the page as the user's would, and a tab's network can be watched).
+// Spindle's service worker: the toolbar button opens the panel, it serves the frame
+// previews show pages in, and it does the page tools' work for the engine (the engine's
+// document cannot reach tabs). Reading needs page reading on; acting needs page actions
+// on as well (chrome.debugger: clicks, keys and typing reach the page as the user's
+// would, and a tab's network can be watched).
 import { ACTING_NAMES, PAGE_ACCESS, PICTURE_ACCESS, pageSwitches, uncertain } from './page-tools.mjs';
 import { read, write } from './shared.mjs';
 
@@ -15,6 +16,44 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
   const access = reason === 'update' && (await chrome.permissions.contains({ origins: PAGE_ACCESS }));
   await write('kv', 'pages', { reading: access, acting: false }).catch(() => {});
 });
+
+// Pages a thread made show in preview.html (page.mjs), served from here as packaged, with
+// a Connection-Allowlist that no page can set or widen: Chrome (152 and later) then makes
+// no connection for the page, or for any frame or worker it makes, that the list does not
+// name. That reaches what a page's policy cannot (WebRTC, resource hints, navigations).
+// The list names nothing, or for a page the user let reach the web (`?reach=web`), HTTPS
+// anywhere (WebRTC stays shut). preview.js tells whether the list holds; a frame not
+// served from here (one that skipped this worker, or came before it was active) shows
+// pages as if it did not.
+const PREVIEW = new URL('preview.html', location.href).pathname;
+const REACH = { none: '()', web: '("https://*:*")' };
+
+// Only where Chrome has static routes (123 and later): there only previews come to the
+// handler, and every other request of Spindle's pages and workers goes on as if there
+// were none (the worker is not woken for each). Without them it serves nothing (no
+// Chrome that old holds a Connection-Allowlist anyway): previews show uncontained.
+if ('addRoutes' in (self.InstallEvent?.prototype ?? {})) {
+  self.addEventListener('install', (event) => {
+    event.waitUntil(event.addRoutes([
+      { condition: { urlPattern: new URLPattern({ pathname: PREVIEW }) }, source: 'fetch-event' },
+      { condition: { urlPattern: new URLPattern({}) }, source: 'network' },
+    ]).catch((error) => console.warn('Spindle: previews go through the fetch handler with everything else:', error)));
+  });
+  self.addEventListener('fetch', (event) => {
+    const url = new URL(event.request.url);
+    if (url.origin !== location.origin || url.pathname !== PREVIEW || event.request.mode !== 'navigate') return;
+    event.respondWith(preview(url));
+  });
+}
+
+async function preview(url) {
+  const packaged = await fetch(PREVIEW);
+  const headers = new Headers(packaged.headers);
+  const sandbox = chrome.runtime.getManifest().content_security_policy?.sandbox;
+  if (sandbox) headers.set('Content-Security-Policy', sandbox);
+  headers.set('Connection-Allowlist', url.searchParams.get('reach') === 'web' ? REACH.web : REACH.none);
+  return new Response(packaged.body, { status: packaged.status, headers });
+}
 
 const TOOLS = {
   list_tabs: listTabs, read_page: readPage, page_elements: pageElements, page_html: pageHtml, screenshot,

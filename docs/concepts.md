@@ -151,9 +151,24 @@ A **task** is a child session the model starts with the `task` tool when the ses
 `tasks` setting is on. It has its own store, rewind and recovery in a directory under
 `tasks/` named by a hash of the call's effect id, works on a copy of the parent's
 workspace, and its answer becomes the tool result. Unless the call says `files: "discard"`, the files it changed land in the
-parent's workspace with that result. Its spend counts against the parent. Given as an
+parent's workspace with that result. A background task (`background: true`, or an
+app's `task_start` with `report: "queue"`) returns immediately; files stay in the
+child and a durable report reaches the parent later: its answer, or that it stopped,
+with a reason when available. A finished parent turn waits for running tasks; a
+stopped child reports rather than wedging the parent. Starting the same id again
+resumes that child with matching input. Reports are delivered once per lineage;
+a rewind before a report makes it readable again. See
+[`turn.rs`](../spindle/store/src/turn.rs) and [API.md](API.md#task_start).
+
+Both hosts support tasks and dollar budgets. Native child spend counts in the
+parent's report, with leases reserving task allowances; the embedded host shares
+the task tree's spend and in-flight worst cases while its hosts are open, and
+reports only each session's own spend through `usage`. A `max_usd` cap refuses a
+fresh request before sending when its worst case will not fit; both hosts use the
+same [`spend.rs`](../spindle/store/src/spend.rs) ledger. Given as an
 object (`max_depth`, `max_running`, `models`), the `tasks` setting bounds depth,
-concurrency and which models tasks may use.
+concurrency and which models tasks may use. See [driver.md](driver.md#budgets-and-cost-accounting)
+and [embedded.md](embedded.md#settings-and-limits) for accounting and restart limits.
 
 ## Isolation and runners
 

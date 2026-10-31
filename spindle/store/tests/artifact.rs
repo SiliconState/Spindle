@@ -282,7 +282,7 @@ fn live_object_read_rejects_oversized_persisted_value() {
 }
 
 #[test]
-fn digest_damage_fences_live_read_and_reopen() {
+fn digest_damage_fences_live_read_and_every_read_after_reopen() {
     let realm = Realm::new();
     let mut store = Store::open(&realm.0).unwrap();
     let stage = stage(&mut store);
@@ -299,5 +299,14 @@ fn digest_damage_fences_live_read_and_reopen() {
     ));
     drop(db);
     drop(store);
-    assert!(matches!(Store::open(&realm.0), Err(Error::Incompatible)));
+    // An open leaves objects to their reads (it never hashes them all): the damaged
+    // one is refused wherever it is read, and by the full check.
+    let mut store = Store::open(&realm.0).unwrap();
+    assert!(matches!(
+        store.read_object("operator", &id),
+        Err(Error::Incompatible)
+    ));
+    drop(store);
+    let mut store = Store::open(&realm.0).unwrap();
+    assert!(matches!(store.check_integrity(), Err(Error::Incompatible)));
 }

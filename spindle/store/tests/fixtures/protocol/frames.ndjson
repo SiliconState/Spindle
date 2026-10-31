@@ -29,4 +29,4 @@
 {"error":{"code":-32004,"data":{"code":"not_found"},"message":"no session in /nonexistent-spindle-golden/x"},"id":25,"jsonrpc":"2.0"}
 {"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`dir` is required"},"id":26,"jsonrpc":"2.0"}
 {"error":{"code":-32602,"data":{"code":"bad_request"},"message":"`dir` is required"},"id":27,"jsonrpc":"2.0"}
-{"id":28,"jsonrpc":"2.0","result":{"api_version":1,"build":"BUILD","engine":"dext-turn-v1","features":["events","expected_head","steering","attachments","import","revisions","export","doctor","usage","display","steer_now","app_tools","state","recover","tasks","session_transfer"],"schema":19,"transport":"stdio","version":"0.1.0"}}
+{"id":28,"jsonrpc":"2.0","result":{"api_version":1,"build":"BUILD","engine":"dext-turn-v1","features":["events","expected_head","steering","attachments","import","revisions","export","doctor","usage","display","steer_now","app_tools","state","recover","tasks","session_transfer","capabilities"],"schema":20,"transport":"stdio","version":"0.1.0"}}

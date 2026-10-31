@@ -39,6 +39,23 @@ RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$(cd .. && pwd)=/src --r
 rm -rf "$out"
 mkdir -p "$out/clients" "$out/icons"
 "$bindgen" --target web --out-dir "$out/web" target/wasm32-unknown-unknown/release/spindle_embed.wasm
+# The engine gives a grown wasm instance's memory back by loading a fresh copy of the
+# glue (engine-worker.mjs `renewEngine`): a module is never unloaded, so this one lets go of
+# its instance and of the views of its memory. Nothing in it is used after.
+for held in '^let wasmModule, wasmInstance, wasm;$' '^let cachedDataViewMemory0 = null;$' \
+    '^let cachedUint8ArrayMemory0 = null;$'; do
+    grep -q "$held" "$out/web/spindle_embed.js" || {
+        echo "the wasm-bindgen glue keeps its instance some other way: check chrome/glue-drop.js" >&2
+        exit 1
+    }
+done
+# And only those two views: one more would be kept by the old instance's glue.
+views=$(grep -c '^let cached.*Memory0' "$out/web/spindle_embed.js" || true)
+[ "$views" = 2 ] || {
+    echo "the wasm-bindgen glue keeps $views views of its memory, not 2: check chrome/glue-drop.js" >&2
+    exit 1
+}
+cat chrome/glue-drop.js >> "$out/web/spindle_embed.js"
 cp chrome/manifest.json chrome/background.js chrome/engine.html chrome/engine.mjs chrome/engine-worker.mjs \
     chrome/linux-frames.mjs chrome/linux-net.mjs chrome/linux-route.mjs chrome/linux-runner.mjs chrome/linux-worker.mjs chrome/linux-workspace.mjs \
     chrome/wasm-linux-worker.mjs chrome/page-tools.mjs chrome/shared.mjs chrome/signin.mjs chrome/vault.mjs chrome/panel.html \
@@ -57,4 +74,37 @@ cp chrome/icons/*.png "$out/icons/"
 cp clients/js/common.mjs clients/js/embedded.mjs clients/js/opfs.mjs "$out/clients/"
 cp store/ui/text.js store/ui/theme.js "$out/"
 cp chrome/THIRD-PARTY.md "$out/"
+# What this build is made of (Settings, About shows it; a report of a fault can name
+# it): the sources' commits, marked when they had changes, the tools, the engine wasm's
+# digest and each Linux image's identity. It names no directory of the machine.
+revision() {
+    local rev
+    rev=$(git -C "$1" rev-parse --short=12 HEAD 2>/dev/null) || { echo unknown; return; }
+    [ -z "$(git -C "$1" status --porcelain -- . 2>/dev/null)" ] || rev="$rev-dirty"
+    echo "$rev"
+}
+# Each one worked out first: a step that fails stops the build, not a blank field.
+built_version=$(sed -n 's/^ *"version": "\([^"]*\)",*$/\1/p' chrome/manifest.json | head -1)
+built_spindle=$(revision .)
+built_engine=$(revision ../dext-engine)
+built_rustc=$(rustc -V | cut -d' ' -f2)
+built_wasm=$(sha256sum "$out/web/spindle_embed_bg.wasm" | cut -c1-64)
+built_linux=$(tr -d '\n' < "$linux/identity")
+built_wasm_linux=null
+if [ -n "$wasm_linux" ]; then built_wasm_linux="\"$(tr -d '\n' < "$wasm_linux/identity")\""; fi
+for value in "$built_version" "$built_rustc" "$built_wasm" "$built_linux"; do
+    [ -n "$value" ] || { echo "build.json: a value could not be worked out" >&2; exit 1; }
+done
+cat > "$out/build.json" <<BUILD
+{
+  "version": "$built_version",
+  "spindle": "$built_spindle",
+  "engine": "$built_engine",
+  "wasm_bindgen": "$have",
+  "rustc": "$built_rustc",
+  "wasm": "$built_wasm",
+  "linux": "$built_linux",
+  "wasm_linux": $built_wasm_linux
+}
+BUILD
 echo "Spindle for Browser in $out ($(du -h "$out/web/spindle_embed_bg.wasm" | cut -f1) wasm, $(du -sh "$out/linux" | cut -f1) Linux$([ -n "$wasm_linux" ] && echo ", $(du -sh "$out/wasm-linux" | cut -f1) wasm Linux"))"

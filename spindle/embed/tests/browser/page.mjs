@@ -2,7 +2,8 @@
 // refused while A holds the session's Web Lock; once A closes, B opens it and reads
 // what A wrote. On a second launch (`?phase=reopen`, the same browser profile) a new
 // worker reopens the session and runs another turn, then moves it by bundle to another
-// OPFS place and goes on there. Results go to `window.result`.
+// OPFS place and goes on there, and compacts a session with free pages (imported from a
+// bundle made under Node). Results go to `window.result`.
 const phase = new URLSearchParams(location.search).get('phase') || 'first';
 function worker() {
   const w = new Worker('./worker.mjs', { type: 'module' });
@@ -60,6 +61,7 @@ try {
     steps.push(['c.import', await c.ask('import', { dir: '/sessions/b', base64: exported.base64 })]);
     steps.push(['c.read.b', await c.ask('read', { dir: '/sessions/b', path: 'a.txt' })]);
     steps.push(['c.prompt.b', await c.ask('prompt', { dir: '/sessions/b' })]);
+    steps.push(['c.compact', await c.ask('compact', { dir: '/sessions/f' })]);
     steps.push(['c.close', await c.ask('close')]);
     steps.push(['c.pool', await c.ask('pool', { phase })]);
   }

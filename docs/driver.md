@@ -58,7 +58,7 @@ flowchart LR
 | [`protocol.rs`](../spindle/store/src/protocol.rs) | The JSON-RPC protocol shared by `spindle api` and the embedded package: turn operations, event JSON, phase and stop codes. |
 | [`shape.rs`](../spindle/store/src/shape.rs) | Pure request shaping: route, reasoning fields, tools, system prompt, history budget, request body. |
 | [`agent.rs`](../spindle/store/src/agent.rs) | The native `Session`: the drive loop, model sends, tool runs, steering, stop, retry. |
-| [`agent/cost.rs`](../spindle/store/src/agent/cost.rs) | Spend accounting, the usage ledger and dollar budgets. |
+| [`spend.rs`](../spindle/store/src/spend.rs), [`agent/cost.rs`](../spindle/store/src/agent/cost.rs) | Shared spend ledger and budget checks; native files and task leases around them. |
 
 The store's tables, revisions, receipts and rewinds are described in
 [store.md](store.md); the engine's turn state (`TurnContinuation`, `TurnControl`,
@@ -221,7 +221,7 @@ intents; pending ones are never re-published.
 | `finish-r<N>` | `Finish` | `commit-finish-r<N>` | A tool-free reply ends the turn. |
 | `extend-r<N>` | `Extend` | `commit-extend-r<N>` | Continue after the step limit. |
 | `state-r<N>-<digest>` | `State { patch }` | `commit-state-r<N>-<digest>` | An app-state merge patch. |
-| `task-report-<task>` | `TaskReport { task, text }` | `commit-task-report-<task>` | A finished background task's answer joins the turn. |
+| `task-report-<task>` | `TaskReport { task, text }` | `commit-task-report-<task>` | A background task's retained answer or stopped report joins the turn. |
 | (none) | (receipt) | `adopt-r<N>` | A model reply or tool result is adopted. |
 
 `<N>` is the head revision the step was decided at. The codec also defines `Budget` and
@@ -429,7 +429,13 @@ The driver commits the next one as a `Steer` step at the turn's next boundary: b
 preparing a request (`ready`, `after_tools`) and before finishing (`final_review`, which
 reopens the turn so the model answers it). Each is admitted as `steer-r<N>` before it is
 committed. Running tool calls are never interrupted by steering; the message follows
-their results. Finished background task reports are delivered before steering.
+their results. Background task reports are delivered before steering: an answer,
+or a stopped report with the reason when available. A child that could not go on
+does not wedge the parent. Reports are committed with delivery state; rewinding
+before one makes it readable again on the new lineage. See
+[`turn.rs`](../spindle/store/src/turn.rs),
+[`driver_summary.rs`](../spindle/store/src/driver_summary.rs) and
+[`embedded/host.rs`](../spindle/store/src/embedded/host.rs).
 
 - A steering message is at most 64 KiB (`MAX_STEER`); the native inbox skips empty
   messages and longer ones. The API accepts up to 32 waiting messages, and 32 waiting
@@ -468,7 +474,7 @@ the turn at its next safe point:
 | Backoff wait | The wait ends with the backoff's stop message; the refused or dropped request keeps its outcome for `continue`. |
 | Tool call running | The command is ended; its candidate workspace is discarded. When the session is opened again, `continue` records the call as not completed; it never runs again. |
 | App call | The app receives the flag; an `AppAnswer::Stopped` records nothing and the call is asked again on `continue`. |
-| Waiting for tasks | Running tasks are stopped. |
+| Waiting for tasks | Native stops the tasks. Embedded ends a finished turn's wait as complete and leaves tasks running; reports wait for the next turn. |
 
 A stop commits no `cancelled` step: the head stays where the work was, and `continue`
 resolves it as described in [Crash and restart](#crash-and-restart).
@@ -476,16 +482,19 @@ resolves it as described in [Crash and restart](#crash-and-restart).
 ## Budgets and cost accounting
 
 The driver asks its `Env` two questions: whether the budget refuses a request
-(`budget_refusal`) and what a recorded call cost (`counted`). The native host answers
-them from its spend ledger in [`agent/cost.rs`](../spindle/store/src/agent/cost.rs),
-described here; the embedded host's `Env` refuses nothing and counts nothing.
+(`budget_refusal`) and what a recorded call cost (`counted`). Both hosts answer
+from the same ledger in [`spend.rs`](../spindle/store/src/spend.rs). The native
+wrapper is [`agent/cost.rs`](../spindle/store/src/agent/cost.rs); the embedded
+wrapper is [`embedded/env.rs`](../spindle/store/src/embedded/env.rs).
 
 Spend is counted from durable records only: recorded replies (including
 ones a rewind abandoned), model-written compaction summaries (each journaled in its own
 stage) and nested `model()` calls of `run_code` scripts. Each call is priced when it is
 first counted, and that price is kept, so a later catalog change never rewrites
-history. The ledger is the store's `usage` metadata, mirrored to `usage.json` in the
-session directory.
+history. The ledger is the store's `usage` metadata; the native host mirrors it to
+`usage.json`. Embedded calls counted here are undated. Without `max_usd`, the
+embedded host does no accounting work during a turn and emits no `cost`; `usage`
+counts from the records when asked. With a budget it counts each call as it goes.
 
 | Billing | Meaning |
 | --- | --- |
@@ -501,7 +510,7 @@ cached tokens) and, through `Env::counted`, `Cost { usd, turn, total, billing }`
 reports no new cost.
 
 **Budgets.** `Settings::max_usd` caps a thread's spend. Before every fresh send the
-driver calls `Env::budget_refusal`; the native host refuses the request when its worst
+driver calls `Env::budget_refusal`; either host refuses the request when its worst
 case plus what the thread has spent would exceed the budget. What counts as spent is the billed
 total plus the worst case of every request whose outcome is unknown. The worst case of a
 request is its body's text at three ASCII bytes per token (any other byte one token),
@@ -509,17 +518,24 @@ each inline image at 10,000 tokens, billed as fresh input or cache write (whiche
 dearer), plus every output token it allows. With a budget set, a model without a catalog
 price is refused; a subscription request costs nothing. The refusal is an error
 (`spending limit: ...`), which `spindle api` reports as the `budget` error (`-32007`) and
-`/v1` as a `command_done` with `code: "budget"` ([API.md](API.md#errors)); the prepared
-request stays `not_sent`, and `continue` sends it
-once the budget is raised or cleared (`Session::set_budget`, `spindle continue --max-usd`).
+`/v1` as a `command_done` with `code: "budget"`; the embedded backend returns
+`failed` for the same refusal ([API.md](API.md#errors)). The prepared request stays
+`not_sent`, and `continue` sends it once the budget is raised or cleared
+(`Session::set_budget`, `spindle continue --max-usd`).
 A budget can be changed at any point of a turn.
 
-**Task leases.** When a session with a budget starts a task (a child session), the
+**Native task leases.** When a session with a budget starts a task (a child session), the
 task's budget is set to what the parent has left after its own spend and the other
 tasks' outstanding leases. While tasks run or are stopped, each lease minus that task's
 own spend is reserved against the parent's budget.
 
-The native host checks a compaction summary request the same way: when the budget
+**Embedded task tree.** Child settings inherit the parent's budget and may narrow
+it. While hosts in one task tree are open, every member checks the shared spend
+and worst case of in-flight requests, including nested script calls and compaction
+summaries. After a restart, a child that ran earlier counts in its own store only.
+Embedded `usage` reports the session's own spend, not its tasks'.
+
+Both hosts check a compaction summary request the same way: when the budget
 cannot cover its worst case, no summary is requested and the digest is used.
 
 ## Compaction
@@ -560,6 +576,9 @@ on `Settings::compaction`:
   digest of the dropped prompts, replies and tool calls, keeping the newest entries
   within 8 KiB. No extra request.
 
+The summary source is built newest-first and stops at its bound, rather than
+formatting the entire dropped history before clipping it; the retained text is
+unchanged. See [`driver_summary.rs`](../spindle/store/src/driver_summary.rs).
 Each compaction emits `Compacted { before, after }` (checkpoint bytes).
 
 ## Request shaping

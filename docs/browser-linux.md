@@ -260,7 +260,7 @@ file only when its digest matches what the package lists.
 
 ## Network
 
-A thread's network is off until the user turns it on (the thread's model menu; see
+A thread's network is off until the user turns it on (the thread's model page; see
 [chrome.md](chrome.md#settings)). Network commands always run on v86. The v86 worker runs one
 command with network at a time, and its network card passes traffic only while that command runs
 (`allowed()` in `wireNetwork`). When the command ends, its connections are cut. A command without
@@ -346,7 +346,7 @@ the relay restarts the v86 machine once no command is running.
 
 `spindle http URL` does not use the network card. It is a Spindle call (see
 [The code bridge](#the-code-bridge)) that the engine sends with `fetch` for sites the user listed
-under Settings, Commands. It therefore works whatever the thread's network setting. The package
+under Settings, Sites scripts may call. It therefore works whatever the thread's network setting. The package
 checks each request against the grants (address prefix and methods), and the request carries no
 cookies and follows no redirect.
 
@@ -406,9 +406,15 @@ start. The Python module talks to the socket directly.
 
 ## Boot, resume and idle
 
-The engine starts the Linuxes ahead of need (`warm`): when a thread whose commands run in the
-browser is created or opened, or switched to run there. A Linux worker that has run nothing for
-10 minutes is terminated (`IDLE_MS`), which gives its memory back.
+The engine warms the optional wasm Linux when a browser-runner thread is opened or
+created. It warms v86 then only if that thread used v86 in the last day; a chat-only
+thread leaves v86 and its 512 MiB unstarted. A command that needs v86 starts it then.
+Choosing This browser as a thread's runner explicitly warms both (`warm()`;
+`warm({v86: false})` skips v86). `onRan` records which Linux ran each
+command. A Linux worker that has run nothing for 10 minutes is terminated
+(`IDLE_MS`), giving its memory back. Sources:
+[`engine-worker.mjs`](../spindle/chrome/engine-worker.mjs) and
+[`linux-runner.mjs`](../spindle/chrome/linux-runner.mjs).
 
 **v86** ([`linux-worker.mjs`](../spindle/chrome/linux-worker.mjs)):
 

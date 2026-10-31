@@ -195,7 +195,7 @@ const rawKeys = () => panel.eval(`new Promise((done) => {
     }));
   };
 })`);
-const unfoldProviders = () => panel.eval(`document.querySelector('[data-fold="providers"]').open = true`);
+const unfoldProviders = () => panel.eval(`document.querySelector('[data-fold="providers"]').open = true; document.querySelector('[data-fold="vault"]').open = true`);
 const row = (id) => `.provider[data-provider="${id}"]`;
 async function choose(provider) {
   // From the thread list: the chip there sets new threads' model.
@@ -236,10 +236,10 @@ try {
   // 1. Sign in through the browser.
   if (!(await panel.eval(`document.querySelector('#settings-dialog').open`))) await panel.click('#settings');
   await unfoldProviders();
-  const buttons = await panel.eval(`[...document.querySelectorAll('${row('subscription')} button')].map((b) => b.textContent)`);
+  const buttons = await panel.eval(`[...document.querySelectorAll('${row('subscription')} button')].map((b) => b.getAttribute('aria-label') ?? b.textContent)`);
   const hasKeyField = await panel.eval(`Boolean(document.querySelector('${row('subscription')} input'))`);
   check('a browser sign-in provider offers Sign in and no key field', () => {
-    assert.deepEqual(buttons, ['Sign in']);
+    assert.deepEqual(buttons, ['Sign in to Subscription']);
     assert.equal(hasKeyField, false);
   });
   const tabsBefore = (await browser.send('Target.getTargets')).targetInfos.filter((t) => t.type === 'page').length;
@@ -283,7 +283,7 @@ try {
   // 3. A key saved through Settings is sealed at rest.
   await panel.click('#settings');
   await unfoldProviders();
-  await panel.click(`${row('scripted')} .provider-head button`);
+  await panel.click(`${row('scripted')} .provider-actions button`);
   await panel.type(`${row('scripted')} input`, apiKey);
   await panel.click(`${row('scripted')} button.primary`);
   await panel.until(`document.querySelector('${row('scripted')} .provider-state')?.textContent === 'key saved' || null`, { what: 'the key' });

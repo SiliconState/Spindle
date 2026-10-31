@@ -12,8 +12,8 @@
 //      so, and Retry finishes it;
 //   5. (with SPINDLE_BIN) a thread moves to a file without Chrome's page tools and with
 //      native's full tool set, a native host continues it with a turn of its own (and
-//      a budget Chrome cannot keep) and moves it back; imported, it gets the page tools
-//      again, the budget goes (and the thread says so), and it goes on in Chrome;
+//      a budget) and moves it back; imported, it gets the page tools again, keeps the
+//      budget (counted here as there, and the thread says so), and goes on in Chrome;
 //   6. a copy exports and the thread stays; deleting a thread (from its menu or the
 //      thread list) removes it and its files; no bundle holds the key;
 //   7. bash runs in the browser Linux (Python and Node, a file written back), its
@@ -318,13 +318,15 @@ async function newThread(panel, prompt) {
   return panel.until(`spindlePanel.current !== ${JSON.stringify(before)} && spindlePanel.current`, { what: 'the new thread to open' });
 }
 
-/** The thread's files, as its workspace page lists them (scratch files shown too). */
+/** The thread's files, as its workspace page lists them (scratch files shown too, every
+ * folder opened). */
 async function filesOf(panel) {
   await panel.click('#title-button');
   await panel.click('#menu-files');
   await panel.until(`!document.querySelector('#workspace').hidden && !document.querySelector('#ws-list').hidden || null`, { what: 'the workspace page' });
   await panel.eval(`(() => { const toggle = document.querySelector('#ws-scratch'); if (toggle.getAttribute('aria-checked') !== 'true') toggle.click(); })()`);
-  const names = await panel.until(`(() => { const rows = [...document.querySelectorAll('#file-list .file-row[data-path]')]; return rows.length ? rows.map((row) => row.dataset.path) : /No files yet/.test(document.querySelector('#file-list .note')?.textContent ?? '') ? [] : null; })()`, { what: 'the file list' });
+  // Folders start shut: every one opened, so every file has its row.
+  const names = await panel.until(`(() => { for (let shut; (shut = [...document.querySelectorAll('#file-list .ws-folder-head[aria-expanded="false"]')]).length;) for (const head of shut) head.click(); const rows = [...document.querySelectorAll('#file-list .file-row[data-path]')]; return rows.length ? rows.map((row) => row.dataset.path) : /No files yet/.test(document.querySelector('#file-list .note')?.textContent ?? '') ? [] : null; })()`, { what: 'the file list' });
   return names;
 }
 
@@ -402,7 +404,7 @@ try {
   }
   await panel.click('#settings');
   const row = `.provider[data-provider="${providerId}"]`;
-  await panel.click(`${row} .provider-head button`);
+  await panel.click(`${row} .provider-actions button`);
   await panel.type(`${row} input`, key);
   await panel.click(`${row} button.primary`);
   await panel.until(`document.querySelector('${row} .provider-state')?.textContent === 'key saved'`, { what: 'the key to be saved' });
@@ -568,7 +570,7 @@ try {
   await panel.click('#model-chip');
   await panel.click('#model-network');
   await panel.click('#model-apply');
-  const networked = await panel.until(`spindlePanel.threads.get(${JSON.stringify(linuxThread)})?.network === true && document.querySelector('#model-chip').textContent`, { what: "the thread's network to be on" }).catch((error) => error.message);
+  const networked = await panel.until(`spindlePanel.threads.get(${JSON.stringify(linuxThread)})?.network === true && document.querySelector('#model-chip').getAttribute('aria-label') + (document.querySelector('#model-chip .icon-globe') ? ' [globe]' : '')`, { what: "the thread's network to be on" }).catch((error) => error.message);
   const online = [
     "curl -sS https://example.com/ | grep -o '<title>[^<]*'",
     "python3 -c \"import urllib.request as u; r = u.urlopen('https://example.com/'); print('python', r.status)\"",
@@ -582,7 +584,7 @@ try {
   await panel.screenshot(join(shots, '03g-network.png'));
   check("a thread's network: off reaches nothing; on (its model menu), websites through Chrome over HTTPS; local addresses stay closed", () => {
     assert.match(offlineCard, /Could not connect|Failed to connect|exit [1-9]/, `without network: ${offlineCard}`);
-    assert.match(String(networked), /· web/, `the model chip says the thread reaches the web: ${networked}`);
+    assert.match(String(networked), /web on \[globe\]$/, `the model button says (and shows) the thread reaches the web: ${networked}`);
     assert.equal(onlineState, 'idle', `state ${onlineState}`);
     assert.ok(onlineCard && !onlineCard.failed, `the networked call: ${JSON.stringify(onlineCard)}`);
     assert.match(onlineCard.text, /<title>Example Domain/, 'curl fetched an HTTPS page through Chrome');
@@ -756,6 +758,9 @@ try {
     if (!leg.error) {
       await panel.click('#home');
       await panel.files('#import-file', [leg.back]);
+      // What changes for it to run here is asked about before it opens.
+      const asked = await panel.until(`document.querySelector('#confirm-dialog').open && document.querySelector('#confirm-text').textContent`, { what: 'the import to ask about its changes' }).catch((error) => error.message);
+      await panel.click('#confirm-yes');
       const known = JSON.stringify([off, first, linuxThread, second, third, fourth]);
       const imported = await panel.until(`spindlePanel.current && !${known}.includes(spindlePanel.current) && spindlePanel.current`, { what: 'the import to open' });
       await panel.until(`spindlePanel.status?.settings`, { what: 'the imported thread to open' });
@@ -769,11 +774,12 @@ try {
       const goes = await settled(panel, imported);
       const backAnswer = await lastAnswer(panel);
       await panel.screenshot(join(shots, '06-back-from-native.png'));
-      check('moved back from the native host, the thread gets the page tools, drops the budget it cannot keep (and says so) and goes on in Chrome', () => {
+      check('moved back from the native host, the import asks first, then the thread gets the page tools, keeps its budget (and says so) and goes on in Chrome', () => {
         assert.ok(importedTools.includes('read_page') && importedTools.includes('list_tabs'), `offered here: ${importedTools}`);
-        assert.equal(importedBudget, null, 'the budget was cleared');
+        assert.equal(importedBudget, 5, 'the budget carried over');
+        assert.match(String(asked), /To run in this browser, .* changes: .*its commands run in this browser's Linux.*Nothing has run yet/, `the import asked first: ${asked}`);
         assert.deepEqual(importedRuns, ['files', 'app'], "file tools, bash in the browser Linux");
-        assert.match(importedNote, /budget removed/, `the thread said: ${importedNote}`);
+        assert.match(importedNote, /its US\$5 spending limit kept/, `the thread said: ${importedNote}`);
         assert.equal(goes, 'idle', `state ${goes}`);
         assert.match(backAnswer, /native/i);
       });
@@ -854,8 +860,9 @@ try {
   const all = filedNames.length ? fs.readFileSync(await downloadBy(panel, '#files-zip', /\.zip$/)) : null;
   const openLink = await panel.eval(`Boolean(document.querySelector('#file-list .file-get[aria-label="Open site.html in a tab"]'))`);
   await closeFiles(panel);
-  // The page opened in a tab: its script runs, fetches its data from the workspace (it
-  // says so on the console: a preview reaches nothing outside the workspace).
+  // The page opened in a tab runs as it shows, contained: its script fetches its data
+  // from the workspace (it says so on the console: a preview reaches nothing outside the
+  // workspace), and nothing is said about it.
   const viewer = await open(browser, `chrome-extension://${extensionId}/view.html?thread=${linuxThread}&path=site.html`, { newWindow: false });
   await hearFrames(viewer);
   const tabSaid = () => frameSaid.filter((said) => said.page === viewer.sessionId).map((said) => said.text);
@@ -863,6 +870,7 @@ try {
     for (const until = Date.now() + 45_000; Date.now() < until; await sleep(250)) if (tabSaid().includes('spindle-test data rendered')) return true;
     return false;
   })();
+  const quietTab = await viewer.eval(`document.querySelector('#view-note').hidden`);
   await browser.send('Target.closeTarget', { targetId: viewer.targetId }).catch(() => {});
   check('a file attached to a message lands in the workspace; what the thread made downloads, alone or as a .zip, and a page of it opens in a tab', () => {
     assert.match(chips, /data\.csv/);
@@ -871,15 +879,16 @@ try {
     assert.equal(one?.toString().trim(), '2', 'count.txt as the thread wrote it');
     assert.ok(all && all.subarray(0, 2).toString() === 'PK' && all.includes(Buffer.from('count.txt')) && all.includes(Buffer.from('a,b\n1,2\n')), 'the .zip holds the workspace');
     assert.ok(openLink, 'a page in the workspace offers to open in a tab');
-    assert.ok(shown, `the page opened in a tab ran its script with its data (it said: ${JSON.stringify(tabSaid())})`);
+    assert.ok(shown, `the page opened in a tab ran its script with its data, unasked (it said: ${JSON.stringify(tabSaid())})`);
+    assert.ok(quietTab, 'nothing is said about a page that runs contained');
   });
 
   // 7f2. What a thread makes shows in the conversation: a report it writes gets a card
-  // with the page running in a preview that reaches nothing outside the workspace (its
-  // script ran; its fetch out was refused; what it loads from the web waits for the
-  // user's yes), Download saves it, navigate to /workspace/NAME opens it in a tab for
-  // the user; a file its command makes is in the one workspace card (marked), which
-  // sits just above the turn's final answer.
+  // with the page in a preview that reaches nothing outside the workspace (its script
+  // runs and its fetch out is refused; what it loads from the web waits for the user's
+  // yes), Download saves it, navigate to
+  // /workspace/NAME opens it in a tab for the user; a file its command makes is in the
+  // one workspace card (marked), which sits just above the turn's final answer.
   step = 'files in the conversation';
   const report = `<!doctype html><title>Report</title><style>h1{color:#3f5b2f}</style><h1>Report</h1><script src="https://cdn.example.invalid/chart.js"></script><script>console.log('spindle-test ran'); fetch('http://127.0.0.1:${port}/rendered?word=leak').then(() => console.log('spindle-test reached'), () => console.log('spindle-test closed'))</script>`;
   const notesCommand = "printf '# Notes\\n\\n- first point\\n' > notes.md";
@@ -897,15 +906,16 @@ try {
   const conversed = await settled(panel, linuxThread, Number(process.env.SPINDLE_STEP_WAIT ?? 300_000));
   const reportCard = await panel.until(`document.querySelector('#history .file-card[data-path="report.html"] .file-frame') && true`, { what: 'the report card with its preview' }).catch((error) => error.message);
   const cardSaid = () => frameSaid.slice(heardBefore).filter((said) => said.page === panel.sessionId).map((said) => said.text);
-  const said = async (word) => {
-    for (const until = Date.now() + 20_000; Date.now() < until; await sleep(250)) if (cardSaid().includes(`spindle-test ${word}`)) return true;
+  const said = async (word, wait = 20_000) => {
+    for (const until = Date.now() + wait; Date.now() < until; await sleep(250)) if (cardSaid().includes(`spindle-test ${word}`)) return true;
     return false;
   };
+  // It runs, shut off from the network; what it would load from the web waits for the user.
   const ran = await said('ran');
   const closedOut = await said('closed');
-  const webNote = await panel.until(`document.querySelector('#history .file-card[data-path="report.html"] .file-web')?.textContent`, { what: "the note of what the page would load from the web" }).catch((error) => error.message);
+  const webNote = await panel.until(`document.querySelector('#history .file-card[data-path="report.html"] .file-web')?.textContent`, { what: 'the note of what the page would load from the web' }).catch((error) => error.message);
   await panel.click('#history .file-card[data-path="report.html"] .file-web button');
-  const webAllowed = await panel.until(`!document.querySelector('#history .file-card[data-path="report.html"] .file-web') && document.querySelector('#history .file-card[data-path="report.html"] .file-frame') && true`, { what: 'the preview again, open to the web' }).catch((error) => error.message);
+  const webAllowed = await panel.until(`(() => { const note = document.querySelector('#history .file-card[data-path="report.html"] .file-web'); return Boolean(note && /^It loads from /.test(note.textContent) && document.querySelector('#history .file-card[data-path="report.html"] .file-frame')); })()`, { what: 'the preview again, open to the web' }).catch((error) => error.message);
   // What its commands made is in the workspace card (no list of its own), and that card
   // sits just above the turn's final answer.
   const notesListed = await panel.until(`document.querySelector('#history .workspace-card .file-row[data-path="notes.md"]') && true`, { what: 'the command\'s notes.md in the workspace card' }).catch((error) => error.message);
@@ -918,13 +928,13 @@ try {
   for (const tab of tabsAfter) await browser.send('Target.closeTarget', { targetId: tab.targetId }).catch(() => {});
   const saved = fs.readFileSync(await downloadBy(panel, '#history .file-card[data-path="report.html"] button[title="Download report.html"]', /^report\.html$/)).toString();
   await panel.screenshot(join(shots, '03h-files-in-conversation.png'));
-  check('what a thread makes shows in the conversation: a report (written to /workspace/report.html) as a page running shut off from the network, the web on a click, Download, opened in a tab by navigate; what its commands made in the one workspace card, folded, just above the final answer', () => {
+  check('what a thread makes shows in the conversation: a report (written to /workspace/report.html) as a page, its script running shut off from the network, the web on a click, Download, opened in a tab by navigate; what its commands made in the one workspace card, folded, just above the final answer', () => {
     assert.equal(conversed, 'idle', `state ${conversed}`);
     assert.equal(reportCard, true, `the report's card shows its page: ${reportCard}`);
-    assert.ok(ran, `the page's script ran in the card (its frames said: ${JSON.stringify(cardSaid())})`);
+    assert.ok(ran, `the page's script ran in the card, unasked (its frames said: ${JSON.stringify(cardSaid())})`);
     assert.ok(closedOut, `its fetch to an outside address was refused (its frames said: ${JSON.stringify(cardSaid())})`);
     assert.ok(!rendered.includes('leak'), 'no preview reached this test\'s server');
-    assert.match(String(webNote), /cdn\.example\.invalid/, `what it would load from the web is said: ${webNote}`);
+    assert.match(String(webNote), /^It would load from .*\bcdn\.example\.invalid\b.*; previews stay offline\. Load from the web$/, `what it would load from the web is said: ${webNote}`);
     assert.equal(webAllowed, true, `Load from the web shows it again, open to the web: ${webAllowed}`);
     assert.equal(tabsAfter.length, tabsBefore + 1, 'navigate to /workspace/report.html opened it in a tab');
     assert.equal(notesListed, true, `the command's notes.md is in the workspace card: ${notesListed}`);
@@ -979,7 +989,8 @@ try {
       assert.equal(refusedState, 'failed', `the refused turn: ${refusedState}`);
       assert.equal(haltedButtons, true, `Take back and Retry show: ${haltedButtons}`);
       assert.equal(haltedSheet, 'Start the turn over', `the sheet says what a change does: ${haltedSheet}`);
-      assert.ok(efforts[0] === 'Default' && efforts.includes('Low') && efforts.includes('High'), `efforts offered: ${efforts}`);
+      // The levels the model takes, without "Default" (none chosen is the model's own).
+      assert.ok(!efforts.includes('Default') && efforts.includes('Low') && efforts.includes('High'), `efforts offered: ${efforts}`);
       assert.equal(pickedEffort.name, 'High', `picked: ${JSON.stringify(pickedEffort)}`);
       assert.match(pickedEffort.note, /effort high/i, `what it does is said: ${pickedEffort.note}`);
       assert.equal(restarted, 'idle', `started over: ${restarted}`);
@@ -987,7 +998,7 @@ try {
       assert.deepEqual(asked, ['Say ready.'], `the message is there once: ${JSON.stringify(asked)}`);
       assert.deepEqual(sentEffort, ['high'], `the request asked for high effort: ${JSON.stringify(sentEffort)}`);
       assert.equal(threadEffort, 'high');
-      assert.match(chip, /effort high/, `the chip says the effort: ${chip}`);
+      assert.match(chip, / · high$/, `the chip says the effort: ${chip}`);
       assert.equal(refusedAgain, 'failed');
       assert.equal(returned, 'Say again.', `the message came back: ${returned}`);
       assert.equal(afterTakeBack, 'idle', `the thread is ready again: ${afterTakeBack}`);
@@ -1082,16 +1093,18 @@ try {
     // 7f4. The camera button: a picture of the tab the user is on goes with the message
     // and shows with it in the conversation.
     step = 'screenshot';
+    await panel.click('#add');
     await panel.click('#shoot');
-    const shotChip = await panel.until(`[...document.querySelectorAll('#attached .chip > span')].map((n) => n.textContent).find((t) => /^screenshot-\\d{8}-\\d{6}\\.png · /.test(t)) || null`, { what: 'the picture attached' }).catch(async (error) => `${error.message} (the panel said: ${await panel.eval(`document.querySelector('#toast').textContent`).catch(() => '?')})`);
+    const shotChip = await panel.until(`[...document.querySelectorAll('#attached .chip > span')].map((n) => n.textContent).find((t) => /^Screenshot \\d{1,2}:\\d{2}:\\d{2}.* · /.test(t)) || null`, { what: 'the picture attached' }).catch(async (error) => `${error.message} (the panel said: ${await panel.eval(`document.querySelector('#toast').textContent`).catch(() => '?')})`);
     scripted.replies.push(text('a picture'));
     await sendPrompt(panel, 'What is in the picture?');
     await panel.until(`spindlePanel.threads.get(${JSON.stringify(refusedThread)})?.state === 'running' || null`, { timeout: 20_000 }).catch(() => {});
     const shotTurn = await settled(panel, refusedThread);
-    const shotShown = await panel.until(`(() => { const img = [...document.querySelectorAll('#history .file-card.kind-picture img.file-picture')].find((i) => /^screenshot-/.test(i.alt)); return img?.complete && img.naturalWidth > 0 ? img.naturalWidth : null; })()`, { what: 'the picture shown with the message' }).catch((error) => error.message);
+    const shotShown = await panel.until(`(() => { const img = [...document.querySelectorAll('#history .file-card.kind-picture img.file-picture')].find((i) => /^Screenshot /.test(i.alt)); return img?.complete && img.naturalWidth > 0 ? img.naturalWidth : null; })()`, { what: 'the picture shown with the message' }).catch((error) => error.message);
     const shotSaid = scripted.seen.at(-1)?.body ?? '';
     check('the camera button attaches a picture of the tab; it shows with the message, and the thread is told it is in the workspace', () => {
-      assert.match(String(shotChip), /^screenshot-.*\.png/, `attached: ${shotChip}`);
+      // Named on screen for when it was taken; the file keeps its stamped name.
+      assert.match(String(shotChip), /^Screenshot \d{1,2}:\d{2}:\d{2}/, `attached: ${shotChip}`);
       assert.equal(shotTurn, 'idle');
       assert.ok(Number(shotShown) > 0, `the picture shows: ${shotShown}`);
       assert.match(shotSaid, /Attached, in the workspace: screenshot-\d{8}-\d{6}\.png/, 'the thread is told where the picture is');
@@ -1138,7 +1151,7 @@ try {
   const browseAnswer = await lastAnswer(panel);
   // The screenshot's picture comes from the workspace a moment after its card.
   await panel.until(`document.querySelector('#history .tool[data-tool="screenshot"] img.shot') && true`, { timeout: 15_000, what: 'the screenshot in the panel' }).catch(() => {});
-  const cards = await panel.eval(`Object.fromEntries([...document.querySelectorAll('#history .tool')].map((c) => [c.dataset.tool, { failed: c.classList.contains('failed'), text: c.querySelector('pre.result')?.textContent ?? '', picture: Boolean(c.querySelector('img.shot')) }]))`);
+  const cards = await panel.eval(`Object.fromEntries([...document.querySelectorAll('#history .tool')].map((c) => [c.dataset.tool, { failed: c.classList.contains('failed'), text: c.querySelector('pre.result')?.textContent ?? '', picture: Boolean(c.querySelector('img.shot')), out: c.querySelector('.tool-out')?.textContent ?? '' }]))`);
   const browseFiles = await filesOf(panel);
   await closeFiles(panel);
   const pageNow = await page.eval('location.pathname');
@@ -1153,6 +1166,8 @@ try {
     assert.ok(pageClicks.includes('confirmed'), `the confirmation was accepted: ${JSON.stringify(pageClicks)}`);
     assert.ok(browseFiles.some((name) => /^screenshots\/.+\.jpg$/.test(name)), `files: ${browseFiles}`);
     assert.ok(cards.screenshot.picture, 'the panel shows the screenshot');
+    // Named on screen for when it was taken, not by its file's stamp and tab number.
+    assert.match(cards.screenshot.out, /^Screenshot \d{1,2}:\d{2}:\d{2}/, `the picture's name: ${cards.screenshot.out}`);
     assert.equal(pageNow, '/second.html', 'the tab went to the second page');
     assert.match(browseAnswer, /200/, `answer: ${browseAnswer}`);
     assert.ok(browseInstructions.includes(standing), `the thread keeps the standing instructions: ${browseInstructions.slice(0, 300)}`);
@@ -1220,13 +1235,28 @@ try {
   await panel.until(`spindlePanel.current === ${JSON.stringify(third)}`, { what: 'the story thread to open' });
   await panel.click('#title-button');
   await panel.click('#menu-delete');
-  await panel.click('#confirm-yes');
-  await panel.until(`!spindlePanel.threads.has(${JSON.stringify(third)})`, { what: 'the thread to go' });
-  // And one from the thread list itself (its row's ×).
+  // Deleted with a moment to undo it: it goes once the moment passes.
+  await panel.until(`!spindlePanel.threads.has(${JSON.stringify(third)})`, { what: 'the thread to go', timeout: 30_000 });
+  // And one from the thread list itself (its row's ⋯ menu): Undo brings it back; deleted
+  // again, it goes.
   await panel.until(`document.querySelector('#threads .thread-row[data-id="${fourth}"]') && true`, { what: 'the list to show the cut thread' });
-  await panel.click(`#threads .thread-item:has(.thread-row[data-id="${fourth}"]) .thread-remove`);
-  await panel.click('#confirm-yes');
-  await panel.until(`!spindlePanel.threads.has(${JSON.stringify(fourth)})`, { what: 'the thread deleted from the list to go' });
+  const deleteFromList = async () => {
+    await panel.click(`#threads .thread-item:has(.thread-row[data-id="${fourth}"]) .thread-more`);
+    await panel.click('#row-menu button.danger');
+  };
+  await deleteFromList();
+  const leftList = await panel.eval(`!document.querySelector('#threads .thread-row[data-id="${fourth}"]') && document.querySelector('#toast-text').textContent`);
+  await panel.click('#toast-action');
+  const undone = await panel.until(`document.querySelector('#threads .thread-row[data-id="${fourth}"]') && spindlePanel.threads.has(${JSON.stringify(fourth)}) || null`, { what: 'Undo to bring it back', timeout: 5000 }).catch(() => false);
+  await new Promise((done) => setTimeout(done, 9000));
+  const stayed = await panel.eval(`spindlePanel.threads.has(${JSON.stringify(fourth)})`);
+  await deleteFromList();
+  await panel.until(`!spindlePanel.threads.has(${JSON.stringify(fourth)})`, { what: 'the thread deleted from the list to go', timeout: 30_000 });
+  check('a thread deleted from the list leaves it at once with Undo, which brings it back', () => {
+    assert.match(leftList || '', /^Deleted “/, `left the list: ${leftList}`);
+    assert.ok(undone, 'Undo brought it back');
+    assert.ok(stayed, 'and it stayed after the moment passed');
+  });
   const after = await panel.eval('spindlePanel.threads.size');
   const freeAfter = await freeSlots();
   await panel.screenshot(join(shots, '07-list.png'));

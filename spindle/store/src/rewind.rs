@@ -100,7 +100,7 @@ fn cut_manifest(
 ) -> Result<(ExecutionCut, Vec<u8>)> {
     use crate::ownership::{ScopeKind, ScopeState};
     use dext_core::turn::{Phase, Stop};
-    use dext_transcript::{Block, turn::TurnContinuation};
+    use dext_transcript::Block;
     use sha2::{Digest, Sha256};
     let scopes = crate::ownership::cut_scopes(db, scope, admission)?;
     let mut cut = ExecutionCut {
@@ -148,7 +148,7 @@ fn cut_manifest(
         if engine != crate::turn::ENGINE {
             return Err(Error::Unsupported);
         }
-        let state = TurnContinuation::restore(&bytes).map_err(|_| Error::Incompatible)?;
+        let state = crate::turn::restored(&bytes).map_err(|_| Error::Incompatible)?;
         if state.scope() != node.scope
             || state.control().phase() != Phase::Stopped(Stop::Complete)
             || !state
@@ -268,7 +268,7 @@ fn restart_initial(
 ) -> Result<String> {
     use crate::turn::{Action, ENGINE, execution_id};
     use dext_core::model::{ModelWait, Phase};
-    use dext_transcript::{Block, turn::TurnContinuation};
+    use dext_transcript::Block;
     if command.kind != ENGINE || command.scope == source_scope {
         return Err(Error::Invalid);
     }
@@ -286,11 +286,11 @@ fn restart_initial(
     if engine != ENGINE {
         return Err(Error::Unsupported);
     }
-    let source = TurnContinuation::restore(&bytes).map_err(|_| Error::Incompatible)?;
+    let source = crate::turn::restored(&bytes).map_err(|_| Error::Incompatible)?;
     let Action::Start { initial, request } = Action::decode(&command.payload)? else {
         return Err(Error::Invalid);
     };
-    let initial_state = TurnContinuation::restore(&initial).map_err(|_| Error::Invalid)?;
+    let initial_state = crate::turn::restored(&initial).map_err(|_| Error::Invalid)?;
     let transcript = initial_state.transcript().map_err(|_| Error::Invalid)?;
     let prompt = transcript.messages.last().ok_or(Error::Invalid)?;
     let [Block::Text { text }] = prompt.content.as_slice() else {
@@ -439,7 +439,6 @@ fn fork(
     target: u64,
 ) -> Result<(Vec<u8>, String, RewindTargetKind)> {
     use dext_core::turn::{Phase, Stop};
-    use dext_transcript::turn::TurnContinuation;
     use sha2::{Digest, Sha256};
     let (engine, bytes, root): (String, Vec<u8>, Option<String>) = db
         .query_row(
@@ -458,7 +457,7 @@ fn fork(
     if engine != crate::turn::ENGINE {
         return Err(Error::Incompatible);
     }
-    let state = TurnContinuation::restore(&bytes).map_err(|_| Error::Incompatible)?;
+    let state = crate::turn::restored(&bytes).map_err(|_| Error::Incompatible)?;
     if state.scope() != scope
         || !state
             .pending_effects()
@@ -1379,6 +1378,12 @@ impl Store {
             )?;
             tx.execute(
                 "UPDATE task_runs SET state='abandoned' WHERE revision>?1 AND revision<=?2",
+                params![plan.target as i64, head as i64],
+            )?;
+            // A report read after the target is gone with what came after it: the task
+            // (started before) reports again on the new lineage.
+            tx.execute(
+                "UPDATE task_runs SET delivered=NULL WHERE delivered>?1 AND delivered<=?2 AND state IN ('finished','stopped')",
                 params![plan.target as i64, head as i64],
             )?;
             let result = status(&tx, scope, command)?.ok_or(Error::Incompatible)?;

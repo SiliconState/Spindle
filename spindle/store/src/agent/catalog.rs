@@ -39,7 +39,7 @@ fn model_json(profile: &ProviderProfile, model: &str) -> Value {
         .map(|route| efforts(&route))
         .unwrap_or_default();
     let price = spec.pricing.as_ref().map(|pricing| {
-        let (pricing, _) = super::cost::priced_by_env(pricing);
+        let (pricing, _) = crate::spend::priced_by_env(pricing);
         json!({
             "input": pricing.input_usd_per_mtok,
             "output": pricing.output_usd_per_mtok,

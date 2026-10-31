@@ -63,8 +63,11 @@ answer while a turn runs in this or another process.
 
 `API_VERSION` is `1` ([`api.rs`](../spindle/store/src/api.rs); `api_version` in the
 stdio `info` result and in `GET /v1`). Within a version, changes are additive only:
-new fields, event types, methods, routes and feature names. Anything a client could
-otherwise notice is a new version.
+new fields, event types, methods, routes and feature names. A security fix is an
+exception: since `preview_scripts`, a preview grant without `scripts` shows pages
+without their scripts. A page policy alone cannot close script-driven WebRTC leaks;
+`preview_contained` adds browser-enforced connection limits. Other changes a client
+could notice require a new version.
 
 A client compares `api_version` for equality and then tests `features` for anything
 added within the version. Clients should ignore fields and event types they do not
@@ -77,7 +80,7 @@ error rather than having the option silently dropped.
 
 | stdio `info.features` | HTTP `GET /v1` `features` |
 | --- | --- |
-| `events`, `expected_head`, `steering`, `attachments`, `import`, `revisions`, `export`, `doctor`, `usage`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `session_transfer` | `commands`, `receipts`, `expected_head`, `events`, `steering`, `attachments`, `revisions`, `archive`, `targets`, `providers`, `bearer_tokens`, `usage`, `preview`, `preview_github`, `models`, `self_edit`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `runner` |
+| `events`, `expected_head`, `steering`, `attachments`, `import`, `revisions`, `export`, `doctor`, `usage`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `session_transfer`, `capabilities` | `commands`, `receipts`, `expected_head`, `events`, `steering`, `attachments`, `revisions`, `archive`, `targets`, `providers`, `bearer_tokens`, `usage`, `preview`, `preview_github`, `models`, `self_edit`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `runner`, `run_stop`, `runner_tokens`, `preview_scripts`, `preview_contained` |
 
 ### Session addressing
 
@@ -112,7 +115,11 @@ Every `/v1` route, including `GET /v1`, needs a credential:
 - `Authorization: Bearer TOKEN`, where `TOKEN` is a paired device's token or a named
   API token minted with `spindle --dir HOST token new NAME` (also `token list` and
   `token revoke NAME`; at most 16 named tokens). The host's pairing key is never
-  accepted as a token.
+  accepted as a token. `token new NAME --runner` mints a restricted token: only
+  `GET /v1`, `/v1/runner`, `/v1/run` and a named run's status and stop routes are
+  reachable. Other `/v1` routes and the phone UI's `/api` refuse it with `403
+  forbidden`, even as a cookie. Token names are 1–40 letters, digits, `-`, `_` or
+  `.`, and cannot start with `-`; `token list` marks restricted tokens `(runner)`.
 - Or a paired browser's cookie. A cookie-authenticated `POST` must also carry an
   `Origin` header equal to the host's origin and `X-Spindle: 1`; otherwise it is
   refused with `403 forbidden`. Bearer requests need neither.
@@ -217,6 +224,7 @@ equivalent route or command kind (see [HTTP API](#http-api)).
 | Method | Kind | Session must be | HTTP equivalent |
 | --- | --- | --- | --- |
 | [`info`](#info) | process | none | `GET /v1` |
+| [`capabilities`](#capabilities) | process | none | none |
 | [`providers`](#providers) | process | none | `GET /v1/providers` |
 | [`list`](#list) | process | none | `GET /v1/sessions` |
 | [`create`](#create) | lifecycle | absent | command `new` |
@@ -270,8 +278,9 @@ when their operation ends, with:
 
 If the operation fails, the error's `data` carries `head` and `unsent` as well. A
 failure after `stop` was requested has code `-32006` (`stopped`). When the session's
-`max_usd` budget refuses the next model request, nothing is sent and the error has code
-`-32007` (`budget`); the request stays prepared, and `continue` sends it once the budget
+`max_usd` budget refuses the next model request, nothing is sent. Native stdio
+reports `-32007` (`budget`); the embedded backend currently reports the turn failure
+as `failed`. The request stays prepared, and `continue` sends it once the budget
 allows it. Two budget refusals stay `failed`, because their message says what else to do:
 a budget on a model the catalog has no price for (raising the budget would not help), and
 a refusal inside a task that `task_start` runs, reported as the task being unable to go
@@ -288,6 +297,25 @@ API version, transport features and this build. Answered immediately.
 Result: `{api_version, transport: "stdio", features, version, schema, engine, build}`.
 `schema` and `engine` identify the store schema and turn engine; `build` is a
 fingerprint of the running binary.
+
+### `capabilities`
+
+Params: none. Returns what this host can run, not the settings of a session:
+`{host, builtin_tools, runners, sandbox, network, toolchain, sources, self_edit,
+budget, tasks, compaction}`. Native answers `host: "native"`, `builtin_tools:
+["all", "files", "none"]`, `runners: ["sandbox"]`, the current sandbox availability,
+true for the five boolean capabilities after it, `tasks: ["wait", "queue"]` and
+`compaction: ["model", "digest"]`. Source:
+[`api/stdio.rs`](../spindle/store/src/api/stdio.rs).
+
+The embedded package also exposes `capabilities` and `fit(dir, runner?)` under
+feature `capabilities`. Its result has `host: "embedded"`, no `sandbox` field,
+`builtin_tools: ["files", "none"]`, `runners: ["app"]` (also `"remote"` when
+connected), budgets and both task modes, but no toolchain, host sources or self-edit.
+`fit` returns `{changes, notes, refused}` without changing anything: `changes` is
+one settings patch, `notes` are `{setting, from, to, why}`, and `refused` names
+settings no patch can support. Its proposed runner defaults to `app`. An embedded
+import includes the same `fit`; see [embedded.md](embedded.md#moving-sessions).
 
 ### `providers`
 
@@ -306,6 +334,8 @@ Params: none.
 
 Result: `{sessions: [{session, busy, running}]}`. `running` names the turn-like
 operation in progress (`prompt`, `continue`, `retry`, `rewind` or `task`) or is null.
+Embedded entries also carry boolean `background`: a task is still running beside
+the session. Embedded status instead reports `background` as a count.
 
 ### `create`
 
@@ -448,7 +478,20 @@ same task again; a later start under the same id with different input fails.
 Result: the [turn result](#turn-result) plus, for `report: "wait"`,
 `{task, answer, failed, state: "finished"}` (`task` is the task's directory), or for
 `report: "queue"`, `{task, queued: true}`. A `wait` task that stops before answering
-fails with `task stopped before answering`. `stop` on the parent stops its tasks too.
+fails with `task stopped before answering`. Native `stop` on the parent stops its
+tasks too. The embedded package supports both modes; stopping a finished parent
+turn that only waits for tasks ends that wait as complete and leaves them running.
+
+A queued task retains a report: its answer, or `[task KEY: stopped]` when it ends
+without one, with a reason when its provider failed, a send is unknown or its worker
+crashed. That reason is retained as `{content, failed: true}` in `answer`. The
+parent reads it at its next request boundary or `continue`, rather than remaining
+blocked. Starting the same stopped task id again resumes it and reports its next
+end; a finished child is not rerun. Rewind abandons children created after the
+target and makes reports delivered after it readable again. Source:
+[`turn.rs`](../spindle/store/src/turn.rs),
+[`agent/tasks.rs`](../spindle/store/src/agent/tasks.rs) and
+[`embedded/host.rs`](../spindle/store/src/embedded/host.rs).
 
 ### `stop`
 
@@ -548,7 +591,8 @@ The conversation committed at a revision.
 Result: `{head, revision, messages, total, app_details}`: `messages` in
 [message form](#messages), `total` counting all messages, and `app_details` the
 private `details` of app tool answers as `[{call, effect, details}]`. `show` results
-carry `display` and steering messages carry `steer` (see [Messages](#messages)).
+carry `display`, steering messages carry `steer`, and task reports carry
+`report: {task, state}` (see [Messages](#messages)).
 
 ### `files`
 
@@ -596,7 +640,12 @@ The session's model spend.
 | --- | --- | --- |
 | `dir` | string | yes |
 
-Result: the [usage form](#usage-form).
+Result: the [usage form](#usage-form). Both hosts use
+[`spend.rs`](../spindle/store/src/spend.rs) for retained pricing and worst-case
+budget checks. The embedded package counts during a turn only with `max_usd`
+(and emits `cost`); without a cap, this method counts when asked. Embedded calls
+are undated and the report excludes child tasks; its open task tree still shares
+spend for budget checks. See [embedded.md](embedded.md#settings-and-limits).
 
 ### `recover`
 
@@ -666,7 +715,20 @@ closes it; it continues only where the bundle is imported.
 | `keep` | boolean | no | Default false. |
 
 Result: `{target, size, head, identity, files, moved, warnings}`. A running
-background task refuses the export.
+background task refuses the export. Moves are checked record by record before
+sealing; copies (`keep`) are checked as far as bundle facts require, and import
+always checks every record. Schema 20 packs workspace objects; schema 19 bundles
+are accepted and migrated in place. A native host never writes metadata into the
+sealed source or into a store owned by the package. See [store.md](store.md).
+
+Embedded storage additionally offers `compact {dir}` (`compactSession(dir)`):
+`{session, before, after, stores}` gives byte sizes and store count after returning
+free pages of the session and its tasks. A synced, fully checked compacted copy
+replaces each closed store; running turns or background tasks refuse it. Memory
+storage returns zeros. `checkBundle(bytes)` checks a bundle whole without writing,
+returning `{head, identity, files}`; `exportSession(..., {keep: true, whole: true})`
+requests full checking for a backup copy too. These are embedded methods, not
+native stdio or HTTP routes; see [embedded.md](embedded.md#giving-space-back).
 
 ### `import_session`
 
@@ -694,11 +756,15 @@ Waits for a task to finish, up to a timeout. Answered by a helper thread.
 Result: `{task, state, answer, pending}`: `task` is the task's directory, `state` its
 run state (`running`, `finished`, `stopped`, `abandoned`), `answer` `{content,
 failed}` or null, and `pending` whether it is still running. Errors: `not_found` (no
-such task).
+such task). Embedded `task_wait` returns immediately with the same entry shape
+as its `tasks` list; `timeout_s` is accepted but ignored. Follow work and events
+to wait.
 
 ### `task_stop`
 
-Stops a running task.
+Native hosts request cancellation of a running task; `stopping` is not an
+acknowledgement that its worker has terminated. The embedded host stops its local
+background child where it is.
 
 | Param | Type | Required |
 | --- | --- | --- |
@@ -718,6 +784,13 @@ The tasks a session started.
 
 Result: `{tasks: [{task, dir, status}]}`: `task` is the task directory's name, `dir`
 its path, and `status` its [head state](#head-state) (or null).
+
+The embedded result is `{tasks: [{task, state, queued, answer, pending, delivered,
+prompt}]}`: `task` is a `dir#key` label, `answer` is `{content, failed}` or null,
+`pending` means its host still runs here, `delivered` is boolean, and `prompt` is
+the first nonblank prompt line, trimmed to 80 characters. Sources:
+[`embedded/backend.rs`](../spindle/store/src/embedded/backend.rs) and
+[`embedded/host.rs`](../spindle/store/src/embedded/host.rs).
 
 ## Events
 
@@ -794,7 +867,7 @@ history is what `history` returns.
 | `type` | Fields | Meaning |
 | --- | --- | --- |
 | `task` | `task`, `event` | An event of a task's own session, wrapped: `event` is that event's JSON form. |
-| `task_reported` | `task`, `text` | A background task's answer was delivered to the session. |
+| `task_reported` | `task`, `name`, `text` | A background task's retained answer or stopped report was committed; `name` is the short task name used by task events. |
 | `task_started` | `task`, `result` | HTTP only: a `task_start` command's result. |
 
 ### App tool calls
@@ -836,6 +909,8 @@ session's own report merged with its [head state](#head-state).
 | `rejected` | integer or null | Requests the provider refused before generating anything; null while a turn runs. |
 | `isolation`, `effort` | string | From the settings. |
 | `phase`, `stop`, `stop_text`, `complete`, `accepts_prompt`, `recorded`, `rejection`, `wake` | | See [head state](#head-state). While a turn runs, `wake` is `{work: "running", why: null}`. |
+| `activity` | string | `stopping`, `waiting_app`, `model`, `tools` or `running` during a turn; `blocked`, `resumable` or `idle` between turns. `wake.why` explains a block. Both hosts report these codes. |
+| `background` | integer | Embedded only: how many background tasks run. Its activity is `waiting_tasks` while a finished turn waits for their reports, or `background` between turns while tasks still run. |
 | `busy` | boolean | A turn-like operation runs in this process. |
 | `running` | string or null | Its name. |
 | `settings` | object | The [settings form](#settings-form). |
@@ -1055,7 +1130,9 @@ requests beside them.
 | `turns` | Per turn, in start order (including turns a rewind left behind): a tally plus `turn`, `revision`, `prompt`, `abandoned`, `parent`, `nested`, `compaction`. |
 | `models` | Per model: a tally plus `provider`, `model`. |
 
-The HTTP session object's `usage` is the totals tally alone.
+The HTTP session object's `usage` is the totals tally alone. Embedded `usage`
+returns its own totals plus `turns` and `models`, without the native report's child
+task aggregation.
 
 ### Messages
 
@@ -1064,7 +1141,7 @@ content}` with content blocks:
 
 | Block `type` | Fields |
 | --- | --- |
-| `text` | `text`; on a user steering message also `steer` (what the user wrote, without the guidance the model reads with it). |
+| `text` | `text`; steering also has `steer` (the user's words without model guidance); a task report has `report: {task, state}` (`task` its short name, `state` `finished`, `failed` or `stopped`). |
 | `thinking` | `text` (signatures are left out). |
 | `redacted_thinking` | none. |
 | `reasoning` | none (provider-specific reasoning items are opaque). |
@@ -1138,7 +1215,11 @@ engine, auth, limits}`. `auth` is `bearer` or `cookie`, as this request authenti
 | `events_retained` | 1024 events in a session's stream window. |
 | `event_bytes` | 524288 bytes in that window. |
 
-`POST /v1/run` takes bodies up to 64 MiB plus 64 KiB.
+`POST /v1/run` takes bodies up to 64 MiB plus 64 KiB. Limits not reported in
+`limits`: 48 connections at once; the request head (at most 16 KiB) must arrive
+within 10 seconds overall. After authorization, the body has its own 10-second
+deadline, or 2 minutes for an upload or `/v1/run`. Each individual read and write
+has at most 10 seconds. See [`serve/http.rs`](../spindle/store/src/serve/http.rs).
 
 ### Routes
 
@@ -1176,9 +1257,59 @@ route.
 | `POST` | `/v1/sessions/:id/steer` | T | Body `{text, now}`: `202 {queued}`. `409 not_running`, `409 nothing_waiting` (`now` alone), `429 rate_limited`. | `steer` |
 | `POST` | `/v1/sessions/:id/app_tool_result` | T | Body: `call` plus an [answer](#app-tool-answer): `200 {accepted: true}`; `409 conflict` when the call is not waiting. | `app_tool_result` |
 | `POST` | `/v1/sessions/:id/upload` | T | Raw body (1 byte to 8 MiB): `{digest, size}`, for a later `say`'s `attachments`. Uploads older than a day are cleared. | none |
-| `POST` | `/v1/sessions/:id/preview` | T | Body `{revision, network}` (`network` `none` or `github`): `{token, url, revision, expires_in, network}`, a read-only static-site preview grant. See [host.md](host.md). | none |
+| `POST` | `/v1/sessions/:id/preview` | T | Body `{revision, network?, scripts?, contained?}`: `network` is `none` or `github`; `scripts` is false, true or one page's workspace path; `contained` is boolean. Result `{token, url, revision, expires_in, network, scripts, contained}`. Scripts default off unless `network: "github"`; `preview_scripts` and `preview_contained` advertise the new fields. See [Static-site previews](#static-site-previews). | none |
 | `GET` | `/v1/runner` | T | `{helper, isolated, implementation}`: this host's sandbox for remote runs; `503 unavailable` without one. | none |
-| `POST` | `/v1/run` | T | Runs one command for an embedded session over a workspace sent with it: body `{command, timeout_s, network, files: [{path, base64, executable}], links, directories}`, result `{output, success, writes, deletes, links, directories, failure, helper}`. See [embedded.md](embedded.md). | none |
+| `POST` | `/v1/run` | T | Runs one command for an embedded session over a workspace sent with it: body `{command, timeout_s, network, files: [{path, base64, executable}], links, directories, run?}`, result `{output, success, writes, deletes, links, directories, failure, helper}`. See [embedded.md](embedded.md). | none |
+| `GET` | `/v1/run/ID` | T | `{run, state}` for the starting token only; feature `run_stop`. | none |
+| `POST` | `/v1/run/ID/stop` | T | Stops that token's named run; `{run, state}`. | none |
+
+Feature `run_stop` lets a client name a run with `run`: 1–128 letters, digits,
+`-`, `_` or `.`. Reusing a retained name under the same token is `409 conflict`.
+`GET /v1/run/ID` returns `{run, state}`: `running`, `stopping`, `stopped` or
+`finished`; `POST /v1/run/ID/stop` requests its stop and returns the same form.
+Only the starting token can see or stop it (another token gets `404`). Up to 256
+named runs may be active (`503 busy` beyond); the newest 1024 ended runs are kept
+for 10 minutes. At most 1024 early stops are retained. A stop that overtakes the
+run's upload returns `404`, but is kept for a minute when that table has room:
+a run with that id and token starts stopped within that interval.
+Stopping does not undo effects already performed; the original run request still
+answers, with `success: false` if stopped. See
+[`serve/v1.rs`](../spindle/store/src/serve/v1.rs).
+
+### Static-site previews
+
+`GET /api/preview/TOKEN/PATH` serves one revision as a static site. Grants last
+30 minutes, are read-only, live only in host memory, and are revoked on restart or
+thread deletion; at most 32 are outstanding. For ordinary grants (`network: "none"`),
+`scripts: false` (also omission) serves pages without scripts or the storage shim,
+with `sandbox` and `script-src 'none'`. A path permits scripts on that page only;
+true permits every page. A GitHub grant also permits scripts (on its named page,
+or all pages when no page is named, even with `scripts: false`), plus GitHub API
+connections and avatar images.
+
+Every preview response carries `Connection-Allowlist` naming only its token's
+prefix, plus those two GitHub origins for a GitHub grant; without a live token the
+list is empty. Browsers that enforce it prevent other connections from the page,
+its frames and workers, including WebRTC and navigation-related connections that
+CSP cannot prevent. `GET /api/preview/check`, without a token, posts
+`{spindleContained: true}` to its parent when that protection is available and
+false otherwise. `contained: true` adds a guard to each HTML page: it runs only
+where that check succeeds, and other file types do not run scripts under that
+grant. This is feature `preview_contained`.
+
+`Connection-Allowlist` is enforced in Chrome 152 and later; the runtime check,
+not the version number, decides whether scripts may run automatically. Older or
+other browsers can still show static pages.
+
+All HTML previews lose meta refreshes, resource hints (`preconnect`,
+`dns-prefetch`, `prefetch`, `prerender`, `preload`, `modulepreload`) and their own
+DNS-prefetch switches; responses carry `X-DNS-Prefetch-Control: off`. A scripted
+page has `sandbox allow-scripts allow-forms allow-modals`, never
+`allow-same-origin`; forms submit nowhere. CSP allows only the token prefix by
+default, but is not a guarantee against all outgoing connections in a browser
+without containment. The phone viewer's **Run scripts** choice is per device and
+page version; see [host.md](host.md#previews) and
+[`serve/preview.rs`](../spindle/store/src/serve/preview.rs).
 
 ### Session object
 
@@ -1190,6 +1321,7 @@ state](#head-state) plus:
 | `id`, `name` | The session. |
 | `busy` | A command's worker runs (then `wake` is `{work: "running"}`). |
 | `stopping` | A stop was requested for the running command. |
+| `activity` | The stable activity code described in [Status object](#status-object). |
 | `since` | When the running command was admitted (ms since the Unix epoch), or null. |
 | `settings` | The [settings form](#settings-form). |
 | `usage` | The totals tally. |

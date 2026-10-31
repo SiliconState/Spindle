@@ -50,6 +50,13 @@ pub trait Storage {
     fn holder(&self) -> Option<String> {
         None
     }
+    /// Gives the free pages of this place's store back (the store closed): a compacted
+    /// copy is written beside it, made durable, checked whole and renamed over it.
+    /// Returns the store's size before and after, in bytes; None where nothing is kept
+    /// on disk (memory).
+    fn compact(&self) -> crate::Result<Option<(u64, u64)>> {
+        Ok(None)
+    }
 }
 
 struct NoGuard;

@@ -1417,7 +1417,7 @@ fn the_api_reads_settings_and_refusals() {
     assert_eq!(info["result"]["transport"], "embedded");
     for (settings, why) in [
         (json!({"builtin_tools": "all"}), "sandbox"),
-        (json!({"max_usd": 1}), "max_usd"),
+        (json!({"max_usd": -1}), "non-negative"),
         (json!({"sources": ["/tmp"]}), "sources"),
     ] {
         let mut params = json!({"dir": "refused", "provider": "fake"});
@@ -1538,10 +1538,499 @@ fn an_app_started_task_answers_and_keeps_its_files() {
     );
     let queued = app.call(
         "task_start",
-        json!({"dir": "ts", "task": "q", "prompt": "x",
+        json!({"dir": "ts", "task": "q", "prompt": "[t:ts-q] in the background",
         "report": "queue"}),
     );
-    assert_eq!(kind(&queued), Some("failed"), "{queued}");
+    assert_eq!(queued["result"]["queued"], true, "{queued}");
+}
+
+#[test]
+fn background_tasks_run_beside_their_session_and_report_when_done() {
+    let host = embedded(Box::new(MemoryPlaces));
+    // The model starts a task in the background and goes on; the task answers later.
+    let mut app = App::new(&host)
+        .script(
+            "bg",
+            vec![
+                Reply::Call(
+                    "task",
+                    json!({"prompt": "[t:bg-task] count the files", "background": true}),
+                ),
+                Reply::Text("it runs in the background"),
+                Reply::Text("thanks for the report"),
+            ],
+        )
+        .script("#", vec![Reply::Text("there are no files")]);
+    app.call(
+        "create",
+        json!({"dir": "bg", "provider": "fake", "tasks": true}),
+    );
+    let first = app.call(
+        "prompt",
+        json!({"dir": "bg", "text": "[t:bg] start a task"}),
+    );
+    assert!(first.get("result").is_some(), "{first}");
+    let tool = app
+        .run
+        .requests
+        .iter()
+        .find(|body| body.contains("started in the background"));
+    assert!(tool.is_some(), "the call is answered at once");
+    let tasks = app.call("tasks", json!({"dir": "bg"}))["result"]["tasks"].clone();
+    assert_eq!(tasks.as_array().unwrap().len(), 1, "{tasks}");
+    assert_eq!(tasks[0]["state"], "finished", "{tasks}");
+    assert_eq!(tasks[0]["queued"], true);
+    assert!(
+        tasks[0]["answer"]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("there are no files"),
+        "{tasks}"
+    );
+    // The task ended while the turn ran (this app answers at once): the turn's next
+    // request read its answer to the model as a queued report.
+    assert_eq!(tasks[0]["delivered"], true, "{tasks}");
+    let reported = app
+        .run
+        .requests
+        .iter()
+        .position(|body| body.contains("there are no files"))
+        .expect("the report reaches the model");
+    let answered = app
+        .run
+        .requests
+        .iter()
+        .position(|body| body.contains("started in the background"))
+        .unwrap();
+    assert!(reported >= answered, "after the call was answered");
+    let label = tasks[0]["task"].as_str().unwrap().to_string();
+    assert_eq!(
+        app.call("task_wait", json!({"dir": "bg", "task": label}))["result"]["state"],
+        "finished"
+    );
+    assert_eq!(
+        app.call("task_stop", json!({"dir": "bg", "task": label}))["result"]["stopping"],
+        false,
+        "nothing runs to stop"
+    );
+    let capabilities = app.call("capabilities", json!({}))["result"].clone();
+    assert_eq!(capabilities["tasks"], json!(["wait", "queue"]));
+}
+
+#[test]
+fn a_background_task_left_running_is_taken_up_when_its_session_opens_again() {
+    let root = temp_root("background-resume");
+    {
+        let host = embedded(Box::new(DirPlaces(root.clone())));
+        let mut app = App::new(&host).script("br", vec![Reply::Text("ready")]);
+        app.call(
+            "create",
+            json!({"dir": "br", "provider": "fake", "tasks": true}),
+        );
+        app.call("prompt", json!({"dir": "br", "text": "[t:br] hello"}));
+        // The task's request goes and its answer never comes: the app closes.
+        app.hold = 2;
+        let queued = app.call(
+            "task_start",
+            json!({"dir": "br", "task": "later", "prompt": "[t:br-task] look", "report": "queue"}),
+        );
+        assert_eq!(queued["result"]["queued"], true, "{queued}");
+        assert_eq!(app.run.requests.len(), 2, "the task's request was sent");
+        let tasks = app.call("tasks", json!({"dir": "br"}))["result"]["tasks"].clone();
+        assert_eq!(tasks[0]["state"], "running", "{tasks}");
+    }
+    let host = embedded(Box::new(DirPlaces(root.clone())));
+    let mut app = App::new(&host).script("br", vec![Reply::Text("more")]);
+    // Read, the session leaves its tasks as they are.
+    let tasks = app.call("tasks", json!({"dir": "br"}))["result"]["tasks"].clone();
+    assert_eq!(tasks[0]["state"], "running", "{tasks}");
+    assert!(app.run.requests.is_empty());
+    // A turn takes the task up; its request's outcome is unknown, so it is not sent
+    // again: the task cannot go on and stops, saying why, and its report says so once the
+    // turn's own work is done (the session goes on: nothing waits for a person).
+    let next = app.call("prompt", json!({"dir": "br", "text": "[t:br] again"}));
+    assert!(next["error"].is_null(), "{next}");
+    let tasks = app.call("tasks", json!({"dir": "br"}))["result"]["tasks"].clone();
+    assert_eq!(tasks[0]["state"], "stopped", "{tasks}");
+    assert!(
+        tasks[0]["answer"]["content"]
+            .as_str()
+            .is_some_and(|said| said.contains("unknown outcome")),
+        "{tasks}"
+    );
+    assert_eq!(tasks[0]["delivered"], true, "{tasks}");
+    assert_eq!(
+        app.run.requests.len(),
+        2,
+        "the turn's own request, then one after the report, never the task's again: {:?}",
+        app.run.requests
+    );
+    assert!(
+        app.run.requests[1].contains("[task app:later: stopped]")
+            && app.run.requests[1].contains("gave no answer. Why: "),
+        "{}",
+        app.run.requests[1]
+    );
+    // Its history shows the report as the task's, not as the user's.
+    let history = app.call("history", json!({"dir": "br"}))["result"]["messages"].clone();
+    let report = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .find(|block| block["report"].is_object())
+        .expect("the report is marked");
+    assert_eq!(report["report"]["state"], "stopped", "{report}");
+    assert_eq!(
+        report["report"]["task"],
+        tasks[0]["task"]
+            .as_str()
+            .unwrap()
+            .rsplit('#')
+            .next()
+            .unwrap(),
+        "{report}"
+    );
+    assert!(
+        app.run.events.iter().any(|event| event["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("could not go on in the background"))),
+        "{:?}",
+        app.run.events
+    );
+}
+
+#[test]
+fn a_turn_ends_once_its_background_tasks_have_reported() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let host = embedded(Box::new(MemoryPlaces));
+    // The task's request is held: the session's turn finishes first.
+    let held: Rc<RefCell<Option<(String, u64)>>> = Rc::default();
+    let hold = held.clone();
+    let mut app = App::new(&host).script(
+        "tw",
+        vec![
+            Reply::Call(
+                "task",
+                json!({"prompt": "[t:tw-task] look around", "background": true}),
+            ),
+            Reply::Text("waiting for it"),
+            Reply::Text("it said: all quiet"),
+        ],
+    );
+    app.hook = Some(Box::new(move |_, session: &str, id, _| {
+        if session.contains('#') && hold.borrow().is_none() {
+            *hold.borrow_mut() = Some((session.to_string(), id));
+            return Some(vec![]);
+        }
+        None
+    }));
+    app.call(
+        "create",
+        json!({"dir": "tw", "provider": "fake", "tasks": true}),
+    );
+    let line = json!({"jsonrpc": "2.0", "id": 77, "method": "prompt",
+        "params": {"dir": "tw", "text": "[t:tw] start it"}});
+    let frames = host.handle(line.to_string().as_bytes());
+    app.drive(frames);
+    assert!(
+        app.run.replies.iter().all(|reply| reply["id"] != 77),
+        "the turn waits for its task: {:?}",
+        app.run.replies
+    );
+    let status = app.call("status", json!({"dir": "tw"}))["result"].clone();
+    assert_eq!(status["activity"], "waiting_tasks", "{status}");
+    assert_eq!(status["background"], 1);
+    // Listed with what it was asked, to name it by.
+    let tasks = app.call("tasks", json!({"dir": "tw"}))["result"]["tasks"].clone();
+    assert_eq!(tasks[0]["prompt"], "[t:tw-task] look around", "{tasks}");
+    assert_eq!(tasks[0]["pending"], true);
+    // The task's answer arrives: its report is read to the session, which ends its turn.
+    let (session, id) = held
+        .borrow_mut()
+        .take()
+        .expect("the task's request was held");
+    let (_, _, body) = wire(&Reply::Text("all quiet"), 9).unwrap();
+    let mut frames = vec![];
+    for part in body.as_bytes().chunks(64) {
+        frames.extend(host.chunk(&session, id, part).0);
+    }
+    frames.extend(
+        host.deliver(
+            &session,
+            id,
+            answer_of(&json!({"kind": "response", "status": 200,
+                "content_type": "text/event-stream"}))
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    app.drive(frames);
+    let done = app
+        .run
+        .replies
+        .iter()
+        .find(|reply| reply["id"] == 77)
+        .expect("the turn ended");
+    assert!(done.get("result").is_some(), "{done}");
+    assert!(
+        app.run.requests.last().unwrap().contains("all quiet"),
+        "the report reached the model"
+    );
+    let status = app.call("status", json!({"dir": "tw"}))["result"].clone();
+    assert_eq!(
+        (status["activity"].clone(), status["background"].clone()),
+        (json!("idle"), json!(0))
+    );
+}
+
+/// Where a task's request waits while a test holds it: its session and work id.
+type Held = std::rc::Rc<std::cell::RefCell<Option<(String, u64)>>>;
+
+/// A session whose finished turn waits for a background task whose request is held:
+/// the app, and where the task's request waits.
+fn waiting_on_a_task<'a>(host: &'a Embedded, dir: &str, replies: Vec<Reply>) -> (App<'a>, Held) {
+    let held: Held = Held::default();
+    let hold = held.clone();
+    let mut app = App::new(host).script(dir, replies);
+    app.hook = Some(Box::new(move |_, session: &str, id, _| {
+        if session.contains('#') && hold.borrow().is_none() {
+            *hold.borrow_mut() = Some((session.to_string(), id));
+            return Some(vec![]);
+        }
+        None
+    }));
+    app.call(
+        "create",
+        json!({"dir": dir, "provider": "fake", "tasks": true}),
+    );
+    let line = json!({"jsonrpc": "2.0", "id": 77, "method": "prompt",
+        "params": {"dir": dir, "text": format!("[t:{dir}] start it")}});
+    let frames = host.handle(line.to_string().as_bytes());
+    app.drive(frames);
+    let status = app.call("status", json!({"dir": dir}))["result"].clone();
+    assert_eq!(status["activity"], "waiting_tasks", "{status}");
+    (app, held)
+}
+
+#[test]
+fn stopping_a_turn_that_waits_for_its_tasks_ends_it_and_they_go_on() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let (mut app, held) = waiting_on_a_task(
+        &host,
+        "sw",
+        vec![
+            Reply::Call(
+                "task",
+                json!({"prompt": "[t:sw-task] look around", "background": true}),
+            ),
+            Reply::Text("waiting for it"),
+            Reply::Text("it said: all quiet"),
+        ],
+    );
+    let stopped = app.call("stop", json!({"dir": "sw"}));
+    assert_eq!(stopped["result"]["stopping"], true, "{stopped}");
+    // The turn had finished: it ends as such, not as an error.
+    let done = app
+        .run
+        .replies
+        .iter()
+        .find(|reply| reply["id"] == 77)
+        .expect("the turn ended")
+        .clone();
+    assert!(done.get("result").is_some(), "{done}");
+    assert_eq!(done["result"]["stopped"]["complete"], true, "{done}");
+    // Its task goes on, and the session is free meanwhile.
+    let status = app.call("status", json!({"dir": "sw"}))["result"].clone();
+    assert_eq!(
+        (status["activity"].clone(), status["background"].clone()),
+        (json!("background"), json!(1)),
+        "{status}"
+    );
+    let (session, id) = held
+        .borrow_mut()
+        .take()
+        .expect("the task's request was held");
+    let (_, _, body) = wire(&Reply::Text("all quiet"), 9).unwrap();
+    let mut frames = vec![];
+    for part in body.as_bytes().chunks(64) {
+        frames.extend(host.chunk(&session, id, part).0);
+    }
+    frames.extend(
+        host.deliver(
+            &session,
+            id,
+            answer_of(&json!({"kind": "response", "status": 200,
+                "content_type": "text/event-stream"}))
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    app.drive(frames);
+    let tasks = app.call("tasks", json!({"dir": "sw"}))["result"]["tasks"].clone();
+    assert_eq!(
+        (tasks[0]["state"].clone(), tasks[0]["delivered"].clone()),
+        (json!("finished"), json!(false)),
+        "{tasks}"
+    );
+    // Its report waits for the session's next turn, which `continue` starts.
+    let before = app.call("status", json!({"dir": "sw"}))["result"]["head"].clone();
+    let requests = app.run.requests.len();
+    let resumed = app.call("continue", json!({"dir": "sw"}));
+    assert!(resumed.get("result").is_some(), "{resumed}");
+    assert_eq!(app.run.requests.len(), requests + 1);
+    assert!(app.run.requests.last().unwrap().contains("all quiet"));
+    let tasks = app.call("tasks", json!({"dir": "sw"}))["result"]["tasks"].clone();
+    assert_eq!(tasks[0]["delivered"], true, "{tasks}");
+    // Gone back to before it was read, the report is read again at the next turn.
+    let rewound = app.call("rewind", json!({"dir": "sw", "revision": before}));
+    assert!(rewound.get("result").is_some(), "{rewound}");
+    let tasks = app.call("tasks", json!({"dir": "sw"}))["result"]["tasks"].clone();
+    assert_eq!(
+        (tasks[0]["state"].clone(), tasks[0]["delivered"].clone()),
+        (json!("finished"), json!(false)),
+        "{tasks}"
+    );
+    app.call("continue", json!({"dir": "sw"}));
+    assert!(app.run.requests.last().unwrap().contains("all quiet"));
+    let tasks = app.call("tasks", json!({"dir": "sw"}))["result"]["tasks"].clone();
+    assert_eq!(tasks[0]["delivered"], true, "{tasks}");
+}
+
+#[test]
+fn stopping_the_task_a_turn_waits_for_tells_the_turn_so_and_it_goes_on() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let (mut app, _held) = waiting_on_a_task(
+        &host,
+        "st",
+        vec![
+            Reply::Call(
+                "task",
+                json!({"prompt": "[t:st-task] look around", "background": true}),
+            ),
+            Reply::Text("waiting for it"),
+            Reply::Text("it stopped, so I will look myself"),
+        ],
+    );
+    let label = app.call("tasks", json!({"dir": "st"}))["result"]["tasks"][0]["task"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stopped = app.call("task_stop", json!({"dir": "st", "task": label}));
+    assert_eq!(stopped["result"]["stopping"], true, "{stopped}");
+    let done = app
+        .run
+        .replies
+        .iter()
+        .find(|reply| reply["id"] == 77)
+        .expect("the turn went on to its end")
+        .clone();
+    assert!(done.get("result").is_some(), "{done}");
+    assert!(
+        app.run.requests.last().unwrap().contains(": stopped]"),
+        "the model heard it stopped: {}",
+        app.run.requests.last().unwrap()
+    );
+    let tasks = app.call("tasks", json!({"dir": "st"}))["result"]["tasks"].clone();
+    assert_eq!(
+        (tasks[0]["state"].clone(), tasks[0]["delivered"].clone()),
+        (json!("stopped"), json!(true)),
+        "{tasks}"
+    );
+}
+
+#[test]
+fn a_task_that_cannot_run_here_is_refused_before_anything_is_kept() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host).script("tr", vec![Reply::Text("ready")]);
+    // Tasks may use one model only, one the session's own is not.
+    let created = app.call(
+        "create",
+        json!({"dir": "tr", "provider": "fake", "tasks": {"models": ["only-this"]}}),
+    );
+    assert!(created.get("result").is_some(), "{created}");
+    app.call("prompt", json!({"dir": "tr", "text": "[t:tr] hello"}));
+    for (task, input, why) in [
+        (
+            "t1",
+            json!({"prompt": "x"}),
+            "not permitted by tasks.models",
+        ),
+        (
+            "t2",
+            json!({"prompt": "x", "model": "other"}),
+            "not permitted by tasks.models",
+        ),
+        (
+            "t3",
+            json!({"effort": "lots", "prompt": "x"}),
+            "`effort` must be",
+        ),
+    ] {
+        let mut params = json!({"dir": "tr", "task": task, "report": "queue"});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(input.as_object().unwrap().clone());
+        let refused = app.call("task_start", params);
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(why)),
+            "{refused}"
+        );
+    }
+    let tasks = app.call("tasks", json!({"dir": "tr"}))["result"]["tasks"].clone();
+    assert_eq!(tasks, json!([]), "nothing kept, so nothing waits on it");
+    let next = app.call("prompt", json!({"dir": "tr", "text": "[t:tr] fine?"}));
+    assert!(next.get("result").is_some(), "{next}");
+}
+
+#[test]
+fn an_app_task_queued_answers_at_once_and_its_report_follows() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host)
+        .script("aq", vec![Reply::Text("ready"), Reply::Text("read it")])
+        .script("#", vec![Reply::Text("queued answer")]);
+    app.call(
+        "create",
+        json!({"dir": "aq", "provider": "fake", "tasks": true}),
+    );
+    app.call("prompt", json!({"dir": "aq", "text": "[t:aq] hello"}));
+    let queued = app.call(
+        "task_start",
+        json!({"dir": "aq", "task": "later", "prompt": "[t:aq-task] look", "report": "queue"}),
+    );
+    assert_eq!(queued["result"]["queued"], true, "{queued}");
+    assert!(
+        queued["result"]["task"]
+            .as_str()
+            .unwrap()
+            .starts_with("aq#")
+    );
+    let waited = app.call("task_wait", json!({"dir": "aq", "task": "later"}))["result"].clone();
+    assert_eq!(waited["state"], "finished", "{waited}");
+    assert!(
+        waited["answer"]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("queued answer")
+    );
+    // The same id again: the same task, already finished, nothing run twice.
+    let again = app.call(
+        "task_start",
+        json!({"dir": "aq", "task": "later", "prompt": "[t:aq-task] look", "report": "queue"}),
+    );
+    assert_eq!(again["result"]["queued"], true, "{again}");
+    let sent = app.run.requests.len();
+    app.call("prompt", json!({"dir": "aq", "text": "[t:aq] anything?"}));
+    assert!(
+        app.run.requests[sent..]
+            .iter()
+            .any(|body| body.contains("queued answer")),
+        "the next turn reads the report"
+    );
 }
 
 #[test]
@@ -1767,35 +2256,66 @@ fn settings_the_package_cannot_honor_wait_for_a_change_before_a_turn() {
     let refused = app.call("prompt", json!({"dir": "m", "text": "[t:moved] two"}));
     assert_eq!(kind(&refused), Some("failed"), "{refused}");
     let message = refused["error"]["message"].as_str().unwrap();
-    for named in ["settings cannot run here", "`builtin_tools`", "`max_usd`"] {
+    for named in ["settings cannot run here", "`builtin_tools`"] {
         assert!(
             message.contains(named),
             "every one is named ({named}): {message}"
         );
     }
     assert!(!message.contains("compaction"), "{message}");
+    assert!(
+        !message.contains("max_usd"),
+        "a budget is kept here: {message}"
+    );
     assert!(app.run.requests.is_empty(), "nothing was sent");
     let history = app.call("history", json!({"dir": "m"}));
     assert!(
         history.get("result").is_some(),
         "reads still work: {history}"
     );
-    let partial = app.call(
-        "settings",
-        json!({"dir": "m", "builtin_tools": "files", "compaction": "digest"}),
+    // The package says what to change, in one settings call, and why.
+    let fit = app.call("fit", json!({"dir": "m"}))["result"].clone();
+    assert_eq!(
+        fit["changes"],
+        json!({"builtin_tools": "files", "runner": "app"}),
+        "{fit}"
     );
+    let noted: Vec<&str> = fit["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|note| note["setting"].as_str().unwrap())
+        .collect();
+    assert_eq!(noted, ["builtin_tools", "runner", "max_usd"], "{fit}");
+    assert_eq!(fit["refused"], json!([]));
+    let mut changes = fit["changes"].clone();
+    changes["dir"] = json!("m");
+    let changed = app.call("settings", changes);
+    assert_eq!(
+        changed["result"]["max_usd"], 1.5,
+        "the budget carries over: {changed}"
+    );
+    assert_eq!(
+        app.call("fit", json!({"dir": "m"}))["result"]["changes"],
+        json!({}),
+        "nothing more to change"
+    );
+    let capabilities = app.call("capabilities", json!({}))["result"].clone();
+    assert_eq!(capabilities["host"], "embedded");
+    assert_eq!(capabilities["budget"], true);
+    assert_eq!(capabilities["builtin_tools"], json!(["files", "none"]));
+    // Its model has no price, so under a budget nothing is sent, as natively.
+    let unpriced = app.call("prompt", json!({"dir": "m", "text": "[t:moved] two"}));
     assert!(
-        partial["error"]["message"]
+        unpriced["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("`max_usd`") && message.contains("null")),
-        "what is left is named, with how to clear it: {partial}"
+            .is_some_and(|message| message.contains("no price for fake/fake-model")),
+        "{unpriced}"
     );
-    let changed = app.call(
-        "settings",
-        json!({"dir": "m", "builtin_tools": "files", "compaction": "digest", "max_usd": null}),
-    );
-    assert_eq!(changed["result"]["max_usd"], Value::Null, "{changed}");
-    let second = app.call("prompt", json!({"dir": "m", "text": "[t:moved] two"}));
+    assert!(app.run.requests.is_empty());
+    let cleared = app.call("settings", json!({"dir": "m", "max_usd": null}));
+    assert_eq!(cleared["result"]["max_usd"], Value::Null, "{cleared}");
+    let second = app.call("continue", json!({"dir": "m"}));
     assert!(second.get("result").is_some(), "{second}");
     assert_eq!(app.run.requests.len(), 1);
 }

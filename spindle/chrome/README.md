@@ -28,8 +28,15 @@ No server and no relay: the extension calls your provider directly with your key
   changed since its last command go in, and only files a command changed come back.
   The Linux keeps the browser's clock. The first command ever boots it (about 20 seconds
   in our measurements, once); after that it resumes in under a second, and rests (giving
-  its memory back) after ten idle minutes. Opening a thread that runs commands
-  there starts it, so a command rarely waits for it.
+  its memory back) after ten idle minutes. Opening a thread that ran commands there in
+  the last day starts it, so its next command rarely waits; a thread that only talks
+  or reads pages leaves it, and its 512 MiB, unstarted until a command needs it.
+  Choosing "This browser" for a thread's commands, or Start in Settings, starts it too.
+- **Memory given back:** wasm memory only grows, so a long thread or a large export
+  leaves the engine at its peak. Once every thread has rested half a minute, an engine
+  that grew past 64 MiB starts a fresh copy of itself (sessions stay on disk; keys,
+  the Linuxes and a connected host carry over) and the old copy's memory goes back to
+  the browser.
 - **A second, faster Linux for plain commands (when built in):** Spindle's wasm Linux is
   Linux itself compiled to WebAssembly, with busybox `sh` and Python 3.13, run at the
   machine's own speed with no emulator: it boots in about half a second and runs plain
@@ -52,7 +59,7 @@ No server and no relay: the extension calls your provider directly with your key
   run on your key, as turns do; each command may make up to 128 calls (32 of them
   models). Calls from several processes wait their turn; `batch` and `models` run up to
   four together.
-- **A thread's network** (off until you turn it on in the thread's model menu, Network
+- **A thread's network** (off until you turn it on in the thread's model page, Network
   for commands): its commands reach websites through Chrome, with no server between.
   The Linux's network card ends inside the extension: a small proxy in the Linux
   (`http_proxy` and `https_proxy` are set for the command) opens HTTPS with a
@@ -65,20 +72,21 @@ No server and no relay: the extension calls your provider directly with your key
   names). Redirects are not followed: Chrome can hide their target, so the gateway
   refuses those rather than contacting an unchecked address. Ask for the final public
   address directly (or use your own relay). A command without network reaches nothing. Chrome asks once for access to sites, the same access page
-  reading uses. The model chip shows `· web` for such a thread.
-- **Or a relay you run** (opt-in, Settings, Commands, Relay): a WISP server address
+  reading uses. The model button in the box shows a globe for such a thread.
+- **Or a relay you run** (opt-in, Settings, Relay): a WISP server address
   (`wisps://...`, such as wisp-js or epoxy-server) gives threads with network the whole
   internet through it, any protocol (ssh, git over SSH, databases), with the Linux's own
   TLS; names are then looked up over DNS-over-HTTPS (cloudflare-dns.com), only while a
   command with network runs. Spindle runs no relay of its own.
 - **Sites scripts may call:** whatever a thread's network, a script can call a site you
-  list in Settings, Commands (an address prefix such as `https://api.example.com/v1/`, to
+  list in Settings, Sites scripts may call (an address prefix such as `https://api.example.com/v1/`, to
   read, or read and change). Chrome asks once for each. Requests are journaled like
   every Spindle call, carry no cookies, follow no redirect, and anything outside a listed
   prefix (or a method it does not allow) is refused, naming what is allowed.
-- **Or your Spindle host's sandbox:** connect your host in Settings, Commands (its
-  address and an API token from `spindle --dir HOST token new chrome`), and choose it for
-  a thread in the model menu (Commands run in).
+- **Or your Spindle host's sandbox:** connect your host in Settings, Your Spindle host (its
+  address and a runner token from `spindle --dir HOST token new chrome --runner`, which
+  runs commands and reaches nothing else there), and choose it for
+  a thread in the model page (Commands run in: Host).
 - **Page reading** (a switch in Settings, Pages; off until you turn it on, when Chrome
   asks for access to sites): threads can list your
   tabs and read the page you are looking at with `list_tabs` and `read_page`, see its
@@ -89,12 +97,18 @@ No server and no relay: the extension calls your provider directly with your key
   each new line once). `screenshot` pictures the tab showing once you have let Spindle picture
   pages (saved in the workspace, shown in the panel; a script can show it to a vision
   model with `spindle model --image FILE`).
-- **Screenshots of your own:** the camera beside the message box pictures the tab you
-  are on and attaches it to your message (it shows with the message; the thread finds
+- **Screenshots of your own:** Capture this tab (the camera under the + in the message
+  box) pictures the tab you are on and attaches it to your message (it shows with the message; the thread finds
   it in its workspace). The first time, Chrome asks to let Spindle picture pages
   (`<all_urls>`, which Chrome requires for a picture of a tab; it covers every site, so
   Chrome then counts site access as given too, while the Pages switches stay as they
-  are). Settings, Pages takes it back with site access.
+  are). Settings, Pages takes it back with site access. A message sent while the
+  thread's turn runs steers that turn, but a running turn takes text only: a message
+  with a screenshot or other files waits in the message box (a line above what you
+  type) and goes as the next turn the moment this one ends (Take back puts it in the box
+  again). It is kept there, saying
+  why, when the thread cannot take it then: an unknown outcome needs you first, or the
+  turn did not finish (you stopped it, say) and waits for Retry, Continue or Take back.
 - **Page actions** (a second switch, off until you turn it on; Chrome's debugger, which
   Chrome does not offer as an optional permission, so the extension holds it and the
   switch decides): threads browse as
@@ -107,15 +121,20 @@ No server and no relay: the extension calls your provider directly with your key
   as real input; Chrome shows that Spindle is debugging a tab while it acts on it.
 - **Files in and out:** attach files to a message (the + beside the box, or drop them on
   the panel) and they land in the thread's workspace. What a thread makes shows in the
-  conversation as a card under the step that wrote it: a web page runs in a preview (its scripts, styles,
-  pictures and data files come from the workspace; it runs in a sandboxed page that
-  cannot reach Spindle or your keys, and reaches nothing outside the workspace: no
-  fetch, picture or script from the web, no form sent, until you press Load from the web
-  on it, which lets that preview load over HTTPS), Markdown is drawn, pictures show,
+  conversation as a card under the step that wrote it: a web page shows in a preview
+  (its styles and pictures come from the workspace; it is a sandboxed page that cannot
+  reach Spindle or your keys, and reaches nothing outside the workspace: no fetch,
+  picture or script from the web, no form sent). Its scripts run only once you press Run
+  its scripts on it, kept for that version of it: the page, its own scripts and the
+  small data files it or they name, which are the files it may then fetch from the
+  workspace (any of them changing asks again). Load from the web lets it run and load
+  over HTTPS. Markdown is drawn, pictures show,
   text and code show as they are; each card has icon buttons (show here, open in the
   workspace, Download; their words in their tooltips). The workspace is listed once, in a
-  card folded until you open it, just above the last turn's final answer: by folder, the
-  files that turn made or changed (by file tools or commands) marked new or edited,
+  card folded until you open it, just above the last turn's final answer: as a tree whose
+  folders stay shut until you open one (a folder holding only a folder shares its row,
+  `lib/python3.14/site-packages`; each says how many files it holds and how many changed),
+  the files that turn made or changed (by file tools or commands) marked new or edited,
   scratch files (`.txt`, `.py`, `tests/`) out of sight until you show them, with
   Download all (.zip); it has a page of its own in the panel (Workspace in the thread's
   menu, or a card's workspace button): its files to filter and open, one at a time with
@@ -126,34 +145,66 @@ No server and no relay: the extension calls your provider directly with your key
   permission), which saves them even when the browser would hold back a download a page
   starts after waiting on something; a name Chrome refuses (`.env`, `con.txt`) is saved
   as `_env`, `_con.txt`.
-- **A long run, readable:** a turn's steps (its tool calls) gather into a group that says
-  how many there were, how many failed and how many were done again, and how long they
-  took on the clock (steps that ran at once, such as a batch of tasks, count once); the
-  running turn's group stays open, its running step spinning with its time (or how many
-  run at once), and every group shuts when the turn ends. Each step says what it does in plain words, in its tense (Running
-  build_report.py, Ran build_report.py), a browser step with the site's icon and its
-  page's name (from the tabs and page parts earlier steps read: Clicked the “Go” button
-  on example.com); opened, its full command with a copy button and what it gave back. A
-  failed step shows a red dot, and "failed → retried ✓" once a later step did it again.
-  A message sent while a turn runs is a bubble of its own; scrolled up while it runs,
-  Latest takes you back down; while a turn runs (and the box is empty) Send is Stop. An
-  answer has a copy button; a table's short cells stay on one line (a wide table
-  scrolls). Chrome's site icons come through its `favicon` permission.
+- **A long run, readable:** a turn's steps (its tool calls) gather into a group whose
+  one-line head says how many there were (Ran 31 steps), how many were done again and
+  how many failed (as icons with numbers), and how long they took on the clock (steps
+  that ran at once, such as a batch of tasks, count once); the running turn's group stays
+  open (Step 3 of 3, its running step spinning with its time), and every group shuts when
+  the turn ends. Each step is a row with an icon for its kind (a command, Python, a file,
+  a folder, a task, tabs) saying what it does in plain words, in its tense (Running
+  build_report.py, Ran build_report.py); a page step shows the site's icon and says what
+  it did without the address (Read HTML, Typed into “Search”; the address shows on
+  hover). The same step done again and again in a row shares one row (Read HTML ×3, the
+  times added; opened, each shows). A long group shows its first rows and "N more
+  steps" (a running one its last rows). Opened, a step shows the picture it took, its
+  input and its output a line each, and copy, view (all of both) and download. A failed
+  step shows a red ✕, and an amber ↻ once a later step did it again. A message sent
+  while a turn runs is a bubble of its own at the right (three lines of a long one,
+  with an arrow for the rest), checked once the running turn has read it; scrolled up
+  while it runs, Latest takes you back down; while a turn runs (and the box is empty)
+  Send is Stop, a red square. An answer has a copy button; a table's short cells stay
+  on one line (a wide table scrolls). Chrome's site icons come through its `favicon`
+  permission.
+- **The panel:** the thread list groups threads into Running, Needs you (a turn that
+  stopped part way, waiting for Continue, Retry or Take back), Today and Earlier, each
+  row showing its state as a shape as well as a colour (a spinner, a warning, a dot for
+  a reply you have not read here) and what it is doing; a search filters them. A
+  thread's header has its name (its menu) and model, what it spent (opening its limit)
+  and Settings, with a thin bar beneath for what it spent against its limit. The message
+  box's top row says how the thread stands (Working and for how long, its tasks at work,
+  a report waiting) and holds the model button (model · effort); its + opens Upload and
+  Capture this tab. Settings and the model are pages of the panel, each with a back
+  button.
 - **Your instructions:** what every thread should keep to (Settings, Your instructions):
   new threads start with them, others take them before their next message.
   While it is off they read nothing, not even a provider's site Spindle may reach.
-- **The model menu** (the chip above the box: provider · model · effort): providers and
-  models in lists you can filter (a model the list does not have can be typed), each
-  model with its context, pictures and price from the catalog; the effort, from the ones
-  that model takes, each said as what it sends (DeepSeek's default is thinking off, a
-  Claude model's adaptive thinking at an effort, a token budget); where commands run;
-  and their network.
+- **The model page** (the model · effort button in the box): whether a change is for
+  this thread or for new threads; providers and models in lists you can filter (a model
+  the list does not have can be typed), each model with its context, pictures and price
+  from the catalog; the effort, from the levels that model takes, each said as what it
+  sends (none chosen leaves the model's own default, which the page names: DeepSeek's
+  thinking off, a Claude model's adaptive thinking); where commands run (a choice that
+  cannot be made says why, with a link to set it up); and their network; whether it may
+  start tasks; and a spending limit in US dollars (for new threads too), with what the
+  thread spent so far (the same ledger a Spindle host keeps: a request that could pass
+  the limit is not sent; raise it and Continue). Back leaves without saving.
+- **Tasks** (off unless switched on in the model page): a thread can start tasks,
+  threads of its own that work beside it in their own workspace and report back. Each
+  shows as a one-line card below the step that started it: working (its steps and time,
+  Stop, what it does now on hover), done, stopped or failed; opened, what it was asked
+  and its answer. The box's top row counts the tasks at work (to the first's card), and
+  says when a report waits for the thread's next turn (Continue reads it in). A turn
+  waits for its tasks before it ends ("Waiting for its task"); Stop then stops the
+  waiting, not the tasks. A task's report
+  shows as the task's, folded; one that stops (or could not go on, saying why) tells the
+  thread so, and the thread goes on.
+  Their spend counts against the thread's limit.
 - **Durable:** a turn cut off by closing Chrome, a crash or Stop says so; Retry sends the
   cut request again (Continue goes on when Spindle knows where it stopped). A turn that
   stopped before it finished (a provider refusing the key, say) can also be started over
-  with another model or effort (the model menu: the turn is taken back and its message
+  with another model or effort (the model page: the turn is taken back and its message
   sent again, its attachments too), or taken back (its message returns to the box).
-- **Going back:** ↺ beside any of your messages takes the thread back to just before it,
+- **Going back:** the back arrow beside any of your messages takes the thread back to just before it,
   conversation and workspace together, and returns the message (and its attachments)
   to the box to change or send again. What came after stays in the thread's record. (A
   thread started with another thread's files keeps them: its first turn can be started
@@ -165,21 +216,38 @@ No server and no relay: the extension calls your provider directly with your key
   earlier messages themselves when asked. A long thread opens on its last 30 turns (the
   rest on a click), and a turn's end draws only that turn again. To start clean, the
   thread menu's **New thread with these files** starts a thread with this one's
-  workspace and none of its conversation (its model too, to change in the model menu).
+  workspace and none of its conversation (its model too, to change in the model page).
 - **Moving:** a thread moves into a `.spindle` file (Thread menu, Move to a file) and
   continues in native Spindle (`spindle --dir DIR import-session FILE`), or in Spindle
   in another browser (Import a .spindle thread). Native Spindle's
   `export-session FILE` moves one back. The moved copy keeps the file until you delete
-  it (Save the file again), so a save you cancelled loses nothing. Export a copy leaves
+  it (Save the file again), so a save you cancelled loses nothing; once the file is on
+  disk (a strict IndexedDB commit) and reads back as written, it is the thread's one copy
+  here (the store it left goes, all but the note of where it went). Export a copy leaves
   the thread here. A thread leaves without the page tools (a native host could not
   answer them) and, where it had the file tools, with native's full tool set (code
   mode's `run_code` too) run in the native host's own sandbox; the thread in Chrome
   keeps its own settings. Imported, a thread gets the page tools back, and one from a
   native host changes what Chrome cannot do (its commands move to the browser Linux,
-  without network; the Rust toolchain, host folders and a dollar budget go) and says so.
-- **Deleting:** the × beside a thread in the list (or Delete this thread in its menu)
-  removes it and its workspace from this browser, after you confirm (stop a running
-  thread first).
+  keeping the network they had; the Rust toolchain and host folders go, a dollar budget
+  stays), as Spindle's `fit` gives it: the panel lists those changes and keeps the thread
+  only if you say so, before anything runs.
+- **Deleting:** Delete in a thread's ⋯ menu in the list (or Delete this thread in its
+  menu) removes it and its workspace from this browser after a moment to Undo it
+  (closing the panel deletes it then); stop a running thread first.
+- **Storage:** Settings, Storage lists what Spindle keeps in this browser, largest
+  first: each thread (with the free space inside its store that can be given back), a
+  moved thread's file, the Linux snapshot v86 resumes from, and everything else (settings,
+  keys, the browser's own bookkeeping). **Free** compacts a thread's store and its tasks'
+  (a copy written beside it with VACUUM INTO, synced, checked whole, then renamed over
+  it: a crash leaves the store or the copy whole), while no thread or background task is
+  at work (it holds the engine for its seconds); **Free all** does every thread that has
+  space to give back. A thread whose first request was
+  tried again keeps the first attempt aside (its unknown request on record); **Remove
+  first attempts** removes them (what they may have cost stays counted). A moved thread
+  that still has its sealed store (one moved by an earlier version) frees it once its
+  file checks whole. **Remove** takes the Linux snapshot away: the next command for v86
+  boots it afresh (under a minute).
 - **Appearance:** the native UI's Paper, Light, Dark or System (Light or Dark as the
   system is) theme, with a Textured or Plain
   background.
@@ -256,8 +324,11 @@ settings changes are ordered too, and changing catalogs refuses while work is pe
 Closing an OPFS session waits for Chrome to finish releasing its Web Lock before the
 same client reopens it. A first-turn reset validates settings and saves the original
 session as a private bundle before replacing it: a failed replacement or interrupted
-reset restores it. Prior records are retained until that thread is deleted. A move
-sealed before its index update is recognized on engine restart. Stop, a page-tool
+reset restores it (the record is written durably, a strict IndexedDB commit, before the
+store is replaced). Once the reset is done the saved record goes (the engine's start
+also drops any no reset is using). A move sealed before its index update is recognized
+on engine restart, and a file a move wrote before the engine stopped short of sealing the
+thread goes then (the thread stayed here, whole). Stop, a page-tool
 deadline, and disabling page actions fence further browser steps; a request already
 dispatched to Chrome cannot be undone. An action cut off once its input reached the page
 (or Chrome was told to move or close a tab) answers unknown rather than failed, so the
@@ -278,8 +349,8 @@ with `SPINDLE_BIN`, bash in a Spindle host's sandbox; `read_page` refused while 
 reading is off and reading the page once it is on, steering, a turn finishing while no
 panel is open, Stop / Continue / Retry, Chrome killed mid-turn and restarted, a move to
 native Spindle (without the page tools, with native's full tool set, a native turn and
-budget) and back (page
-tools again, the budget dropped and said), saving a moved thread's file again, a copy,
+budget) and back (page tools again, the budget kept and said), saving a moved thread's
+file again, a copy,
 attaching files and downloading them (one, and all as a .zip), a page of the workspace
 opened in a tab running its script and data, browsing (page_elements, type, click,
 screenshot, page_html, network, navigate) under standing instructions, a long thread
@@ -308,9 +379,13 @@ a side panel.
 cancellation, gateway redirect/buffer bounds, IPv6 checks, and dotted CDP request IDs
 without a browser. `review_browser.mjs DIST` uses a disposable real Chrome profile and
 a scripted provider to check permission/send races, camera gating, interrupted-reset
-and sealed-move recovery, page Stop, and file previews after idle close/reopen. The
-package's `embed/tests/browser_opfs.mjs` adds 80 same-worker close/reopen cycles with
-concurrent reads while retaining its two-worker contention test.
+and sealed-move recovery (no reset backup kept after), a moved thread keeping one copy,
+Storage freeing a thread's free space (a store fragmented under Node by the build's own
+wasm, then imported) and a set-aside first attempt, page Stop, and file previews after
+idle close/reopen. The package's `embed/tests/browser_opfs.mjs` adds 80 same-worker
+close/reopen cycles with concurrent reads while retaining its two-worker contention test,
+and compacts a store with free pages in OPFS; `node_compact.mjs` compacts one with its
+task's under Node.
 
 ```sh
 node chrome/tests/review_regressions.mjs
@@ -374,12 +449,21 @@ The test's work folder, whose Chrome profile holds the key, is always removed;
 - The page tools see the top page, not inside frames; refs last until the page changes
   (read `page_elements` again after); a screenshot (the tool's, or one you attach) is not
   shown to the model directly (a script can ask a vision model about it). A page opened
-  from the workspace gets its files put in (scripts, styles, pictures, small data files
-  it fetches by relative address); links between its pages and larger data are not
-  followed.
-- A preview reaches nothing outside the workspace until you let it, but a page can still
-  move its own frame to another address (which you would see), and that request can
-  carry what the page read: preview what a thread made from pages you do not trust with
-  that in mind. Public names resolving into a private network remain a limitation of
+  from the workspace gets its files put in (scripts, styles, pictures, and the small
+  data files it or its scripts name, which its scripts fetch by relative address); links
+  between its pages, larger data and files whose names a script puts together are not.
+- A preview reaches nothing outside the workspace until you let it load from the web,
+  and its scripts run as it shows. A page's policy cannot keep a script from sending
+  what the page shows out of the browser (through WebRTC, a resource hint, or a host
+  name it navigates to, which Chrome looks up before refusing), so the extension serves
+  the preview's frame itself under a Connection-Allowlist: Chrome (152 and later) then
+  makes no connection for the page, or for any frame or worker it makes, that the list
+  does not name (nothing, or HTTPS once you let it load from the web; WebRTC never). The
+  frame checks that the list holds before a page runs in it. Where it does not (an
+  older Chrome), a page shows without its scripts, frames or outside links until you
+  run that version of it, which then runs uncontained. Meta refreshes, resource hints
+  and a page's own DNS-prefetch switch are taken out either way. A page that tries
+  WebRTC from a `srcdoc` or `data:` frame it makes loses its preview (Chrome ends the
+  frame's process; nothing leaves). Public names resolving into a private network remain a limitation of
   Chrome's fetch: the extension cannot inspect DNS resolution. Hidden redirects are
   refused before following, rather than after contacting their destination.

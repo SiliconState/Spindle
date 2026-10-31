@@ -9198,3 +9198,86 @@ fn code_mode_channel_is_separate_from_output_and_safe_for_threads() {
         assert!(content.trim_end().ends_with("ok"), "{language}: {content}");
     }
 }
+
+/// A long-lived host (`keep_workspaces`) starts a session's next sandboxed command from
+/// the workspace its last one left: a file neither command's tree changed is the very
+/// same file (its inode), not written again; one the last command made is written anew.
+#[cfg(feature = "dext-strict-workspace")]
+#[cfg(target_os = "linux")]
+#[test]
+fn sandboxed_commands_of_a_session_start_from_the_workspace_the_last_one_left() {
+    use spindle_store::broker::DispatchOutcome;
+    use std::sync::atomic::AtomicBool;
+    struct Keeping;
+    impl Drop for Keeping {
+        fn drop(&mut self) {
+            dext_native::strict::keep_workspaces(false);
+        }
+    }
+    dext_native::strict::keep_workspaces(true);
+    let _keeping = Keeping;
+    let executor = strict_executor();
+    let realm = Realm::new();
+    let mut store = Store::open(&realm.0).unwrap();
+    let call = |id: &str, command: &str| Block::ToolUse {
+        id: id.into(),
+        name: "bash".into(),
+        input: serde_json::json!({"command": command, "timeout": 5}),
+    };
+    let (tools, _) = prepared_workspace_blocks(
+        &mut store,
+        vec![
+            call("first", "stat -c %i input.txt; printf made > made.txt"),
+            call("second", "stat -c %i input.txt; cat input.txt made.txt"),
+        ],
+    );
+    let mut ran = vec![];
+    for index in 0..2 {
+        let mut request = strict_dispatch_request(&store, &tools, &executor);
+        request.expected_revision = store.snapshot().unwrap().revision;
+        request.intent = tools.effects[index].clone();
+        request.attempt.effect = tools.effects[index].id.clone();
+        request.attempt.id = format!("reuse-attempt-{index}");
+        let DispatchOutcome::Recorded(bytes) = store
+            .dispatch_strict_workspace(&request, &AtomicBool::new(false), &executor, |_| Ok(()))
+            .unwrap()
+        else {
+            panic!("strict ingress")
+        };
+        let block: Block = serde_json::from_slice(&bytes).unwrap();
+        let Block::ToolResult { content, .. } = &block else {
+            panic!("tool result")
+        };
+        ran.push(content.clone());
+        let before = state(&mut store);
+        let after = before.apply_tool(&request.intent.id, vec![block]).unwrap();
+        let mut apply = receipt_proposal(
+            &mut store,
+            &format!("reuse-apply-{index}"),
+            &request.attempt,
+            &before,
+            &after,
+        );
+        apply.workspace = store.workspace_receipt(&request.attempt.id).unwrap();
+        store
+            .commit_turn_workspace_receipt(
+                &apply,
+                &receipt_binding(
+                    &request.attempt,
+                    tools.expected_revision + 1,
+                    &request.intent,
+                    &bytes,
+                ),
+                *executor.helper_digest(),
+            )
+            .unwrap();
+    }
+    let first = ran[0].trim();
+    let mut second = ran[1].lines();
+    assert_eq!(
+        second.next(),
+        Some(first),
+        "input.txt is the file the last command had"
+    );
+    assert_eq!(second.next(), Some("oldmade"));
+}

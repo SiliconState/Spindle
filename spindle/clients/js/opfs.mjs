@@ -19,8 +19,9 @@ const GENERATION = HEADER - 8;
 const MAX_PATH = GENERATION - MAGIC.length - 2;
 /** A directory moving: a slot named MOVE, then the old and new names (a path holds no
  * NUL), written before its first file moves and let go of after its last. A pool opened
- * with one finishes that move (`adoptSlots`), so a crash midway never leaves a directory
- * split between its two names. */
+ * with one finishes that move (`adoptSlots`) for the files it began with (older than the
+ * record), so a crash midway never leaves a directory split between its two names, and a
+ * directory made again under the old name since a move failed is not taken with it. */
 const MOVE = '\0move\0';
 /** The fd `openSync` gives a directory (synced by flushing its slots' headers). */
 const DIRECTORY = -2;
@@ -48,13 +49,21 @@ export async function openOpfsPool({ directory = 'spindle', slots = 48 } = {}) {
   } catch (error) {
     throw failure('EBUSY', `the OPFS pool is held by another worker or tab (${error.message})`);
   }
-  return new OpfsFs(pool, dir, adoptSlots(pool));
+  let generation;
+  try {
+    generation = adoptSlots(pool);
+  } catch (error) {
+    // Let the handles go, so opening again is not refused as held elsewhere.
+    for (const slot of pool) slot.handle.close();
+    throw error;
+  }
+  return new OpfsFs(pool, dir, generation);
 }
 
 /** Reads each slot's header into it (`path`, `generation`), lets go of the older of
  * two slots one replacement left with the same path (a crash between its two steps:
- * the newest generation is the file), and finishes a directory move a crash cut short.
- * Returns the newest generation given. */
+ * the newest generation is the file), and finishes a directory move a crash or a failed
+ * write cut short. Returns the newest generation given. */
 export function adoptSlots(pool) {
   let latest = 0;
   const named = new Map();
@@ -76,6 +85,8 @@ export function adoptSlots(pool) {
     const [from, to] = move.path.slice(MOVE.length).split('\0');
     for (const slot of pool) {
       if (slot.path !== from && !slot.path.startsWith(`${from}/`)) continue;
+      // Named there after the move began (it failed, and the directory was made again).
+      if (slot.generation > move.generation) continue;
       latest += 1;
       const path = to + slot.path.slice(from.length);
       writePath(slot.handle, path, latest);
@@ -95,25 +106,50 @@ function release(slot) {
   slot.path = '';
 }
 
-/** Opens slots `from`..`to` (all or none: on a failure the ones opened are closed). */
+/** Opens slots `from`..`to`, in order (all or none: on a failure the ones opened are
+ * closed). Their handles open at once: one after another, 48 take ~30 ms, together ~4. */
 async function openSlots(dir, from, to) {
-  const slots = [];
-  try {
-    for (let index = from; index < to; index++) {
-      const file = await dir.getFileHandle(`slot-${index}`, { create: true });
-      slots.push({ handle: await file.createSyncAccessHandle(), path: '' });
-    }
-  } catch (error) {
-    for (const slot of slots) slot.handle.close();
-    throw error;
+  const opening = [];
+  for (let index = from; index < to; index++) {
+    opening.push(dir.getFileHandle(`slot-${index}`, { create: true }).then((file) => file.createSyncAccessHandle()));
   }
-  return slots;
+  const opened = await Promise.allSettled(opening);
+  const failed = opened.find((outcome) => outcome.status === 'rejected');
+  if (failed) {
+    for (const outcome of opened) if (outcome.status === 'fulfilled') outcome.value.close();
+    throw failed.reason;
+  }
+  return opened.map((outcome) => ({ handle: outcome.value, path: '' }));
+}
+
+/** Reads `into` from `at` whole: a sync access handle may read less than asked. The
+ * count read: less only where the handle gives nothing more (the file's end). */
+function readFully(handle, into, at) {
+  let done = 0;
+  while (done < into.length) {
+    const read = handle.read(into.subarray(done), { at: at + done });
+    if (!(read > 0)) break;
+    done += read;
+  }
+  return done;
+}
+
+/** Writes `bytes` at `at` whole: a sync access handle may write less than asked (and
+ * say so only by its count), so a write that stops making progress fails. */
+function writeFully(handle, bytes, at) {
+  let done = 0;
+  while (done < bytes.length) {
+    const written = handle.write(bytes.subarray(done), { at: at + done });
+    if (!(written > 0)) throw failure('EIO', 'an OPFS slot could not be written');
+    done += written;
+  }
 }
 
 function readHeader(handle) {
   if (handle.getSize() < HEADER) return { path: '', generation: 0 };
   const header = new Uint8Array(HEADER);
-  handle.read(header, { at: 0 });
+  // Not taken for an empty slot, which would be reused and the file in it written over.
+  if (readFully(handle, header, 0) < HEADER) throw failure('EIO', 'an OPFS slot header could not be read');
   if (!MAGIC.every((byte, at) => header[at] === byte)) return { path: '', generation: 0 };
   const length = header[MAGIC.length] | (header[MAGIC.length + 1] << 8);
   const path = new TextDecoder().decode(header.subarray(MAGIC.length + 2, MAGIC.length + 2 + length));
@@ -130,7 +166,8 @@ function writePath(handle, path, generation) {
   header.set(bytes, MAGIC.length + 2);
   new DataView(header.buffer).setBigUint64(GENERATION, BigInt(generation), true);
   if (handle.getSize() < HEADER) handle.truncate(HEADER);
-  handle.write(header, { at: 0 });
+  // Whole, or this throws: callers name or let go of a slot in memory only after it.
+  writeFully(handle, header, 0);
   handle.flush();
 }
 
@@ -153,6 +190,14 @@ export class OpfsFs {
 
   /** How many slots hold no file. */
   get free() { return this.#pool.filter((slot) => !slot.path).length; }
+
+  /** Every file the pool holds, with its size in bytes (what it takes on disk, but for
+   * its slot's header). */
+  files() {
+    return this.#pool
+      .filter((slot) => slot.path && !slot.path.startsWith(MOVE))
+      .map((slot) => ({ path: slot.path, size: Math.max(0, slot.handle.getSize() - HEADER) }));
+  }
 
   /** Adds `count` empty slots (sync access handles open asynchronously, so call it
    * between operations, before `free` runs out). */
@@ -223,6 +268,10 @@ export class OpfsFs {
   renameSync(from, to) {
     const moving = this.#pool.filter((slot) => slot.path === from || slot.path.startsWith(`${from}/`));
     if (!moving.length) throw failure('ENOENT', from);
+    // As rename(2): a name renamed to itself is left as it is (it would replace itself),
+    // and a directory cannot move inside itself (a crash midway would move it again).
+    if (from === to) return;
+    if (to.startsWith(`${from}/`)) throw failure('EINVAL', `${to} is inside ${from}`);
     // A file replaces a file, as rename(2) does: it takes the name first, under a newer
     // generation, and the old slot is let go of after, so a crash between leaves the
     // new file under the name (the older slot goes when the pool is next opened), never
@@ -261,7 +310,7 @@ export class OpfsFs {
   readFileSync(path) {
     const slot = this.#slot(this.#find(path));
     const bytes = new Uint8Array(Math.max(0, slot.handle.getSize() - HEADER));
-    slot.handle.read(bytes, { at: HEADER });
+    if (readFully(slot.handle, bytes, HEADER) < bytes.length) throw failure('EIO', `${path} could not be read`);
     return new TextDecoder().decode(bytes);
   }
   /** Releases every slot's handle (the pool can then be opened elsewhere). */

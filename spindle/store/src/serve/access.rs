@@ -105,9 +105,14 @@ impl Access {
             .and_then(|response| response.error_for_status())
             .and_then(|response| response.text())
             .map_err(|error| format!("{url}: {error}"))?;
-        let rsa = parse_keys(&text);
+        self.keep(&text).map_err(|error| format!("{url} {error}"))
+    }
+
+    /// Keeps a fetched key set (the team's whole set: a key it no longer lists is gone).
+    fn keep(&self, text: &str) -> Result<(), String> {
+        let rsa = parse_keys(text);
         if rsa.is_empty() {
-            return Err(format!("{url} listed no RS256 keys"));
+            return Err("listed no RS256 keys".into());
         }
         // A cache: refetched when missing, but never left torn (refreshes can race).
         let _ = spindle_store::durable::write(&self.cache, text.as_bytes());
@@ -119,6 +124,15 @@ impl Access {
 
     /// The key for `kid`, refreshing the set when it is stale or does not have it.
     fn key(&self, kid: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.key_refreshed_by(kid, || self.refresh())
+    }
+
+    /// `key`, with `refresh` the fetch (a test's stand-in for Cloudflare).
+    fn key_refreshed_by(
+        &self,
+        kid: &str,
+        refresh: impl FnOnce() -> Result<(), String>,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
         let (known, stale, may_retry) = {
             let keys = self.lock();
             (
@@ -128,10 +142,12 @@ impl Access {
             )
         };
         if (known.is_none() || stale) && may_retry {
-            if let Err(error) = self.refresh() {
+            if let Err(error) = refresh() {
                 eprintln!("spindle serve: Cloudflare Access keys not refreshed: {error}");
             }
-            return self.lock().rsa.get(kid).cloned().or(known);
+            // The set as it is now: the team's current keys after a refresh (never the
+            // one it dropped), the keys it had after a failed one.
+            return self.lock().rsa.get(kid).cloned();
         }
         known
     }
@@ -456,6 +472,51 @@ mod tests {
             ),
             "does not list",
         );
+    }
+
+    #[test]
+    fn a_refreshed_set_drops_a_key_the_team_no_longer_lists() {
+        let signer = Signer::new();
+        let dir = std::env::temp_dir().join(format!("spindle-access-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut access = access(&signer.jwks("k1"));
+        access.cache = dir.join("access-keys.json");
+        let cached = |access: &Access| {
+            let text = std::fs::read_to_string(&access.cache).unwrap();
+            parse_keys(&text).into_keys().collect::<Vec<_>>()
+        };
+        let due = |access: &Access| {
+            let mut keys = access.lock();
+            keys.fetched = None;
+            keys.attempted = None;
+        };
+        // What `refresh` does, given Cloudflare's answer (no fetch here, and the attempt
+        // marked, so the lookups after it do not fetch either).
+        let refresh = |access: &Access, answer: Result<String, &str>| {
+            access.lock().attempted = Some(Instant::now());
+            answer
+                .map_err(String::from)
+                .and_then(|text| access.keep(&text))
+        };
+        // Cloudflare unreachable: the keys already known still verify.
+        due(&access);
+        let offline = access.key_refreshed_by("k1", || refresh(&access, Err("offline")));
+        assert!(offline.is_some());
+        // A refresh that succeeds with only k2: k1 is refused on that very lookup.
+        due(&access);
+        let rotated = access.key_refreshed_by("k1", || refresh(&access, Ok(signer.jwks("k2"))));
+        assert!(rotated.is_none());
+        assert!(access.key("k1").is_none(), "and after");
+        assert!(access.key("k2").is_some());
+        assert_eq!(cached(&access), ["k2"], "and after a restart");
+        // A set with no RS256 keys is not kept.
+        due(&access);
+        let empty =
+            access.key_refreshed_by("k2", || refresh(&access, Ok(r#"{"keys": []}"#.into())));
+        assert!(empty.is_some());
+        assert_eq!(cached(&access), ["k2"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -65,7 +65,8 @@ What the host does at start, in order (`run` and `Host::open` in
 5. Prunes old command receipts, restores a registered thread whose directory was left
    in `HOST/trash`, migrates any thread store that an older schema wrote (the
    pre-migration copy is kept as `store/authority.vNN.sqlite`), and removes
-   unregistered leftovers from the trash in the background.
+   unregistered leftovers from the trash in the background. Schema 20 packs workspace
+   objects; older stores, including schema 19, migrate in place.
 6. With `--access-team`, loads the team's signing keys; then binds the listener.
 
 ## Request path
@@ -83,7 +84,7 @@ flowchart TD
     xsite -->|"no"| access{"Through --origin with<br/>--access-team set?"}
     access -->|"token invalid or missing"| deny3["403 with the reason"]
     access -->|"token valid, or not applicable"| path{"Path"}
-    path -->|"/api/preview/TOKEN/..."| preview["Preview grant lookup<br/>the token is the only authority"]
+    path -->|"/api/preview/..."| preview["Preview grant or probe"]
     path -->|"/v1/..."| v1["Bearer token or device cookie<br/>then v1 dispatch"]
     path -->|"anything else"| same{"POST with matching Origin<br/>and X-Spindle: 1?"}
     same -->|"no"| deny4["403 same-origin command required"]
@@ -111,7 +112,7 @@ is caught, so it never takes the host down.
 | Request line | `GET` or `POST`, `HTTP/1.1`, absolute path | [`http.rs`](../spindle/store/src/serve/http.rs) |
 | Request head | 16 KiB; a `Host` header is required; duplicate headers, duplicate query keys, `Transfer-Encoding` and `Expect` are refused | `http.rs` |
 | Request body | 64 KiB; 8 MiB for attachment uploads and `/v1` app data; 64 MiB plus 64 KiB for `/v1/run`; none on `GET` | `http.rs` |
-| Timeouts | 10 s per read and write; a body must arrive within 10 s, or 2 minutes for uploads and `/v1/run` | `http.rs` |
+| Timeouts | 10 s overall for the request head; after authorization, 10 s overall for the body, or 2 minutes for uploads and `/v1/run`; each read and write at most 10 s | `http.rs` |
 
 A request body is read only after the request has been authorized, so an unpaired
 client cannot make the host buffer an 8 MiB upload.
@@ -136,11 +137,15 @@ Every request passes these checks in order (`route` in [`mod.rs`](../spindle/sto
    token is verified ([below](#cloudflare-access-verification)). Local requests are not
    checked against Access.
 4. **Previews** (`/api/preview/...`) are handled next, authorized only by the token in
-   the path ([Previews](#previews)).
+   the path; the containment check is token-free ([Previews](#previews)).
 5. **`/v1`** requests go to the HTTP API, which accepts `Authorization: Bearer TOKEN` (a
    device token or a named API token) or the device cookie. With the cookie, a `POST`
    needs the same Origin and `X-Spindle: 1` header as `/api`. The pairing key is never
-   accepted as a bearer token or as a `/v1` cookie. See [API.md](API.md).
+   accepted as a bearer token or as a `/v1` cookie. A token minted with
+   `spindle --dir HOST token new NAME --runner` reaches only `GET /v1`,
+   `/v1/runner`, `/v1/run` and a named run's status and stop; everything else is
+   `403 forbidden`, including `/api` with that token as a cookie. `token list`
+   marks it `(runner)`. See [API.md](API.md).
 6. **Same-origin commands.** Every other `POST` must carry `Origin` equal to the expected
    origin and the custom header `X-Spindle: 1`.
 7. **Embedded UI files** are served without pairing.
@@ -221,7 +226,9 @@ served.
 
 The team's keys come from `https://TEAM/cdn-cgi/access/certs`, are kept in
 `HOST/access-keys.json` so that a restart does not depend on reaching Cloudflare, and are
-refreshed hourly and whenever a token names an unknown key (at most once a minute). If
+refreshed hourly and whenever a token names an unknown key (at most once a minute).
+A successful refresh replaces the set immediately, so a key the team dropped is
+refused on that lookup too; a failed refresh retains the known keys. If
 no keys can be loaded at start, the host still starts and logs it; public requests are
 refused until keys are available. A refused request is logged to standard error with
 its method, path (preview tokens redacted) and reason. When the Access sign-in expires,
@@ -276,6 +283,27 @@ inspects the recovery report of each such thread and submits a `continue` for th
 whose remaining work is ready and has no unknown outcome; when four threads are already
 running it waits up to 30 minutes for room. Every other thread waits for a person.
 
+Like every native entry point, the host refuses an embedded-owned or moved store
+and writes no metadata into it, including while the package closes SQLite to
+replace a compacted store. The fence is checked by
+[`meta.rs`](../spindle/store/src/meta.rs).
+
+The host reuses a session's last isolated command workspace where content ids and
+file stamps still match, rather than writing every input again; links, changed
+files and leftovers are reconciled against the committed tree first. This is only
+a process-local optimization, not another authority. See
+[`strict.rs`](../dext-engine/native/src/strict.rs) and
+[`agent.rs`](../spindle/store/src/agent.rs).
+
+Remote commands (`/v1/run`) may carry a client-chosen `run` id. `GET /v1/run/ID`
+reports it and `POST /v1/run/ID/stop` stops it, scoped to the starting token;
+[API.md](API.md#routes) gives the retention, bounds and early-stop behavior.
+Native stdio `capabilities` reports what this host can run; embedded `fit` describes
+settings changes for a moved session, without applying them. Neither is a new
+HTTP route. Session JSON includes stable `activity` codes (`model`, `tools`,
+`waiting_app`, `stopping`, `running`, `blocked`, `resumable`, `idle`) rather than
+requiring clients to parse a status sentence; see [API.md](API.md#status-object).
+
 ## The browser UI
 
 The UI is plain HTML, CSS and ES modules in
@@ -298,14 +326,21 @@ Screens and features:
 
 | Area | What it offers |
 | --- | --- |
-| Thread list | Every thread with its state (running, stopping, done, stopped, needs attention, reply saved, new), last activity, spend and a self-edit tag; a filter; a composer that starts a new thread. Refreshed every 20 seconds while visible. |
-| Thread view | The conversation with tool cards, streamed model text and live command output marked as an uncommitted preview, messages waiting for the running turn, find in thread, and a context gauge for the newest request. |
-| Dock | Phase and elapsed time, the model chip, and Stop, Continue, Retry, Recover, Rewind and Sign in when they apply; revision stepping for viewing history; attachments and the composer. |
-| Model picker | Provider and model search, effort, Network and Rust toolchain toggles, and for a new thread its name, compaction mode and budget. |
+| Thread list | Running, Needs you, Today and Earlier groups, state shapes as well as colours, activity, spend and search; a composer starts a thread. Delete hides it immediately with Undo before the delete is sent. Refreshed every 20 seconds while visible. |
+| Thread view | A header with back, name, model and spend, and a budget hairline. Consecutive tool calls fold into a “Ran N steps” row with failures counted; steering is a right-hand bubble, checked when read, with long text folded until tapped. Streamed text and command output remain uncommitted previews. |
+| Dock | One composer box: revision, activity, model button and the action that applies now above the message. With a turn running and no text written, Stop takes Send's place. Continue, Retry, Recover and Sign in appear when needed. |
+| Model picker | Provider and model search, effort with the model's own default outlined and named when none is chosen, Network and Rust toolchain switches labelled On or Off, and for a new thread its name, compaction mode and budget. |
 | Thread menu | Rename, spend and budget, compaction, the Spindle change card, Files, History, Find, Note for next turn, Download workspace (`.tar`), Export transcript (`.md`), Delete. |
-| Files and viewer | Files of a revision marked new, changed or deleted, a per-file diff, rendered Markdown, images, sandboxed HTML previews, Open in a tab, GitHub access for a preview, and Shelf. |
+| Files and viewer | A workspace tree whose folders stay shut until tapped, changes marked on files and their folders, per-file diffs, Markdown, images, sandboxed HTML, Open in a tab, Run scripts where needed, GitHub access, and Shelf. |
 | History | Every committed step, with Rewind here and Return to live. |
 | Settings (gear) | Appearance and host skin, Sign-ins (Dext's flows; credentials go to the host's credential store, never to the browser), Screens, Notifications, Shelf, Code tools (a read-only summary of the code policy), Usage, and Spindle: version, build, schema, engine, uptime, disk use, Roll back binary, Restart host. |
+
+Settings, Files and History open as full pages on a phone, with a way back rather
+than a small floating sheet. Light is neutral rather than tinted; Paper, Dark and
+System remain available. The page's `theme-color` follows the header background.
+The layout and interactions are in [`app.js`](../spindle/store/ui/app.js),
+[`style.css`](../spindle/store/ui/style.css) and
+[`theme.js`](../spindle/store/ui/theme.js).
 
 Typed commands in the composer ([`commands.js`](../spindle/store/ui/commands.js)) run UI
 actions instead of messaging the model when they match exactly: for example `stop`,
@@ -328,7 +363,32 @@ retires the oldest). A restart or the thread's deletion revokes them all. A prev
 request reads no cookie: the token is its whole authority, and an unknown, expired or
 forged token reads nothing.
 
-**Isolation.** Every preview response carries this policy, where `OWN` is
+**Scripts and containment.** A grant's `scripts` is false (the default), true for
+all pages, or one page's workspace path. Without permission a page loses its
+scripts and storage shim, shows its `<noscript>` fallback, and has `sandbox` and
+`script-src 'none'`. A page named by a grant cannot grant scripts to another page
+it links to or frames.
+
+CSP cannot prevent every outgoing connection a script can cause, notably WebRTC
+and name lookups for navigation. Every preview response therefore also carries
+`Connection-Allowlist: ("ORIGIN/api/preview/TOKEN/*")`, adding GitHub's API and
+avatar origins for a GitHub grant; without a live token it is `()`. In a browser
+that enforces it (Chrome 152 and later), no other connection is made for the page,
+its frames or its workers. The UI checks `GET /api/preview/check`, a token-free
+page that posts `{spindleContained: true}` to its parent when protected and false
+otherwise.
+It requests `{scripts: true, contained: true}` only when that succeeds. Each HTML
+page of a contained grant checks again before its content runs; on a browser
+without protection it treats the remaining page as text and says why.
+
+Otherwise the viewer offers **Run scripts**. That mints a grant for this page and
+remembers the choice on this device for its version: the page, the scripts it
+loads and the files it or they name. A change asks again; inline cards follow the
+choice. Explicitly running scripts without containment can disclose page data
+outside the browser despite CSP. Features `preview_scripts` and
+`preview_contained` advertise these behaviors in `/v1`.
+
+**Isolation.** A response allowed to run scripts carries this policy, where `OWN` is
 `ORIGIN/api/preview/TOKEN/` and `ORIGIN` the host page's origin:
 
 ```text
@@ -342,8 +402,11 @@ frame-ancestors ORIGIN
 
 The sandbox never includes `allow-same-origin`, so the page runs in an opaque origin
 without the host's cookies, storage, service worker or API, and cannot navigate or frame
-the host. Its loads are confined to the token's own prefix (root-relative URLs leave it
-and do not load), and forms submit nowhere. The UI's preview frame is itself sandboxed
+the host. CSP restricts loads to the token's own prefix (root-relative URLs leave it
+and do not load), and forms submit nowhere. Before serving HTML the host removes
+meta refreshes, DNS-prefetch switches and resource hints (`preconnect`,
+`dns-prefetch`, `prefetch`, `prerender`, `preload`, `modulepreload`); every response
+also has `X-DNS-Prefetch-Control: off`. The UI's preview frame is itself sandboxed
 the same way with `referrerpolicy="no-referrer"`. Responses allow any origin to read
 them (`Access-Control-Allow-Origin: *`) because a sandboxed document's module scripts,
 fonts and fetches are CORS requests from the `null` origin. Paths are checked like every
@@ -354,14 +417,16 @@ types served as `application/octet-stream`.
 **GitHub grant.** A preview minted with `network: "github"` (the viewer's GitHub access,
 after a confirmation) additionally allows connections to GitHub's API origin and images
 from GitHub's avatar origin, for that token only. This can disclose page data to GitHub.
-No host path is ever granted.
+No host path is ever granted. A GitHub grant permits scripts too: on the page named
+by `scripts`, or every page when none is named (even with `scripts: false`).
 
 **Whole pages.** An HTML page is served with its own stylesheets, classic scripts and
 images from the same revision inlined (at most 16 MiB in total and 4 MiB per file), so it
 renders even when a proxy withholds cookies from the sandboxed page's subrequests.
-Stylesheet URLs are rewritten to the token's prefix. A shim placed first in the page
-gives it in-memory `localStorage`, `sessionStorage` and `document.cookie`, which an
-opaque origin cannot use, so apps that save state still start. What cannot be inlined
+Stylesheet URLs are rewritten to the token's prefix. A shim placed first in a
+page allowed to run scripts gives it in-memory `localStorage`, `sessionStorage`
+and `document.cookie`, which an opaque origin cannot use, so apps that save state
+still start. What cannot be inlined
 (modules, absolute or missing URLs, files over the caps) is left for the browser to load
 under the policy above. Behind Cloudflare Access, preview requests still pass the Access
 check; a sandboxed page's own subrequests reach the host only if the browser sends the
@@ -369,9 +434,9 @@ check; a sandboxed page's own subrequests reach the host only if the browser sen
 `SameSite=None`.
 
 **Single files.** `GET /api/sessions/ID/file?revision=N&path=P` serves raster images by
-type and every other file, SVG and HTML included, as `text/plain`. With `&render=1` it
-serves the file as HTML under a stricter single-file sandbox: inline styles and scripts,
-images and fonts only from `data:` URLs, and no network.
+type and every other file, SVG and HTML included, as `text/plain`. With `&render=1`,
+HTML is scrubbed and served without scripts or network under the single-file
+sandbox; other types, including SVG, are served as their own type rather than HTML.
 
 ## Host skin
 
@@ -564,12 +629,13 @@ The UI's own routes; all `POST`s need the same-origin header, and all but the UI
 | GET | `/api/sessions/ID/snapshot`, `/files`, `/file`, `/archive`, `/events` | Thread state, a revision's files, one file, a ustar archive of a revision (`workspace/` plus `state.json`), the event stream. |
 | POST | `/api/sessions/ID/steer` | A message for the running turn, or `now` to have waiting messages read at once. |
 | POST | `/api/sessions/ID/upload` | One attachment (raw bytes), stored by digest. |
-| POST | `/api/sessions/ID/preview` | Mint a preview token. |
+| POST | `/api/sessions/ID/preview` | Mint a revision grant with `network`, `scripts` and `contained` (see [Previews](#previews)). |
 | POST | `/api/sessions/ID/pack-ui` | Answer a session pack's pending question. |
 | POST | `/api/sessions/ID/attention` | Report what the operator opened or wrote. |
 | POST | `/api/sessions/ID/shelf` | Copy a head file to the shelf. |
 | GET | `/api/shelf`, `/api/shelf/file?name=NAME` | List the shelf notes; read one. |
 | POST | `/api/shelf` | Write a note, or delete one (`action: "delete"`). |
+| GET | `/api/preview/check` | Token-free containment check; posts `{spindleContained: boolean}` to its parent. |
 | GET | `/api/preview/TOKEN/PATH` | Token-authorized preview. |
 
 ## Source map

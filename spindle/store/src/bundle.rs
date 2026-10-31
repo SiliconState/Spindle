@@ -110,10 +110,11 @@ fn check_sidecar(file: &BundleFile) -> Result<(), String> {
     Ok(())
 }
 
-/// Checks `files` (paths, sidecars, every store) and returns the session store's facts.
-/// Each place's `session.json` is its store's own settings (the store is what every
-/// host reads; the file only mirrors it): one is filled in, or set right, from them.
-fn check_files(files: &mut Vec<BundleFile>) -> Result<ImageFacts, String> {
+/// Checks `files` (paths, sidecars, every store: each `whole`, or its facts only, as
+/// `write_copy` does) and returns the session store's facts. Each place's
+/// `session.json` is its store's own settings (the store is what every host reads; the
+/// file only mirrors it): one is filled in, or set right, from them.
+fn check_files(files: &mut Vec<BundleFile>, whole: bool) -> Result<ImageFacts, String> {
     if files.len() > MAX_FILES {
         return Err(format!("a bundle holds at most {MAX_FILES} files"));
     }
@@ -129,7 +130,12 @@ fn check_files(files: &mut Vec<BundleFile>) -> Result<ImageFacts, String> {
     let mut main = None;
     let mut mirrors = Vec::new();
     for file in files.iter().filter(|file| file.path.ends_with(STORE)) {
-        let facts = check_image(&file.bytes).map_err(|error| {
+        let checked = if whole {
+            check_image(&file.bytes)
+        } else {
+            crate::image_facts(&file.bytes)
+        };
+        let facts = checked.map_err(|error| {
             format!("{} is not a store this build opens ({error:?})", file.path)
         })?;
         if let Some(settings) = &facts.settings {
@@ -171,9 +177,22 @@ pub struct Written {
     pub files: usize,
 }
 
-/// Writes `files` (a session directory's portable files) as a bundle.
-pub fn write(mut files: Vec<BundleFile>) -> Result<Written, String> {
-    let main = check_files(&mut files)?;
+/// Writes `files` (a session directory's portable files) as a bundle, every store in
+/// it checked whole first: what a move needs, as the session then goes on only from
+/// the bundle.
+pub fn write(files: Vec<BundleFile>) -> Result<Written, String> {
+    written(files, true)
+}
+
+/// `write` for a copy: the session stays where it is, so each store is checked as far
+/// as the bundle records it (pages, schema, facts), not record by record; `read` checks
+/// every record before an import uses one.
+pub fn write_copy(files: Vec<BundleFile>) -> Result<Written, String> {
+    written(files, false)
+}
+
+fn written(mut files: Vec<BundleFile>, whole: bool) -> Result<Written, String> {
+    let main = check_files(&mut files, whole)?;
     order(&mut files);
     let manifest = json!({
         "format": FORMAT,
@@ -192,12 +211,14 @@ pub fn write(mut files: Vec<BundleFile>) -> Result<Written, String> {
         + manifest.len()
         + files.iter().map(|file| file.bytes.len()).sum::<usize>()
         + 32;
+    let count = files.len();
     let mut out = Vec::with_capacity(size);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&FORMAT.to_le_bytes());
     out.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
     out.extend_from_slice(manifest.as_bytes());
-    for file in &files {
+    // Each file goes once it is in the bundle: a store's image is the whole store.
+    for file in files {
         out.extend_from_slice(&file.bytes);
     }
     let sum = Sha256::digest(&out);
@@ -205,7 +226,7 @@ pub fn write(mut files: Vec<BundleFile>) -> Result<Written, String> {
     Ok(Written {
         bytes: out,
         facts: main,
-        files: files.len(),
+        files: count,
     })
 }
 
@@ -237,7 +258,7 @@ pub fn read(bytes: &[u8]) -> Result<Bundle, String> {
     let manifest: Value = serde_json::from_slice(&body[start..start + length])
         .map_err(|_| refused("its manifest is not JSON"))?;
     let schema = manifest["schema"].as_i64().unwrap_or(-1);
-    if schema != i64::from(crate::CAPABILITIES.schema) {
+    if schema != i64::from(crate::CAPABILITIES.schema) && schema != crate::PREVIOUS_SCHEMA {
         return Err(format!(
             "the bundle holds schema {schema} stores; this build reads schema {}",
             crate::CAPABILITIES.schema
@@ -278,7 +299,7 @@ pub fn read(bytes: &[u8]) -> Result<Bundle, String> {
     if at != body.len() {
         return Err(refused("bytes follow its last file"));
     }
-    let main = check_files(&mut files)?;
+    let main = check_files(&mut files, true)?;
     if manifest["head"].as_u64() != Some(main.head)
         || manifest["identity"].as_str() != Some(main.identity.as_str())
     {

@@ -85,7 +85,7 @@ check them.
   session.json               mirror of the settings metadata
   pending-settings.json      mirror of a queued settings change
   output-limits.json         older file, read only to seed metadata
-  usage.json  usage.lock     spend ledger and its cross-process lock
+  usage.json  usage.lock     native spend mirror and cross-process lock
   cache/                     build cache and task-slot locks (never bundled)
   store/
     authority.sqlite         the store
@@ -107,14 +107,16 @@ check them.
 | `session.json` | host settings code | A mirror of the store's `settings` metadata. The store's copy is authoritative; a bundle rewrites the mirror from it. |
 | `pending-settings.json` | `settings` tool | A mirror of the `pending_settings` metadata, removed when nothing is queued. |
 | `output-limits.json` | older builds | Read only to seed the `output_limits` metadata. |
-| `usage.json`, `usage.lock` | spend accounting | The spend ledger. When the store holds `usage` metadata, readers use that. |
+| `usage.json`, `usage.lock` | native spend accounting | Mirror and cross-process lock; both hosts share the ledger format in the store's `usage` metadata. |
 | `tasks/<key>/` | task tool | A task's own session directory. `<key>` is the first 10 bytes of the SHA-256 of the task key, as 20 lowercase hex digits ([`agent/tasks.rs`](../spindle/store/src/agent/tasks.rs)). It holds `task.json`, the task's identity record. |
 | `store.abandoned-N/` | retry | When the very first request of a session must be retried, the whole store is renamed aside (its unknown request stays on record there) and a fresh store starts the same prompt. |
 
 When the native host opens a session, `meta::seed` copies `session.json`,
 `pending-settings.json`, `output-limits.json` and `usage.json` into the matching metadata keys
 the store does not have yet, so sessions written before the store kept metadata keep their
-settings and spend.
+settings and spend. Native metadata writes refuse a store fenced by an embedded
+owner or a moved-session seal, even while SQLite is closed during replacement
+([`meta.rs`](../spindle/store/src/meta.rs)).
 
 On Unix the store directory is created `0700`, and `owner.lock` and the fence `0600`;
 `durable::write` creates the host's files `0600`. `Store::open` refuses a store
@@ -166,7 +168,7 @@ flowchart TD
     D --> E["lock owner.lock, hold the fence"]
     E --> F{"application_id and user_version"}
     F -->|"current schema"| G["validate table definitions"]
-    F -->|"schema 14 to 18"| H["validate the old schema's definitions"]
+    F -->|"schema 14 to 19"| H["validate the old schema's definitions"]
     F -->|"anything else"| X["Incompatible"]
     G --> I["WAL, synchronous FULL, foreign keys ON"]
     H --> I
@@ -190,8 +192,8 @@ flowchart TD
 2. **Checks paths** as described in [Session directory](#session-directory), then takes the
    owner lock and holds the fence.
 3. **Identifies the database.** `PRAGMA application_id` must be `0x53504e44` (ASCII `SPND`)
-   and `PRAGMA user_version` the schema, `19` in this build. An empty database is refused
-   unless this open just created it. Schemas 14 to 18 are migrated (see
+   and `PRAGMA user_version` the schema, `20` in this build. An empty database is refused
+   unless this open just created it. Schemas 14 to 19 are migrated (see
    [Schema migration](#schema-migration-and-binary-upgrade)); any other value is
    `Incompatible`, and the file is left untouched.
 4. **Validates the table definitions.** Every row of `sqlite_schema` must equal what this
@@ -199,8 +201,9 @@ flowchart TD
    reference without the tables later schemas added). At most 128 schema records of at most
    8 KiB each are read, so a hostile file cannot make the check allocate without bound.
    `trusted_schema` is off.
-5. **Sets connection pragmas.** `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`,
-   a 250 ms busy timeout, and on macOS `fullfsync` and `checkpoint_fullfsync`. If SQLite does
+5. **Sets connection pragmas.** `journal_mode=WAL`, `journal_size_limit=16777216`,
+   `synchronous=FULL`, `foreign_keys=ON`, a 250 ms busy timeout, and on macOS
+   `fullfsync` and `checkpoint_fullfsync`. If SQLite does
    not confirm WAL, FULL and foreign keys, the open fails with `Unsupported`.
 6. **Takes over** (`take_over`): checks the SQLite type and label syntax of each checked
    column in every row, checks that admissions have no gaps (count, maximum sequence and the
@@ -342,7 +345,7 @@ SQLite does not enforce). The tables below list every table this build creates.
 
 | Table | Columns | Holds |
 | --- | --- | --- |
-| `objects` | `digest` (64 hex), `bytes` | Immutable objects: workspace files, workspace manifests, output artifacts, images and journal records. Stored as-is, at most 64 MiB each. |
+| `objects` | `digest` (64 hex), `bytes`, `size` | Immutable objects: workspace files, manifests, output artifacts, images and journal records. `bytes` is raw deflate when worth packing, otherwise unchanged; `size` is the logical length for packed rows and null otherwise. Logical objects are at most 64 MiB. Digests cover logical bytes. |
 | `artifact_stages` | `id`, `scope`, `owner_epoch` | Named groups of pins, each bound to a scope and the epoch that began it. |
 | `staging_pins` | `stage` → `artifact_stages`, `digest` → `objects` | Which stage keeps which object. Every object must be pinned by at least one stage. |
 | `image_provenance` | `scope`, `digest`, `worker`, `source`, `width`, `height`, `owner_epoch` | Where a sanitized image object came from. |
@@ -372,8 +375,9 @@ Garbage collection removes only stages, pins and objects (see
 
 `validate_all` checks the stored records against each other. A normal open checks
 proposals and receipts in full only above the `validated` watermark; counts and bounds,
-every object against its digest, the metadata values and the ownership and rewind
-records are checked on every open. `Store::check_integrity` (what `spindle doctor` runs), every migration and every
+every object reached by newly validated records against its digest, the metadata
+values and the ownership and rewind records are checked on every open. Already
+validated workspace files are reused from the watermark. `Store::check_integrity` (what `spindle doctor` runs), every migration and every
 store image check is full: `PRAGMA quick_check` over every page, every chunk against its
 digest, and every admission and receipt value decoded. Among the checks:
 
@@ -525,7 +529,10 @@ them (see [Takeover](#scopes-cancellation-and-takeover)), and the session report
 
 Equal object digests mean equal bytes, so storing an object that already exists writes only
 a pin. Every read of an object (`read_object`, `ReadView::object`) recomputes its digest, and
-root validation hashes each object once per connection; a mismatch is `Incompatible`.
+root validation remembers verified objects; a mismatch is `Incompatible`. On reopen,
+the last validated revision's manifest seeds the known files, so unchanged workspace
+objects need not be inflated and hashed again. A full integrity check still checks
+all objects ([`workspace.rs`](../spindle/store/src/workspace.rs)).
 
 ### Value encoding
 
@@ -546,7 +553,7 @@ every store.
 - **Compression** (`pack`): a long-range pass indexes 64-byte blocks and replaces repeats of
   128 bytes or more, at any distance, with copy tokens (a waiting step holds its history
   twice, once in the transcript and once in the request), then `miniz_oxide` deflate at level
-  6 compresses the tokens. Tokens are `0x00 varint(len) bytes` (literal) and
+  3 compresses the tokens (older level-6 rows still read). Tokens are `0x00 varint(len) bytes` (literal) and
   `0x01 varint(distance) varint(len)` (copy). A packed value is never more than one byte
   longer than its logical bytes.
 - **Chunking** (`store`): a value over 16 KiB is cut at content-defined boundaries with a
@@ -556,13 +563,17 @@ every store.
 - **Loading** (`load`): the declared length is bounded by the caller and by the chunk count
   before anything is allocated; each chunk is inflated with a size limit and checked against
   its digest; the total must equal the declared length. Malformed input is `Incompatible`.
-- **Recent chunks**: the process keeps up to 32 MiB of recently stored or read chunks by
-  digest, with the packed form their row held. A read whose row holds exactly that packed
-  form reuses the checked logical bytes instead of inflating and hashing again; a row that
-  differs is checked in full.
+- **Recent chunks**: the process keeps checked logical bytes and packed rows within
+  a working-set bound from 4 MiB to 32 MiB, dropping least recently used entries.
+  A read reuses them only when the row still matches; changed rows are checked in full.
 
-`meta` values use `pack` only. `objects`, `task_runs` and execution-cut manifests are stored
-uncompressed.
+`meta` values use `codec::pack` only. Workspace objects use their own
+[`artifact.rs`](../spindle/store/src/artifact.rs) encoding: objects at least 1 KiB
+are tried with raw deflate at level 1, kept packed only when it saves at least an
+eighth; large objects are sampled first. `objects.size` is null for raw bytes or
+the logical length for packed bytes. Inflation must consume the exact stream and
+produce exactly that length before digest verification. `task_runs` and
+execution-cut manifests remain uncompressed.
 
 ## Workspace trees and objects
 
@@ -615,8 +626,9 @@ app tool attempt (host, image, import and rewind stages, and unresolved attempts
 artifact a resolved bash or app tool receipt names; and the child journals of `run_code`
 attempts. Journals of resolved scripts are collected too once any cap is more than half used,
 after each nested model call's outcome and usage is kept in a spend stage so spend accounting
-still counts it. Objects whose last pin went are deleted. Space is reused by later writes; it
-is not returned to the filesystem.
+still counts it. Objects whose last pin went are deleted. Space is reused by later
+writes; returning free pages to the filesystem is a separate
+[store compaction](#giving-free-pages-back).
 
 `spindle doctor` runs a collection, and the store collects before a write when usage is above
 three quarters of a cap (or the write would not fit), at most once per noticeable growth.
@@ -716,7 +728,7 @@ the session.
 - `View::open(store_dir)` opens `authority.sqlite` read-only with `query_only`, no owner
   lock and a 500 ms busy timeout. `ReadView::read` runs several reads inside one transaction,
   so they see one consistent snapshot, and reads the schema version inside it, so a migration
-  by the owner is seen before or after, never half-way. Views read schemas 14 to 19; tables a
+  by the owner is seen before or after, never half-way. Views read schemas 14 to 20; tables a
   schema lacks read as empty.
 - `ReadView::from_store(&store)` borrows the owner's connection without changing its pragmas
   or transactions (the embedded host reads this way).
@@ -808,25 +820,32 @@ flushes (the negative control shows such loss is detected, not that it cannot ha
 | 17 | `app_state`, `opens`, `app_patches`. |
 | 18 | `meta`. |
 | 19 | `instance`, `app_details`, `retry_delays`, `task_runs`. |
+| 20 | Packed `objects.bytes` and logical `objects.size`; object ids and workspace roots stay the same. |
 
 ### Migration on open
 
-`Store::open` migrates a store at schema 14 to 18 in place (`migrate_legacy`). `legacy_store`
-tells whether the next open will.
+`Store::open` migrates stores written at schemas 14–19 to schema 20 in place
+(`migrate_legacy`). `legacy_store` tells whether the next open will.
 
 1. Check every page (`quick_check`) and the old schema's exact table definitions.
 2. `VACUUM INTO` a staged copy, sync it, rename it to `authority.vN.sqlite` and sync the
    directory.
 3. In one `IMMEDIATE` transaction: create the tables each later schema added, give the store
-   a random identity, re-encode every large value when coming from schema 14 or 15 (values
-   are only re-encoded, never changed), set `user_version` to 19, then validate every row and
+   a random identity when coming from before schema 19, re-encode every large value
+   when coming from schema 14 or 15 (values
+   are only re-encoded, never changed), pack workspace objects with their logical sizes,
+   set `user_version` to 20, then validate every row and
    record in full and set the watermark.
-4. Commit. When values were re-encoded, `VACUUM` once to return the space (best effort).
+4. Commit, then `VACUUM` once to return freed space (best effort).
 
 If validation fails the transaction rolls back and the store stays at its old schema, still
 readable by the build that wrote it. Other versions are refused with `Incompatible` and left
-untouched. `Store::from_connection` and `Store::from_image` accept only the current schema:
-migration is a native operation.
+untouched. `Store::from_connection`, including the embedded package, also accepts
+schema 19 and migrates it in one transaction to 20 (without a backup copy or a
+post-migration vacuum). Images and bundles at schema 19 are checked whole and
+migrated on import; an in-memory image keeps its existing raw object rows and
+packs new ones, avoiding a second rewritten object set in memory. Older migrations
+remain a native-path operation.
 
 ### Replacing the binary
 
@@ -855,11 +874,30 @@ opens it counts no crash for the exporting owner. `image_with(metadata)` replace
 in the copy only. It is refused inside a transaction.
 
 `check_image(bytes)` accepts an image only if it is an unencrypted rollback-journal SQLite file
-with this build's application id and schema, exact table definitions, every page valid, every
+with this build's application id and current or immediately previous schema, exact
+table definitions, every page valid, every
 record valid under the full check, and a non-zero identity. It returns `ImageFacts { head,
 identity, settings }`. `Store::from_image` opens a checked image as a memory store; written as
 `store/authority.sqlite` beside an `owner.lock`, an image also opens with `Store::open` or
 through a host connection.
+
+### Giving free pages back
+
+Every store connection sets `journal_size_limit` to 16 MiB. A large transaction can
+grow the WAL beyond it; after a checkpoint consumes the log, SQLite truncates it
+back to the limit. It is not a transaction-size cap.
+
+`Store::pages()` returns `(page_size, page_count, freelist_count)`.
+`Store::compact_into(target)` writes a compacted copy to a new file with
+`VACUUM INTO`, without another whole database image in memory, and marks its open
+record cleanly closed. SQLite does not sync that copy: callers must make it durable
+and validate it before replacing anything. The embedded `compactSession` / `compact`
+method does that for a session and all its tasks, holding exclusion through sync,
+a whole integrity check, a head comparison and rename. See
+[`lib.rs`](../spindle/store/src/lib.rs),
+[`embed/src/places.rs`](../spindle/embed/src/places.rs) and
+[embedded.md](embedded.md#giving-space-back). This frees unused database pages,
+not conversation history.
 
 ### Session bundles
 
@@ -877,9 +915,12 @@ directory's portable files, so a session can move where no directory is shared.
 
 - **Paths**: `(tasks/<20 hex>/)*` (at most 16 levels) followed by `store/authority.sqlite`,
   `session.json`, or, inside a task, `task.json`. At most 4096 files. Nothing else is
-  carried: no WAL files, no `cache/`, no usage ledger.
+  carried: no WAL files, no `cache/`, no separate usage sidecar; the ledger in store
+  metadata travels with it.
 - **Checks on write and read**: every path valid and unique; every store passes
-  `check_image`; the session's own store is present; sidecars are JSON of at most 4 MiB
+  `check_image` in full for a move or import; a copy may check only pages, schema and
+  bundle facts (the embedded `whole` option requests a full copy check). The session's
+  own store is present; sidecars are JSON of at most 4 MiB
   (`task.json` an object), each beside a store; each place's `session.json` is filled in or
   corrected from its store's `settings` metadata when the store has any. Reading also
   verifies the framing, the format and schema, every file's size and digest, and that the
@@ -950,7 +991,7 @@ and revision roots never change once recorded; and replay traces against tampere
 | Intents per revision | 8 | `transition::MAX_EFFECTS` |
 | App state | 1 MiB JSON object | `transition::MAX_STATE` |
 | One object | 64 MiB | `artifact::MAX_OBJECT` |
-| Object bytes in all | 16 GiB | `artifact::MAX_OBJECT_BYTES` |
+| Object bytes in all (stored, after packing) | 16 GiB | `artifact::MAX_OBJECT_BYTES` |
 | Objects, stages | 2^20 each | `MAX_OBJECTS`, `MAX_STAGES` |
 | Pins | 2^22 | `MAX_PINS` |
 | Objects referenced by one artifact receipt | 8 | `MAX_RECEIPT_OBJECTS` |

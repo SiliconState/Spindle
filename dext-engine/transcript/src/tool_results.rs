@@ -183,7 +183,7 @@ impl ToolResultsContinuation {
         ));
         // Refuse batches that cannot publish even minimal results. Actual outputs
         // still need independent bounded admission; this is not disk reservation.
-        eventual.checkpoint()?;
+        eventual.checkpoint_len()?;
         let mut out = b"DTC2".to_vec();
         for field in [response, results] {
             out.extend_from_slice(&(field.len() as u32).to_be_bytes());

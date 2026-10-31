@@ -160,17 +160,17 @@ function theme(saved, prefersDark = false, texture = null) {
 test('Paper is default even on a dark system; selection persists', () => {
   const current = theme(null, true);
   assert.equal(current.root.dataset.theme, 'paper');
-  assert.equal(current.meta.content, '#f6f2e9');
+  assert.equal(current.meta.content, '#ece6d8');
   current.api.set('dark');
   assert.equal(current.root.dataset.theme, 'dark');
-  assert.equal(current.meta.content, '#111511');
+  assert.equal(current.meta.content, '#161c14');
   current.api.set('system');
   assert.equal(current.storage.get('spindle-theme'), 'system');
   assert.equal(current.root.dataset.theme, 'dark', 'System follows the dark system');
   current.media.matches = false;
   current.media.change();
   assert.equal(current.root.dataset.theme, 'light', 'System follows the light system with Light, not Paper');
-  assert.equal(current.meta.content, '#f6f7f5');
+  assert.equal(current.meta.content, '#f0f0f0');
   current.api.set('light');
   assert.equal(current.storage.get('spindle-theme'), 'light');
   current.media.matches = true;
@@ -320,4 +320,38 @@ test('paths of the revision become links; tool results get a one-line summary', 
   assert.equal(text.priceLine({input: 1.4, output: 4.4}), '$1.40 / $4.40');
   assert.equal(text.priceLine({input: 0.07, output: 0.28}), '$0.07 / $0.28');
   assert.equal(text.priceLine(null), '');
+});
+
+test('a file tree: own files first, folders shut in name order, single-folder chains on one row, counts and marks', () => {
+  const files = ['zeta.md', 'README.md', '.venv/pyvenv.cfg', '.venv/lib/python3.14/site-packages/pip/__init__.py', '.venv/lib/python3.14/site-packages/pip-26.2.2.dist-info/RECORD',
+    '.venv/lib/python3.14/site-packages/pip-26.2.2.dist-info/METADATA', 'src/a.rs', 'src/deep/er/x.rs', 'b/c/d/only.txt'].map(path => ({path}));
+  const marks = new Map([['src/a.rs', 'new'], ['src/deep/er/x.rs', 'edited'], ['.venv/pyvenv.cfg', 'new']]);
+  const tree = text.fileTree(files, file => marks.get(file.path) || '');
+  assert.deepEqual(tree.files.map(f => f.path), ['README.md', 'zeta.md'], 'own files first, by name');
+  assert.deepEqual(tree.folders.map(f => [f.name, f.path, f.count]), [['.venv', '.venv', 4], ['b/c/d', 'b/c/d', 1], ['src', 'src', 2]]);
+  assert.equal(tree.count, 9);
+  assert.deepEqual(tree.marks, {new: 2, edited: 1});
+  const venv = tree.folders[0];
+  assert.deepEqual(venv.files.map(f => f.path), ['.venv/pyvenv.cfg']);
+  assert.deepEqual(venv.marks, {new: 1});
+  assert.deepEqual(venv.folders.map(f => [f.name, f.path]), [['lib/python3.14/site-packages', '.venv/lib/python3.14/site-packages']], 'a chain of lone folders is one row');
+  assert.deepEqual(venv.folders[0].paths, ['.venv/lib', '.venv/lib/python3.14', '.venv/lib/python3.14/site-packages'], 'the row stands for every folder of its chain');
+  assert.deepEqual(venv.paths, ['.venv']);
+  assert.deepEqual(venv.folders[0].folders.map(f => [f.name, f.count]), [['pip', 1], ['pip-26.2.2.dist-info', 2]]);
+  assert.deepEqual(tree.folders[2].folders.map(f => [f.name, f.path, f.marks]), [['deep/er', 'src/deep/er', {edited: 1}]]);
+  assert.deepEqual(tree.order.map(f => f.path), ['README.md', 'zeta.md', '.venv/pyvenv.cfg', '.venv/lib/python3.14/site-packages/pip/__init__.py',
+    '.venv/lib/python3.14/site-packages/pip-26.2.2.dist-info/METADATA', '.venv/lib/python3.14/site-packages/pip-26.2.2.dist-info/RECORD', 'b/c/d/only.txt', 'src/a.rs', 'src/deep/er/x.rs'], 'every file in list order');
+  // Only folders: the root lists them; nothing at all is an empty root.
+  assert.deepEqual(text.fileTree([{path: 'a/b/c.txt'}]).folders.map(f => f.name), ['a/b']);
+  assert.deepEqual(text.fileTree([]), {name: '', path: '', paths: [''], files: [], folders: [], count: 0, marks: {}, order: []});
+  // Numbers in names sort by value; marks read new, edited, changed, deleted.
+  assert.deepEqual(text.fileTree(['f10.rs', 'f2.rs', 'f1.rs', 'd10/x', 'd9/x'].map(path => ({path}))).order.map(f => f.path), ['f1.rs', 'f2.rs', 'f10.rs', 'd9/x', 'd10/x']);
+  const kinds = {'d/a': 'deleted', 'd/b': 'edited', 'd/c': 'new', 'd/e': 'changed'};
+  assert.deepEqual(Object.keys(text.fileTree(Object.keys(kinds).map(path => ({path})), f => kinds[f.path]).folders[0].marks), ['new', 'edited', 'changed', 'deleted']);
+  // 50,000 files stay quick to arrange (the list draws only what is open).
+  const many = Array.from({length: 50000}, (_, i) => ({path: `.venv/lib/python3.14/site-packages/pkg${i % 500}/mod${i}.py`}));
+  const started = performance.now();
+  const big = text.fileTree(many);
+  assert.equal(big.count, 50000); assert.equal(big.order.length, 50000);
+  assert(performance.now() - started < 1500, `50,000 files arranged in ${Math.round(performance.now() - started)} ms`);
 });

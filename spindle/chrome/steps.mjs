@@ -40,6 +40,7 @@ const VERBS = {
   watch: ['Watch', 'Watching', 'Watched'],
   close: ['Close', 'Closing', 'Closed'],
   answer: ['Answer', 'Answering', 'Answered'],
+  start: ['Start', 'Starting', 'Started'],
 };
 const TENSE = { failed: 0, running: 1, done: 2 };
 
@@ -195,9 +196,67 @@ function shell(command) {
   }
 }
 
-/** A step's label and how to show it: {label, domain, url, title}. `state`: running,
- * done or failed; `tabs`: tabsFrom(the steps before it); `parts`: partsFrom(them). */
+/** The steps that act on a page (their rows show its site's icon). */
+export const PAGE_STEPS = new Set(['read_page', 'page_elements', 'page_html', 'screenshot', 'navigate', 'click', 'type', 'select', 'press', 'scroll', 'wait_for', 'dialog', 'close_tab', 'network']);
+
+/** A part of a page in a few words, without the page: “Go”; a link; `fallback`. */
+function partShort(ref, parts, fallback) {
+  const part = ref != null ? parts.get(String(ref)) : null;
+  if (!part) return fallback;
+  return part.name ? quote(part.name, 24) : `a ${ROLE_WORDS[part.role] ?? part.role}`;
+}
+
+/** What kind of step a command is, for its row's icon: code (Python, Node), folder, file,
+ * web or command. */
+function shellKind(command) {
+  const { program } = firstProgram(command);
+  if (/^(python3?|node|deno|bun|tsx|ts-node|pytest|jest|vitest|mocha)$/.test(program)) return 'code';
+  if (/^(ls|tree|find|fd|mkdir|rmdir|du)$/.test(program)) return 'folder';
+  if (/^(cat|head|tail|less|more|bat|wc|touch|sed|cp|mv|rm|echo|printf|tee)$/.test(program)) return 'file';
+  if (/^(curl|wget|http)$/.test(program)) return 'web';
+  return 'command';
+}
+
+/** A step's label and how to show it: {label, short, kind, domain, url, title}. `short`
+ * says what a page step did without its page (the row shows the page's icon, and its
+ * address on hover); `kind` names its icon (command, code, file, folder, tabs, page,
+ * task, web, tool). `state`: running, done or failed; `tabs`: tabsFrom(the steps before
+ * it); `parts`: partsFrom(them). */
 export function describe(name, input = {}, state = 'done', tabs = new Map(), parts = new Map()) {
+  const said = describeLong(name, input, state, tabs, parts);
+  const tense = TENSE[state] ?? 2;
+  const say = (verb, object) => `${VERBS[verb][tense]}${object ? ` ${object}` : ''}`;
+  const short = {
+    read_page: () => say('read', 'page'),
+    page_elements: () => say('read', 'parts'),
+    page_html: () => say('read', 'HTML'),
+    screenshot: () => say('picture', 'the tab'),
+    click: () => say('click', partShort(input?.ref, parts, 'on the page')),
+    type: () => say('type', partShort(input?.ref, parts, 'a field')),
+    select: () => say('choose', partShort(input?.ref, parts, 'a list')),
+    press: () => say('press', input?.key ?? 'a key'),
+    scroll: () => say('scroll', 'the page'),
+    wait_for: () => say('wait', input?.text ? quote(input.text, 20) : 'the page'),
+    dialog: () => say('answer', 'a dialog'),
+    close_tab: () => say('close', 'the tab'),
+    network: () => say('watch', 'the network'),
+    // Back, forward and reload act on the page it is on; going to an address names where.
+    navigate: () => ({
+      back: ['Go back', 'Going back', 'Went back'],
+      forward: ['Go forward', 'Going forward', 'Went forward'],
+      reload: ['Reload the tab', 'Reloading the tab', 'Reloaded the tab'],
+    }[input?.action]?.[tense]),
+  }[name]?.() ?? said.label;
+  const kind = name === 'bash' ? shellKind(input?.command ?? '')
+    : /^(read_file|write_file|edit_file)$/.test(name) ? 'file'
+    : name === 'list_tabs' ? 'tabs'
+    : name === 'task' ? 'task'
+    : PAGE_STEPS.has(name) ? 'page'
+    : 'tool';
+  return { ...said, short, kind };
+}
+
+function describeLong(name, input = {}, state = 'done', tabs = new Map(), parts = new Map()) {
   const tense = TENSE[state] ?? 2;
   const say = (verb, object) => `${VERBS[verb][tense]}${object ? ` ${object}` : ''}`;
   const page = () => {
@@ -238,8 +297,20 @@ export function describe(name, input = {}, state = 'done', tabs = new Map(), par
     case 'dialog': { const p = page(); return { label: say('answer', `a dialog on ${p.where}`), ...p }; }
     case 'close_tab': { const p = page(); return { label: say('close', p.where), ...p }; }
     case 'network': { const p = page(); return { label: say('watch', `the network of ${p.where}`), ...p }; }
+    // A background task's call only starts it; a task in the foreground runs in it.
+    case 'task': return { label: say(input?.background === true ? 'start' : 'run', `a task: ${taskTitle(input?.prompt)}`) };
     default: return { label: say('use', name.replace(/_/g, ' ')) };
   }
+}
+
+/** What a task is called: the first line of what it was asked, without Markdown's marks,
+ * cut at a word to about `most` characters. */
+export function taskTitle(prompt, most = 60) {
+  const line = String(prompt ?? '').split('\n').map((part) => part.replace(/^\s*(?:#{1,6}|>|[-*+]|\d+[.)])\s+/, '').replace(/[*_`]+/g, '').trim()).find(Boolean) ?? '';
+  if (line.length <= most) return line || 'untitled';
+  const cut = line.slice(0, most - 1);
+  const word = cut.lastIndexOf(' ');
+  return `${(word > most / 2 ? cut.slice(0, word) : cut).replace(/[\s,;:.]+$/, '')}…`;
 }
 
 /** What makes two steps the same action (for "failed → retried"). */
@@ -262,16 +333,24 @@ export function retried(steps) {
   return found;
 }
 
-/** A duration as a row shows it: 820ms, 1.2s, 14s, 2m 5s, 1h 4m. */
+/** A duration as a row shows it: 820ms, 1.2s, 14s, then on the clock: 2:05, 1:04:00. */
 export function duration(ms) {
   if (!Number.isFinite(ms) || ms < 0) return '';
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 9950) return `${(ms / 1000).toFixed(1)}s`;
   const seconds = Math.round(ms / 1000);
   if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m${seconds % 60 ? ` ${seconds % 60}s` : ''}`;
-  const minutes = Math.round(seconds / 60);
-  return `${Math.floor(minutes / 60)}h${minutes % 60 ? ` ${minutes % 60}m` : ''}`;
+  return clock(seconds * 1000);
+}
+
+/** A time on the clock, as a running one ticks: 0:42, 6:18, 1:02:03. */
+export function clock(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const seconds = Math.floor(ms / 1000);
+  const two = (n) => String(n).padStart(2, '0');
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds / 60) % 60;
+  return hours ? `${hours}:${two(minutes)}:${two(seconds % 60)}` : `${minutes}:${two(seconds % 60)}`;
 }
 
 /** Whether `span` is a step's [start, end] in ms: two numbers, the end not before the start
@@ -299,4 +378,29 @@ export function elapsed(steps) {
 /** Files a command run in a sandbox is not meant to leave (kept out of sight by default). */
 export function isScratch(path) {
   return /\.(txt|py|pyc|log|tmp)$/i.test(path) || /(^|\/)(tests?|__pycache__|\.cache)\//.test(path);
+}
+
+/** A file's name as the panel shows it. A picture Spindle named for the moment it was taken
+ * (a page's, `screenshots/20261030T232633287-tab12.jpg`, or one captured with the message,
+ * `screenshot-20261030-232633.png`; both in UTC) is "Screenshot 11:26:33 PM", the day added
+ * when not today; any other file is its own name. The file keeps its real name. */
+const SHOT = /^(?:screenshot-(\d{8})-(\d{6})\.png|(\d{8})T(\d{6})\d{3}-tab\d+\.jpg)$/;
+export function shownName(path, now = new Date()) {
+  const name = path.slice(path.lastIndexOf('/') + 1);
+  const found = SHOT.exec(name);
+  if (!found) return name;
+  const [day, time] = found[1] ? [found[1], found[2]] : [found[3], found[4]];
+  const n = (text, from, to) => Number(text.slice(from, to));
+  const taken = new Date(Date.UTC(n(day, 0, 4), n(day, 4, 6) - 1, n(day, 6, 8), n(time, 0, 2), n(time, 2, 4), n(time, 4, 6)));
+  if (Number.isNaN(taken.getTime())) return name;
+  const clockTime = taken.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+  if (taken.toDateString() === now.toDateString()) return `Screenshot ${clockTime}`;
+  const date = taken.toLocaleDateString([], { month: 'short', day: 'numeric', ...(taken.getFullYear() === now.getFullYear() ? {} : { year: 'numeric' }) });
+  return `Screenshot ${date}, ${clockTime}`;
+}
+
+/** A path as the panel shows it: its folders, then its shown name. */
+export function shownPath(path) {
+  const at = path.lastIndexOf('/');
+  return `${at >= 0 ? path.slice(0, at + 1) : ''}${shownName(path)}`;
 }

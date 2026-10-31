@@ -95,9 +95,11 @@ flowchart TB
 - **Where commands run.** A bubblewrap sandbox or the host itself, a runner the program
   supplies, or in Spindle for Browser a Linux inside the browser (v86, plus a faster wasm
   Linux when built from source).
-- **Tools.** Only Spindle for Browser has page tools, for reading and acting on tabs. Only the
-  native binary has a spending limit per thread (`--max-usd`) and your Rust toolchain,
-  read-only, for commands (`--toolchain`).
+- **Tools.** Only Spindle for Browser has page tools for reading and acting on tabs.
+  Only the native binary mounts your Rust toolchain read-only for commands
+  (`--toolchain`). Both hosts support a dollar budget (`max_usd`), the same
+  [spend ledger](spindle/store/src/spend.rs), and child tasks with queued reports;
+  their accounting and restart limits are in [docs/embedded.md](docs/embedded.md).
 - **Keys and sign-in.** The native binary uses Dext's sign-in flows and credential store and
   reads a key when it sends a request. Spindle for Browser takes keys or a ChatGPT sign-in
   (not a Claude subscription sign-in) and seals them in the extension's storage. A session
@@ -139,10 +141,17 @@ Interrupted? `spindle --dir ../demo continue`. The web UI:
 [docs/host.md](docs/host.md#remote-access-through-a-reverse-proxy)). Full walkthrough:
 [docs/getting-started.md](docs/getting-started.md).
 
-**Spindle for Browser.** It needs no build: download `spindle-browser-VERSION.zip` from the
+**Spindle for Browser 0.1.4.** Download `spindle-browser-0.1.4.zip` from the
 [latest release](https://github.com/SiliconState/Spindle/releases/latest), unzip it, and load
 the folder with **Load unpacked** in `chrome://extensions` or `edge://extensions`
-([docs/chrome.md](docs/chrome.md#install-a-release)).
+([docs/chrome.md](docs/chrome.md#install-a-release)). Its single-box composer,
+grouped threads, compact steps and task cards share the web UI's design. Workspace
+pages run scripts automatically only when the browser enforces containment;
+otherwise they are static until you allow that version. Settings > Storage can
+return free database pages without deleting history. The native phone UI follows
+the same layout, adapted to the smaller screen. Sources:
+[`panel.mjs`](spindle/chrome/panel.mjs), [`page.mjs`](spindle/chrome/page.mjs) and
+[`app.js`](spindle/store/ui/app.js).
 
 ## Documentation
 

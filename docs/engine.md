@@ -297,9 +297,11 @@ Source: [`transcript/src/`](../dext-engine/transcript/src). Depends on `dext-cor
 
 [`checkpoint.rs`](../dext-engine/transcript/src/checkpoint.rs) encodes values as a 4-byte
 magic followed by JSON. Encoding is bounded while it is written (at most 32 MiB,
-`MAX_CHECKPOINT_BYTES`; nesting depth 64; 131,072 structural tokens). Decoding re-encodes
-the value and requires the same bytes, so unknown or duplicate fields, aliases and
-trailing data are rejected.
+`MAX_CHECKPOINT_BYTES`; nesting depth 64; 131,072 structural tokens). Decoding checks
+the canonical serialization against the input through a comparing writer, without
+allocating a second encoded copy. Unknown or duplicate fields, aliases and trailing
+data are still rejected. `checkpoint_len` counts encoded bytes with the same bounds
+without building them; turn validation uses it for size checks.
 
 | Magic | Type | Contents and checks |
 |---|---|---|
@@ -355,7 +357,15 @@ tool effects `<execution>/m/<ordinal>/t/<position>`.
 | `pending_effects` | The model or tool effects still owed. |
 
 Every method returns a new value, re-validates it and checks that it checkpoints.
-`restore` decodes `DTT1` and requires the value to re-encode to the same bytes.
+`checkpoint_len` avoids building an encoding where only its size is needed.
+`restore` decodes `DTT1`; its JSON components compare canonical output with the
+original bytes without retaining another encoding, but the outer composite frame
+still re-encodes through `checkpoint()` for its final equality check.
+`transcript_ref` borrows an existing transcript in transcript/model states and
+builds a copy in a tool batch. `into_transcript` consumes the continuation instead
+of copying those states.
+Partial batches keep the original transcript; complete ones add exactly one result
+message in call order.
 
 ### Runtime guards and failure classification
 
@@ -513,9 +523,14 @@ runs. Each run gets:
   (`SCRATCH_HEADROOM`). The candidate may grow to twice the tree limit, never into that
   headroom; a monitor stops the run when it grows past that or free space falls below
   half the headroom.
-- Materializes the input in a fresh private candidate directory: `execute`/`execute_with`
-  take the files in memory, `execute_tree` streams each file from a `RunHost` so the
-  input is never held whole. argv is 1 to 128 elements, each at most 80 KiB with no NUL,
+- Materializes input in a private candidate directory: `execute`/`execute_with`
+  take files in memory; `execute_tree` streams them from a `RunHost`. With
+  `keep_workspaces(true)` and `RunHost::place`, an isolated run can start from the
+  last run's candidate for that place. Files are reused only when content ids and
+  stamps agree; changed inputs, links, modes and leftovers are reconciled first.
+  Keeping is off by default, process-local, bounded to 4 places and 256 MiB;
+  `forget_workspace(place)` drops one. The native serving host enables it.
+  argv is 1 to 128 elements, each at most 80 KiB with no NUL,
   and `argv[0]` must be absolute; the timeout is non-zero and at most 1800 s.
 - Sets, before exec on Linux: parent-death `SIGKILL`, a check that the parent did not
   already change, `no_new_privs`, and close-on-exec on every descriptor except the ones
@@ -535,8 +550,12 @@ runs. Each run gets:
   the process group of a host run, every member of the run's cgroup, or the namespace.
 - Is sealed: regular files (hard links become plain files), symbolic links (never
   followed; target at most 4095 bytes) and empty directories are kept. A file whose inode,
-  size, times and mode still equal the materialized input is reported `Unchanged` and not
-  read again. Sockets, pipes and devices are left out and named in stderr. Non-UTF-8 names,
+  size, times and mode equal the input can be `Unchanged`. On Linux an inotify
+  watcher also records input files opened for writing: shared-mapping writes can
+  leave timestamps unchanged on tmpfs. Those files are read back; if watching fails
+  or its event queue overflows, every input file is treated as possibly changed.
+  Other platforms rely on stamps alone. Sockets, pipes and devices are left out
+  and named in stderr. Non-UTF-8 names,
   invalid paths, or too many entries or bytes make the run fail with the reason.
 
 A run that ends without a sealed tree returns an `io::Error` carrying a `RunFailure`
@@ -544,7 +563,10 @@ A run that ends without a sealed tree returns an `io::Error` carrying a `RunFail
 `TimedOut`, `FileTooLarge`, `OutOfMemory`, `InvalidData` (changes that cannot be sealed)
 or `Other` (setup failures, which say that nothing ran), and nothing the run changed is
 kept. `sweep_abandoned_candidates` removes candidates (`spindle-candidate-<hex>` in the
-scratch root) whose owner lock is free, which only frees disk.
+scratch root) whose owner lock is free, which only frees disk. The reuse and
+shared-mapping cases are checked by
+[`strict_reuse.rs`](../dext-engine/native/tests/strict_reuse.rs) and
+[`strict.rs`](../dext-engine/native/tests/strict.rs).
 
 **Host runner.** The command runs directly over the private copy with a cleared
 environment: only `PATH`, `LANG` (default `C.UTF-8`) and, on Windows, the system variables

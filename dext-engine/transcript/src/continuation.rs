@@ -89,6 +89,9 @@ impl ResponseContinuation {
     pub fn transcript(&self) -> &TranscriptCheckpoint {
         &self.transcript
     }
+    pub fn into_transcript(self) -> TranscriptCheckpoint {
+        self.transcript
+    }
     pub fn model(&self) -> &ModelWait<Vec<u8>> {
         &self.model
     }

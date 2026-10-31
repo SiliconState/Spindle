@@ -204,13 +204,13 @@ impl Store {
             return Ok(records);
         }
         let mut query = self.db.prepare(&format!(
-            "SELECT p.stage,o.bytes FROM objects o JOIN staging_pins p ON p.digest=o.digest WHERE p.stage IN ({})",
+            "SELECT p.stage,o.bytes,o.size,o.digest FROM objects o JOIN staging_pins p ON p.digest=o.digest WHERE p.stage IN ({})",
             vec!["?"; stages.len()].join(",")
         ))?;
         let rows = query.query_map(rusqlite::params_from_iter(stages.keys()), |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                crate::bounded_blob(r, 1, crate::artifact::MAX_OBJECT)?,
+                crate::artifact::checked_at(r, 3, 1)?,
             ))
         })?;
         for row in rows {
@@ -674,10 +674,8 @@ impl Store {
 
     /// Operator inspection; this never resumes or retries child effects.
     pub fn code_receipts(&mut self, scope: &str) -> Result<Vec<Value>> {
-        let mut query = self.db.prepare("SELECT o.bytes FROM objects o JOIN staging_pins p ON p.digest=o.digest JOIN artifact_stages s ON s.id=p.stage WHERE s.scope=?1 AND substr(s.id,1,5)='code-' ORDER BY s.id,o.digest")?;
-        let rows = query.query_map(params![scope], |r| {
-            crate::bounded_blob(r, 0, crate::artifact::MAX_OBJECT)
-        })?;
+        let mut query = self.db.prepare("SELECT o.bytes,o.size,o.digest FROM objects o JOIN staging_pins p ON p.digest=o.digest JOIN artifact_stages s ON s.id=p.stage WHERE s.scope=?1 AND substr(s.id,1,5)='code-' ORDER BY s.id,o.digest")?;
+        let rows = query.query_map(params![scope], |r| crate::artifact::checked_at(r, 2, 0))?;
         rows.map(|bytes| serde_json::from_slice(&bytes?).map_err(|_| Error::Incompatible))
             .collect()
     }
@@ -1074,9 +1072,9 @@ mod tests {
         tx.commit().unwrap();
         let spend: Vec<Value> = store
             .db
-            .prepare("SELECT o.bytes FROM staging_pins p JOIN objects o ON o.digest=p.digest WHERE p.stage=?1")
+            .prepare("SELECT o.bytes,o.size FROM staging_pins p JOIN objects o ON o.digest=p.digest WHERE p.stage=?1")
             .unwrap()
-            .query_map([crate::artifact::spend_stage("parent")], |r| r.get::<_, Vec<u8>>(0))
+            .query_map([crate::artifact::spend_stage("parent")], |r| crate::artifact::object_at(r, 0))
             .unwrap()
             .map(|bytes| serde_json::from_slice(&bytes.unwrap()).unwrap())
             .collect();
@@ -1332,11 +1330,18 @@ mod tests {
                         return json!({"ok":true,"data":"fast"});
                     }
                     let db = rusqlite::Connection::open(&database).unwrap();
+                    // Every object as stored (packed or not), read as the store reads it.
+                    let journaled = || -> rusqlite::Result<bool> {
+                        let mut query = db.prepare("SELECT bytes,size FROM objects")?;
+                        let objects = query
+                            .query_map([], |row| crate::artifact::object_at(row, 0))?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        Ok(objects.iter().any(|bytes| {
+                            String::from_utf8_lossy(bytes).contains("\"kind\":\"result\"")
+                        }))
+                    };
                     for _ in 0..500 {
-                        let journaled: i64 = db
-                            .query_row("SELECT count(*) FROM objects WHERE instr(CAST(bytes AS TEXT),'\"kind\":\"result\"')>0", [], |r| r.get(0))
-                            .unwrap_or(0);
-                        if journaled > 0 {
+                        if journaled().unwrap_or(false) {
                             return json!({"ok":true,"data":"saw the fast result journaled"});
                         }
                         std::thread::sleep(Duration::from_millis(10));

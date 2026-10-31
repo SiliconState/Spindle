@@ -6,7 +6,7 @@ use crate::{Error, MAX_PAYLOAD, Result, Store};
 use dext_core::model::{ModelWait, Phase};
 use dext_transcript::Block;
 use dext_transcript::checkpoint::NativeResponse;
-use dext_transcript::turn::{Effect, TurnContinuation};
+use dext_transcript::turn::Effect;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -166,7 +166,8 @@ fn validate_request(request: &DispatchRequest) -> Result<()> {
 /// Post-reservation check: tolerates suspension so reserved work can drain.
 fn pending_effect(db: &rusqlite::Connection, request: &DispatchRequest) -> Result<Effect> {
     crate::ownership::live_allowed(db, &request.scope)?;
-    let cancelled: bool = db.query_row(
+    let cancelled: bool = crate::cached_row(
+        db,
         "SELECT EXISTS(SELECT 1 FROM cancellations WHERE scope=?1)",
         [&request.scope],
         |r| r.get(0),
@@ -186,27 +187,28 @@ fn reserved_effect(
     request: &DispatchRequest,
 ) -> Result<Effect> {
     // This owner's epoch must still be the realm's (a fenced owner records nothing).
-    let realm: u64 = db.query_row("SELECT epoch FROM realm WHERE id=1", [], |r| {
+    let realm: u64 = crate::cached_row(db, "SELECT epoch FROM realm WHERE id=1", [], |r| {
         crate::nonnegative_id(r, 0)
     })?;
     if request.owner_epoch != epoch || realm != epoch || request.attempt.owner_epoch > epoch {
         return Err(Error::Stale);
     }
-    let attempt: Option<(String, u64, String, String)> = db
-        .query_row(
-            "SELECT effect,owner_epoch,implementation,grant_reference FROM attempts WHERE id=?1",
-            [&request.attempt.id],
-            |r| {
-                Ok((
-                    crate::bounded_label(r, 0)?,
-                    crate::nonnegative_id(r, 1)?,
-                    crate::bounded_label(r, 2)?,
-                    crate::bounded_label(r, 3)?,
-                ))
-            },
-        )
-        .optional()?;
-    let recorded: bool = db.query_row(
+    let attempt: Option<(String, u64, String, String)> = crate::cached_row(
+        db,
+        "SELECT effect,owner_epoch,implementation,grant_reference FROM attempts WHERE id=?1",
+        [&request.attempt.id],
+        |r| {
+            Ok((
+                crate::bounded_label(r, 0)?,
+                crate::nonnegative_id(r, 1)?,
+                crate::bounded_label(r, 2)?,
+                crate::bounded_label(r, 3)?,
+            ))
+        },
+    )
+    .optional()?;
+    let recorded: bool = crate::cached_row(
+        db,
         "SELECT EXISTS(SELECT 1 FROM receipts WHERE attempt=?1)",
         [&request.attempt.id],
         |r| r.get(0),
@@ -223,7 +225,7 @@ fn reserved_effect(
     {
         return Err(Error::Conflict);
     }
-    let intent: Option<(u64, String, Vec<u8>, String)> = db.query_row(
+    let intent: Option<(u64, String, Vec<u8>, String)> = crate::cached_row(db,
         "SELECT i.revision,i.adapter,i.input,r.scope FROM intents i JOIN revisions r ON r.revision=i.revision WHERE i.id=?1",
         [&request.intent.id],
         |row| Ok((crate::nonnegative_id(row, 0)?, crate::bounded_label(row, 1)?, crate::packed_blob(db, row, 2, MAX_PAYLOAD)?, crate::bounded_label(row, 3)?)),
@@ -239,7 +241,8 @@ fn reserved_effect(
         return Err(Error::Conflict);
     }
     crate::ownership::live_allowed(db, &request.scope)?;
-    let cancelled: bool = db.query_row(
+    let cancelled: bool = crate::cached_row(
+        db,
         "SELECT EXISTS(SELECT 1 FROM cancellations WHERE scope=?1)",
         [&request.scope],
         |r| r.get(0),
@@ -251,7 +254,7 @@ fn reserved_effect(
 }
 
 fn bound_effect(db: &rusqlite::Connection, request: &DispatchRequest) -> Result<Effect> {
-    let epoch: u64 = db.query_row("SELECT epoch FROM realm WHERE id=1", [], |r| {
+    let epoch: u64 = crate::cached_row(db, "SELECT epoch FROM realm WHERE id=1", [], |r| {
         crate::nonnegative_id(r, 0)
     })?;
     if epoch != request.owner_epoch || request.attempt.owner_epoch != epoch {
@@ -263,7 +266,8 @@ fn bound_effect(db: &rusqlite::Connection, request: &DispatchRequest) -> Result<
 /// The still-pending obligation at the scope head that exactly matches the intent.
 fn head_effect(db: &rusqlite::Connection, request: &DispatchRequest) -> Result<Effect> {
     let selected = crate::transition::scope_revision(db, &request.scope)?;
-    let (revision, scope, engine, bytes): (u64, String, String, Vec<u8>) = db.query_row(
+    let (revision, scope, engine, bytes): (u64, String, String, Vec<u8>) = crate::cached_row(
+        db,
         "SELECT revision,scope,engine,continuation FROM revisions WHERE revision=?1",
         [selected as i64],
         |r| {
@@ -281,7 +285,7 @@ fn head_effect(db: &rusqlite::Connection, request: &DispatchRequest) -> Result<E
     if scope != request.scope || engine != crate::turn::ENGINE {
         return Err(Error::Conflict);
     }
-    let state = TurnContinuation::restore(&bytes).map_err(|_| Error::Incompatible)?;
+    let state = crate::turn::restored(&bytes).map_err(|_| Error::Incompatible)?;
     if state.scope() != request.scope {
         return Err(Error::Conflict);
     }
@@ -315,12 +319,13 @@ fn head_effect(db: &rusqlite::Connection, request: &DispatchRequest) -> Result<E
 /// Guard verdicts use batch-start state, so they cannot change mid-batch.
 fn refuse_guarded(db: &rusqlite::Connection, request: &DispatchRequest) -> Result<()> {
     let selected = crate::transition::scope_revision(db, &request.scope)?;
-    let bytes: Vec<u8> = db.query_row(
+    let bytes: Vec<u8> = crate::cached_row(
+        db,
         "SELECT continuation FROM revisions WHERE revision=?1",
         [selected as i64],
         |r| crate::packed_blob(db, r, 0, MAX_PAYLOAD),
     )?;
-    let state = TurnContinuation::restore(&bytes).map_err(|_| Error::Incompatible)?;
+    let state = crate::turn::restored(&bytes).map_err(|_| Error::Incompatible)?;
     if state
         .guard_tool(&request.intent.id)
         .map_err(|_| Error::Invalid)?
@@ -549,11 +554,10 @@ impl HostWorkspace<'_> {
     }
     /// The size of a file's bytes, without reading them.
     pub fn size(&mut self, object: &str) -> Result<u64> {
-        let length: i64 = self.store.db.query_row(
-            "SELECT length(bytes) FROM objects WHERE digest=?1",
-            [object],
-            |row| row.get(0),
-        )?;
+        let length: i64 =
+            crate::cached_row(&self.store.db, crate::artifact::SIZE, [object], |row| {
+                row.get(0)
+            })?;
         Ok(length.max(0) as u64)
     }
     /// A file's bytes.
@@ -1526,10 +1530,8 @@ impl dext_native::strict::RunHost for StoreRun<'_, '_> {
             let bytes = self
                 .store
                 .db
-                .prepare_cached("SELECT bytes FROM objects WHERE digest=?1")?
-                .query_row([digest], |row| {
-                    crate::bounded_blob(row, 0, crate::artifact::MAX_OBJECT)
-                })?;
+                .prepare_cached(crate::artifact::STORED)?
+                .query_row([digest], |row| crate::artifact::object_at(row, 0))?;
             if crate::artifact::object_digest(&bytes) != *digest {
                 return Err(Error::Incompatible);
             }
@@ -1542,6 +1544,19 @@ impl dext_native::strict::RunHost for StoreRun<'_, '_> {
                 Err(std::io::Error::other("workspace input could not be read"))
             }
         }
+    }
+
+    /// The scope's workspace in this store (by its call-identity namespace, which a
+    /// moved copy shares: equal contents make a shared place harmless).
+    fn place(&self) -> Option<String> {
+        self.store
+            .call_id(&format!("workspace {}", self.parent.scope))
+            .ok()
+    }
+
+    /// A file's object digest: equal digests are equal bytes.
+    fn content(&self, path: &str) -> Option<String> {
+        self.objects.get(path).cloned()
     }
 
     fn request(
@@ -2395,14 +2410,14 @@ impl Store {
         if self.paused {
             return Err(Error::Paused);
         }
-        self.db
-            .query_row(
-                "SELECT value FROM app_details WHERE attempt=?1",
-                [attempt],
-                |row| crate::packed_blob(&self.db, row, 0, crate::transition::MAX_STATE),
-            )
-            .optional()
-            .map_err(Error::from)
+        crate::cached_row(
+            &self.db,
+            "SELECT value FROM app_details WHERE attempt=?1",
+            [attempt],
+            |row| crate::packed_blob(&self.db, row, 0, crate::transition::MAX_STATE),
+        )
+        .optional()
+        .map_err(Error::from)
     }
 
     /// Effect ids of the app tool calls answered in `scope` after revision `after` that
@@ -2590,9 +2605,7 @@ impl Store {
             )));
         }
         let kept = (|| -> Result<u64> {
-            let mut size = self
-                .db
-                .prepare_cached("SELECT length(bytes) FROM objects WHERE digest=?1")?;
+            let mut size = self.db.prepare_cached(crate::artifact::SIZE)?;
             let mut total = 0u64;
             for entry in before.files.iter().filter(|e| !drop(&e.path)) {
                 let length: i64 = size.query_row([&entry.object], |row| row.get(0))?;
@@ -2628,7 +2641,8 @@ impl Store {
     /// sealed base against the root just before it.
     #[cfg(feature = "driver")]
     fn strict_base(&self, request: &DispatchRequest) -> Result<String> {
-        let selected: Option<String> = self.db.query_row(
+        let selected: Option<String> = crate::cached_row(
+            &self.db,
             "SELECT workspace FROM revisions WHERE revision=?1",
             [crate::transition::scope_revision(&self.db, &request.scope)? as i64],
             |row| crate::optional_digest(row, 0),
@@ -2645,9 +2659,7 @@ impl Store {
         use dext_native::strict::Input;
         let mut inputs = std::collections::BTreeMap::new();
         let sizes = (|| -> Result<()> {
-            let mut size = self
-                .db
-                .prepare_cached("SELECT length(bytes) FROM objects WHERE digest=?1")?;
+            let mut size = self.db.prepare_cached(crate::artifact::SIZE)?;
             for entry in &tree.files {
                 let length: i64 = size.query_row([&entry.object], |row| row.get(0))?;
                 inputs.insert(
@@ -2918,9 +2930,7 @@ impl Store {
             )));
         }
         let others = (|| -> Result<u64> {
-            let mut size = self
-                .db
-                .prepare_cached("SELECT length(bytes) FROM objects WHERE digest=?1")?;
+            let mut size = self.db.prepare_cached(crate::artifact::SIZE)?;
             let mut total = 0u64;
             for entry in tree.files.iter().filter(|entry| entry.path != *path) {
                 let length: i64 = size.query_row([&entry.object], |row| row.get(0))?;
@@ -3289,7 +3299,7 @@ impl Store {
         let execution = match request.intent.id.rsplit_once("/m/") {
             Some((execution, _)) => format!("{execution}/"),
             None => {
-                let state = TurnContinuation::restore(&self.snapshot()?.continuation)
+                let state = crate::turn::restored(&self.snapshot()?.continuation)
                     .map_err(|_| Error::Invalid)?;
                 format!("{}/", state.execution())
             }
@@ -3530,8 +3540,25 @@ impl Store {
     /// One file of a reserved runner call's workspace, by its tree entry's object.
     #[cfg(feature = "workspace-tools")]
     pub fn runner_file(&mut self, request: &DispatchRequest, object: &str) -> Result<Vec<u8>> {
-        let tree = self.runner_tree(request)?;
-        if !tree.files.iter().any(|entry| entry.object == object) {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        validate_request(request)?;
+        pending_effect(&self.db, request)?;
+        let base = self.strict_base(request)?;
+        // The tree is checked and decoded once per call, not again for each file.
+        let known = matches!(&self.runner_objects,
+            Some((scope, root, _)) if *scope == request.scope && *root == base);
+        if !known {
+            let tree = self.tree_map(&request.scope, &base)?;
+            let objects = tree.files.into_iter().map(|entry| entry.object).collect();
+            self.runner_objects = Some((request.scope.clone(), base, objects));
+        }
+        if !self
+            .runner_objects
+            .as_ref()
+            .is_some_and(|(_, _, objects)| objects.contains(object))
+        {
             return Err(Error::Invalid);
         }
         self.read_object(&request.scope, object)
@@ -3650,18 +3677,20 @@ impl Store {
             let tx = self
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let epoch: u64 = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |r| {
-                crate::nonnegative_id(r, 0)
-            })?;
+            let epoch: u64 =
+                crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |r| {
+                    crate::nonnegative_id(r, 0)
+                })?;
             if epoch != self.epoch {
                 return Err(Error::Stale);
             }
-            let attempt: Option<(String, u64, String, String)> = tx.query_row(
+            let attempt: Option<(String, u64, String, String)> = crate::cached_row(&tx,
                 "SELECT effect,owner_epoch,implementation,grant_reference FROM attempts WHERE id=?1",
                 [&request.attempt.id],
                 |r| Ok((crate::bounded_label(r, 0)?, crate::nonnegative_id(r, 1)?, crate::bounded_label(r, 2)?, crate::bounded_label(r, 3)?)),
             ).optional()?;
-            let recorded: bool = tx.query_row(
+            let recorded: bool = crate::cached_row(
+                &tx,
                 "SELECT EXISTS(SELECT 1 FROM receipts WHERE attempt=?1)",
                 [&request.attempt.id],
                 |r| r.get(0),
@@ -3677,7 +3706,7 @@ impl Store {
             {
                 return Err(Error::Conflict);
             }
-            let intent: Option<(u64, String, Vec<u8>, String)> = tx.query_row(
+            let intent: Option<(u64, String, Vec<u8>, String)> = crate::cached_row(&tx,
                 "SELECT i.revision,i.adapter,i.input,r.scope FROM intents i JOIN revisions r ON r.revision=i.revision WHERE i.id=?1", [&request.intent.id],
                 |r| Ok((crate::nonnegative_id(r, 0)?, crate::bounded_label(r, 1)?, crate::packed_blob(&tx, r, 2, MAX_PAYLOAD)?, crate::bounded_label(r, 3)?)),
             ).optional()?;
@@ -3700,7 +3729,8 @@ impl Store {
             // The call ran (as every strict call does) over the scope head's tree,
             // which head_effect just proved `expected_revision` is; calls of a batch
             // chain, so that can be a later tree than the one that made the call.
-            let base: Option<String> = tx.query_row(
+            let base: Option<String> = crate::cached_row(
+                &tx,
                 "SELECT workspace FROM revisions WHERE revision=?1 AND scope=?2",
                 params![request.expected_revision as i64, request.scope],
                 |row| crate::optional_digest(row, 0),
@@ -3920,7 +3950,8 @@ impl Store {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
-            let (saved_worker, old): (String, u64) = tx.query_row(
+            let (saved_worker, old): (String, u64) = crate::cached_row(
+                &tx,
                 "SELECT worker,state FROM image_executions WHERE attempt=?1",
                 [&request.attempt.id],
                 |row| {
@@ -4174,7 +4205,7 @@ impl Store {
     ) -> Result<()> {
         let receipt = crate::image::ImageReceipt::decode(bytes)?;
         let tx = self.db.transaction()?;
-        let epoch = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |row| {
+        let epoch = crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |row| {
             crate::nonnegative_id(row, 0)
         })?;
         if epoch != self.epoch || epoch != request.owner_epoch {
@@ -4194,13 +4225,13 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let epoch: u64 = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |r| {
+        let epoch: u64 = crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |r| {
             crate::nonnegative_id(r, 0)
         })?;
         if epoch != self.epoch || epoch != request.owner_epoch {
             return Err(Error::Stale);
         }
-        let intent: Option<(u64, String, Vec<u8>, String)> = tx.query_row(
+        let intent: Option<(u64, String, Vec<u8>, String)> = crate::cached_row(&tx,
             "SELECT i.revision,i.adapter,i.input,r.scope FROM intents i JOIN revisions r ON r.revision=i.revision WHERE i.id=?1", [&request.intent.id],
             |r| Ok((crate::nonnegative_id(r, 0)?, crate::bounded_label(r, 1)?, crate::packed_blob(&tx, r, 2, MAX_PAYLOAD)?, crate::bounded_label(r, 3)?)),
         ).optional()?;
@@ -4215,7 +4246,7 @@ impl Store {
         {
             return Err(Error::Conflict);
         }
-        let old: Option<(String, String, u64, String, String)> = tx.query_row(
+        let old: Option<(String, String, u64, String, String)> = crate::cached_row(&tx,
             "SELECT id,effect,owner_epoch,implementation,grant_reference FROM attempts WHERE id=?1 OR effect=?2 LIMIT 1",
             params![request.attempt.id, request.attempt.effect],
             |r| Ok((crate::bounded_label(r, 0)?, crate::bounded_label(r, 1)?, crate::nonnegative_id(r, 2)?, crate::bounded_label(r, 3)?, crate::bounded_label(r, 4)?)),
@@ -4232,13 +4263,13 @@ impl Store {
             {
                 return Err(Error::Conflict);
             }
-            let receipt: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT result FROM receipts WHERE attempt=?1",
-                    [&request.attempt.id],
-                    |r| crate::packed_blob(&tx, r, 0, MAX_PAYLOAD),
-                )
-                .optional()?;
+            let receipt: Option<Vec<u8>> = crate::cached_row(
+                &tx,
+                "SELECT result FROM receipts WHERE attempt=?1",
+                [&request.attempt.id],
+                |r| crate::packed_blob(&tx, r, 0, MAX_PAYLOAD),
+            )
+            .optional()?;
             return Ok(match receipt {
                 Some(bytes) => Reservation::Recorded(bytes),
                 None => Reservation::Unresolved,

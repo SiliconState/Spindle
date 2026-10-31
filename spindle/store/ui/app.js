@@ -1,9 +1,28 @@
 import {Terminal} from './terminal.js';
 import {intent} from './commands.js';
-import {matches, unified, transcript, ago, size, duration, tokens, usageLine, money, turnCost, linkParts, blocks, titleFrom, markdown, pathParts, resultSummary, settingsLine, priceLine, EFFORT_NAMES} from './text.js';
+import {matches, unified, transcript, ago, size, duration, tokens, usageLine, money, turnCost, linkParts, blocks, titleFrom, markdown, pathParts, resultSummary, settingsLine, priceLine, EFFORT_NAMES, fileTree} from './text.js';
 const $ = id => document.getElementById(id);
 const el = (tag, cls, text) => {const node = document.createElement(tag); if(cls) node.className = cls; if(text !== undefined) node.textContent = text; return node;};
 const decode = text => Uint8Array.from(atob(text), c => c.charCodeAt(0));
+// Line icons in the text's colour, as inline SVG (the page's CSP loads no image data):
+// paths on a 24-unit grid; `w` the stroke width, `fill` a filled shape.
+const ring = (x, y, r) => `M${x - r} ${y}a${r} ${r} 0 1 0 ${2 * r} 0a${r} ${r} 0 1 0 ${-2 * r} 0`;
+const ICONS = {
+  check: {d: ['M5 12.5l4.5 4.5L19 7.5'], w: 2.4}, x: {d: ['M6 6l12 12M18 6L6 18'], w: 2.2}, spinner: {d: ['M12 3a9 9 0 1 0 9 9'], w: 2.6},
+  next: {d: ['M9 6l6 6-6 6'], w: 2.2}, down: {d: ['M6 9l6 6 6-6'], w: 2.2}, warning: {d: ['M12 4l9 16H3z', 'M12 10v4M12 17v.5'], w: 2},
+  command: {d: ['M5 7l4 5-4 5M12 17h7'], w: 2}, code: {d: ['M9 7l-5 5 5 5M15 7l5 5-5 5'], w: 2}, file: {d: ['M14 3H7a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7z', 'M14 3v4h4']},
+  job: {d: ['M5 12h4l2-5 3 10 2-5h3'], w: 2}, show: {d: ['M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z', ring(12, 12, 3)]}, tool: {d: ['M14.5 6.5a4 4 0 0 0-5 5L4 17l3 3 5.5-5.5a4 4 0 0 0 5-5l-2.5 2.5-2.5-.5-.5-2.5z']},
+  more: {fill: true, d: [ring(5, 12, 1.6), ring(12, 12, 1.6), ring(19, 12, 1.6)]}, trash: {d: ['M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13']},
+  signin: {d: ['M14 4h5v16h-5M4 12h10M10 8l4 4-4 4'], w: 2}, signout: {d: ['M14 4h5v16h-5M10 8l-4 4 4 4M6 12h10'], w: 2}, retry: {d: ['M20 12a8 8 0 1 1-2.3-5.7', 'M20 4v4h-4'], w: 2.2},
+};
+function icon(name, size = 16) {
+  const spec = ICONS[name] || {}, ns = 'http://www.w3.org/2000/svg', svg = document.createElementNS(ns, 'svg');
+  for(const [key, value] of Object.entries({viewBox: '0 0 24 24', width: size, height: size, 'aria-hidden': 'true', class: `icon icon-${name}`})) svg.setAttribute(key, String(value));
+  if(spec.fill) svg.setAttribute('fill', 'currentColor');
+  else for(const [key, value] of Object.entries({fill: 'none', stroke: 'currentColor', 'stroke-width': String(spec.w || 1.8), 'stroke-linecap': 'round', 'stroke-linejoin': 'round'})) svg.setAttribute(key, value);
+  for(const d of spec.d || []) {const path = document.createElementNS(ns, 'path'); path.setAttribute('d', d); svg.append(path);}
+  return svg;
+}
 let sessions = [], selected = null, snapshot = null, source = null, cursor = '', historical = false, following = true, activeTool = null, modelText = null, refreshTimer = 0, generation = 0, submitting = false, stopping = false;
 // Catch-up: events at or below this sequence happened before this screen subscribed.
 let catchup = 0, buffered = null, activity = {label:'', since:0};
@@ -26,12 +45,21 @@ const drafts = {get: key => {try{return localStorage.getItem(key) || '';}catch{r
 // A short notice over the page; a tap dismisses it. An open modal dialog makes the rest
 // of the page inert (unseen, unannounced, untappable), so the notice joins the dialog on
 // top: a confirmation over another sheet, else the last open one.
-function toast(text, kind = 'error') {
+// `action`: [label, run], a button in the notice (Undo, say), which then sits above the
+// composer, in a thumb's reach; `ms`: how long it stays.
+function toast(text, kind = 'error', {action = null, ms = null} = {}) {
   const node = $('toast'), open = [...document.querySelectorAll('dialog[open]')];
   const host = open.find(d => d.id === 'confirm-dialog') || open.find(d => d.id === 'pair-dialog') || open.at(-1) || document.body;
   if(node.parentNode !== host) host.append(node);
   node.textContent = text; node.dataset.kind = kind; node.hidden = false;
-  clearTimeout(toast.timer); toast.timer = setTimeout(hideToast, kind === 'error' ? 12000 : 5000);
+  node.classList.toggle('actionable', Boolean(action));
+  if(action) {
+    const button = el('button', 'toast-action', action[0]); button.type = 'button';
+    button.onclick = event => {event?.stopPropagation?.(); hideToast(); action[1]();};
+    node.append(button);
+    node.style.setProperty?.('--dock-h', `${$('dock').offsetHeight || 0}px`);
+  }
+  clearTimeout(toast.timer); toast.timer = setTimeout(hideToast, ms ?? (kind === 'error' ? 12000 : 5000));
 }
 function hideToast() {$('toast').hidden = true;}
 const note = text => toast(text, 'info');
@@ -81,7 +109,8 @@ setInterval(tick, 1000);
 // being written stays literal text. Workspace paths in either open the file viewer.
 function message(parent, role, text, preview = false, label = '') {
   const article = el('article', `message ${role}`); if(preview) article.classList.add('preview');
-  article.append(el('span','role-label',label || (role === 'user' ? 'YOU' : preview ? 'SPINDLE · LIVE PREVIEW' : 'SPINDLE')));
+  const head = el('span','role-label',label || (role === 'user' ? 'YOU' : preview ? 'SPINDLE · LIVE PREVIEW' : 'SPINDLE'));
+  article.append(head);
   const body = el('div');
   if(preview) body.textContent = text;
   else if(role === 'assistant') {body.className = 'md'; mdNodes(body, markdown(text));}
@@ -90,7 +119,42 @@ function message(parent, role, text, preview = false, label = '') {
     if(parts.some(part => 'code' in part)) body.append(...parts.map(part => 'code' in part ? codeBlock(part) : linked(el('div','prose'), part.text)));
     else linked(body, text);
   }
-  article.append(body); parent.append(article); return body;
+  article.append(body); parent.append(article);
+  // A message sent while a run went: a bubble at the right, checked once the run read it.
+  if(label.startsWith('YOU · ')) steerBubble(article, head, body, label === 'YOU · WHILE RUNNING', parent !== $('queued'));
+  return body;
+}
+// Three lines of a long bubble until it is tapped; whether it is long is measured once it
+// is laid out (and again if its width changes), and marked a frame later (a class changed
+// inside the observer's callback would resize what it observes: a loop to the browser).
+const clamped = typeof ResizeObserver === 'function' ? new ResizeObserver(entries => {
+  const changed = [];
+  for(const {target} of entries) {
+    if(!target.isConnected) {clamped.unobserve(target); continue;}
+    const article = target.parentElement;
+    if(!article || article.classList.contains('whole') || !target.clientHeight) continue;
+    const long = target.scrollHeight > target.clientHeight + 1;
+    if(long !== article.classList.contains('long')) changed.push([article, target, long]);
+  }
+  if(changed.length) requestAnimationFrame(() => {for(const [article, body, long] of changed) markLong(article, body, long);});
+}) : null;
+// Waiting to be read (`clamp` false), a bubble stays whole.
+function steerBubble(article, head, body, read, clamp = true) {
+  article.classList.add('steer');
+  if(read) {const check = icon('check', 12); check.removeAttribute('aria-hidden'); check.setAttribute('role','img'); check.setAttribute('aria-label','Read by the running turn'); head.append(check);}
+  if(!clamp) return;
+  body.onclick = event => {if(!article.classList.contains('long') || event?.target?.closest?.('a, button')) return; const whole = !article.classList.contains('whole'); article.classList.toggle('whole', whole); body.setAttribute('aria-expanded', String(whole));};
+  body.onkeydown = event => {if((event.key === 'Enter' || event.key === ' ') && article.classList.contains('long')) {event.preventDefault(); body.onclick();}};
+  clamped?.observe(body);
+}
+function markLong(article, body, long) {
+  article.classList.toggle('long', long);
+  if(long) {
+    body.setAttribute('role','button'); body.tabIndex = 0; body.setAttribute('aria-expanded', String(article.classList.contains('whole')));
+    if(!body.querySelector('.steer-arrow')) {const arrow = el('span','steer-arrow'); arrow.append(icon('down', 14)); body.append(arrow);}
+  } else {
+    body.removeAttribute('role'); body.removeAttribute('tabindex'); body.removeAttribute('aria-expanded'); body.querySelector('.steer-arrow')?.remove();
+  }
 }
 function codeBlock(part) {const pre = el('pre','code',part.code); pre.tabIndex = 0; if(part.lang) pre.dataset.lang = part.lang; return pre;}
 // Text with every known workspace path as a link; plain text when none is named.
@@ -154,7 +218,10 @@ function tool(parent, call, result, preview = false) {
   card.dataset.call = call.id; card.dataset.recorded = String(Boolean(result));
   const summary = el('summary');
   const input = call.input || {};
-  summary.append(el('span','tool-icon', call.name === 'bash' ? '>_' : call.name === 'run_code' ? '{ }' : call.name === 'start_job' ? '&' : '↳'));
+  // An icon for its kind: a command, code, a job, a file, a shown file, any other tool.
+  const kindIcon = el('span','tool-icon'); kindIcon.setAttribute('aria-hidden','true');
+  kindIcon.append(icon(call.name === 'bash' ? 'command' : call.name === 'run_code' ? 'code' : ['start_job','read_job','stop_job'].includes(call.name) ? 'job' : ['read_file','write_file','edit_file','read_output'].includes(call.name) ? 'file' : call.name === 'show' ? 'show' : 'tool', 15));
+  summary.append(kindIcon);
   const title = input.command || input.path || (call.name === 'read_job' ? (input.job ? `read ${input.job}` : 'list jobs') : call.name === 'stop_job' ? `stop ${input.job || ''}` : '') || (call.name === 'run_code' && typeof input.code === 'string' ? firstLine(input.code) : call.name === 'read_output' ? `read_output ${String(input.artifact || '').slice(0,12)}` : `${input.language || ''} ${call.name}`);
   const kind = call.name === 'run_code' ? String(input.language || 'code') : KINDS[call.name] || call.name;
   // Collapsed, a card still says what came back: one quiet line under its title.
@@ -223,7 +290,7 @@ function renderBar(data) {
   else if(stopped) $('phase-text').textContent = `stopped · ${data.stop.replace(/^stopped:?\s*/,'')}`;
   $('recover').hidden = !stopped || !data.recover;
   if(data.recover) $('recover').textContent = `Recover r${data.recover}`;
-  $('stop').hidden = !data.busy || historical;
+  renderStop();
   const extendable = data.stop === 'stopped: step limit reached';
   // A request the provider refused: Retry sends it again (after fixing the cause);
   // Continue would only meet the same refusal.
@@ -240,16 +307,23 @@ function renderBar(data) {
   $('hist-chip').setAttribute('aria-label', `Revision history, ${$('hist-chip').textContent.replace(' ▾','')}`);
   $('prompt').placeholder = historical ? `Read-only: viewing r${data.revision}` : data.busy ? 'Steer the run, or: stop' : data.complete || !data.head ? 'Message' : 'Not ready for a message';
   // A crowded row keeps the chip to model · effort.
-  $('bar').dataset.actions = String(['bar-signin','recover','stop','continue','retry'].filter(id => !$(id).hidden).length);
+  $('bar').dataset.actions = String(['bar-signin','recover','continue','retry'].filter(id => !$(id).hidden).length);
   renderChip();
 }
 const BAR_ACTIONS = ['hist-prev','hist-next','bar-signin','recover','stop','continue','retry','bar-rewind','bar-live'];
+// While a run goes and nothing is written, Stop takes Send's place (a red square); a
+// message written then steers the run, and Send comes back for it.
+function renderStop() {
+  const busy = Boolean(selected && snapshot?.busy && !historical);
+  $('stop').hidden = !busy || Boolean($('prompt').value.trim());
+  $('send').hidden = !$('stop').hidden;
+}
 // Before a thread's first snapshot nothing of the previous thread's state may show.
 function resetBar() {
   activity = {label:'', since:0};
   for(const id of BAR_ACTIONS) $(id).hidden = true;
   $('bar').dataset.mode = 'live'; $('hist-chip').hidden = false; $('hist-chip').textContent = 'r…'; $('phase-text').textContent = 'loading';
-  $('pending-settings').hidden = true; renderChip();
+  $('send').hidden = false; $('pending-settings').hidden = true; renderChip();
 }
 // On the thread list the dock starts a new thread: the row keeps only the model chip.
 function homeBar() {
@@ -257,7 +331,7 @@ function homeBar() {
   for(const id of [...BAR_ACTIONS, 'hist-chip']) $(id).hidden = true;
   const busy = sessions.filter(s => running(s.status?.state)).length;
   $('bar').dataset.mode = 'home'; $('phase-text').textContent = busy ? `new thread · ${busy} running` : 'new thread';
-  $('pending-settings').hidden = true; renderChip();
+  $('send').hidden = false; $('pending-settings').hidden = true; renderChip();
 }
 function explainStatus() {
   if(!selected) {$('prompt').focus?.(); return;}
@@ -348,6 +422,7 @@ function render(data) {
     else if(spent) spentLine = spent;
   }
   endTurn();
+  foldSteps($('history'), opened);
   packCards(data);
   if(data.self_edit && !historical && pendingChange(data.self_edit)) $('history').append(changeCard(data, opened));
   if(!$('history').children.length && !data.busy && !data.missing) $('history').append(el('p','note empty','No messages yet. Write the first one below.'));
@@ -361,9 +436,12 @@ function render(data) {
   // Replayed events name the current step themselves; until then the run is just running.
   if(data.busy) setActivity(!data.replay && (data.pending || [])[0] ? `Running ${data.pending[0].name}` : 'Working on the host');
   else {activity = {label:'', since:0}; $('phase-text').textContent = data.missing ? 'no store · delete this thread' : needsSignin(data) ? `needs sign-in · ${data.provider || 'provider'}` : data.rejected ? refusal(data.rejected) : data.complete && data.follow_up ? 'pack follow-up waiting · Continue' : data.complete ? 'ready' : data.stop ? data.stop : data.budget?.blocked ? 'budget reached · raise it in the thread menu, then Continue' : data.phase?.includes('ModelWait') ? (data.recorded ? 'reply saved · Continue' : 'interrupted model request · Retry') : data.phase || '';}
-  // The model and effort live on the chip; the title line carries what the thread cost.
-  $('subtitle').textContent = spendLine(data);
-  $('subtitle').title = [data.reasoning ? `Reasoning: ${data.reasoning.label}` : '', data.context?.window ? `Context window: ${tokens(data.context.window)} tokens` : '', usageLine(data.usage)].filter(Boolean).join('\n');
+  // The model under the title; what the thread spent at the right (its limit and usage are
+  // in the thread menu), and a hairline under the header of it against the limit.
+  const settings = threadSettings(data);
+  $('subtitle').textContent = [settings.provider, settings.model || data.model].filter(Boolean).join(' · ');
+  $('subtitle').title = [data.reasoning ? `Reasoning: ${data.reasoning.label}` : '', data.context?.window ? `Context window: ${tokens(data.context.window)} tokens` : ''].filter(Boolean).join('\n');
+  renderSpend(data);
   renderGauge(data); renderAttention(data.attention);
   renderBar(data);
   const pending = !historical && data.pending_settings && typeof data.pending_settings === 'object' ? settingsLine(data.pending_settings) : '';
@@ -377,6 +455,50 @@ function render(data) {
   if(data.head > 0 && newDraft()?.session === selected) drafts.set('draft:new','');
   if(!$('findbar').hidden) search($('find-text').value, false);
   scroll();
+}
+// The header's spend: what the thread spent ("$0.041", "subscription", "12K tok"), and the
+// bar under the header of it against its limit.
+function renderSpend(data) {
+  const button = $('spend'), bar = $('spend-bar');
+  const max = data ? data.budget?.max_usd ?? threadSettings(data).max_usd : null, usd = Number(data?.usage?.usd) || 0;
+  const short = data ? usageLine(data.usage, true) : '';
+  button.hidden = !data || (!short && typeof max !== 'number');
+  bar.hidden = !data;
+  if(!data) return;
+  button.textContent = short || money(0);
+  const over = typeof max === 'number' && usd >= max;
+  button.classList.toggle('over', over); bar.classList.toggle('over', over);
+  bar.firstElementChild?.style?.setProperty?.('width', typeof max === 'number' ? `${max > 0 ? Math.min(100, usd / max * 100) : 100}%` : '0');
+  const said = spendLine(data);
+  button.setAttribute('aria-label', `Spent ${said}. Usage and limit`);
+  button.title = [said, usageLine(data.usage)].filter(Boolean).join('\n');
+}
+// Consecutive tool cards share one folding row, "Ran N steps" (a failure counted with a
+// cross); one alone stands by itself. Opened groups stay open through a re-render.
+function foldSteps(box, opened) {
+  const out = []; let run = [];
+  const flush = () => {if(run.length > 1) out.push(stepGroup(run, opened)); else out.push(...run); run = [];};
+  for(const node of [...box.children]) {
+    if(hasClass(node, 'tool-card') && node.dataset?.call) run.push(node);
+    else {flush(); out.push(node);}
+  }
+  flush();
+  box.replaceChildren(...out);
+}
+function stepGroup(cards, opened) {
+  const group = el('details','steps'); group.dataset.key = `steps:${cards[0].dataset.call}`;
+  // Open as left, or when a card in it was left open.
+  group.open = opened.has(group.dataset.key) || cards.some(card => card.open);
+  const failed = cards.filter(card => hasClass(card, 'failed')).length;
+  if(failed) group.classList.add('has-failed');
+  const summary = el('summary'), status = el('span','steps-status'); status.setAttribute('aria-hidden','true');
+  status.append(icon(failed ? 'x' : 'check', 14));
+  summary.append(status, el('span','steps-label',`Ran ${cards.length} steps`));
+  if(failed) {const count = el('span','steps-count'); count.setAttribute('role','img'); count.setAttribute('aria-label',`${failed} failed`); count.append(icon('x', 11), document.createTextNode(String(failed))); summary.append(count);}
+  const chevron = el('span','steps-chevron'); chevron.setAttribute('aria-hidden','true'); chevron.append(icon('next', 14));
+  summary.append(chevron);
+  group.append(summary, ...cards);
+  return group;
 }
 // "$0.041 of $5.00", "subscription", "12K tok" or "no model calls yet".
 function spendLine(data) {
@@ -558,12 +680,16 @@ function gone(id) {
   home().then(() => {toast(reason); if(created) openNew(lastError);}).catch(fail);
 }
 async function openThread(id) {
+  // Back to a thread deleted a moment ago (the browser's Back, say): it stays.
+  if(pendingDelete?.id === id) {undoDelete(id); hideToast();}
+  menuFor = null;
   source?.close(); cursor = ''; generation++; historical = false; selected = id; snapshot = null; following = true; knownFiles = new Set(); displayNodes.clear(); filesCache.clear();
   $('history').replaceChildren(el('p','note loading','Loading…')); $('live').replaceChildren(); queued = null; renderQueued(); $('send').disabled = true; closeSearch(); attached = []; renderAttachments(); resetBar(); $('jump').hidden = true;
   $('welcome').hidden = true; $('thread').hidden = false; $('dock').hidden = false; $('attach').hidden = false; $('settings').hidden = true; $('title-button').hidden = false; document.body.dataset.view = 'thread';
   const name = sessions.find(s => s.id === id)?.name || 'Thread';
   lastThread = {id, name};
-  $('title').textContent = name; $('subtitle').textContent = ''; $('title-button').setAttribute('aria-label', `Thread menu: ${name}`);
+  $('title').textContent = name; $('subtitle').textContent = ''; renderSpend(null); $('title-button').setAttribute('aria-label', `Thread menu: ${name}`);
+  markSeen(id);
   $('prompt').placeholder = 'Message';
   $('prompt').value = drafts.get(`draft:${id}`);
   fitPrompt();
@@ -579,22 +705,95 @@ function loadFailed(id) {
   $('history').replaceChildren(box);
 }
 const STATES = {running:'RUNNING', stopping:'STOPPING', done:'DONE', stopped:'STOPPED', 'needs attention':'NEEDS ATTENTION', 'reply saved':'REPLY SAVED', empty:'NEW', missing:'NO STORE', unreadable:'UNREADABLE'};
+// The thread list: Running, Needs you (a run that stopped and waits on the operator),
+// Today and Earlier; each row's state as a shape (a spinner, a warning, a square for a
+// reply not yet read here), what it is doing, how long ago, and ⋯ for its actions.
+const NEEDS = new Set(['needs attention', 'reply saved', 'missing', 'unreadable']);
+const DOING = {running: 'Working', stopping: 'Stopping', done: 'Finished', stopped: 'Stopped', 'needs attention': 'Needs you: open it to see why', 'reply saved': 'Reply saved: Continue records it', empty: 'New', missing: 'No store: delete it', unreadable: 'Could not be read'};
+const hasClass = (node, cls) => String(node?.className || '').split(' ').includes(cls);
+// How long ago, as the list shows it: now, 13m, 3h, 2d, then the date.
+function since(at, now = Date.now()) {
+  if(!at) return '';
+  const minutes = Math.max(0, Math.floor((now - at) / 60000));
+  if(minutes < 1) return 'now';
+  if(minutes < 60) return `${minutes}m`;
+  if(minutes < 1440) return `${Math.floor(minutes / 60)}h`;
+  if(minutes < 10080) return `${Math.floor(minutes / 1440)}d`;
+  return new Date(at).toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+}
+// When this screen last saw each thread (its status time then): one that finished since
+// has a reply not yet read here. A thread never seen before counts as seen.
+function threadSeen() {try {return JSON.parse(drafts.get('thread-seen') || '{}') || {};} catch {return {};}}
+function markSeen(id) {
+  const at = sessions.find(s => s.id === id)?.status?.at; if(!at) return;
+  const seen = threadSeen(); if(seen[id] === at) return;
+  seen[id] = at; drafts.set('thread-seen', JSON.stringify(seen));
+}
+function unreadThread(session) {
+  const at = session.status?.at;
+  if(session.id === selected || session.status?.state !== 'done' || !at) return false;
+  const seen = threadSeen();
+  if(!(session.id in seen)) {seen[session.id] = at; drafts.set('thread-seen', JSON.stringify(seen)); return false;}
+  return seen[session.id] < at;
+}
+// Threads deleted a moment ago (Undo can still bring them back), and the row whose
+// actions are showing.
+const hiddenThreads = new Set();
+let pendingDelete = null, menuFor = null;
 function listSessions() {
   const filter = $('filter').value.trim().toLowerCase();
   $('sessions').replaceChildren();
-  for(const session of sessions) {
-    if(filter && !session.name.toLowerCase().includes(filter)) continue;
-    const row = el('div','session-row'); const state = session.status?.state || '';
-    row.dataset.state = state;
-    const button = el('button','session');
-    const status = [session.dev || session.self_edit ? 'SELF-EDIT' : '', STATES[state] || state.toUpperCase(), ago(session.status?.at), session.usd > 0 ? money(session.usd) : ''].filter(Boolean).join(' · ');
-    button.append(el('strong','',session.name),el('small','',status)); button.onclick = () => openThread(session.id).catch(fail);
-    const remove = el('button','remove','×'); remove.setAttribute('aria-label',`Delete ${session.name}`); remove.onclick = () => deleteThread(session.id, session.name);
-    row.append(button,remove); $('sessions').append(row);
+  const visible = sessions.filter(s => !hiddenThreads.has(s.id));
+  const shown = visible.filter(s => !filter || s.name.toLowerCase().includes(filter)).sort((x, y) => (y.status?.at || 0) - (x.status?.at || 0));
+  const today = new Date().setHours(0, 0, 0, 0), placed = new Set();
+  const groups = [['Running', s => running(s.status?.state)], ['Needs you', s => NEEDS.has(s.status?.state)], ['Today', s => (s.status?.at || 0) >= today], ['Earlier', () => true]];
+  for(const [name, member] of groups) {
+    const members = shown.filter(s => !placed.has(s.id) && member(s));
+    if(!members.length) continue;
+    for(const s of members) placed.add(s.id);
+    $('sessions').append(el('h2','thread-group',name));
+    members.forEach((session, at) => {
+      $('sessions').append(sessionRow(session, at === members.length - 1));
+      if(menuFor === session.id) $('sessions').append(rowActions(session));
+    });
   }
-  $('filter').hidden = sessions.length < 6 && !filter;
-  $('intro').hidden = sessions.length > 0;
-  if(filter && !$('sessions').children.length) $('sessions').append(el('p','note',`No thread name contains “${$('filter').value.trim()}”.`));
+  $('filter-box').hidden = !visible.length && !filter;
+  $('intro').hidden = visible.length > 0;
+  if(filter && !shown.length) $('sessions').append(el('p','note',`No thread name contains “${$('filter').value.trim()}”.`));
+}
+function sessionRow(session, last) {
+  const state = session.status?.state || '', needs = NEEDS.has(state), fresh = unreadThread(session);
+  const row = el('div', `session-row${last ? ' last' : ''}${running(state) ? ' running' : ''}${needs ? ' needs' : ''}${fresh ? ' unread' : ''}`);
+  row.dataset.state = state;
+  const button = el('button','session'); button.type = 'button';
+  const mark = el('span','thread-mark'); mark.setAttribute('aria-hidden','true');
+  if(running(state)) mark.append(icon('spinner', 14)); else if(needs) mark.append(icon('warning', 16)); else if(fresh) mark.append(el('span','dot'));
+  const text = el('span','thread-text'), top = el('span','thread-top');
+  top.append(el('strong','',session.name), el('span','thread-time',since(session.status?.at)));
+  const doing = [session.dev || session.self_edit ? 'Self-edit' : '', fresh ? 'Finished · new reply' : DOING[state] || state || 'New', session.usd > 0 ? money(session.usd) : ''].filter(Boolean).join(' · ');
+  text.append(top, el('small','',doing));
+  button.append(mark, text);
+  button.title = [session.name, STATES[state] || state, session.status?.at ? new Date(session.status.at).toLocaleString() : ''].filter(Boolean).join(' · ');
+  button.onclick = () => openThread(session.id).catch(fail);
+  const more = el('button','thread-more'); more.type = 'button';
+  more.setAttribute('aria-label', `More actions for ${session.name}`); more.title = 'More actions';
+  more.setAttribute('aria-expanded', String(menuFor === session.id)); more.append(icon('more', 18));
+  more.dataset.session = session.id;
+  more.onclick = event => {
+    event?.stopPropagation?.(); menuFor = menuFor === session.id ? null : session.id; listSessions();
+    [...$('sessions').querySelectorAll('.thread-more')].find(node => node.dataset.session === session.id)?.focus?.();
+  };
+  row.append(button, more);
+  return row;
+}
+// A row's actions, under it while its ⋯ is open.
+function rowActions(session) {
+  const box = el('div','row-actions');
+  const drop = el('button','danger'); drop.type = 'button';
+  drop.append(icon('trash', 16), document.createTextNode(`Delete “${session.name}”`));
+  drop.onclick = () => deleteThread(session.id, session.name);
+  box.append(drop);
+  return box;
 }
 // Run notifications: a phone only shows them through the service worker; nothing is
 // pushed by a server, so they come from this page while it is open, or as a summary
@@ -631,9 +830,10 @@ async function loadSessions() {
   return data;
 }
 async function home(clearHash = true) {
+  const leaving = selected;
   source?.close(); source = null; generation++; selected = null; snapshot = null; historical = false; queued = null; renderQueued(); activity = {label:'', since:0}; if(clearHash && location.hash) location.hash = '';
   $('welcome').hidden = false; $('thread').hidden = true; $('dock').hidden = false; $('jump').hidden = true; banner('gone'); banner('stream'); document.body.dataset.view = 'home';
-  $('title').textContent = 'Spindle'; $('subtitle').textContent = 'A place for work to keep going.'; $('title-button').hidden = true; $('settings').hidden = false;
+  $('title').textContent = 'Spindle'; $('subtitle').textContent = ''; renderSpend(null); $('title-button').hidden = true; $('settings').hidden = false; $('spend').hidden = true;
   // The dock starts a new thread here: just type. Attachments go with a thread's messages.
   attached = []; renderAttachments(); $('attach').hidden = true; closeSearch();
   $('prompt').disabled = false; $('send').disabled = false; $('prompt').placeholder = 'Start a new thread…';
@@ -641,6 +841,8 @@ async function home(clearHash = true) {
   homeBar();
   const current = generation;
   const data = await loadSessions();
+  // What was seen of the thread just left is read.
+  if(leaving) markSeen(leaving);
   if(current !== generation || selected) return;
   fallback = providersOf(data.providers);
   listSessions(); homeBar();
@@ -769,15 +971,27 @@ function renderPicker() {
     list.append(row);
   }
   if(!shown && !raw) list.append(el('p','note',catalog ? 'No models are configured on the host.' : 'Loading models…'));
+  // The levels the model takes; none chosen (auto) is the model's own default, outlined,
+  // which the line under them names (and a chosen level can go back to).
   const efforts = effortsFor(p.provider, p.model), fallbackEffort = findModel(p.provider, p.model)?.model?.default_effort;
   if(!efforts.includes(p.effort)) p.effort = 'default';
-  $('effort-choice').replaceChildren(...efforts.map(level => {
-    const button = el('button', p.effort === level ? 'active' : '', EFFORT_NAMES[level] || level); button.type = 'button';
+  $('effort-choice').replaceChildren(...efforts.filter(level => level !== 'default').map(level => {
+    const auto = p.effort === 'default' && level === fallbackEffort;
+    const button = el('button', p.effort === level ? 'active' : auto ? 'auto' : '', EFFORT_NAMES[level] || level); button.type = 'button';
     button.dataset.effort = level; button.setAttribute('aria-pressed', String(p.effort === level));
+    if(auto) button.title = "This model's default, used while no level is chosen";
     button.onclick = () => {p.effort = level; commitNew(); renderPicker();};
     return button;
   }));
-  $('effort-note').textContent = p.effort === 'default' ? `· auto = ${fallbackEffort || "provider's default"}` : '';
+  $('effort-note').textContent = p.effort === 'default' ? '· auto' : '';
+  const words = {off: 'Off', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'X-high', max: 'Max'};
+  const named = fallbackEffort ? `${words[fallbackEffort] || fallbackEffort} is this model's default` : "The provider's default applies";
+  $('effort-default').replaceChildren(document.createTextNode(p.effort === 'default' ? `${named}; none chosen.` : `${named}.`));
+  if(p.effort !== 'default') {
+    const back = el('button','link-like','Use the default'); back.type = 'button';
+    back.onclick = () => {p.effort = 'default'; commitNew(); renderPicker();};
+    $('effort-default').append(back);
+  }
   $('picker-network').checked = p.network; $('picker-toolchain').checked = p.toolchain;
   const changed = pickerChanges(), dirty = Object.keys(changed).length > 0;
   $('model-apply').textContent = p.thread && dirty ? (snapshot?.busy ? 'Apply after this turn' : 'Apply') : 'Done';
@@ -878,7 +1092,7 @@ async function command(kind, more = {}) {
     if(kind === 'say' && $('prompt').value.trim() === more.text) {$('prompt').value = ''; fitPrompt();}
     if(!stop && kind !== 'settings') {
       historical = false;
-      if(snapshot) {snapshot.busy = receipt.state === 'running'; $('stop').hidden = !snapshot.busy;}
+      if(snapshot) {snapshot.busy = receipt.state === 'running'; renderStop();}
       // Show the run as started now, not when its first event arrives.
       if(receipt.state === 'running') {remember(id, 'running'); if(snapshot) {renderBar(snapshot); setActivity('Starting'); for(const state of $('live').querySelectorAll('.notice.state')) state.remove();}}
     }
@@ -957,8 +1171,33 @@ function retryThread() {
 function rewindThread(revision) {
   confirmCommand(`Rewind to r${revision}?`,'Restore the conversation and workspace together. The abandoned future stays recorded. External network effects cannot be undone. Rewinding does not automatically resume execution.','rewind',{revision});
 }
+// Deleting leaves the list at once, with a moment to Undo; the host deletes when the moment
+// passes, or as soon as this screen is left (an unknown outcome is checked again by its
+// request ID, like any command). A running thread must be stopped first.
+const UNDO_MS = 8000;
 function deleteThread(id, name) {
-  confirmAction(`Delete “${name}”?`,'The conversation, revisions and workspace files are removed from the active host. Command receipts are kept for an hour, then forgotten; backups are not erased. A running thread must be stopped first. This cannot be undone.',async () => {await command('delete',{session:id}); $('thread-dialog').close();},{yes:'Delete'});
+  const session = sessions.find(s => s.id === id);
+  if(running(session?.status?.state) || (selected === id && snapshot?.busy)) {toast('Stop this thread before deleting it.'); return;}
+  finishDelete();
+  $('thread-dialog').close();
+  menuFor = null; hiddenThreads.add(id);
+  if(selected === id) home().catch(fail); else listSessions();
+  pendingDelete = {id, timer: setTimeout(finishDelete, UNDO_MS)};
+  toast(`Deleted “${name}”`, 'info', {action: ['Undo', () => undoDelete(id)], ms: UNDO_MS});
+}
+function finishDelete() {
+  if(!pendingDelete) return;
+  clearTimeout(pendingDelete.timer);
+  // One submission at a time: a message on its way goes first.
+  if(submitting) {pendingDelete.timer = setTimeout(finishDelete, 500); return;}
+  const {id} = pendingDelete; pendingDelete = null;
+  // The open thread (another one by now) is not what this deletes.
+  command('delete', {session: id, expected_revision: undefined}).then(() => {hiddenThreads.delete(id);}, error => {hiddenThreads.delete(id); if(!selected) listSessions(); fail(error);});
+}
+function undoDelete(id) {
+  if(pendingDelete?.id !== id) return;
+  clearTimeout(pendingDelete.timer); pendingDelete = null;
+  hiddenThreads.delete(id); if(!selected) listSessions();
 }
 // What the thread has cost, for the thread menu.
 function usageText(data) {
@@ -1154,7 +1393,12 @@ function show(jump) {
   for(const other of found) other.node.classList.remove('find-current');
   hit.node.classList.add('find-current');
   $('find-count').textContent = `${foundAt + 1}/${found.length}`;
-  if(jump) {if(hit.node.tagName === 'DETAILS' || hit.node.tagName === 'details') hit.node.open = true; following = false; hit.node.scrollIntoView?.({block:'center'});}
+  if(jump) {
+    if(hit.node.tagName === 'DETAILS' || hit.node.tagName === 'details') hit.node.open = true;
+    // A card folded into a run of steps: the run opens too.
+    const group = hit.node.parentElement; if(group && hasClass(group, 'steps')) group.open = true;
+    following = false; hit.node.scrollIntoView?.({block:'center'});
+  }
 }
 function step(by) {if(!found.length) return; foundAt = (foundAt + by + found.length) % found.length; show(true);}
 function highlight(query) {
@@ -1210,7 +1454,7 @@ async function runIntent(text) {
     case 'install': confirmInstall(); break;
     case 'update': confirmUpdate(); break;
     case 'new': await startNew(); break;
-    case 'filter': {await home(); $('filter').hidden = false; $('filter').value = wanted.query; listSessions(); break;}
+    case 'filter': {await home(); $('filter-box').hidden = false; $('filter').value = wanted.query; listSessions(); break;}
     case 'find': search(wanted.query); break;
     case 'export': exportTranscript(); break;
     case 'download': download(); break;
@@ -1272,6 +1516,7 @@ function exportTranscript() {
 $('home').onclick = () => home().catch(fail);
 $('settings').onclick = () => openHost().catch(fail);
 $('title-button').onclick = openThreadMenu;
+$('spend').onclick = openThreadMenu;
 $('model-chip').onclick = () => openPicker().catch(fail);
 $('pending-settings').onclick = () => openPicker().catch(fail);
 $('model-search').oninput = renderPicker;
@@ -1365,7 +1610,7 @@ $('restart').onclick = () => confirmAction('Restart the host?','The host process
 // the reply being written so it is read at once.
 async function steer(id, text) {
   const reply = await api(`/api/sessions/${id}/steer`,{text});
-  if(selected === id && $('prompt').value.trim() === text) {$('prompt').value = ''; fitPrompt();}
+  if(selected === id && $('prompt').value.trim() === text) {$('prompt').value = ''; fitPrompt(); renderStop();}
   if(drafts.get(`draft:${id}`).trim() === text) drafts.set(`draft:${id}`,'');
   // Shown at once, as the host says it waits (its `queued` event may come first).
   if(selected === id) {queued = reply.waiting?.messages ? reply.waiting : {messages:[...(queued?.messages || []), text], now: Boolean(queued?.now)}; renderQueued(); scroll();}
@@ -1426,14 +1671,20 @@ async function loadLogins() {
 function renderLogins(logins) {
   const needed = logins.filter(login => login.status !== 'not-required');
   $('logins-state').textContent = needed.length ? `${needed.filter(login => login.signed_in).length} of ${needed.length} signed in` : '';
+  // A row each: a filled square signed in (a hollow one when not, or when none is needed),
+  // its state, and icons to sign in (again) and out.
   $('logins').replaceChildren(...logins.map(login => {
-    const row = el('div','login-row');
-    const state = login.signed_in ? (login.status === 'not-required' ? 'no sign-in needed' : login.status.startsWith('env:') ? `signed in (${login.status.slice(4)})` : 'signed in') : login.status === 'auth(unresolved)' ? 'credential unresolved' : 'not signed in';
-    row.append(el('span','',login.name || login.provider), el('small', login.signed_in ? 'ok' : '', state));
-    if(login.status !== 'not-required' && !login.status.startsWith('env:')) {
-      const action = el('button', login.signed_in && login.status === 'auth' ? 'danger' : '', login.signed_in && login.status === 'auth' ? 'Sign out' : 'Sign in'); action.type = 'button';
-      action.onclick = () => login.signed_in && login.status === 'auth' ? signOut(login) : openSignIn(login);
-      row.append(action);
+    const name = login.name || login.provider, needed = login.status !== 'not-required';
+    const row = el('div', `login-row${login.signed_in && needed ? ' ok' : ''}`);
+    const state = login.signed_in ? (!needed ? 'no sign-in needed' : login.status.startsWith('env:') ? `signed in (${login.status.slice(4)})` : 'signed in') : login.status === 'auth(unresolved)' ? 'credential unresolved' : 'not signed in';
+    const mark = el('span','login-mark'); mark.setAttribute('aria-hidden','true');
+    row.append(mark, el('span','login-name',name), el('small', login.signed_in ? 'ok' : '', state));
+    const action = (label, glyph, run, cls = '') => {const button = el('button', cls); button.type = 'button'; button.setAttribute('aria-label', label); button.title = label; button.append(icon(glyph, 17)); button.onclick = run; row.append(button);};
+    if(needed && !login.status.startsWith('env:')) {
+      if(login.signed_in && login.status === 'auth') {
+        action(`Sign in to ${name} again`, 'retry', () => openSignIn(login));
+        action(`Sign out of ${name}`, 'signout', () => signOut(login), 'danger');
+      } else action(`Sign in to ${name}`, 'signin', () => openSignIn(login));
     }
     return row;
   }));
@@ -1507,7 +1758,7 @@ $('composer').onsubmit = async event => {
   } catch(error) {fail(error);}
   finally {inflight = '';}
 };
-$('prompt').oninput = () => {drafts.set(selected ? `draft:${selected}` : 'draft:home',$('prompt').value); fitPrompt();};
+$('prompt').oninput = () => {drafts.set(selected ? `draft:${selected}` : 'draft:home',$('prompt').value); fitPrompt(); renderStop();};
 // Ctrl/Cmd+Enter sends from a keyboard; Enter alone is a new line.
 $('prompt').onkeydown = event => {if(event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {event.preventDefault(); $('composer').requestSubmit?.();}};
 $('stop').onclick = () => command('stop').catch(() => {});
@@ -1561,11 +1812,15 @@ async function fileText(id, revision, path) {
 // scripts and images load through one. Each is reused until a minute before it lapses.
 // Cards of one revision that ask at once share the request (the host keeps at most 32).
 const previewLinks = new Map();
-async function previewUrl(id, revision, path, network = 'none') {
-  const key = `${id}:${revision}:${network}`;
+async function previewUrl(id, revision, path, network = 'none', scripts = false) {
+  // A link that runs scripts runs them on its own page only (GitHub access runs them),
+  // or, where previews are contained (`'all'`), on every page of the revision, and only
+  // where the browser keeps them offline (the host stops them anywhere else).
+  const runs = scripts === 'all' && network === 'none' ? true : scripts || network === 'github' ? path : null;
+  const key = `${id}:${revision}:${network}:${runs === true ? '*' : runs ?? ''}`;
   let link = previewLinks.get(key);
   if(!link || link.until <= Date.now()) {
-    const minting = api(`/api/sessions/${id}/preview`, network === 'none' ? {revision} : {revision, network}).then(grant => ({url: grant.url, until: Date.now() + Math.max(0, grant.expires_in - 60) * 1000}));
+    const minting = api(`/api/sessions/${id}/preview`, {revision, ...(network !== 'none' && {network}), ...(runs !== null && {scripts: runs}), ...(runs === true && {contained: true})}).then(grant => ({url: grant.url, until: Date.now() + Math.max(0, grant.expires_in - 60) * 1000}));
     link = {pending: minting, until: Infinity};
     previewLinks.set(key, link);
     try {link = await minting; if(previewLinks.get(key)?.pending === minting) previewLinks.set(key, link);}
@@ -1574,6 +1829,79 @@ async function previewUrl(id, revision, path, network = 'none') {
   return link.url + path.split('/').map(encodeURIComponent).join('/');
 }
 const renderUrl = (id, revision, path) => `/api/sessions/${id}/file?revision=${revision}&path=${encodeURIComponent(path)}&render=1`;
+// Whether this browser keeps a running preview offline. A preview carries a
+// Connection-Allowlist naming only its own files (preview.rs), and Chrome (152 and later)
+// holds every connection of the page to it, WebRTC, hints and navigations included, which
+// no page policy can; the host's check page tells whether it does here (asked as the app
+// starts, and again after a while when it only timed out: a slow answer is no answer).
+let containing = null;
+let containingUntil = Infinity;
+function previewsContained() {
+  if(containing && Date.now() > containingUntil) containing = null;
+  // One check at a time: until it answers, every caller waits for it.
+  if(!containing) containingUntil = Infinity;
+  containing ??= new Promise(resolve => {
+    // Without WebRTC there is no telling.
+    if(typeof RTCPeerConnection !== 'function') {resolve({contained: false, sure: true}); return;}
+    const frame = el('iframe'); frame.hidden = true; frame.title = 'Preview check'; frame.setAttribute('sandbox', 'allow-scripts');
+    let timer = setTimeout(() => done(false, false), 5000);
+    const done = (contained, sure) => {window.removeEventListener('message', heard); clearTimeout(timer); frame.remove(); resolve({contained, sure});};
+    const heard = ({source, data}) => {if(source === frame.contentWindow && typeof data?.spindleContained === 'boolean') done(data.spindleContained, true);};
+    // Loaded without a word (an error page): a no, once its word would have come.
+    frame.onload = () => {clearTimeout(timer); timer = setTimeout(() => done(false, false), 1000);};
+    window.addEventListener('message', heard);
+    frame.src = '/api/preview/check';
+    document.body.append(frame);
+  }).then(({contained, sure}) => {
+    containingUntil = contained || sure ? Infinity : Date.now() + 30_000;
+    return contained;
+  });
+  return containing;
+}
+// Whether a page's scripts run in its preview: where previews are contained, always (and
+// so every page of its revision's, `'all'`); else as the user let this version of it.
+async function scriptsRun(id, revision, path) {return await previewsContained() ? 'all' : scriptsLet(id, revision, path);}
+// Where previews are not contained, a page's scripts run in its preview only once let, for
+// that version of it: the page, the scripts it loads, and the files it or they name (what
+// they fetch is meant to be among them); any of those changing asks again, as a script
+// could send what the page shows out of the browser. Kept on this device; the link the
+// host gives runs that page's scripts alone.
+const versions = new Map();
+const PASSIVE = /\.(png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|mp3|mp4|webm|wav|ogg)$/i;
+function pageVersion(id, revision, path) {
+  const key = `${id}:${revision}:${path}`;
+  if(!versions.has(key)) versions.set(key, (async () => {
+    const files = await filesAt(id, revision);
+    const listed = new Map(files.map(file => [file.path, file]));
+    const text = listed.has(path) ? await fileText(id, revision, path) : null;
+    if(text === null) return null;
+    const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/') + 1) : '';
+    const local = ref => {
+      if(!ref || /^([a-z][a-z0-9+.-]*:|\/\/|#)/i.test(ref.trim())) return null;
+      try {const name = decodeURIComponent(new URL(ref.trim(), `https://workspace.invalid/${dir}`).pathname.slice(1)); return listed.has(name) ? name : null;}
+      catch {return null;}
+    };
+    const doc = new DOMParser().parseFromString(text, 'text/html');
+    const scripts = [...new Set([...doc.querySelectorAll('script[src]')].map(script => local(script.getAttribute('src'))).filter(Boolean))].sort();
+    const said = [text, ...await Promise.all(scripts.map(name => fileText(id, revision, name).then(code => code ?? '')))].join('\n');
+    const named = files.filter(file => file.path !== path && !scripts.includes(file.path) && !PASSIVE.test(file.path) && said.includes(file.path.split('/').pop())).map(file => file.path).sort();
+    const parts = [listed.get(path).digest, ...[...scripts, ...named].map(name => `${name}:${listed.get(name).digest}`)].join('|');
+    try {return [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(parts)))].map(byte => byte.toString(16).padStart(2,'0')).join('');}
+    catch {return parts;}
+  })().catch(error => {versions.delete(key); throw error;}));
+  return versions.get(key);
+}
+async function scriptsLet(id, revision, path) {
+  try {
+    const kept = JSON.parse(localStorage.getItem(`spindle-preview:${id}:${path}`) || 'null');
+    if(!kept?.scripts) return false;
+    const version = await pageVersion(id, revision, path);
+    return Boolean(version) && kept.version === version;
+  } catch {return false;}
+}
+async function letScripts(id, revision, path, scripts) {
+  try {localStorage.setItem(`spindle-preview:${id}:${path}`, JSON.stringify({version: await pageVersion(id, revision, path), scripts}));} catch {}
+}
 // The file list of a revision never changes once committed: fetched once per thread.
 const filesCache = new Map();
 async function filesAt(id, revision) {
@@ -1621,7 +1949,7 @@ function displayCard(item, id) {
     const frame = el('iframe'); frame.title = `Preview of ${title}`; frame.tabIndex = -1;
     frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals'); frame.setAttribute('referrerpolicy', 'no-referrer'); frame.setAttribute('loading', 'lazy');
     body.append(frame, cover());
-    whenVisible(card, () => previewUrl(id, revision, path).then(url => {frame.src = url;}, () => {frame.src = renderUrl(id, revision, path);}));
+    whenVisible(card, () => scriptsRun(id, revision, path).then(scripts => previewUrl(id, revision, path, 'none', scripts)).then(url => {frame.src = url;}, () => {frame.src = renderUrl(id, revision, path);}));
   } else if(kind === 'image' || kind === 'svg') {
     const image = el('img'); image.alt = title; image.decoding = 'async';
     body.append(image, cover());
@@ -1656,11 +1984,11 @@ function clearViewer() {
   for(const id of ['file-html','file-image','file-md','file-content']) $(id).hidden = true;
   $('file-html').removeAttribute('src'); $('file-image').removeAttribute('src');
   $('file-md').replaceChildren(); $('file-content').replaceChildren();
-  $('file-view-toggle').hidden = true; $('file-view-network').hidden = true; $('file-view-network').onclick = null; $('file-open').hidden = true; $('file-open').removeAttribute('href');
+  $('file-view-toggle').hidden = true; $('file-view-network').hidden = true; $('file-view-network').onclick = null; $('file-view-scripts').hidden = true; $('file-view-scripts').onclick = null; $('file-open').hidden = true; $('file-open').removeAttribute('href');
 }
 async function openViewer(id, revision, path, options = {}) {
   if(viewing && viewing.id === id && viewing.path !== path) attend('file', viewing.path, viewing.at);
-  const token = viewing = {id, revision, path, kind: kindOf(path, options.kind), network: 'none', from: options.from || 'chat', base: options.base, at: Date.now()};
+  const token = viewing = {id, revision, path, kind: kindOf(path, options.kind), network: 'none', scripts: undefined, from: options.from || 'chat', base: options.base, at: Date.now()};
   attend('file', path);
   // The shelf keeps this head's bytes for every thread; an old revision is past its reach.
   $('file-view-shelf').hidden = historical || !snapshot || revision !== snapshot.head;
@@ -1682,11 +2010,25 @@ async function showFile(token) {
       // A page renders as a site of this revision (sandboxed, with its sibling files);
       // without a preview link (an older host) a page or SVG still renders on its own.
       let src = '', site = false;
-      try {src = await previewUrl(id, revision, path, token.network); site = true;}
+      // Whether this version runs, asked once the viewer shows it (another file opened
+      // meanwhile takes over): always where previews are contained.
+      if(kind === 'html' && token.scripts === undefined) {
+        token.scripts = await scriptsRun(id, revision, path);
+        if(!viewed(token)) return;
+      }
+      try {src = await previewUrl(id, revision, path, token.network, token.scripts === 'all' ? 'all' : Boolean(token.scripts)); site = true;}
       catch(error) {if(error.status === 0 || error.status === 401) throw error; if(kind === 'html' || kind === 'svg') src = renderUrl(id, revision, path);}
       if(!viewed(token)) return;
       if(site) {$('file-open').href = src; $('file-open').hidden = false;}
       if(site && kind === 'html') {
+        const scripts = $('file-view-scripts'); scripts.hidden = token.network === 'github' || token.scripts === 'all';
+        scripts.textContent = token.scripts ? 'Stop scripts' : 'Run scripts';
+        scripts.title = token.scripts ? 'Show this page without running its scripts' : "Let this version of the page run its scripts (only its own files; this browser cannot keep a running page offline, so a script could send what the page shows out of it)";
+        scripts.onclick = () => {
+          if(!viewed(token)) return;
+          token.scripts = !token.scripts;
+          letScripts(id, revision, path, token.scripts).then(() => showFile(token)).catch(fail);
+        };
         const control = $('file-view-network'); control.hidden = false;
         control.textContent = token.network === 'github' ? 'Use isolated preview' : 'GitHub access';
         control.onclick = () => {
@@ -1762,41 +2104,68 @@ async function showDiff(token) {
 $('viewer-back').onclick = () => $('viewer-dialog').close();
 $('viewer-close').onclick = () => {const from = viewing?.from; $('viewer-dialog').close(); if(from === 'files') $('files-dialog').close();};
 $('viewer-dialog').onclose = () => {if(viewing) attend('file', viewing.path, viewing.at); viewing = null; clearViewer();};
-// Files: the whole sheet is the list (filterable when long); a file opens the viewer.
+// Files: the whole sheet is the list, a folder at a time (each shut until tapped, a lone
+// folder chain on one row); a long list filters to the paths that match; a file opens the
+// viewer. What the revision changed is marked, on files and on the folders holding them.
+let fileSheet = null; const openFolders = new Map(), ROWS_AT_ONCE = 400;
 async function openFiles() {
   if(!snapshot) {toast('Wait for the thread to load.'); return;}
-  const id = selected, revision = snapshot.revision;
-  $('file-revision').textContent = `WORKSPACE · r${revision}`; $('file-list').replaceChildren();
-  const listed = snapshot.files || [];
+  const id = selected, revision = snapshot.revision, listed = snapshot.files || [];
+  $('file-revision').textContent = `WORKSPACE · r${revision}`;
   $('file-filter').value = ''; $('file-filter').hidden = listed.length < 12;
-  const rows = new Map();
-  for(const file of listed) {
-    const button = el('button'); button.type = 'button'; button.dataset.path = file.path;
-    const mark = el('small','',size(file.size)); button.append(el('span','',file.path),mark);
-    button.onclick = () => openViewer(id, revision, file.path, {from: 'files'}).catch(fail);
-    $('file-list').append(button); rows.set(file.path, {file, mark});
-  }
-  if(!listed.length) $('file-list').append(el('p','note','No files at this revision.'));
+  fileSheet = {id, revision, files: listed, marks: new Map()}; drawFileList();
   if(!$('files-dialog').open) $('files-dialog').showModal();
   // Mark what this revision changed, and list what it deleted, against the one before.
   if(revision <= 1) return;
   try {
     const before = await filesAt(id, revision - 1);
-    if(!(selected === id && snapshot?.revision === revision && $('files-dialog').open)) return;
-    const old = new Map(before.map(f => [f.path, f]));
-    for(const [path, {file, mark}] of rows) {const was = old.get(path); if(!was || was.digest !== file.digest) {mark.textContent = `${was ? 'changed' : 'new'} · ${mark.textContent}`; mark.classList.add('changed');}}
-    for(const [path] of old) if(!rows.has(path)) {
-      const button = el('button'); button.type = 'button'; button.dataset.path = path;
-      button.append(el('span','',path),el('small','changed','deleted'));
-      button.onclick = () => openViewer(id, revision, path, {from: 'files', diff: true}).catch(fail);
-      $('file-list').append(button);
-    }
+    if(!(selected === id && snapshot?.revision === revision && $('files-dialog').open && fileSheet?.id === id && fileSheet.revision === revision)) return;
+    const old = new Map(before.map(f => [f.path, f])), now = new Set(listed.map(f => f.path)), marks = new Map();
+    for(const file of listed) {const was = old.get(file.path); if(!was || was.digest !== file.digest) marks.set(file.path, was ? 'changed' : 'new');}
+    const gone = before.filter(f => !now.has(f.path)).map(f => ({path: f.path, deleted: true}));
+    for(const file of gone) marks.set(file.path, 'deleted');
+    fileSheet = {id, revision, files: [...listed, ...gone], marks}; drawFileList();
   } catch {}
 }
-$('file-filter').oninput = () => {
-  const query = $('file-filter').value.trim().toLowerCase();
-  for(const row of $('file-list').children) if(row.dataset?.path !== undefined) row.hidden = Boolean(query) && !row.dataset.path.toLowerCase().includes(query);
-};
+function drawFileList() {
+  const {id, revision, files, marks} = fileSheet, query = $('file-filter').value.trim().toLowerCase();
+  if(!openFolders.has(id)) openFolders.set(id, new Set());
+  const open = openFolders.get(id), tree = fileTree(query ? files.filter(f => f.path.toLowerCase().includes(query)) : files, f => marks.get(f.path) || '');
+  const fileRow = (file, label) => {
+    const button = el('button'); button.type = 'button'; button.dataset.path = file.path;
+    const mark = marks.get(file.path);
+    button.append(el('span','',label), el('small', mark ? 'changed' : '', file.deleted ? 'deleted' : mark ? `${mark} · ${size(file.size)}` : size(file.size)));
+    button.onclick = () => openViewer(id, revision, file.path, file.deleted ? {from: 'files', diff: true} : {from: 'files'}).catch(fail);
+    return button;
+  };
+  const folderRow = node => {
+    const group = el('div','tree-folder'), head = el('button','tree-folder-head'), inside = el('div','tree-folder-files'), present = node.count - (node.marks.deleted || 0);
+    head.type = 'button'; head.dataset.folder = node.path; head.title = node.path;
+    const notes = Object.entries(node.marks).map(([kind, n]) => `${n} ${kind}`);
+    head.append(el('span','tree-folder-name',node.name), el('small', notes.length ? 'changed' : '', [`${present} file${present === 1 ? '' : 's'}`, ...notes].join(' · ')));
+    let drawn = false;
+    // Open state by every folder the row stands for: a turn that joins or splits the chain keeps it.
+    const show = on => {if(on && !drawn) {drawn = true; entries(inside, node);} inside.hidden = !on; head.setAttribute('aria-expanded', String(on)); for(const path of node.paths) if(on) open.add(path); else open.delete(path);};
+    head.onclick = () => show(inside.hidden); show(open.has(node.path));
+    group.append(head, inside); return group;
+  };
+  // A few hundred rows at a time: "Show more" draws the next ones, the focus moving to the first.
+  const rows = (into, items, draw, from = 0) => {
+    const first = into.children.length;
+    for(const item of items.slice(from, from + ROWS_AT_ONCE)) into.append(draw(item));
+    const left = items.length - from - ROWS_AT_ONCE;
+    if(left > 0) {
+      const more = el('button','tree-more',`Show ${Math.min(left, ROWS_AT_ONCE)} more of ${left}`); more.type = 'button';
+      more.onclick = () => {more.remove(); rows(into, items, draw, from + ROWS_AT_ONCE)?.focus();}; into.append(more);
+    }
+    const drawn = into.children[first]; return drawn?.tagName?.toLowerCase() === 'button' ? drawn : drawn?.querySelector('button');
+  };
+  const entries = (into, node) => rows(into, [...node.files, ...node.folders], item => Array.isArray(item.folders) ? folderRow(item) : fileRow(item, item.path.split('/').pop()));
+  $('file-list').replaceChildren();
+  if(query) rows($('file-list'), tree.order, file => fileRow(file, file.path)); else entries($('file-list'), tree);
+  if(!tree.count) $('file-list').append(el('p','note', query ? 'No file matches.' : 'No files at this revision.'));
+}
+$('file-filter').oninput = () => {if(fileSheet) drawFileList();};
 // Update from host source: merges the host's current source into a self-edit thread.
 function confirmUpdate() {
   confirmCommand('Update from host source?','Spindle merges the host\'s current source into this thread\'s workspace (a three-way merge against the source the thread last synced with) and starts a turn: the model is told what changed and resolves any conflicts. Nothing is built or installed; install afterwards. The turn\'s model calls may be billed.','update',{},{yes:'Update'});
@@ -1891,7 +2260,9 @@ $('rollback').onclick = () => {
 // While visible, the thread list refreshes now and then, so ended runs are noticed.
 function poll() {if(document.hidden) return; loadSessions().then(() => {if(!selected) listSessions();}).catch(() => {});}
 setInterval(poll, 20000);
-document.addEventListener('visibilitychange',() => {if(document.hidden) {source?.close(); source = null;} else {recover(); poll(); if(selected && !historical) {cursor = ''; connect();}}});
+document.addEventListener('visibilitychange',() => {if(document.hidden) {finishDelete(); source?.close(); source = null;} else {recover(); poll(); if(selected && !historical) {cursor = ''; connect();}}});
+// Leaving the page deletes what waits for its Undo.
+window.addEventListener('pagehide', finishDelete);
 window.addEventListener('online',() => {recover(); cursor = ''; connect();});
 window.addEventListener('offline',() => {$('connection').textContent = 'Offline';});
 window.addEventListener('hashchange',async () => {
@@ -2006,5 +2377,5 @@ function closePackCard(card, label) {
   const footer = [...card.children].find(node => node.className === 'tool-footer');
   if(footer) footer.replaceChildren(el('span','meta',label));
 }
-async function init() {const hash = location.hash; await home(false); checkBuild(); const match = hash.match(/^#thread\/([a-zA-Z0-9_-]+)$/); if(match && sessions.some(s => s.id === match[1])) await openThread(match[1]); await recover(); if(notifiable()) registerWorker();}
+async function init() {const hash = location.hash; await home(false); checkBuild(); previewsContained(); const match = hash.match(/^#thread\/([a-zA-Z0-9_-]+)$/); if(match && sessions.some(s => s.id === match[1])) await openThread(match[1]); await recover(); if(notifiable()) registerWorker();}
 init().catch(error => {if(!$('pair-dialog').open) fail(error);});

@@ -26,12 +26,12 @@ implement what each page describes.
 
 | Document | Component | Source |
 | --- | --- | --- |
-| [Store](store.md) | SQLite authority, revisions, objects and workspace trees, rewind, ownership, bundles, migrations | [`spindle/store/src`](../spindle/store/src), [`spindle/src`](../spindle/src) |
+| [Store](store.md) | Schema 20, packed objects, revisions and workspace trees, rewind, ownership, checked compaction, bundles and migrations | [`spindle/store/src`](../spindle/store/src), [`spindle/src`](../spindle/src) |
 | [Driver and session](driver.md) | The decision driver, the native `Session`, model requests, recovery, steering, budgets, compaction | [`driver.rs`](../spindle/store/src/driver.rs), [`agent.rs`](../spindle/store/src/agent.rs) |
 | [Tools and execution](tools.md) | Built-in tools, sandboxed commands, background jobs, images, app tools, tasks, code mode | [`agent/`](../spindle/store/src/agent), [`code_mode.rs`](../spindle/store/src/code_mode.rs) |
 | [Browser host](host.md) | `spindle serve`: listener, pairing, remote access, previews, self-edit, web UI | [`serve/`](../spindle/store/src/serve), [`ui/`](../spindle/store/ui) |
-| [Embedded package](embedded.md) | Spindle inside a JS app via WebAssembly; Node and OPFS storage; moving sessions | [`embed/`](../spindle/embed), [`embedded/`](../spindle/store/src/embedded) |
-| [Browser extension](chrome.md) | Spindle for Browser: contexts, threads, keys and sign-in, page tools, build and tests | [`chrome/`](../spindle/chrome) |
+| [Embedded package](embedded.md) | WebAssembly sessions in a JS app; Node/OPFS storage, budgets, background tasks, capabilities and moving sessions | [`embed/`](../spindle/embed), [`embedded/`](../spindle/store/src/embedded) |
+| [Browser extension](chrome.md) | Spindle for Browser 0.1.4: panel, storage controls, preview choices, sealed credentials, page tools, build and tests | [`chrome/`](../spindle/chrome) |
 | [Browser Linux](browser-linux.md) | The v86 and WebAssembly Linuxes that run commands in the browser | [`chrome/linux`](../spindle/chrome/linux), [`chrome/wasm-linux`](../spindle/chrome/wasm-linux) |
 | [Engine crates](engine.md) | `dext-core`, `dext-transcript`, `dext-native`, `dext-provider`; provider catalog and wire formats | [`dext-engine/`](../dext-engine) |
 

@@ -279,12 +279,6 @@ fn take_text(bytes: &mut &[u8], limit: usize) -> Result<String> {
         .map_err(|_| Error::Incompatible)
 }
 
-/// The regular files of a manifest (v1 or v2).
-#[cfg(feature = "dext-turn")]
-pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<Entry>> {
-    decode_tree(bytes).map(|tree| tree.files)
-}
-
 /// A whole manifest; only its one canonical encoding is accepted.
 pub fn decode_tree(bytes: &[u8]) -> Result<Tree> {
     if bytes.len() > crate::artifact::MAX_OBJECT {
@@ -371,33 +365,40 @@ pub(crate) fn validate_root(db: &Connection, scope: &str, root: &str) -> Result<
 /// The tree of a workspace root: its manifest and every file object are pinned in
 /// `scope` and match their digests. Each object is hashed once per connection (its
 /// digest is then remembered), so a step only hashes the objects it newly reaches.
+/// A connection starts out knowing the files of the last validated revision's
+/// workspace (`known_files`), so a reopen hashes (and inflates) only the files written
+/// since, never the whole workspace again.
 pub(crate) fn validate_tree_root(db: &Connection, scope: &str, root: &str) -> Result<Tree> {
     if !valid_digest(root) {
         return Err(Error::Invalid);
     }
+    let fresh: bool = db.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE name='spindle_valid_objects')",
+        [],
+        |row| row.get(0),
+    )?;
     db.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS spindle_valid_roots(scope TEXT NOT NULL, root TEXT NOT NULL, PRIMARY KEY(scope,root));
          CREATE TEMP TABLE IF NOT EXISTS spindle_valid_objects(digest TEXT PRIMARY KEY);",
     )?;
+    if fresh {
+        known_files(db)?;
+    }
     let known: bool = db
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM temp.spindle_valid_roots WHERE scope=?1 AND root=?2)",
         )?
         .query_row(params![scope, root], |row| row.get(0))?;
     let bytes: Option<Vec<u8>> = if known {
-        db.prepare_cached("SELECT bytes FROM objects WHERE digest=?1")?
-            .query_row([root], |row| {
-                crate::bounded_blob(row, 0, crate::artifact::MAX_OBJECT)
-            })
+        db.prepare_cached(crate::artifact::STORED)?
+            .query_row([root], |row| crate::artifact::object_at(row, 0))
             .optional()?
     } else {
-        db.prepare_cached(
-            "SELECT o.bytes FROM objects o WHERE o.digest=?1 AND EXISTS(SELECT 1 FROM staging_pins p JOIN artifact_stages s ON p.stage=s.id WHERE p.digest=o.digest AND s.scope=?2)",
-        )?
-        .query_row(params![root, scope], |row| {
-            crate::bounded_blob(row, 0, crate::artifact::MAX_OBJECT)
-        })
-        .optional()?
+        db.prepare_cached(crate::artifact::STORED_IN_SCOPE)?
+            .query_row(params![root, scope], |row| {
+                crate::artifact::object_at(row, 0)
+            })
+            .optional()?
     };
     let bytes = bytes.ok_or(Error::Invalid)?;
     if object_digest(&bytes) != root {
@@ -409,7 +410,7 @@ pub(crate) fn validate_tree_root(db: &Connection, scope: &str, root: &str) -> Re
         let mut verified = db.prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM temp.spindle_valid_objects WHERE digest=?1)",
         )?;
-        let mut stored = db.prepare_cached("SELECT bytes FROM objects WHERE digest=?1")?;
+        let mut stored = db.prepare_cached(crate::artifact::STORED)?;
         let mut remember =
             db.prepare_cached("INSERT OR IGNORE INTO temp.spindle_valid_objects VALUES(?1)")?;
         for entry in &tree.files {
@@ -419,9 +420,8 @@ pub(crate) fn validate_tree_root(db: &Connection, scope: &str, root: &str) -> Re
             if verified.query_row([&entry.object], |row| row.get(0))? {
                 continue;
             }
-            let bytes = stored.query_row([&entry.object], |row| {
-                crate::bounded_blob(row, 0, crate::artifact::MAX_OBJECT)
-            })?;
+            let bytes =
+                stored.query_row([&entry.object], |row| crate::artifact::object_at(row, 0))?;
             if object_digest(&bytes) != entry.object {
                 return Err(Error::Incompatible);
             }
@@ -431,6 +431,39 @@ pub(crate) fn validate_tree_root(db: &Connection, scope: &str, root: &str) -> Re
             .execute(params![scope, root])?;
     }
     Ok(tree)
+}
+
+/// The files of the last validated revision's workspace (the head an earlier open
+/// validated, its files hashed then or by an open before it), remembered as verified
+/// on this connection. Its manifest is still checked against its digest.
+fn known_files(db: &Connection) -> Result<()> {
+    let root: Option<String> = db
+        .query_row(
+            "SELECT r.workspace FROM validated v JOIN revisions r ON r.revision=v.revision WHERE v.id=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(root) = root.filter(|root| valid_digest(root)) else {
+        return Ok(());
+    };
+    let Some(bytes) = db
+        .prepare_cached(crate::artifact::STORED)?
+        .query_row([&root], |row| crate::artifact::object_at(row, 0))
+        .optional()?
+    else {
+        return Err(Error::Incompatible);
+    };
+    if object_digest(&bytes) != root {
+        return Err(Error::Incompatible);
+    }
+    let mut remember =
+        db.prepare_cached("INSERT OR IGNORE INTO temp.spindle_valid_objects VALUES(?1)")?;
+    for entry in decode_tree(&bytes)?.files {
+        remember.execute([&entry.object])?;
+    }
+    Ok(())
 }
 
 impl Store {

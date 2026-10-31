@@ -5,16 +5,20 @@
 // --allow-file-access-from-files); results are read over the DevTools protocol
 // (--remote-debugging-pipe). Chrome runs twice on one profile: two workers contend
 // for one session (the second is refused until the first closes, then reads its
-// work), and after a restart a new worker reopens the session and continues it.
+// work), and after a restart a new worker reopens the session and continues it, and
+// compacts a session whose store has free pages (a bundle made with the Node glue beside
+// GLUE_DIR, when it and node:sqlite are there).
 //
 // usage: node browser_opfs.mjs GLUE_DIR   (SPINDLE_BROWSER names Chrome or Chromium)
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { StdioClient } from '../../clients/js/spindle.mjs';
+import { nodeClient } from '../../clients/js/embedded-node.mjs';
+import { KEY, call, catalog, scriptedFetch, text } from './scripted.mjs';
 
 const glue = process.argv[2];
 const browser = process.env.SPINDLE_BROWSER;
@@ -32,6 +36,36 @@ cpSync(glue, join(site, 'glue'), { recursive: true });
 cpSync(join(here, '../../clients/js'), join(site, 'clients'), { recursive: true });
 cpSync(join(here, 'browser'), join(site, 'test'), { recursive: true });
 cpSync(join(here, 'scripted.mjs'), join(site, 'scripted.mjs'));
+
+/** A session bundle whose store has free pages (8 MiB of them), made with the Node glue
+ * beside GLUE_DIR and node:sqlite, for the browser to compact; null where either is
+ * missing. */
+async function fragmentedBundle() {
+  const nodeGlue = join(glue, '..', 'node', 'spindle_embed.js');
+  const sqlite = await import('node:sqlite').catch(() => null);
+  if (!sqlite || !existsSync(nodeGlue)) return null;
+  const dir = join(work, 'fragmented');
+  const fetch = scriptedFetch([call('write_file', { path: 'notes.md', content: 'kept\n' }), text('done')]);
+  let client = nodeClient({ glue: nodeGlue, catalog: catalog(), credentials: async () => ({ authorization: `Bearer ${KEY}` }), fetch });
+  await client.create(dir, 'fake');
+  await client.prompt(dir, 'write notes');
+  await client.close();
+  const database = join(dir, 'store', 'authority.sqlite');
+  const db = new sqlite.DatabaseSync(database);
+  db.exec(`CREATE TABLE junk(b BLOB);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 8)
+    INSERT INTO junk SELECT randomblob(1048576) FROM n;
+    DROP TABLE junk;`);
+  db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  db.close();
+  for (const end of ['-wal', '-shm']) rmSync(database + end, { force: true });
+  client = nodeClient({ glue: nodeGlue, catalog: catalog(), credentials: async () => ({}), fetch });
+  const bytes = await client.exportSession(dir, { keep: true });
+  await client.close();
+  return bytes;
+}
+const fragmented = await fragmentedBundle();
+if (fragmented) writeFileSync(join(site, 'test', 'fragmented.spindle'), fragmented);
 
 /** Opens the page in a fresh Chrome on the shared profile; resolves with `window.result`. */
 async function run(phase) {
@@ -119,6 +153,16 @@ try {
   const goes = step(second, 'c.prompt.b');
   assert.equal(goes.ok, true, JSON.stringify(goes));
   assert.ok(goes.head > prompted.head);
+  const compacted = step(second, 'c.compact');
+  if (fragmented) {
+    assert.equal(compacted.ok, true, JSON.stringify(compacted));
+    assert.equal(compacted.head, compacted.importedHead, 'the same session, compacted');
+    assert.ok(compacted.before - compacted.after >= 7 * 1048576, `the free pages went: ${JSON.stringify(compacted)}`);
+    assert.equal(compacted.stores, 1);
+    assert.ok(compacted.sameFiles, 'its files are the same');
+    assert.equal(compacted.text, 'kept\n');
+    assert.equal(compacted.againBefore, compacted.againAfter, 'nothing more to give back');
+  }
   const { id: _b, ...grown } = step(second, 'c.pool');
   assert.deepEqual(grown, { ok: true, free: 4, kept: 'kept', gone: false }, 'a reopened pool has the slots a grow added');
   // A native host continues what the browser exported (when SPINDLE_BIN is set).
@@ -141,5 +185,5 @@ console.log(
   'browser-opfs passed: OPFS sessions in headless Chrome workers (create and turn, second worker ' +
     'refused by the Web Lock, reopened by it after the first closed, reopened after a restart, ' +
     'moved by bundle to another place and, with SPINDLE_BIN, into a native host; the pool grows, ' +
-    'removes trees and reopens grown)',
+    'removes trees and reopens grown; a session with free pages compacts in OPFS)',
 );

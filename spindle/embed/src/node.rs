@@ -713,6 +713,30 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<(), Error> {
     written.map_err(io)
 }
 
+/// Removes the file `path`, if it is there, durably.
+pub fn remove_file(path: &str) -> Result<(), Error> {
+    with_fs(|fs, _| {
+        if !fs.exists_sync(path) {
+            return Ok(false);
+        }
+        fs.unlink_sync(path).map(|()| true)
+    })
+    .and_then(|removed| if removed { sync_dir(path) } else { Ok(()) })
+    .map_err(io)
+}
+
+/// Makes the file `path` durable (what was written to it reaches the disk). Opened
+/// writable: Windows flushes a file only through a handle that may write it.
+pub fn sync_file(path: &str) -> Result<(), Error> {
+    with_fs(|fs, _| {
+        let fd = fs.open_sync(path, "r+", 0)?;
+        let synced = fs.fsync_sync(fd);
+        let closed = fs.close_sync(fd);
+        synced.and(closed)
+    })
+    .map_err(io)
+}
+
 /// Renames `from` to `to` (in the same directory) durably.
 pub fn rename(from: &str, to: &str) -> Result<(), Error> {
     with_fs(|fs, _| fs.rename_sync(from, to))

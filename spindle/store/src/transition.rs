@@ -78,7 +78,7 @@ fn validate_receipt_binding(
     scope: &str,
     binding: &ReceiptBinding<'_>,
 ) -> Result<()> {
-    let retained = tx.query_row(
+    let retained = crate::cached_row(tx,
         "SELECT a.effect,a.owner_epoch,a.implementation,a.grant_reference,i.revision,i.adapter,i.input,q.result,r.scope FROM attempts a JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision JOIN receipts q ON q.attempt=a.id WHERE a.id=?1",
         [&binding.attempt.id],
         |row| Ok((
@@ -123,7 +123,7 @@ pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
          CREATE TABLE applied_receipts(attempt TEXT PRIMARY KEY REFERENCES receipts(attempt), revision INTEGER NOT NULL UNIQUE REFERENCES revisions(revision));
          CREATE TABLE cancellations(scope TEXT PRIMARY KEY, command_id TEXT NOT NULL, epoch INTEGER NOT NULL);
          CREATE TABLE image_executions(attempt TEXT PRIMARY KEY REFERENCES attempts(id), worker TEXT NOT NULL, state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 3));
-         CREATE TABLE strict_receipts(attempt TEXT PRIMARY KEY REFERENCES receipts(attempt),base TEXT NOT NULL REFERENCES objects(digest),root TEXT NOT NULL REFERENCES objects(digest),helper TEXT NOT NULL);", 
+         CREATE TABLE strict_receipts(attempt TEXT PRIMARY KEY REFERENCES receipts(attempt),base TEXT NOT NULL REFERENCES objects(digest),root TEXT NOT NULL REFERENCES objects(digest),helper TEXT NOT NULL);",
     )?;
     Ok(())
 }
@@ -131,20 +131,26 @@ pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
 /// Counts and bounds always; proposals, intents and receipt roots in full only above
 /// revision `since` and receipt row `receipts_since` (the last full pass).
 pub(crate) fn validate_storage(db: &Connection, since: i64, receipts_since: i64) -> Result<()> {
-    let heads: i64 = db.query_row("SELECT count(*) FROM head WHERE id=1", [], |r| r.get(0))?;
-    let revisions: i64 = db.query_row("SELECT count(*) FROM revisions", [], |r| r.get(0))?;
-    let proposals: i64 = db.query_row("SELECT count(*) FROM proposals", [], |r| r.get(0))?;
-    let consumed: i64 = db.query_row("SELECT count(*) FROM consumed", [], |r| r.get(0))?;
+    let heads: i64 =
+        crate::cached_row(db, "SELECT count(*) FROM head WHERE id=1", [], |r| r.get(0))?;
+    let revisions: i64 = crate::cached_row(db, "SELECT count(*) FROM revisions", [], |r| r.get(0))?;
+    let proposals: i64 = crate::cached_row(db, "SELECT count(*) FROM proposals", [], |r| r.get(0))?;
+    let consumed: i64 = crate::cached_row(db, "SELECT count(*) FROM consumed", [], |r| r.get(0))?;
     let applied_receipts: i64 =
-        db.query_row("SELECT count(*) FROM applied_receipts", [], |r| r.get(0))?;
-    let intents: i64 = db.query_row("SELECT count(*) FROM intents", [], |r| r.get(0))?;
-    let attempts: i64 = db.query_row("SELECT count(*) FROM attempts", [], |r| r.get(0))?;
-    let receipts: i64 = db.query_row("SELECT count(*) FROM receipts", [], |r| r.get(0))?;
-    let head: i64 = db.query_row("SELECT revision FROM head WHERE id=1", [], |r| r.get(0))?;
-    let max: i64 = db.query_row("SELECT max(revision) FROM revisions", [], |r| r.get(0))?;
-    let invalid: i64 = db.query_row(
+        crate::cached_row(db, "SELECT count(*) FROM applied_receipts", [], |r| {
+            r.get(0)
+        })?;
+    let intents: i64 = crate::cached_row(db, "SELECT count(*) FROM intents", [], |r| r.get(0))?;
+    let attempts: i64 = crate::cached_row(db, "SELECT count(*) FROM attempts", [], |r| r.get(0))?;
+    let receipts: i64 = crate::cached_row(db, "SELECT count(*) FROM receipts", [], |r| r.get(0))?;
+    let head: i64 =
+        crate::cached_row(db, "SELECT revision FROM head WHERE id=1", [], |r| r.get(0))?;
+    let max: i64 = crate::cached_row(db, "SELECT max(revision) FROM revisions", [], |r| r.get(0))?;
+    let invalid: i64 = crate::cached_row(
+        db,
         "SELECT count(*) FROM revisions WHERE revision<0 OR length(continuation)>?1 OR length(engine) NOT BETWEEN 1 AND 128",
-        [crate::codec::stored_bound(MAX_PAYLOAD) as i64], |r| r.get(0),
+        [crate::codec::stored_bound(MAX_PAYLOAD) as i64],
+        |r| r.get(0),
     )?;
     let foreign_fault = db.prepare("PRAGMA foreign_key_check")?.exists([])?;
     if heads != 1
@@ -174,7 +180,7 @@ pub(crate) fn validate_storage(db: &Connection, since: i64, receipts_since: i64)
 }
 
 fn validate_records(db: &Connection, since: i64) -> Result<()> {
-    let invalid: i64 = db.query_row(
+    let invalid: i64 = crate::cached_row(db,
         "SELECT
           (SELECT count(*) FROM intents WHERE revision<=0 OR position<0 OR position>=8 OR length(id) NOT BETWEEN 1 AND 128 OR length(adapter) NOT BETWEEN 1 AND 128 OR length(input)>?1)
         + (SELECT count(*) FROM receipts WHERE length(result)>?1)
@@ -194,7 +200,8 @@ fn validate_records(db: &Connection, since: i64) -> Result<()> {
     if invalid != 0 {
         return Err(Error::Incompatible);
     }
-    let initial: (String, String, Vec<u8>) = db.query_row(
+    let initial: (String, String, Vec<u8>) = crate::cached_row(
+        db,
         "SELECT scope,engine,continuation FROM revisions WHERE revision=0",
         [],
         |r| {
@@ -208,7 +215,8 @@ fn validate_records(db: &Connection, since: i64) -> Result<()> {
     if initial != (String::new(), "uninitialized".into(), Vec::new()) {
         return Err(Error::Incompatible);
     }
-    let initial_workspace: Option<String> = db.query_row(
+    let initial_workspace: Option<String> = crate::cached_row(
+        db,
         "SELECT workspace FROM revisions WHERE revision=0",
         [],
         |r| r.get(0),
@@ -216,7 +224,7 @@ fn validate_records(db: &Connection, since: i64) -> Result<()> {
     if initial_workspace.is_some() {
         return Err(Error::Incompatible);
     }
-    let epoch: i64 = db.query_row("SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
+    let epoch: i64 = crate::cached_row(db, "SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
     // Records up to `since` were validated before; only each scope's newest revision
     // among them matters for the chain after it (one grouped query, so their records
     // are never read).
@@ -249,7 +257,8 @@ fn validate_records(db: &Connection, since: i64) -> Result<()> {
         {
             return Err(Error::Incompatible);
         }
-        let retained: (String, String, Vec<u8>) = db.query_row(
+        let retained: (String, String, Vec<u8>) = crate::cached_row(
+            db,
             "SELECT scope,engine,continuation FROM revisions WHERE revision=?1",
             [revision],
             |r| {
@@ -269,12 +278,14 @@ fn validate_records(db: &Connection, since: i64) -> Result<()> {
         {
             return Err(Error::Incompatible);
         }
-        let prior_root: Option<String> = db.query_row(
+        let prior_root: Option<String> = crate::cached_row(
+            db,
             "SELECT workspace FROM revisions WHERE revision=?1",
             [proposal.expected_revision as i64],
             |r| r.get(0),
         )?;
-        let selected_root: Option<String> = db.query_row(
+        let selected_root: Option<String> = crate::cached_row(
+            db,
             "SELECT workspace FROM revisions WHERE revision=?1",
             [revision],
             |r| r.get(0),
@@ -285,26 +296,40 @@ fn validate_records(db: &Connection, since: i64) -> Result<()> {
         if let Some(root) = selected_root {
             crate::workspace::validate_root(db, &proposal.scope, &root)?;
         }
-        let admission: Option<i64> = db
-            .query_row(
-                "SELECT admission FROM consumed WHERE revision=?1",
-                [revision],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let receipt: Option<String> = db
-            .query_row(
-                "SELECT attempt FROM applied_receipts WHERE revision=?1",
-                [revision],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let admission: Option<i64> = crate::cached_row(
+            db,
+            "SELECT admission FROM consumed WHERE revision=?1",
+            [revision],
+            |r| r.get(0),
+        )
+        .optional()?;
+        let receipt: Option<String> = crate::cached_row(
+            db,
+            "SELECT attempt FROM applied_receipts WHERE revision=?1",
+            [revision],
+            |r| r.get(0),
+        )
+        .optional()?;
         let scope: String = match &proposal.observation {
-            Observation::Admission(expected) if admission == Some(*expected as i64) && receipt.is_none() => {
-                db.query_row("SELECT scope FROM admissions WHERE sequence=?1", [*expected as i64], |r| r.get(0))?
+            Observation::Admission(expected)
+                if admission == Some(*expected as i64) && receipt.is_none() =>
+            {
+                crate::cached_row(
+                    db,
+                    "SELECT scope FROM admissions WHERE sequence=?1",
+                    [*expected as i64],
+                    |r| r.get(0),
+                )?
             }
-            Observation::Receipt(expected) if receipt.as_ref() == Some(expected) && admission.is_none() => {
-                db.query_row("SELECT r.scope FROM attempts a JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE a.id=?1 AND r.revision<?2", params![expected, revision], |r| r.get(0))?
+            Observation::Receipt(expected)
+                if receipt.as_ref() == Some(expected) && admission.is_none() =>
+            {
+                crate::cached_row(
+                    db,
+                    "SELECT r.scope FROM attempts a JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE a.id=?1 AND r.revision<?2",
+                    params![expected, revision],
+                    |r| r.get(0),
+                )?
             }
             _ => return Err(Error::Incompatible),
         };
@@ -313,7 +338,8 @@ fn validate_records(db: &Connection, since: i64) -> Result<()> {
         }
         crate::rewind::validate_proposal(db, &proposal, revision as u64)?;
         if let Observation::Receipt(attempt) = &proposal.observation {
-            let sealed_root: Option<String> = db.query_row(
+            let sealed_root: Option<String> = crate::cached_row(
+                db,
                 "SELECT workspace FROM receipts WHERE attempt=?1",
                 [attempt],
                 |r| r.get(0),
@@ -322,8 +348,14 @@ fn validate_records(db: &Connection, since: i64) -> Result<()> {
                 return Err(Error::Incompatible);
             }
             if sealed_root.is_some() {
-                let base_root: Option<String> = db.query_row("SELECT coalesce((SELECT s.base FROM strict_receipts s WHERE s.attempt=a.id),r.workspace) FROM attempts a JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE a.id=?1", [attempt], |r| r.get(0))?;
-                let prior_root: Option<String> = db.query_row(
+                let base_root: Option<String> = crate::cached_row(
+                    db,
+                    "SELECT coalesce((SELECT s.base FROM strict_receipts s WHERE s.attempt=a.id),r.workspace) FROM attempts a JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE a.id=?1",
+                    [attempt],
+                    |r| r.get(0),
+                )?;
+                let prior_root: Option<String> = crate::cached_row(
+                    db,
                     "SELECT workspace FROM revisions WHERE revision=?1",
                     [proposal.expected_revision as i64],
                     |r| r.get(0),
@@ -536,13 +568,13 @@ fn receipt_state(
     prior: u64,
     attempt: &str,
 ) -> Result<Option<Vec<u8>>> {
-    let patch: Option<Vec<u8>> = db
-        .query_row(
-            "SELECT patch FROM app_patches WHERE attempt=?1",
-            [attempt],
-            |r| crate::packed_blob(db, r, 0, MAX_STATE),
-        )
-        .optional()?;
+    let patch: Option<Vec<u8>> = crate::cached_row(
+        db,
+        "SELECT patch FROM app_patches WHERE attempt=?1",
+        [attempt],
+        |r| crate::packed_blob(db, r, 0, MAX_STATE),
+    )
+    .optional()?;
     let Some(patch) = patch else {
         return Ok(None);
     };
@@ -571,20 +603,19 @@ impl Store {
 
 /// The app state committed with `revision`, if that revision set one.
 pub(crate) fn app_state_row(db: &Connection, revision: u64) -> Result<Option<Vec<u8>>> {
-    Ok(db
-        .query_row(
-            "SELECT value FROM app_state WHERE revision=?1",
-            [revision as i64],
-            |r| crate::packed_blob(db, r, 0, MAX_STATE),
-        )
-        .optional()?)
+    Ok(crate::cached_row(
+        db,
+        "SELECT value FROM app_state WHERE revision=?1",
+        [revision as i64],
+        |r| crate::packed_blob(db, r, 0, MAX_STATE),
+    )
+    .optional()?)
 }
 
 /// The app state of `scope` as of `revision`: what the newest revision at or before
 /// it that set one committed, or an empty object.
 pub fn app_state_at(db: &Connection, scope: &str, revision: u64) -> Result<Vec<u8>> {
-    Ok(db
-        .query_row(
+    Ok(crate::cached_row(db,
             "SELECT s.value FROM app_state s JOIN revisions r ON r.revision=s.revision WHERE r.scope=?1 AND s.revision<=?2 ORDER BY s.revision DESC LIMIT 1",
             params![scope, revision.min(i64::MAX as u64) as i64],
             |r| crate::packed_blob(db, r, 0, MAX_STATE),
@@ -594,7 +625,8 @@ pub fn app_state_at(db: &Connection, scope: &str, revision: u64) -> Result<Vec<u
 }
 
 pub(crate) fn scope_revision(db: &Connection, scope: &str) -> Result<u64> {
-    Ok(db.query_row(
+    Ok(crate::cached_row(
+        db,
         "SELECT coalesce(max(revision),0) FROM revisions WHERE scope=?1",
         [scope],
         |row| crate::nonnegative_id(row, 0),
@@ -606,9 +638,18 @@ impl Store {
         if self.paused {
             return Err(Error::Paused);
         }
-        let result = self.db.query_row(
+        let result = crate::cached_row(
+            &self.db,
             "SELECT r.revision,r.engine,r.continuation,r.workspace FROM head h JOIN revisions r ON h.revision=r.revision WHERE h.id=1",
-            [], |r| Ok(Snapshot { revision: crate::nonnegative_id(r, 0)?, engine: crate::bounded_label(r, 1)?, continuation: crate::packed_blob(&self.db, r, 2, MAX_PAYLOAD)?, workspace: crate::optional_digest(r, 3)? }),
+            [],
+            |r| {
+                Ok(Snapshot {
+                    revision: crate::nonnegative_id(r, 0)?,
+                    engine: crate::bounded_label(r, 1)?,
+                    continuation: crate::packed_blob(&self.db, r, 2, MAX_PAYLOAD)?,
+                    workspace: crate::optional_digest(r, 3)?,
+                })
+            },
         );
         match result {
             Ok(snapshot) => Ok(snapshot),
@@ -655,7 +696,7 @@ impl Store {
         if !valid_label(scope) || revision > i64::MAX as u64 {
             return Err(Error::Invalid);
         }
-        let result = self.db.query_row(
+        let result = crate::cached_row(&self.db,
             "SELECT revision,engine,continuation,workspace FROM revisions WHERE revision=?1 AND scope=?2",
             params![revision as i64, scope],
             |r| Ok(Snapshot { revision: crate::nonnegative_id(r, 0)?, engine: crate::bounded_label(r, 1)?, continuation: crate::packed_blob(&self.db, r, 2, MAX_PAYLOAD)?, workspace: crate::optional_digest(r, 3)? }),
@@ -803,18 +844,19 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let epoch: i64 = tx.query_row("SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
+        let epoch: i64 =
+            crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
         if epoch != self.epoch as i64 {
             return Err(Error::Stale);
         }
         if let Observation::Admission(admission) = &proposal.observation {
-            let kind: Option<String> = tx
-                .query_row(
-                    "SELECT kind FROM admissions WHERE sequence=?1",
-                    [*admission as i64],
-                    |row| crate::bounded_label(row, 0),
-                )
-                .optional()?;
+            let kind: Option<String> = crate::cached_row(
+                &tx,
+                "SELECT kind FROM admissions WHERE sequence=?1",
+                [*admission as i64],
+                |row| crate::bounded_label(row, 0),
+            )
+            .optional()?;
             if kind.as_deref() == Some(crate::rewind::KIND) {
                 return Err(Error::Invalid);
             }
@@ -823,18 +865,18 @@ impl Store {
             validate_receipt_binding(&tx, &proposal.scope, binding)?;
         }
         validate(&tx)?;
-        let old: Option<(Vec<u8>, u64)> = tx
-            .query_row(
-                "SELECT canonical,revision FROM proposals WHERE id=?1",
-                [&proposal.id],
-                |r| {
-                    Ok((
-                        crate::packed_blob(&tx, r, 0, crate::MAX_CANONICAL)?,
-                        crate::nonnegative_id(r, 1)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let old: Option<(Vec<u8>, u64)> = crate::cached_row(
+            &tx,
+            "SELECT canonical,revision FROM proposals WHERE id=?1",
+            [&proposal.id],
+            |r| {
+                Ok((
+                    crate::packed_blob(&tx, r, 0, crate::MAX_CANONICAL)?,
+                    crate::nonnegative_id(r, 1)?,
+                ))
+            },
+        )
+        .optional()?;
         if let Some((old_bytes, revision)) = old {
             if revision == 0 {
                 return Err(Error::Incompatible);
@@ -845,7 +887,8 @@ impl Store {
                 Err(Error::Conflict)
             };
         }
-        let cancelled: bool = tx.query_row(
+        let cancelled: bool = crate::cached_row(
+            &tx,
             "SELECT EXISTS(SELECT 1 FROM cancellations WHERE scope=?1)",
             [&proposal.scope],
             |r| r.get(0),
@@ -857,19 +900,41 @@ impl Store {
         if proposal.owner_epoch != self.epoch {
             return Err(Error::Stale);
         }
-        let head: i64 = tx.query_row("SELECT revision FROM head WHERE id=1", [], |r| r.get(0))?;
+        let head: i64 = crate::cached_row(&tx, "SELECT revision FROM head WHERE id=1", [], |r| {
+            r.get(0)
+        })?;
         let baseline = scope_revision(&tx, &proposal.scope)?;
         if head >= MAX_ADMISSIONS {
             return Err(Error::Exhausted);
         }
         let (exists, consumed): (bool, bool) = match &proposal.observation {
             Observation::Admission(id) => (
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM admissions a JOIN realm r ON a.lineage=r.lineage WHERE a.sequence=?1 AND a.scope=?2 AND r.id=1)", params![*id as i64, proposal.scope], |r| r.get(0))?,
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM consumed WHERE admission=?1)", [*id as i64], |r| r.get(0))?,
+                crate::cached_row(
+                    &tx,
+                    "SELECT EXISTS(SELECT 1 FROM admissions a JOIN realm r ON a.lineage=r.lineage WHERE a.sequence=?1 AND a.scope=?2 AND r.id=1)",
+                    params![*id as i64, proposal.scope],
+                    |r| r.get(0),
+                )?,
+                crate::cached_row(
+                    &tx,
+                    "SELECT EXISTS(SELECT 1 FROM consumed WHERE admission=?1)",
+                    [*id as i64],
+                    |r| r.get(0),
+                )?,
             ),
             Observation::Receipt(id) => (
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM receipts q JOIN attempts a ON q.attempt=a.id JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE q.attempt=?1 AND r.scope=?2)", params![id, proposal.scope], |r| r.get(0))?,
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM applied_receipts WHERE attempt=?1)", [id], |r| r.get(0))?,
+                crate::cached_row(
+                    &tx,
+                    "SELECT EXISTS(SELECT 1 FROM receipts q JOIN attempts a ON q.attempt=a.id JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE q.attempt=?1 AND r.scope=?2)",
+                    params![id, proposal.scope],
+                    |r| r.get(0),
+                )?,
+                crate::cached_row(
+                    &tx,
+                    "SELECT EXISTS(SELECT 1 FROM applied_receipts WHERE attempt=?1)",
+                    [id],
+                    |r| r.get(0),
+                )?,
             ),
         };
         if !exists {
@@ -879,7 +944,8 @@ impl Store {
             return Err(Error::Stale);
         }
         let dropped = match &proposal.observation {
-            Observation::Admission(id) => tx.query_row(
+            Observation::Admission(id) => crate::cached_row(
+                &tx,
                 "SELECT EXISTS(SELECT 1 FROM dropped_admissions WHERE admission=?1)",
                 [*id as i64],
                 |r| r.get(0),
@@ -890,7 +956,8 @@ impl Store {
             return Err(Error::Conflict);
         }
         for effect in &proposal.effects {
-            let used: bool = tx.query_row(
+            let used: bool = crate::cached_row(
+                &tx,
                 "SELECT EXISTS(SELECT 1 FROM intents WHERE id=?1)",
                 [&effect.id],
                 |r| r.get(0),
@@ -899,13 +966,15 @@ impl Store {
                 return Err(Error::Conflict);
             }
         }
-        let prior_root: Option<String> = tx.query_row(
+        let prior_root: Option<String> = crate::cached_row(
+            &tx,
             "SELECT workspace FROM revisions WHERE revision=?1",
             [baseline as i64],
             |r| r.get(0),
         )?;
         if let Observation::Receipt(attempt) = &proposal.observation {
-            let sealed_root: Option<String> = tx.query_row(
+            let sealed_root: Option<String> = crate::cached_row(
+                &tx,
                 "SELECT workspace FROM receipts WHERE attempt=?1",
                 [attempt],
                 |r| r.get(0),
@@ -914,7 +983,12 @@ impl Store {
                 return Err(Error::Conflict);
             }
             if sealed_root.is_some() {
-                let base_root: Option<String> = tx.query_row("SELECT coalesce((SELECT s.base FROM strict_receipts s WHERE s.attempt=a.id),r.workspace) FROM attempts a JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE a.id=?1", [attempt], |r| r.get(0))?;
+                let base_root: Option<String> = crate::cached_row(
+                    &tx,
+                    "SELECT coalesce((SELECT s.base FROM strict_receipts s WHERE s.attempt=a.id),r.workspace) FROM attempts a JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE a.id=?1",
+                    [attempt],
+                    |r| r.get(0),
+                )?;
                 if base_root != prior_root {
                     return Err(Error::Stale);
                 }
@@ -987,7 +1061,8 @@ impl Store {
         crate::execute_one(&tx, "UPDATE head SET revision=?1 WHERE id=1", [revision])?;
         #[cfg(feature = "dext-turn")]
         if let Observation::Admission(admission) = proposal.observation {
-            let (kind, payload): (String, Vec<u8>) = tx.query_row(
+            let (kind, payload): (String, Vec<u8>) = crate::cached_row(
+                &tx,
                 "SELECT kind,payload FROM admissions WHERE sequence=?1",
                 [admission as i64],
                 |row| Ok((row.get(0)?, crate::packed_blob(&tx, row, 1, MAX_PAYLOAD)?)),
@@ -998,7 +1073,7 @@ impl Store {
             {
                 crate::execute_one(
                     &tx,
-                    "UPDATE task_runs SET delivered=?1 WHERE task=?2 AND delivered IS NULL AND state='finished'",
+                    "UPDATE task_runs SET delivered=?1 WHERE task=?2 AND delivered IS NULL AND state IN ('finished','stopped')",
                     params![revision, task],
                 )?;
             }

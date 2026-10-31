@@ -104,6 +104,25 @@ function steady(conn) {
   return conn;
 }
 
+/** Why a request to `url` that did not go through could not: it is the browser's own
+ * extension store (Chrome's, or Edge's), which the browser keeps from every extension
+ * whatever sites it may reach (Chrome tells it as a CORS refusal). Null otherwise. */
+export function storeRefusal(url) {
+  let address;
+  try {
+    address = new URL(url);
+  } catch {
+    return null;
+  }
+  const { hostname, pathname } = address;
+  const store = hostname === 'chromewebstore.google.com'
+    || (hostname === 'chrome.google.com' && pathname.startsWith('/webstore'))
+    || (hostname === 'microsoftedge.microsoft.com' && pathname.startsWith('/addons'));
+  return store
+    ? `${hostname} is the browser's extension store, which the browser never lets an extension reach (whatever sites it may reach), so Spindle cannot fetch it: look for what you need somewhere else`
+    : null;
+}
+
 /** Whether `hostname` (as URL gives it) names this computer or a local network: by
  * address, or by a name only a local network gives (no dot, or a local suffix). */
 export function local(hostname) {
@@ -419,8 +438,12 @@ function serve(conn, scheme, gone) {
       });
     } catch (error) {
       if (!closed) {
-        reply(502, `Chrome could not fetch ${url.href}: ${error.message}. If Spindle may not reach websites, `
-          + "turn the thread's network on again in Spindle (Chrome asks for access to sites).", close);
+        const store = storeRefusal(url);
+        if (store) reply(403, `${store}.`, close);
+        else {
+          reply(502, `Chrome could not fetch ${url.href}: ${error.message}. If Spindle may not reach websites, `
+            + "turn the thread's network on again in Spindle (Chrome asks for access to sites).", close);
+        }
       }
       return;
     }
