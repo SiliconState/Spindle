@@ -97,6 +97,7 @@ pub struct ModelTransport {
     client: reqwest::Client,
     deadlines: Deadlines,
     rejection: std::sync::Mutex<Option<Rejection>>,
+    failure: std::sync::Mutex<Option<String>>,
 }
 impl ModelTransport {
     /// No redirect, proxy/environment discovery, cookies or implicit retries.
@@ -114,6 +115,7 @@ impl ModelTransport {
             client,
             deadlines,
             rejection: std::sync::Mutex::new(None),
+            failure: std::sync::Mutex::new(None),
         })
     }
 
@@ -124,6 +126,22 @@ impl ModelTransport {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+
+    /// Why the most recent `AttemptError::Protocol` from this transport was raised (the
+    /// parser's words, or the reply's type when it was not an event stream), taken once.
+    pub fn take_failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn set_failure(&self, failure: Option<String>) {
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = failure;
     }
 
     /// `waiting` must already have a committed dispatch reservation. The trusted
@@ -168,6 +186,7 @@ impl ModelTransport {
         {
             return Err(AttemptError::Invalid);
         }
+        self.set_failure(None);
         let mut attempt = WireAttempt::new(
             waiting,
             route.capture_reasoning,
@@ -223,6 +242,13 @@ impl ModelTransport {
                 .get("content-type")
                 .map(|value| value.to_str().unwrap_or("\u{0}"));
             if !event_stream(content_type) {
+                let stated: String = content_type
+                    .unwrap_or_default()
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(120)
+                    .collect();
+                self.set_failure(Some(format!("the reply was {stated}, not an event stream")));
                 return Err(AttemptError::Protocol);
             }
             let mut stream = response.bytes_stream();
@@ -243,10 +269,19 @@ impl ModelTransport {
                             attempt.take_rejection();
                         return Err(AttemptError::Http(status));
                     }
+                    Err(AttemptError::Protocol) => {
+                        self.set_failure(attempt.take_failure());
+                        return Err(AttemptError::Protocol);
+                    }
                     Err(error) => return Err(error),
                 }
             }
-            attempt.finish(waiting, observe)
+            attempt
+                .finish_explained(waiting, observe)
+                .map_err(|(error, why)| {
+                    self.set_failure(why);
+                    error
+                })
         };
         tokio::pin!(execution);
         let total = tokio::time::sleep(self.deadlines.total);

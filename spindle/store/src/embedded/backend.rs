@@ -5,7 +5,9 @@
 //! Besides replies and `event` notifications, the frames carry the app's work:
 //! `work` (`{session, id, work}`: something to do for a running turn, answered with
 //! `Embedded::deliver`) and `work_cancel` (`{session, id}`: the turn stopped waiting
-//! for it; the app ends it). The `EmbeddedClient` in the package does both.
+//! for it; the app ends it) and `work_stop` (`{session, id}`: the user stopped the
+//! command it runs; the app stops it and still answers it, with what it printed until
+//! then). The `EmbeddedClient` in the package does all three.
 use super::env::Catalog;
 use super::host::{self, Dropped, Finished, Host, Progress, Work, WorkAnswer};
 use super::storage::Storage;
@@ -228,6 +230,8 @@ pub fn answer_of(value: &Value) -> Result<WorkAnswer, String> {
                 links,
                 directories: strings("directories")?,
                 failure: text("failure"),
+                // The host knows whether it asked for the stop; the app does not say.
+                stopped: false,
             })
         }
         "waited" => WorkAnswer::Waited,
@@ -391,22 +395,13 @@ impl Embedded {
 
     /// The endpoints scripts' `http()` may reach: grants as a native code policy's
     /// `http` list, checked as native checks them (URL prefix, methods, timeout, response
-    /// size). The app sends each request. Grants hold no headers here: the package keeps
-    /// no secrets. An empty list grants nothing, as by default.
+    /// size). The app sends each request. The package keeps no secrets: a grant's
+    /// `headers` only name those the app adds as it sends (`{"Authorization": {"app":
+    /// true}}`), which a script may then not set. An empty list grants nothing, as by
+    /// default.
     pub fn set_http_grants(&self, grants: &Value) -> Result<(), Fault> {
         let policy = json!({"http": grants});
-        crate::code_http::validate(&policy).map_err(bad)?;
-        if let Some(grant) = grants
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|grant| grant.get("headers").is_some())
-        {
-            return Err(bad(format!(
-                "http grant {}: grants hold no headers here (the package keeps no secrets)",
-                grant["name"].as_str().unwrap_or("?")
-            )));
-        }
+        crate::code_http::validate_app(&policy).map_err(bad)?;
         *self.http.borrow_mut() = policy;
         Ok(())
     }
@@ -509,6 +504,10 @@ impl Embedded {
         }
         for (label, id) in session.host.take_cancelled() {
             self.send(json!({"jsonrpc": "2.0", "method": "work_cancel",
+                "params": {"session": label, "id": id}}));
+        }
+        for (label, id) in session.host.take_stopping() {
+            self.send(json!({"jsonrpc": "2.0", "method": "work_stop",
                 "params": {"session": label, "id": id}}));
         }
         let ended = match progress {

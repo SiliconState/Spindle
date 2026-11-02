@@ -94,6 +94,11 @@ const MAX_HELD: usize = 32 * 1024 * 1024;
 const CHILDREN: [&str; 3] = ["model", "tool", "http"];
 /// The sandbox's descriptors: the agent's status line, as the helper and init have it.
 const STATUS: RawFd = 3;
+/// Mount flags for what a command writes (its workspace and scratch): data, never
+/// programs. This Linux runs only the programs its image was built with (v86 runs the
+/// rest, and runs again a command refused here), so nothing a command saved, or a
+/// command on v86 fetched, is ever compiled and run as WebAssembly by the extension.
+const DATA_ONLY: libc::c_ulong = libc::MS_NOEXEC | libc::MS_NOSUID | libc::MS_NODEV;
 /// Scratch mounts of a command's own.
 const SCRATCH: [(&str, &str); 4] = [
     ("/tmp", "mode=1777"),
@@ -379,10 +384,18 @@ fn sandbox(cpus: &str, workdir: &str, socket: &str, command: &str) -> ! {
     loopback_up();
     mounted(None, "/", None, libc::MS_REC | libc::MS_PRIVATE, None);
     mounted(Some(workdir), "/workspace", None, libc::MS_BIND, None);
+    // A bind mount takes its flags from a remount.
+    mounted(
+        None,
+        "/workspace",
+        None,
+        libc::MS_BIND | libc::MS_REMOUNT | DATA_ONLY,
+        None,
+    );
     // Without an MMU tmpfs is ramfs: no size limit, and no uid= or gid= (it drops them),
     // so the home is given to the commands' user after.
     for (path, options) in SCRATCH {
-        mounted(Some("tmpfs"), path, Some("tmpfs"), 0, Some(options));
+        mounted(Some("tmpfs"), path, Some("tmpfs"), DATA_ONLY, Some(options));
     }
     check(
         unsafe { libc::chown(c("/home/spindle").as_ptr(), UID, GID) },

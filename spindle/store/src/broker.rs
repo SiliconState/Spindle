@@ -482,7 +482,9 @@ pub enum RunnerReservation {
 
 /// What a runner reported for a `bash` call: its output (stdout, then stderr), whether
 /// the command succeeded, and the workspace changes it made. `failure` says why the
-/// run could not start or finish; its changes are then not kept.
+/// run could not start or finish; its changes are then not kept. `stopped`: the user's
+/// stop ended it (the host asked the runner to stop it): recorded as stopped, with the
+/// output it printed until then.
 #[cfg(feature = "workspace-tools")]
 #[derive(Default)]
 pub struct RunnerResult {
@@ -493,6 +495,7 @@ pub struct RunnerResult {
     pub links: Vec<crate::workspace::Link>,
     pub directories: Vec<String>,
     pub failure: Option<String>,
+    pub stopped: bool,
 }
 
 /// Every file under `prefix` ("" for the whole workspace) replaced by `files`, whose
@@ -1589,6 +1592,27 @@ const INTERRUPTED_STRICT: &str = "The tool call did not complete: the runner sto
 its result was saved. Nothing it changed in the workspace was kept; the workspace is as it was \
 before. External model/tool calls may already have run or been billed. Inspect code-receipts; they are never rolled back or automatically retried.";
 
+/// The status a tool result the user's stop ended carries (Dext's word for it), so the
+/// call reads as stopped, not as failed by itself, and the rest of its batch is not run.
+#[cfg(feature = "driver")]
+pub const STOPPED_STATUS: &str = "interrupted";
+/// Ends the recorded text of a command the user stopped (after what it printed).
+#[cfg(feature = "workspace-tools")]
+pub const STOPPED_RUN: &str =
+    "[the user stopped this command before it finished; none of its workspace changes were kept]";
+/// Ends the recorded text of a script the user stopped.
+#[cfg(feature = "workspace-tools")]
+pub const STOPPED_SCRIPT: &str = "[the user stopped this script before it finished; none of its \
+workspace changes were kept, but calls it made (models, tools, the network) may have run]";
+/// Ends a stopped command's text when its runner kept the changes it made before the stop.
+#[cfg(feature = "workspace-tools")]
+pub const STOPPED_RUN_KEPT: &str = "[the user stopped this command before it finished; the \
+workspace changes its runner reported were kept]";
+/// A call the user's stop ended before anything about it was saved (its run had ended).
+#[cfg(feature = "driver")]
+pub const STOPPED_CALL: &str = "The user stopped this call before it finished. Nothing it \
+changed in the workspace was kept; anything it did outside the workspace (the network, calls \
+it made) may have happened.";
 /// Ends the recorded text of a run killed by its own deadline or size bounds.
 #[cfg(feature = "workspace-tools")]
 pub const KILLED_RUN: &str = "the command was killed and its changes discarded";
@@ -2056,7 +2080,20 @@ impl Store {
                     }
                 }
             }
-            Err(_) if interrupt.load(Ordering::SeqCst) => return Err(Error::Cancelled),
+            // The user's stop ended it: a known outcome, recorded with what it printed (the
+            // executor discarded its changes), so nothing runs it again.
+            Err(error) if interrupt.load(Ordering::SeqCst) => {
+                let content = dext_native::strict::run_failure(&error)
+                    .map(|failure| output(&failure.stdout, &failure.stderr))
+                    .unwrap_or_default();
+                let separator = if content.is_empty() { "" } else { "\n" };
+                let ending = if atomic { STOPPED_SCRIPT } else { STOPPED_RUN };
+                let recorded = Recorded {
+                    trailer: format!("{separator}{ending}"),
+                    ..failed(content)
+                };
+                return self.record_stopped(request, &call_id, &helper, &base, recorded);
+            }
             Err(error) => {
                 let (reason, content) = match dext_native::strict::run_failure(&error) {
                     Some(failure) => (
@@ -2403,6 +2440,7 @@ impl Store {
                 details: details.as_deref(),
                 max_output,
             }),
+            None,
         )
     }
 
@@ -3251,13 +3289,37 @@ impl Store {
         base: &str,
         recorded: Recorded,
     ) -> Result<DispatchOutcome> {
-        self.record_sealed(request, call_id, helper, base, recorded, None)
+        self.record_sealed(request, call_id, helper, base, recorded, None, None)
+    }
+
+    /// `record_strict` for a call the user's stop ended: its result carries
+    /// `STOPPED_STATUS`, so it reads as stopped and the rest of its batch is not run.
+    #[cfg(feature = "workspace-tools")]
+    fn record_stopped(
+        &mut self,
+        request: &DispatchRequest,
+        call_id: &str,
+        helper: &str,
+        base: &str,
+        recorded: Recorded,
+    ) -> Result<DispatchOutcome> {
+        self.record_sealed(
+            request,
+            call_id,
+            helper,
+            base,
+            recorded,
+            None,
+            Some(STOPPED_STATUS),
+        )
     }
 
     /// Records a sealed workspace result. `app`: an app tool's answer (with its state
     /// patch, if any), whose reservation may be an earlier owner's (`reserved_effect`)
-    /// and whose input's fields are the app's, not an output size.
+    /// and whose input's fields are the app's, not an output size. `status` replaces the
+    /// result's own (`ok` or `error`).
     #[cfg(feature = "driver")]
+    #[allow(clippy::too_many_arguments)]
     fn record_sealed(
         &mut self,
         request: &DispatchRequest,
@@ -3266,6 +3328,7 @@ impl Store {
         base: &str,
         recorded: Recorded,
         app: Option<AppReceipt<'_>>,
+        status: Option<&'static str>,
     ) -> Result<DispatchOutcome> {
         let patch = app.as_ref().and_then(|app| app.patch);
         let details = app.as_ref().and_then(|app| app.details);
@@ -3354,7 +3417,11 @@ impl Store {
             content,
             is_error: Some(!success),
             metadata: dext_transcript::ToolResultMetadata {
-                status: Some(if success { "ok" } else { "error" }.into()),
+                status: Some(
+                    status
+                        .unwrap_or(if success { "ok" } else { "error" })
+                        .into(),
+                ),
                 artifact,
                 ..Default::default()
             },
@@ -3597,9 +3664,18 @@ impl Store {
             links,
             directories,
             failure,
+            stopped,
         } = result;
         let separator = if output.is_empty() { "" } else { "\n" };
+        // A stopped command keeps what its runner says it left, as any run does; its
+        // text says the user stopped it, whatever reason the runner gave.
         let recorded = match failure {
+            Some(_) if stopped => Recorded {
+                trailer: format!("{separator}{STOPPED_RUN}"),
+                content: output,
+                success: false,
+                root: base.clone(),
+            },
             Some(reason) => Recorded {
                 trailer: format!("{separator}{reason}; {UNSEALED_RUN}"),
                 content: output,
@@ -3613,16 +3689,36 @@ impl Store {
                     links,
                     directories,
                 };
-                let staged = match changes.is_empty() {
-                    true => Ok(base.clone()),
-                    false => self.stage_answer(request, &base, changes)?,
+                let changed = !changes.is_empty();
+                let staged = match changed {
+                    false => Ok(base.clone()),
+                    true => self.stage_answer(request, &base, changes)?,
                 };
                 match staged {
+                    Ok(root) if stopped => Recorded {
+                        trailer: format!(
+                            "{separator}{}",
+                            if changed {
+                                STOPPED_RUN_KEPT
+                            } else {
+                                STOPPED_RUN
+                            }
+                        ),
+                        content: output,
+                        success: false,
+                        root,
+                    },
                     Ok(root) => Recorded {
                         content: output,
                         success,
                         root,
                         trailer: String::new(),
+                    },
+                    Err(reason) if stopped => Recorded {
+                        trailer: format!("{separator}{reason}; {STOPPED_RUN}"),
+                        content: output,
+                        success: false,
+                        root: base.clone(),
                     },
                     Err(reason) => Recorded {
                         trailer: format!("{separator}{reason}; {UNSEALED_RUN}"),
@@ -3633,7 +3729,10 @@ impl Store {
                 }
             }
         };
-        self.record_strict(request, &call.id, &hex, &base, recorded)
+        match stopped {
+            true => self.record_stopped(request, &call.id, &hex, &base, recorded),
+            false => self.record_strict(request, &call.id, &hex, &base, recorded),
+        }
     }
 
     #[cfg(feature = "dext-strict-workspace")]
@@ -3662,6 +3761,39 @@ impl Store {
         request: &DispatchRequest,
         digest: [u8; 32],
     ) -> Result<Vec<u8>> {
+        if request.attempt.owner_epoch >= self.epoch {
+            return Err(Error::Conflict);
+        }
+        self.seal_unrecorded(request, digest, INTERRUPTED_STRICT, "error")
+    }
+
+    /// Seals a reservation this owner made whose call the user's stop ended before
+    /// anything about it was recorded (the stop came between its reservation and its run,
+    /// or its run ended with no result to keep). The caller's dispatch has returned, so
+    /// nothing runs it; nothing it staged was adopted. Recorded as stopped over the
+    /// unchanged base, a known outcome: it is never run again.
+    #[cfg(feature = "driver")]
+    pub fn seal_stopped_with_digest(
+        &mut self,
+        request: &DispatchRequest,
+        digest: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        if request.attempt.owner_epoch != self.epoch {
+            return Err(Error::Conflict);
+        }
+        self.seal_unrecorded(request, digest, STOPPED_CALL, STOPPED_STATUS)
+    }
+
+    /// Records `content` as the failed result of a reserved, unrecorded strict call
+    /// over the workspace it was dispatched on. Never runs anything.
+    #[cfg(feature = "driver")]
+    fn seal_unrecorded(
+        &mut self,
+        request: &DispatchRequest,
+        digest: [u8; 32],
+        content: &str,
+        status: &str,
+    ) -> Result<Vec<u8>> {
         if self.paused {
             return Err(Error::Paused);
         }
@@ -3669,7 +3801,6 @@ impl Store {
         let helper: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         if request.attempt.implementation != crate::turn::runner_label(&digest)
             || request.owner_epoch != self.epoch
-            || request.attempt.owner_epoch >= self.epoch
         {
             return Err(Error::Conflict);
         }
@@ -3738,10 +3869,10 @@ impl Store {
             let base = base.ok_or(Error::Invalid)?;
             let block = Block::ToolResult {
                 tool_use_id: call.id.clone(),
-                content: INTERRUPTED_STRICT.into(),
+                content: content.into(),
                 is_error: Some(true),
                 metadata: dext_transcript::ToolResultMetadata {
-                    status: Some("error".into()),
+                    status: Some(status.into()),
                     ..Default::default()
                 },
             };

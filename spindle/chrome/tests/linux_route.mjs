@@ -111,4 +111,11 @@ assert.equal(wantsV86({ success: false, code: 1, output: 'Traceback (most recent
 const missingProgram = 'Traceback (most recent call last):\n  File "/usr/lib/python3.13/subprocess.py", line 1955, in _execute_child\nFileNotFoundError: [Errno 2] No such file or directory: \'git\'\n';
 assert.equal(wantsV86({ success: false, code: 1, output: missingProgram }), true);
 assert.equal(wantsV86({ success: false, code: 1, output: 'Traceback (most recent call last):\n  File "a.py", line 1, in <module>\nFileNotFoundError: [Errno 2] No such file or directory: \'data.csv\'\n' }), false, 'a missing data file is the script\'s');
-console.log(`linux-route passed: ${wasm.length} commands to the wasm Linux, ${v86.length} to v86, fallbacks told (GNU options too)`);
+// A program a command saved does not run in the wasm Linux (its workspace and scratch
+// are data only): v86 runs the command again.
+assert.equal(wantsV86({ success: false, code: 126, output: 'sh: ./tool: Permission denied\n' }), true);
+assert.equal(wantsV86({ success: false, code: 126, output: "env: can't execute './tool': Permission denied\n" }), true);
+const savedProgram = 'Traceback (most recent call last):\n  File "/usr/lib/python3.13/subprocess.py", line 1955, in _execute_child\nPermissionError: [Errno 13] Permission denied: \'./tool\'\n';
+assert.equal(wantsV86({ success: false, code: 1, output: savedProgram }), true);
+assert.equal(wantsV86({ success: false, code: 1, output: 'Traceback (most recent call last):\n  File "a.py", line 1, in <module>\nPermissionError: [Errno 13] Permission denied: \'/etc/shadow\'\n' }), false, 'a file the script may not read is the script\'s');
+console.log(`linux-route passed: ${wasm.length} commands to the wasm Linux, ${v86.length} to v86, fallbacks told (GNU options, saved programs too)`);

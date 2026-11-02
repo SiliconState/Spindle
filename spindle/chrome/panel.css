@@ -59,37 +59,39 @@
   --warn-bg: #fdf2dd;
   --warn-line: #e6c68c;
 }
-:root[data-theme="dark"], :root[data-theme="dark"] dialog, :root[data-theme="dark"] #toast, :root[data-theme="dark"] .row-menu {
+/* Dim: the dark theme, a soft warm charcoal rather than near-black, green only in the
+   accent; every label keeps WCAG AA (4.5:1) on every surface. */
+:root[data-theme="dim"], :root[data-theme="dim"] dialog, :root[data-theme="dim"] #toast, :root[data-theme="dim"] .row-menu {
   color-scheme: dark;
-  --page: #111511;
-  --chrome: #161c14;
-  --surface: #171d15;
-  --soft: #1c241a;
-  --input: #141a12;
-  --ink: #dfe4d6;
-  --ink-2: #c3cab8;
-  --muted: #a4b194;
-  --line: #3a4730;
-  --edge: #2b3524;
-  --hair: #232c1e;
-  --track: #2f3a28;
-  --rule: #46553a;
-  --accent: #b9e07f;
-  --accent-soft: #233019;
-  --on-accent: #16200d;
-  --terminal: #0d110b;
-  --code: #c3d3ab;
-  --error: #f3b3a0;
-  --error-line: #7f5443;
-  --danger: #b4442e;
+  --page: #262624;
+  --chrome: #2c2c2a;
+  --surface: #30302d;
+  --soft: #363633;
+  --input: #2a2a28;
+  --ink: #ebe7df;
+  --ink-2: #d3cfc5;
+  --muted: #aaa69c;
+  --line: #4d4c47;
+  --edge: #42413d;
+  --hair: #383835;
+  --track: #464540;
+  --rule: #5f5d57;
+  --accent: #a7c78a;
+  --accent-soft: #363d2f;
+  --on-accent: #1b2214;
+  --terminal: #1f1f1e;
+  --code: #cbd8b9;
+  --error: #f0aa98;
+  --error-line: #7d5448;
+  --danger: #c4503a;
   --on-danger: #ffffff;
-  --warn: #f0c27a;
-  --warn-ink: #f5dcb0;
-  --warn-bg: #2a2213;
-  --warn-line: #6d5427;
-  --shadow: #0006;
-  --grain: #ffffff08;
-  --steer: #232b1e;
+  --warn: #e9bf7c;
+  --warn-ink: #f3ddb6;
+  --warn-bg: #3b3122;
+  --warn-line: #6f5b36;
+  --shadow: #00000059;
+  --grain: #ffffff07;
+  --steer: #353532;
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -632,9 +634,24 @@ details[open] > summary > .chev { transform: rotate(90deg); }
 a.button-like { justify-content: center; text-decoration: none; margin-top: 10px; }
 #standing { width: 100%; resize: vertical; min-height: 80px; padding: 8px; border: 1px solid var(--line); background: var(--input); color: var(--ink); font-size: 13px; line-height: 1.5; }
 .site { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 4px 0 10px; }
+.site-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
 .site + .site { border-top: 1px solid var(--hair); }
-.site-host { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.site-host { min-width: 0; font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .site-kind { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+.site-secret { display: flex; align-items: center; gap: 4px; min-width: 0; font-size: 11px; color: var(--muted); }
+.site-secret-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.site-secret.lost { color: var(--warn-ink); }
+.site-secret svg { flex-shrink: 0; }
+.site-secret-field { margin-top: 10px; }
+.act-confirm-field { margin: 10px 0 8px; }
+/* A page action waiting for the user's answer (Settings, Pages, Before acting). */
+#asking { display: grid; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--warn-line); background: var(--warn-bg); color: var(--warn-ink); font-size: 12px; }
+#asking[hidden] { display: none; }
+.ask-item { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ask-text { flex: 1; min-width: 0; overflow-wrap: anywhere; line-height: 1.4; }
+.ask-item button { min-height: 28px; height: 28px; padding: 0 10px; font-size: 12px; flex-shrink: 0; }
+.pair { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 8px; }
+.pair label { margin-top: 4px; }
 .vault .note { margin: 0 0 6px; }
 .vault-form { display: grid; gap: 6px; margin: 0 0 4px; }
 .vault-form input { width: 100%; min-width: 0; padding: 6px 8px; border: 1px solid var(--line); background: var(--input); color: var(--ink); font-size: 13px; }

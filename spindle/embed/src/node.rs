@@ -63,6 +63,8 @@ extern "C" {
     fn mkdir_sync(this: &NodeFs, path: &str, options: &JsValue) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(method, catch, js_name = renameSync)]
     fn rename_sync(this: &NodeFs, from: &str, to: &str) -> Result<(), JsValue>;
+    #[wasm_bindgen(method, catch, js_name = linkSync)]
+    fn link_sync(this: &NodeFs, existing: &str, new: &str) -> Result<(), JsValue>;
     #[wasm_bindgen(method, catch, js_name = readdirSync)]
     fn readdir_sync(this: &NodeFs, path: &str) -> Result<Vec<String>, JsValue>;
 
@@ -156,6 +158,35 @@ fn parent(path: &str) -> &str {
         Some(at) => &path[..at],
         None => ".",
     }
+}
+
+/// Writes all of `bytes` to `fd` from its start.
+fn write_all(fs: &NodeFs, fd: i32, bytes: &[u8]) -> Result<(), JsValue> {
+    let mut done = 0usize;
+    while done < bytes.len() {
+        let rest = &bytes[done..];
+        let written = fs.write_sync(fd, rest, 0, rest.len() as u32, done as f64)?;
+        if written == 0 {
+            return Err(JsValue::from_str("the lock file could not be written"));
+        }
+        done += written as usize;
+    }
+    Ok(())
+}
+
+/// Writes `bytes` to the file at `path` opened with `flags` (mode 600) and syncs it; a
+/// file it could not fill is removed.
+fn write_whole(path: &str, bytes: &[u8], flags: &str) -> Result<(), JsValue> {
+    with_fs(|fs, _| {
+        let fd = fs.open_sync(path, flags, 0o600)?;
+        let written = write_all(fs, fd, bytes).and_then(|()| fs.fsync_sync(fd));
+        let closed = fs.close_sync(fd);
+        let done = written.and(closed);
+        if done.is_err() {
+            let _ = fs.unlink_sync(path);
+        }
+        done
+    })
 }
 
 /// Makes a created or removed directory entry under `path`'s directory durable.
@@ -555,33 +586,29 @@ impl NodeOwner {
     pub fn acquire(database: &str, note: &str) -> Result<Self, Error> {
         let path = Self::path(database);
         let note = format!("spindle-embed: {note}");
-        let fd = with_fs(|fs, _| fs.open_sync(&path, "wx", 0o600)).map_err(|error| {
-            if code(&error) == "EEXIST" {
-                Error::Locked
-            } else {
-                io(error)
+        // The note is linked into place whole, so a crash leaves no lock file or the
+        // whole one, never an empty one: no host could tell that from another owner's
+        // half-made file, so every host would refuse the store until someone removed it.
+        // A link fails where the lock file exists, as an exclusive create does.
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).map_err(|error| io(JsValue::from_str(&error.to_string())))?;
+        let draft = format!(
+            "{path}.embed-{}-draft",
+            nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        write_whole(&draft, note.as_bytes(), "wx").map_err(io)?;
+        let linked = with_fs(|fs, _| fs.link_sync(&draft, &path));
+        let _ = with_fs(|fs, _| fs.unlink_sync(&draft));
+        match linked {
+            Ok(()) => {
+                let owner = Self { path, seal: None };
+                // A failure here drops `owner`, which removes the lock file.
+                sync_dir(&owner.path).map_err(io)?;
+                Ok(owner)
             }
-        })?;
-        let owner = Self { path, seal: None };
-        let written = with_fs(|fs, _| {
-            let bytes = note.as_bytes();
-            let mut done = 0usize;
-            while done < bytes.len() {
-                let rest = &bytes[done..];
-                let written = fs.write_sync(fd, rest, 0, rest.len() as u32, done as f64)?;
-                if written == 0 {
-                    return Err(JsValue::from_str("the lock file could not be written"));
-                }
-                done += written as usize;
-            }
-            let synced = fs.fsync_sync(fd);
-            let closed = fs.close_sync(fd);
-            synced.and(closed)
-        })
-        .and_then(|()| sync_dir(&owner.path));
-        // A failure here drops `owner`, which removes the half-made lock file.
-        written.map_err(io)?;
-        Ok(owner)
+            Err(error) if code(&error) == "EEXIST" => Err(Error::Locked),
+            Err(error) => Err(io(error)),
+        }
     }
 
     /// What the lock file of `database` says about its owner, if there is one.

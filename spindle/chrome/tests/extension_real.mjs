@@ -19,10 +19,14 @@
 //   7. bash runs in the browser Linux (Python and Node, a file written back), its
 //      scripts make Spindle calls (a nested model, a page tool: code mode through bash),
 //      reach a site the user allowed in Settings (GET only, as allowed), run TypeScript;
-//      a file attached to a message lands in the workspace and what a thread made
-//      downloads, alone or as a .zip; a thread browses (page_elements, type, click,
-//      screenshot, page_html, network, navigate); (scripted, with the wasm Linux built
-//      in) a plain sh command runs in the wasm Linux;
+//      a site's secret header is added to a script's request, never shown to it, kept
+//      as text or in the thread, and removed with the site; a file attached to a message
+//      lands in the workspace and what a thread made downloads, alone or as a .zip; a
+//      thread browses (page_elements, type, click, screenshot, page_html, network,
+//      navigate); (scripted) Before acting: Ask asks and No does nothing, Auto asks only
+//      before Enter; (scripted, with the wasm Linux built in) a plain sh command runs in
+//      the wasm Linux; (scripted) a command stopped while it runs is kept as stopped,
+//      with what it printed, and a reply goes on with the turn;
 //      and (with SPINDLE_BIN) it runs in a Spindle host's sandbox once switched to it;
 //   8. (scripted) a long thread: a turn's end draws only that turn; back to before a
 //      message; a history over its window compacted with a summary the model writes,
@@ -49,7 +53,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { StdioClient } from '../../clients/js/spindle.mjs';
-import { launch, open } from './cdp.mjs';
+import { attach, launch, open } from './cdp.mjs';
 
 const args = process.argv.slice(2);
 const distArg = args.shift();
@@ -86,6 +90,9 @@ const secret = `heron-${randomBytes(3).toString('hex')}`;
 const scripted = { replies: [], seen: [], holding: [] };
 /** What reached this test's site (/api/): a script's requests through its grant. */
 const siteVisits = [];
+/** What reached this test's keyed site (/keyed/): a script's requests with the secret
+ * header Spindle adds. */
+const keyedVisits = [];
 /** What the test page's Go button searched for (a thread clicking and typing on it). */
 const pageClicks = [];
 /** What a page a thread holds said once open in a tab (its script ran, its data came). */
@@ -119,6 +126,14 @@ const server = http.createServer(async (request, response) => {
   if (request.method === 'GET' && request.url === '/second.html') {
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     response.end('<!doctype html><title>Second page</title><h1>The second page</h1>');
+    return;
+  }
+  if (request.url.startsWith('/keyed/')) {
+    const auth = request.headers.authorization ?? '';
+    keyedVisits.push({ url: request.url, authorization: request.headers.authorization ?? null, cookie: request.headers.cookie ?? null });
+    // Echoes the header back, as some APIs do in their errors: Spindle takes it out.
+    response.writeHead(200, { 'content-type': 'application/json', 'x-echo': auth });
+    response.end(JSON.stringify({ auth, token: auth.replace(/^Bearer /, ''), b64: Buffer.from(auth.replace(/^Bearer /, '')).toString('base64') }));
     return;
   }
   if (request.url.startsWith('/api/')) {
@@ -200,19 +215,39 @@ probe.free();
 if (!profileOf) throw new Error(`provider ${providerId} is not in the catalog`);
 const providerOrigin = new URL(profileOf.base_url).origin;
 
-// A Spindle host for the remote runner (with SPINDLE_BIN), in a home of its own.
+// A Spindle host for the remote runner and threads moved there (with SPINDLE_BIN), in a
+// home of its own and a directory only this user reads; scripted, its model is this
+// test's provider (the catalog and the key in that home), so nothing is paid for.
 let spindleHost = null;
+/** Starts the host's `serve` (port 0: any free one but the ports a live host uses). */
+async function serveHost(port = 0) {
+  for (;;) {
+    const serve = spawn(native, ['--dir', spindleHost.dir, 'serve', '--port', String(port)], { env: spindleHost.env, stdio: ['ignore', 'pipe', 'ignore'] });
+    const hostPort = Number(await new Promise((done) => serve.stdout.once('data', (text) => done(/127\.0\.0\.1:(\d+)/.exec(String(text))?.[1]))));
+    if (port === 0 && [8790, 8799, 8811].includes(hostPort)) {
+      serve.kill();
+      continue;
+    }
+    Object.assign(spindleHost, { serve, port: hostPort, url: `http://127.0.0.1:${hostPort}` });
+    return;
+  }
+}
 if (native) {
   const home = join(work, 'host-home');
   const hostEnv = { ...process.env, HOME: home, DEXT_HOME: join(home, '.dext') };
-  fs.mkdirSync(hostEnv.DEXT_HOME, { recursive: true });
+  fs.mkdirSync(hostEnv.DEXT_HOME, { recursive: true, mode: 0o700 });
+  if (options.scripted) {
+    fs.copyFileSync(catalogFile, join(hostEnv.DEXT_HOME, 'providers.json'));
+    fs.writeFileSync(join(hostEnv.DEXT_HOME, 'auth.json'), JSON.stringify({ version: 1, providers: { scripted: { type: 'api_key', key } } }), { mode: 0o600 });
+  }
   const dir = join(work, 'host');
+  fs.mkdirSync(dir, { mode: 0o700 });
   const token = execFileSync(native, ['--dir', dir, 'token', 'new', 'chrome'], { env: hostEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-  const serve = spawn(native, ['--dir', dir, 'serve', '--port', '0'], { env: hostEnv, stdio: ['ignore', 'pipe', 'ignore'] });
-  const hostPort = await new Promise((done) => serve.stdout.once('data', (text) => done(/127\.0\.0\.1:(\d+)/.exec(String(text))[1])));
-  const probe = await fetch(`http://127.0.0.1:${hostPort}/v1/runner`, { headers: { authorization: `Bearer ${token}` } });
-  spindleHost = { serve, token, url: `http://127.0.0.1:${hostPort}`, sandbox: probe.status === 200 };
-  process.on('exit', () => serve.kill());
+  spindleHost = { dir, env: hostEnv, token };
+  await serveHost();
+  const probe = await fetch(`${spindleHost.url}/v1/runner`, { headers: { authorization: `Bearer ${token}` } });
+  spindleHost.sandbox = probe.status === 200;
+  process.on('exit', () => spindleHost.serve.kill());
 }
 
 // The test's copy of the extension, its permissions granted up front: first the
@@ -388,7 +423,343 @@ async function downloadBy(panel, selector, named = /\.spindle$/) {
   return file.path;
 }
 
+/**
+ * The leg on the user's Spindle host (SPINDLE_BIN, scripted): Connect through the host's
+ * own page, Run on my host, turns there (a program only the host has, steering, Stop and
+ * Retry, a page tool answered by this browser), the engine restarted mid-turn, the host
+ * out of reach and back, Bring back (the host's pack session id kept), and a crash or a
+ * reload at every step of both moves: one live copy after each. Returns the panel (a
+ * crash opens another).
+ */
+async function hostedLeg(panel) {
+  const hostGet = async (path) => (await fetch(`${spindleHost.url}${path}`, { headers: { authorization: `Bearer ${spindleHost.token}` } })).json();
+  const engineOp = (op, args = {}) => panel.eval(`new Promise((done, fail) => {
+    const channel = new BroadcastChannel('spindle-engine');
+    const me = 'test-' + Math.random();
+    channel.onmessage = ({ data }) => { if (data?.to === me) { channel.close(); data.ok ? done(data.result) : fail(new Error(data.error.message)); } };
+    channel.postMessage({ to: 'engine', from: me, id: 1, op: ${JSON.stringify(op)}, args: ${JSON.stringify(args)} });
+    setTimeout(() => fail(new Error('the engine did not answer')), 60_000);
+  })`);
+  const threadOf = (id) => panel.eval(`spindlePanel.threads.get(${JSON.stringify(id)}) ?? null`);
+  const sendHosted = async (prompt) => {
+    const before = scripted.seen.length;
+    await sendPrompt(panel, prompt);
+    await waitFor(() => scripted.seen.length > before, 'the host to admit the new prompt');
+  };
+  const drawnAnswer = (text) => panel.until(`(() => { const answer = [...document.querySelectorAll('#history .message.assistant')].at(-1)?.innerText ?? ''; return answer.includes(${JSON.stringify(text)}) && answer; })()`, { timeout: 20_000, what: `the new answer ${text} to be drawn` });
+  const lastCard = (tool) => panel.eval(`(() => { const card = [...document.querySelectorAll('#history .tool[data-tool=${JSON.stringify(tool)}]')].at(-1); return card ? { failed: card.classList.contains('failed'), text: card.querySelector('pre.result')?.textContent ?? '' } : null; })()`);
+  const targets = async () => (await browser.send('Target.getTargets')).targetInfos;
+  const waitFor = async (probe, what, timeout = 30_000) => {
+    for (const end = Date.now() + timeout; ;) {
+      const found = await probe();
+      if (found) return found;
+      if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+      await sleep(200);
+    }
+  };
+  const openIt = async (id) => {
+    await panel.click('#home');
+    await panel.click(`#threads .thread-row[data-id="${id}"]`);
+    await panel.until(`spindlePanel.current === ${JSON.stringify(id)}`, { what: 'the hosted thread to open' });
+  };
+  /** Where the thread lives: 'host' or 'here' once no move is under way. */
+  const settledHome = (id, where, timeout = 90_000) => panel.until(`(() => { const t = spindlePanel.threads.get(${JSON.stringify(id)}); return t && !t.moving && (${where === 'host'} ? Boolean(t.home) : !t.home) && t; })()`, { timeout, what: `the thread to live ${where === 'host' ? 'on the host' : 'here'}` });
+  /** The thread's live copies: the host's sessions not sealed, and its store here. */
+  const liveCopies = async (id) => {
+    const { sessions } = await hostGet('/v1/sessions');
+    const usage = (await engineOp('storage')).threads.find((one) => one.id === id);
+    const thread = await threadOf(id);
+    return {
+      host: sessions.filter((session) => session.status?.state !== 'moved').length,
+      sealedThere: sessions.filter((session) => session.status?.state === 'moved').length,
+      here: thread && !thread.home && !thread.moving ? 1 : 0,
+      storeHere: usage ? usage.database : 0,
+      held: usage?.held ?? 0,
+      move: usage?.move ?? null,
+    };
+  };
+
+  // Connect: the host's own page opens in a tab, pairs with the host's key and allows
+  // this browser; the extension catches the answer there, closes the tab and keeps a
+  // browser token named for this browser.
+  step = 'hosted: connect';
+  await panel.click('#home');
+  await panel.click('#settings');
+  await unfold(panel, 'commands', 'host');
+  await panel.eval(`document.querySelector('#host-url').value = ''`);
+  await panel.type('#host-url', spindleHost.url);
+  await panel.click('#host-connect');
+  const connectTarget = await waitFor(async () => (await targets()).find((target) => target.type === 'page' && target.url.startsWith(`${spindleHost.url}/connect?`)), 'the connect tab');
+  const tab = await attach(browser, connectTarget.targetId);
+  await tab.until(`document.readyState === 'complete' && document.querySelector('#connect-card') && true`, { what: 'the connect page' }).catch(async (error) => {
+    throw new Error(`${error.message}; the tab shows ${await tab.eval('location.href + " " + document.body?.innerText.slice(0, 300)').catch((failed) => failed.message)}`);
+  });
+  const askedFor = await tab.eval(`document.querySelector('#connect-card').dataset.client`);
+  if (await tab.eval(`!document.querySelector('#connect-pair').hidden`)) {
+    await tab.type('#pair-key', fs.readFileSync(join(spindleHost.dir, 'pairing.key'), 'utf8').trim());
+    await tab.click('#pair-form button');
+  }
+  await tab.click('#allow');
+  const connected = await panel.until(`spindlePanel.engine.host?.kind === 'browser' && spindlePanel.engine.host`, { timeout: 30_000, what: 'the host to connect with a browser token' });
+  const tabClosed = await waitFor(async () => !(await targets()).some((target) => target.targetId === connectTarget.targetId), 'the connect tab to close', 10_000).catch(() => false);
+  const tokens = execFileSync(native, ['--dir', spindleHost.dir, 'token', 'list'], { env: spindleHost.env, encoding: 'utf8' });
+  const hostSaid = await panel.eval(`document.querySelector('#host-state').textContent`);
+  await panel.click('#settings-dialog [data-close]');
+  check("Connect: the host's page pairs and allows in a tab; the extension catches the answer, closes the tab and keeps a browser token named for this browser", () => {
+    assert.match(askedFor, /^Chrome on Linux [0-9a-f]{6}$/, `the name asked for: ${askedFor}`);
+    assert.equal(connected.client, askedFor);
+    assert.ok(tabClosed, 'the connect tab closed');
+    assert.ok(tokens.includes(askedFor) && /\(browser\)/.test(tokens), `the host's tokens: ${tokens}`);
+    assert.match(hostSaid, /threads and commands/, hostSaid);
+  });
+
+  // Run on my host: the move, a turn there running a program only the host has, and
+  // what is left here.
+  step = 'hosted: move';
+  scripted.replies.push(text('Ready here.'));
+  const id = await newThread(panel, 'Reply with only: ready.');
+  await settled(panel, id);
+  await panel.click('#title-button');
+  await panel.click('#menu-host');
+  await panel.until(`document.querySelector('#host-dialog').open`, { what: 'the host dialog' });
+  const asksModel = await panel.eval(`!document.querySelector('#host-model-field').hidden`);
+  const told = await panel.eval(`document.querySelector('#host-dialog-text').textContent`);
+  await panel.click('#host-dialog-yes');
+  const home = (await settledHome(id, 'host')).home;
+  const there = await liveCopies(id);
+  scripted.replies.push(call('bash', { command: 'uname -m && gcc --version | head -1' }), text('Ran on the host.'));
+  await sendPrompt(panel, 'Run uname -m and gcc --version with bash.');
+  await panel.until(`spindlePanel.threads.get(${JSON.stringify(id)})?.state === 'running' || null`, { timeout: 20_000 }).catch(() => {});
+  const ran = await settled(panel, id, 120_000);
+  const hostCard = await lastCard('bash');
+  const ranAnswer = await lastAnswer(panel);
+  await panel.screenshot(join(shots, '08-hosted.png'));
+  check('Run on my host: the thread moves (one live copy, on the host; here only the note of where it went) and a turn there runs a program only the host has', () => {
+    assert.equal(asksModel, false, 'its model is signed in on the host: nothing to choose');
+    assert.match(told, /keeps its copy until your host holds the thread/, told);
+    assert.equal(home.url, spindleHost.url);
+    assert.deepEqual([there.host, there.here, there.storeHere, there.held, there.move], [1, 0, 0, 0, null], JSON.stringify(there));
+    assert.equal(ran, 'idle');
+    assert.ok(hostCard && !hostCard.failed, JSON.stringify(hostCard));
+    assert.match(hostCard.text, /x86_64/, "the host's machine, not the browser Linux's");
+    assert.match(hostCard.text, /gcc/i, 'a program the browser Linux does not have');
+    assert.match(ranAnswer, /Ran on the host/);
+  });
+
+  // Steering, a page tool this browser answers, Stop and Retry: driven as here.
+  step = 'hosted: steer';
+  let release;
+  const gate = new Promise((done) => { release = done; });
+  const steer = `Hosted steer ${randomBytes(2).toString('hex')}`;
+  scripted.replies.push({ after: gate, then: call('read_page', {}) }, text('Steered and read.'));
+  const seenBefore = scripted.seen.length;
+  await sendPrompt(panel, 'Wait for my next message, then read the page.');
+  await panel.until(`spindlePanel.threads.get(${JSON.stringify(id)})?.state === 'running' || null`, { what: 'the hosted turn to run' });
+  await waitFor(() => scripted.seen.length > seenBefore || null, 'the host to ask the model');
+  await sendPrompt(panel, steer);
+  const steered = await panel.until(`!document.querySelector('#toast').hidden && document.querySelector('#toast').textContent === 'Sent to the running turn.'`, { what: 'the steering message to be taken' }).catch((error) => error.message);
+  release();
+  const afterSteer = await settled(panel, id, 120_000);
+  const pageCard = await lastCard('read_page');
+  check('a hosted turn is steered from the panel, and the page tool it calls is answered by this browser', () => {
+    assert.equal(steered, true, steered);
+    assert.equal(afterSteer, 'idle');
+    assert.ok(scripted.seen.slice(seenBefore).some((seen) => seen.body.includes(steer)), 'the steering message reached the model');
+    assert.ok(pageCard, 'the page tool ran');
+    assert.doesNotMatch(pageCard.text, /no_answer|did not answer|no answer/i, `answered: ${pageCard.text}`);
+  });
+
+  step = 'hosted: stop';
+  scripted.replies.push({ hold: 'Once upon a time, on a host, ' }, text('Retried on the host.'));
+  await sendPrompt(panel, 'Write a long story.');
+  await panel.until(`(document.querySelector('#history .live .message')?.innerText ?? '').length > 10`, { timeout: 60_000, what: 'the hosted reply to stream' });
+  await panel.until(`document.querySelector('#send').classList.contains('stop') || null`, { what: 'Send to become Stop' });
+  await panel.click('#send');
+  const stopped = await settled(panel, id, 60_000);
+  const stopNote = await panel.eval(`spindlePanel.threads.get(${JSON.stringify(id)})?.note ?? ''`);
+  for (const response of scripted.holding.splice(0)) response.destroy();
+  // (The steering's toast, still up, lies over the buttons for a few seconds.)
+  await panel.until(`document.querySelector('#toast').hidden || null`, { timeout: 10_000, what: 'the toast to go' }).catch(() => {});
+  await panel.click('#retry');
+  await panel.until(`spindlePanel.threads.get(${JSON.stringify(id)})?.state === 'running' || null`, { timeout: 10_000 }).catch(() => {});
+  const retried = await settled(panel, id, 60_000);
+  const retriedNote = await panel.eval(`spindlePanel.threads.get(${JSON.stringify(id)})?.note ?? ''`);
+  const retriedAnswer = await lastAnswer(panel);
+  check('Stop ends a hosted turn mid-reply, and Retry sends it again on the host', () => {
+    assert.equal(stopped, 'stopped', `after Stop: ${stopped} (${stopNote})`);
+    assert.equal(retried, 'idle', `after Retry: ${retried} (${retriedNote})`);
+    assert.match(retriedAnswer, /Retried on the host/);
+  });
+
+  // The engine restarted while a hosted turn runs: the new engine finds it running there
+  // and follows it to its end.
+  step = 'hosted: reload';
+  let releaseAfter;
+  const afterReload = new Promise((done) => { releaseAfter = done; });
+  scripted.replies.push({ after: afterReload, then: text('Finished after the reload.') });
+  const seenReload = scripted.seen.length;
+  await sendPrompt(panel, 'Take your time.');
+  await waitFor(() => scripted.seen.length > seenReload || null, 'the host to ask the model');
+  await panel.eval('globalThis.beforeRestart = spindlePanel.engine');
+  await panel.click('#settings');
+  await unfold(panel, 'about');
+  await panel.click('#restart-engine');
+  await panel.until('spindlePanel.engine && spindlePanel.engine !== globalThis.beforeRestart', { timeout: 60_000, what: 'a new engine to answer' }).catch(async (error) => {
+    throw new Error(`${error.message}; the panel says ${await panel.eval(`document.querySelector('#banner').textContent + ' / ' + document.querySelector('#toast-text').textContent`).catch(() => '?')}; it logged ${panelConsole.slice(-6).join(' | ')}`);
+  });
+  await panel.click('#settings-dialog [data-close]').catch(() => {});
+  const runningAfter = await panel.until(`spindlePanel.threads.get(${JSON.stringify(id)})?.state === 'running' || null`, { timeout: 30_000 }).catch(() => false);
+  releaseAfter();
+  await openIt(id);
+  const reloaded = await settled(panel, id, 90_000);
+  const reloadAnswer = await lastAnswer(panel);
+  check('the engine restarted mid-turn: the hosted turn goes on there, and the new engine follows it to its end', () => {
+    assert.ok(runningAfter, 'still running after the restart');
+    assert.equal(reloaded, 'idle');
+    assert.match(reloadAnswer, /Finished after the reload/);
+  });
+
+  // The host out of reach: the thread says so and loses nothing; back, it goes on.
+  step = 'hosted: away';
+  spindleHost.serve.kill('SIGTERM');
+  await new Promise((done) => spindleHost.serve.once('exit', done));
+  await openIt(id);
+  const awaySaid = await panel.until(`spindlePanel.threads.get(${JSON.stringify(id)})?.away ?? null`, { timeout: 45_000, what: 'the thread to say its host is away' });
+  const awayShown = await panel.eval(`document.querySelector('#history').textContent + ' ' + (document.querySelector('#notice').hidden ? '' : document.querySelector('#notice').textContent)`);
+  await serveHost(spindleHost.port);
+  await panel.until(`!spindlePanel.threads.get(${JSON.stringify(id)})?.away || null`, { timeout: 45_000, what: 'the host to be in reach again' });
+  scripted.replies.push(text('Back in reach.'));
+  await sendHosted('Are you there?');
+  const backInReach = await settled(panel, id, 60_000);
+  await drawnAnswer('Back in reach.');
+  const history = await panel.eval(`document.querySelector('#history').innerText`);
+  check('the host out of reach: the thread says so, loses nothing, and goes on once the host is back', () => {
+    assert.match(awaySaid, /does not answer|could not be reached|not connected/, awaySaid);
+    assert.match(awayShown, /out of reach|does not answer/, awayShown);
+    assert.equal(backInReach, 'idle');
+    assert.match(history, /Ran on the host[\s\S]*Retried on the host[\s\S]*Finished after the reload[\s\S]*Back in reach/, 'its whole history');
+  });
+
+  // Stop while the host is offline survives an engine restart without starting work.
+  step = 'hosted: offline stop';
+  scripted.replies.push({ hold: 'A reply held while the host goes away, ' });
+  await sendHosted('Wait until I stop you.');
+  const original = (await hostGet(`/v1/sessions/${home.session}`)).running_request;
+  assert.ok(original, 'the host exposes the exact running command');
+  spindleHost.serve.kill('SIGTERM');
+  await new Promise((done) => spindleHost.serve.once('exit', done));
+  const stoppedOffline = await engineOp('stop', { id });
+  const keptStop = await panel.eval(`import('./shared.mjs').then((shared) => shared.read('kv', 'host-stop:${id}'))`);
+  for (const response of scripted.holding.splice(0)) response.destroy();
+  await panel.eval('globalThis.beforeRestart = spindlePanel.engine');
+  await panel.click('#settings');
+  await unfold(panel, 'about');
+  await panel.click('#restart-engine');
+  await panel.until('spindlePanel.engine && spindlePanel.engine !== globalThis.beforeRestart', { timeout: 60_000, what: 'the engine with a saved Stop to restart' });
+  await panel.click('#settings-dialog [data-close]').catch(() => {});
+  const beforeRecovery = scripted.seen.length;
+  await serveHost(spindleHost.port);
+  await panel.until(`import('./shared.mjs').then((shared) => shared.read('kv', 'host-stop:${id}')).then((stop) => !stop)`, { timeout: 60_000, what: 'the original command Stop to reconcile' });
+  await settled(panel, id, 60_000);
+  const recoverySends = scripted.seen.length - beforeRecovery;
+  scripted.replies.push(text('A later turn is not stopped.'));
+  await openIt(id);
+  await engineOp('send', { id, text: 'Skip the interrupted reply and go on.' });
+  const laterState = await settled(panel, id, 60_000);
+  check('offline Stop is kept across engine and host restarts, never resends work and cannot stop a later turn', () => {
+    assert.equal(stoppedOffline.pending, true);
+    assert.equal(keptStop.target, original);
+    assert.equal(recoverySends, 0);
+    assert.equal(laterState, 'idle');
+  });
+
+  // Bring back: the browser's fit said first, the host's pack session id kept with it.
+  step = 'hosted: back';
+  const session = home.session;
+  fs.writeFileSync(join(spindleHost.dir, 'sessions', session, 'pack-session-id'), '1761990000-77-a1b2c3d4e5f6\n');
+  await panel.click('#title-button');
+  await panel.click('#menu-back');
+  const asked = await panel.until(`document.querySelector('#confirm-dialog').open && document.querySelector('#confirm-title').textContent + ' ' + document.querySelector('#confirm-text').textContent`, { what: 'Bring back to ask first' });
+  await panel.click('#confirm-yes');
+  const back = await settledHome(id, 'here');
+  const afterBack = await liveCopies(id);
+  scripted.replies.push(call('read_file', { path: 'nothing.txt' }), text('Here again.'));
+  await sendPrompt(panel, 'Say you are here again.');
+  const hereAgain = await settled(panel, id, 60_000);
+  const tools = await panel.eval(`spindlePanel.status?.settings?.tools?.map((tool) => tool.name) ?? []`);
+  await panel.click('#title-button');
+  const copy = fs.readFileSync(await downloadBy(panel, '#menu-copy'));
+  bundles.push(['hosted copy', copy]);
+  check('Bring back: asked first, it moves back (the host deletes its copy), runs here with the page tools, and keeps the pack session id', () => {
+    assert.match(asked, /Keep this thread here\? .*its commands run in this browser's Linux/, asked);
+    assert.match(back.note ?? '', /Back from your host/, back.note);
+    assert.deepEqual([afterBack.host, afterBack.sealedThere, afterBack.here, afterBack.held, afterBack.move], [0, 0, 1, 0, null], JSON.stringify(afterBack));
+    assert.equal(hereAgain, 'idle');
+    assert.ok(tools.includes('read_page'), `tools here: ${tools}`);
+    assert.ok(copy.includes(Buffer.from('pack-session-id')) && copy.includes(Buffer.from('1761990000-77-a1b2c3d4e5f6')), 'the pack session id came back and leaves with the thread again');
+  });
+
+  // A crash (Chrome killed) or a reload (the engine restarted) at every step of both
+  // moves: each finishes by itself once the engine starts again, one live copy after.
+  step = 'hosted: cuts';
+  const cuts = [
+    ['to:recorded', 'reload'], ['back:recorded', 'reload'], ['to:uploaded', 'crash'], ['back:held', 'crash'],
+    ['to:session', 'reload'], ['back:imported', 'reload'], ['to:sealed', 'reload'], ['back:released', 'reload'], ['to:home', 'reload'],
+  ];
+  const outcomes = [];
+  for (const [at, how] of cuts) {
+    step = `hosted: cut ${at} (${how})`;
+    await panel.eval(`new Promise((done, fail) => { const opened = indexedDB.open('spindle', 2); opened.onsuccess = () => { const tx = opened.result.transaction('kv', 'readwrite', { durability: 'strict' }); tx.objectStore('kv').put(${JSON.stringify(at)}, 'cut-move'); tx.oncomplete = () => { opened.result.close(); done(true); }; tx.onerror = () => fail(tx.error); }; opened.onerror = () => fail(opened.error); })`);
+    await panel.eval(`globalThis.cutAt = null; globalThis.cutHeard ??= new BroadcastChannel('spindle-engine'); cutHeard.onmessage = ({ data }) => { if (data?.type === 'cut') globalThis.cutAt = data.at; }`);
+    await openIt(id);
+    await panel.click('#title-button');
+    if (at.startsWith('to:')) {
+      await panel.click('#menu-host');
+      await panel.until(`document.querySelector('#host-dialog').open`, { what: 'the host dialog' });
+      await panel.click('#host-dialog-yes');
+    } else {
+      await panel.click('#menu-back');
+      await panel.until(`document.querySelector('#confirm-dialog').open`, { what: 'Bring back to ask' });
+      await panel.click('#confirm-yes');
+    }
+    await panel.until(`globalThis.cutAt === ${JSON.stringify(at)}`, { timeout: 60_000, what: `the move to stop at ${at}` });
+    if (how === 'crash') {
+      await browser.crash();
+      await startChrome();
+      panel = await openPanel();
+    } else {
+      await panel.eval('globalThis.beforeRestart = spindlePanel.engine');
+      await panel.click('#settings');
+      await unfold(panel, 'about');
+      await panel.click('#restart-engine');
+      await panel.until('spindlePanel.engine && spindlePanel.engine !== globalThis.beforeRestart', { timeout: 60_000, what: 'a new engine to answer' });
+      await panel.click('#settings-dialog [data-close]').catch(() => {});
+    }
+    const lives = at.startsWith('to:') ? 'host' : 'here';
+    await settledHome(id, lives, 120_000);
+    outcomes.push([at, how, lives, await liveCopies(id)]);
+  }
+  // It still works where it ended up (on the host), and comes home once more.
+  scripted.replies.push(text('Still whole.'));
+  await openIt(id);
+  await sendHosted('Still there?');
+  const stillWhole = await settled(panel, id, 60_000);
+  const wholeAnswer = await drawnAnswer('Still whole.');
+  check('a crash or reload at every step of both moves: each move finishes by itself, one live copy after each, and the thread goes on', () => {
+    for (const [at, how, lives, copies] of outcomes) {
+      const want = lives === 'host' ? [1, 0, 0, 0, 0, null] : [0, 0, 1, 1, 0, null];
+      const got = [copies.host, copies.sealedThere, copies.here, Math.min(1, copies.storeHere), copies.held, copies.move];
+      assert.deepEqual(got, want, `${how} at ${at}: ${JSON.stringify(copies)}`);
+    }
+    assert.equal(stillWhole, 'idle');
+    assert.match(wholeAnswer, /Still whole/);
+  });
+  return panel;
+}
+
 const bundles = [];
+/** Thrown to end a run of only part of the steps (SPINDLE_ONLY). */
+const ONLY = Symbol('only');
 let step = 'start';
 try {
   step = 'setup';
@@ -421,6 +792,11 @@ try {
   }
   await panel.screenshot(join(shots, '02b-model.png'));
   await panel.click('#model-apply');
+  // SPINDLE_ONLY=hosted: only the leg on the host (working on it), then the end.
+  if (process.env.SPINDLE_ONLY === 'hosted') {
+    panel = await hostedLeg(panel);
+    throw ONLY;
+  }
 
   // 1. The page tool: refused while page reading is off, then reading the page.
   step = 'page reading off';
@@ -591,6 +967,53 @@ try {
     assert.match(onlineCard.text, /python 200/, "Python's urllib trusts the Linux's own authority");
     assert.match(onlineCard.text, /closed to it/, 'an address on this computer is refused');
   });
+
+  // 7h. (scripted) Stop a running command, then say what to do: the command is kept as
+  // stopped (with what it printed), never runs again, and a reply goes on with the turn,
+  // the model reading the stopped result and then the reply.
+  if (options.scripted) {
+    step = 'stop a command, then reply';
+    const long = 'echo started-long; sleep 120; echo never-printed';
+    scripted.replies.push(call('bash', { command: long }), text('Skipped it, as you asked.'));
+    const bashCards = `[...document.querySelectorAll('#history .tool')].filter((c) => c.querySelector('.tool-name').textContent === 'bash')`;
+    const cardsBefore = await panel.eval(`${bashCards}.length`);
+    await sendPrompt(panel, `Run exactly this command with bash: ${long}`);
+    await panel.until(`${bashCards}.length > ${cardsBefore} && spindlePanel.threads.get(${JSON.stringify(linuxThread)})?.state === 'running' || null`, { timeout: 60_000, what: 'the command to start' });
+    // The Linux is warm: the command prints at once, then sleeps.
+    await sleep(8000);
+    await panel.until(`document.querySelector('#send').classList.contains('stop') || null`, { what: 'Send to become Stop' });
+    await panel.click('#send');
+    const stoppedCommand = await settled(panel, linuxThread, 60_000);
+    const seenAtStop = scripted.seen.length;
+    const notice = await panel.until(`(() => { const n = document.querySelector('#notice'); return !n.hidden && /You stopped this step/.test(n.textContent) ? n.textContent : null; })()`, { timeout: 15_000, what: 'the stopped notice' }).catch((error) => error.message);
+    const placeholder = await panel.eval(`document.querySelector('#prompt').placeholder`);
+    const stopCard = await panel.eval(`(() => { const card = ${bashCards}.at(-1); return card ? { failed: card.classList.contains('failed'), text: card.querySelector('pre.result')?.textContent ?? '' } : null; })()`);
+    await panel.screenshot(join(shots, '03h-command-stopped.png'));
+    const reply = `Skip that one (${randomBytes(2).toString('hex')}) and say so.`;
+    await sendPrompt(panel, reply);
+    await panel.until(`spindlePanel.threads.get(${JSON.stringify(linuxThread)})?.state === 'running' || null`, { timeout: 20_000 }).catch(() => {});
+    const afterReply = await settled(panel, linuxThread, 120_000);
+    const replied = await lastAnswer(panel);
+    const ran = await panel.eval(`${bashCards}.filter((c) => (c.querySelector('pre.result')?.textContent ?? '').includes('started-long')).length`);
+    await panel.screenshot(join(shots, '03h-reply-after-stop.png'));
+    check('Stop a running command, then reply: it is kept as stopped with what it printed, never run again, and the turn goes on with the reply', () => {
+      assert.equal(stoppedCommand, 'stopped', `after Stop: ${stoppedCommand}`);
+      assert.match(String(notice), /You stopped this step/, `notice: ${notice}`);
+      assert.match(String(notice), /Continue[\s\S]*Retry[\s\S]*Take back/, 'the notice names the other ways on');
+      assert.equal(placeholder, 'Reply to go on…');
+      assert.ok(stopCard?.failed, `the stopped call: ${JSON.stringify(stopCard)}`);
+      assert.match(stopCard.text, /started-long/, 'what it printed before the stop is kept');
+      assert.match(stopCard.text, /the user stopped this command/, stopCard.text);
+      assert.ok(!stopCard.text.includes('never-printed'), stopCard.text);
+      assert.equal(afterReply, 'idle', `after the reply: ${afterReply}`);
+      assert.match(replied, /Skipped it/, `answer: ${replied}`);
+      assert.equal(scripted.seen.length, seenAtStop + 1, 'the reply made one request, and nothing ran again');
+      const body = scripted.seen.at(-1).body;
+      const stoppedAt = body.indexOf('the user stopped this command');
+      assert.ok(stoppedAt >= 0 && stoppedAt < body.indexOf('Skip that one'), 'the model read the stopped result, then the reply');
+      assert.equal(ran, 1, 'one run of the command');
+    });
+  }
 
   // 2. A turn that finishes while no panel is open.
   step = 'panel closed';
@@ -832,6 +1255,93 @@ try {
     assert.match(siteCard.text, /ts 42/, 'TypeScript ran');
     assert.ok(siteVisits.length >= 1 && siteVisits.every((visit) => visit.method === 'GET'), `the site saw: ${JSON.stringify(siteVisits)}`);
     assert.ok(siteVisits.every((visit) => visit.cookie === null), 'no cookies went with it');
+  });
+
+  // 7e. A site with a secret header: Spindle adds it to each request a script makes
+  // there, the script never sees it (an echo of it comes back redacted), a script may
+  // not set it itself, nothing the extension keeps holds it as text, and removing the
+  // site removes it.
+  step = 'secret header';
+  const siteToken = `sk-site-${randomBytes(16).toString('hex')}`;
+  await panel.click('#home');
+  await panel.click('#settings');
+  await unfold(panel, 'commands', 'sites');
+  await panel.type('#site-url', `http://127.0.0.1:${port}/keyed/`);
+  await panel.type('#site-header', 'Authorization');
+  await panel.type('#site-secret', `Bearer ${siteToken}`);
+  await panel.click('#site-form button.primary');
+  const keyedSite = await panel.until(`spindlePanel.engine.sites?.find((grant) => grant.url.endsWith('/keyed/')) || null`, { what: 'the keyed site to be kept' });
+  await panel.until(`(spindlePanel.engine.vault?.sites ?? []).includes(${JSON.stringify(keyedSite.name)}) || null`, { what: 'its secret to be sealed' });
+  const keyedRow = await panel.eval(`[...document.querySelectorAll('#sites .site')].map((row) => row.textContent).join(' | ')`);
+  const keyedCleared = await panel.eval(`['site-url', 'site-header', 'site-secret'].every((id) => document.getElementById(id).value === '')`);
+  const stored = () => panel.eval(`new Promise((done, failed) => {
+    const opening = indexedDB.open('spindle');
+    opening.onerror = () => failed(opening.error);
+    opening.onsuccess = () => {
+      const tx = opening.result.transaction(['kv', 'keys'], 'readonly');
+      const sites = tx.objectStore('kv').get('sites');
+      const secrets = tx.objectStore('kv').get('site-secrets');
+      const names = tx.objectStore('keys').getAllKeys();
+      const values = tx.objectStore('keys').getAll();
+      tx.oncomplete = () => done({ sites: JSON.stringify(sites.result ?? null), secrets: secrets.result ?? null, keys: names.result.map((name, i) => ({ name: String(name),
+        kind: values.result[i]?.kind ?? null, text: typeof values.result[i] === 'string' ? values.result[i] : null,
+        sealed: values.result[i]?.data instanceof ArrayBuffer && values.result[i]?.iv?.length === 12 })) });
+      tx.onerror = () => failed(tx.error);
+    };
+  })`);
+  const keptKeyed = await stored();
+  await panel.click('#settings-dialog [data-close]');
+  const keyedUrl = `http://127.0.0.1:${port}/keyed/echo`;
+  const keyedScript = `spindle http ${keyedUrl} && (spindle http -H 'Authorization: Bearer mine' ${keyedUrl} || echo "own refused")`;
+  scripted.replies.push(call('bash', { command: keyedScript, timeout: 180 }), text('Echoed; own header refused.'));
+  await panel.click(`#threads .thread-row[data-id="${linuxThread}"]`);
+  await panel.until(`spindlePanel.current === ${JSON.stringify(linuxThread)} && spindlePanel.status`, { what: 'the Linux thread to open' });
+  await sendPrompt(panel, `Run exactly this command with bash, then reply with only its output: ${keyedScript}`);
+  await panel.until(`spindlePanel.threads.get(${JSON.stringify(linuxThread)})?.state === 'running' || null`, { timeout: 20_000 }).catch(() => {});
+  const keyedRan = await settled(panel, linuxThread, Number(process.env.SPINDLE_STEP_WAIT ?? 300_000));
+  const keyedCard = await panel.eval(`(() => { const cards = [...document.querySelectorAll('#history .tool')].filter((c) => c.querySelector('.tool-name').textContent === 'bash'); const card = cards.at(-1); return card ? { failed: card.classList.contains('failed'), text: card.querySelector('pre.result')?.textContent ?? '' } : null; })()`);
+  const keyedHistory = await panel.eval(`document.querySelector('#history').textContent`);
+  // The thread as a file: what it keeps (its journal of the script's calls among it).
+  await panel.click('#title-button');
+  const keyedBundle = fs.readFileSync(await downloadBy(panel, '#menu-copy'));
+  const keyedForms = [siteToken, Buffer.from(siteToken).toString('base64').slice(0, 40)];
+  check('a site\'s secret header: added to a script\'s request, never shown to it, kept as text or in the thread; a script may not set it', () => {
+    assert.deepEqual(keyedSite.secret, ['Authorization'], JSON.stringify(keyedSite));
+    assert.match(keyedRow, /Authorization/, `the Settings list: ${keyedRow}`);
+    assert.ok(keyedCleared, 'the form forgets what was typed');
+    assert.ok(!keptKeyed.sites.includes(siteToken), `kv/sites: ${keptKeyed.sites}`);
+    // The list stays as builds before secret headers read it; the header's name is kept
+    // beside it, its value only sealed.
+    assert.ok(!keptKeyed.sites.includes('"secret"'), `kv/sites: ${keptKeyed.sites}`);
+    assert.deepEqual(keptKeyed.secrets, { [keyedSite.name]: { url: keyedSite.url, names: ['Authorization'] } });
+    const record = keptKeyed.keys.find((kept) => kept.name === `:site:${keyedSite.name}`);
+    assert.ok(record?.sealed && record.text === null && record.kind === 'site', JSON.stringify(keptKeyed.keys));
+    assert.equal(keyedRan, 'idle', `state ${keyedRan}`);
+    assert.ok(keyedCard && !keyedCard.failed, `the bash call: ${JSON.stringify(keyedCard)}`);
+    assert.equal(keyedVisits.length, 1, `the keyed site saw: ${JSON.stringify(keyedVisits)}`);
+    assert.equal(keyedVisits[0].authorization, `Bearer ${siteToken}`, 'Spindle added the header');
+    assert.equal(keyedVisits[0].cookie, null, 'no cookies went with it');
+    assert.match(keyedCard.text, /\[redacted\]/, keyedCard.text);
+    assert.match(keyedCard.text, /supplied by grant[\s\S]*own refused/, 'a script may not set it');
+    // The copy holds the journaled reply (redacted), so a token in it would be found.
+    assert.ok(keyedBundle.includes('[redacted]'), 'the thread\'s file holds the script\'s journaled reply');
+    for (const form of keyedForms) {
+      assert.ok(!keyedCard.text.includes(form), `the script saw ${form}: ${keyedCard.text}`);
+      assert.ok(!keyedHistory.includes(form), 'nor does the thread show it');
+      assert.ok(!keyedBundle.includes(form), 'nor does the thread keep it');
+    }
+  });
+  // Removing the site removes its secret.
+  await panel.click('#home');
+  await panel.click('#settings');
+  await unfold(panel, 'commands', 'sites');
+  await panel.eval(`[...document.querySelectorAll('#sites .site')].find((row) => row.textContent.includes('/keyed/')).querySelector('button').click()`);
+  await panel.until(`!spindlePanel.engine.sites?.some((grant) => grant.url.endsWith('/keyed/')) || null`, { what: 'the keyed site to go' });
+  const afterKeyed = await stored();
+  await panel.click('#settings-dialog [data-close]');
+  check('removing a site removes its secret header', () => {
+    assert.ok(!afterKeyed.keys.some((kept) => kept.name.startsWith(':site:')), JSON.stringify(afterKeyed.keys));
+    assert.deepEqual(afterKeyed.secrets, {});
   });
 
   // 7f. Files in and out: a file attached to a message lands in the workspace, bash uses
@@ -1178,6 +1688,50 @@ try {
     }
   });
 
+  // 7c. Before acting (Settings, Pages): Ask asks before every action and the user's No
+  // does nothing (a known outcome); Auto lets a plain key go and asks before Enter; the
+  // user's Yes goes ahead. Full (the default) asked nothing above.
+  if (options.scripted) {
+    step = 'before acting';
+    const confirmTo = async (value) => {
+      await panel.click('#home');
+      await panel.click('#settings');
+      await unfold(panel, 'pages');
+      await panel.click(`#act-confirm button[data-value="${value}"]`);
+      await panel.until(`document.querySelector('#act-confirm button[data-value="${value}"]').getAttribute('aria-checked') === 'true' || null`, { what: `Before acting: ${value}` });
+      await panel.click('#settings-dialog [data-close]');
+    };
+    const question = () => panel.until(`document.querySelector('#asking:not([hidden]) .ask-text')?.textContent || null`, { timeout: 60_000, what: 'the question' });
+    await confirmTo('ask');
+    scripted.replies.push(call('navigate', { url: `http://127.0.0.1:${port}/page.html` }), text('Not allowed.'));
+    const askThread = await newThread(panel, 'Go back to the first page.');
+    const askedText = await question();
+    const askedRow = await panel.eval(`(() => { const row = document.querySelector('#threads .thread-row[data-id="${askThread}"] .thread-meta'); return row ? row.textContent : null; })()`);
+    await panel.click('#asking button:not(.primary)');
+    const denied = await settled(panel, askThread, 120_000);
+    const deniedCard = await panel.eval(`(() => { const card = [...document.querySelectorAll('#history .tool')].find((c) => c.dataset.tool === 'navigate'); return card ? card.querySelector('pre.result')?.textContent ?? '' : null; })()`);
+    const pageAfterDeny = await page.eval('location.pathname');
+    await confirmTo('auto');
+    scripted.replies.push(call('press', { key: 'Tab' }), call('press', { key: 'Enter' }), text('Pressed.'));
+    const autoThread = await newThread(panel, 'Press Tab, then Enter.');
+    const autoAsked = await question();
+    await panel.click('#asking button.primary');
+    const allowed = await settled(panel, autoThread, 120_000);
+    const pressCards = await panel.eval(`[...document.querySelectorAll('#history .tool')].filter((c) => c.dataset.tool === 'press').map((c) => ({ failed: c.classList.contains('failed'), text: c.querySelector('pre.result')?.textContent ?? '' }))`);
+    await confirmTo('full');
+    check('Before acting: Ask asks before an action and No does nothing; Auto lets a plain key go and asks before Enter; Yes goes ahead', () => {
+      assert.match(askedText, /Go to http:\/\/127\.0\.0\.1:\d+\/page\.html/, askedText);
+      assert.equal(denied, 'idle', `state ${denied}`);
+      assert.match(deniedCard ?? '', /said no/, `the navigate card: ${deniedCard}`);
+      assert.equal(pageAfterDeny, '/second.html', 'the tab stayed where it was');
+      assert.match(autoAsked, /Press Enter/, autoAsked);
+      assert.equal(allowed, 'idle', `state ${allowed}`);
+      assert.equal(pressCards.length, 2, JSON.stringify(pressCards));
+      assert.ok(pressCards.every((card) => !card.failed), JSON.stringify(pressCards));
+      if (askedRow !== null) assert.match(askedRow, /Asks you/, askedRow);
+    });
+  }
+
   if (spindleHost?.sandbox) {
     // 7b. The thread's commands in the Spindle host's sandbox.
     step = 'host runner';
@@ -1187,7 +1741,7 @@ try {
     await panel.eval(`document.querySelector('#host-url').value = ''`);
     await panel.type('#host-url', spindleHost.url);
     await panel.type('#host-token', spindleHost.token);
-    await panel.click('#host-form button.primary');
+    await panel.click('#host-token-form button.primary');
     const hostSaid = await panel.until(`spindlePanel.engine.host?.connected || (spindlePanel.engine.host?.error && 'error: ' + spindlePanel.engine.host.error) || (!document.querySelector('#toast').hidden && document.querySelector('#toast').textContent.includes('not connect') && document.querySelector('#toast').textContent)`, { timeout: 30_000, what: 'the host to connect' });
     await panel.click('#settings-dialog [data-close]');
     await panel.click(`#threads .thread-row[data-id="${linuxThread}"]`);
@@ -1212,6 +1766,9 @@ try {
   } else {
     console.log(`skip a thread switched to the Spindle host (${spindleHost ? 'the host has no sandbox' : 'no SPINDLE_BIN'})`);
   }
+  // 9. Threads on the host: Connect, Run on my host, turns there, Bring back, moves cut.
+  if (spindleHost?.sandbox && options.scripted && process.env.SPINDLE_ONLY !== 'browser') panel = await hostedLeg(panel);
+  else console.log(`skip threads on the Spindle host (${process.env.SPINDLE_ONLY === 'browser' ? 'separate hosted suite requested' : !spindleHost ? 'no SPINDLE_BIN' : !spindleHost.sandbox ? 'the host has no sandbox' : 'a real provider'})`);
 
   step = 'restart engine';
   await panel.click('#home');
@@ -1268,8 +1825,10 @@ try {
   });
   await page.close().catch(() => {});
 } catch (error) {
-  results.push([`step ${step}`, false, error.stack ?? error.message]);
-  console.log(`FAIL step ${step}: ${error.stack ?? error.message}`);
+  if (error !== ONLY) {
+    results.push([`step ${step}`, false, error.stack ?? error.message]);
+    console.log(`FAIL step ${step}: ${error.stack ?? error.message}`);
+  }
 } finally {
   await browser?.close().catch(() => {});
   server.close();

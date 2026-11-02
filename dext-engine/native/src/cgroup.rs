@@ -258,7 +258,7 @@ fn enable_controllers(group: &Path) {
 }
 
 /// Physical memory in bytes, from /proc/meminfo.
-fn memory_total() -> Option<u64> {
+pub(crate) fn memory_total() -> Option<u64> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = info
         .lines()

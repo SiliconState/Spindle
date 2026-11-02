@@ -105,11 +105,16 @@ impl CodeHost for Bridge<'_> {
             }
             "http" => {
                 // Checked and frozen as native code mode does; the app sends it, with
-                // the most of its body the grant brings back.
+                // the most of its body the grant brings back and the headers it adds
+                // (named here; their values never reach the package).
                 let mut prepared = crate::code_http::prepare(self.http, input)?;
-                let grant = prepared["grant"].as_str().unwrap_or_default();
+                let grant = prepared["grant"].as_str().unwrap_or_default().to_string();
                 prepared["max_response_bytes"] =
-                    json!(crate::code_http::response_limit(self.http, grant));
+                    json!(crate::code_http::response_limit(self.http, &grant));
+                let added = crate::code_http::app_headers(self.http, &grant);
+                if !added.is_empty() {
+                    prepared["app_headers"] = json!(added);
+                }
                 Ok(prepared)
             }
             _ => {

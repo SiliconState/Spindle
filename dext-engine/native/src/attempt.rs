@@ -43,6 +43,18 @@ pub struct Rejection {
 /// Longest rejection body kept.
 pub const MAX_REJECTION_BODY: usize = 4096;
 
+/// Longest reason kept for a `Protocol` error.
+const MAX_FAILURE: usize = 600;
+
+/// A parse error as one bounded line (its causes joined).
+fn failure_text(error: &anyhow::Error) -> String {
+    let text = format!("{error:#}").replace(['\n', '\r'], " ");
+    match text.char_indices().nth(MAX_FAILURE) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text,
+    }
+}
+
 /// Stream frames that come before any output: the message/response opening, keepalives,
 /// and Chat Completions chunks whose delta carries nothing yet.
 fn preamble(frame: &SseFrame) -> bool {
@@ -210,6 +222,8 @@ pub struct WireAttempt {
     total: usize,
     generating: bool,
     rejection: Option<Rejection>,
+    /// Why the last `Protocol` error from `push` was raised (the parser's words).
+    failure: Option<String>,
 }
 
 impl WireAttempt {
@@ -230,6 +244,7 @@ impl WireAttempt {
             total: 0,
             generating: false,
             rejection: None,
+            failure: None,
         })
     }
 
@@ -245,11 +260,11 @@ impl WireAttempt {
             return Err(AttemptError::Exhausted);
         }
         let mut updates = Vec::new();
-        for frame in self
-            .decoder
-            .push(chunk)
-            .map_err(|_| AttemptError::Protocol)?
-        {
+        let frames = match self.decoder.push(chunk) {
+            Ok(frames) => frames,
+            Err(error) => return Err(self.protocol(&error)),
+        };
+        for frame in frames {
             match stream_refusal(&frame) {
                 Some(rejection) if !self.generating => {
                     let status = rejection.status;
@@ -259,13 +274,24 @@ impl WireAttempt {
                 None if !preamble(&frame) => self.generating = true,
                 _ => {}
             }
-            updates.extend(
-                self.parser
-                    .push_frame(frame)
-                    .map_err(|_| AttemptError::Protocol)?,
-            );
+            match self.parser.push_frame(frame) {
+                Ok(more) => updates.extend(more),
+                Err(error) => return Err(self.protocol(&error)),
+            }
         }
         Ok(updates)
+    }
+
+    /// A `Protocol` error, its reason kept for `take_failure`.
+    fn protocol(&mut self, error: &anyhow::Error) -> AttemptError {
+        self.failure = Some(failure_text(error));
+        AttemptError::Protocol
+    }
+
+    /// Why the last `Protocol` error from `push` was raised, taken once: the parser's
+    /// words (which event, what was wrong, or the error the provider streamed).
+    pub fn take_failure(&mut self) -> Option<String> {
+        self.failure.take()
     }
 
     /// The refusal behind the last `Http` error from `push`, taken once.
@@ -280,20 +306,35 @@ impl WireAttempt {
         waiting: &ModelWait<B>,
         observe: &dyn Fn(&StreamUpdate),
     ) -> Result<ModelWait<B>, AttemptError> {
+        self.finish_explained(waiting, observe)
+            .map_err(|(error, _)| error)
+    }
+
+    /// As `finish`, with why a `Protocol` error was raised (the parser's words).
+    pub fn finish_explained<B: AsRef<[u8]> + Clone>(
+        self,
+        waiting: &ModelWait<B>,
+        observe: &dyn Fn(&StreamUpdate),
+    ) -> Result<ModelWait<B>, (AttemptError, Option<String>)> {
+        let protocol = |error: anyhow::Error| (AttemptError::Protocol, Some(failure_text(&error)));
         let mut parser = self.parser;
-        for frame in self.decoder.finish().map_err(|_| AttemptError::Protocol)? {
-            for update in parser
-                .push_frame(frame)
-                .map_err(|_| AttemptError::Protocol)?
-            {
+        for frame in self.decoder.finish().map_err(protocol)? {
+            for update in parser.push_frame(frame).map_err(protocol)? {
                 observe(&update);
             }
         }
-        let response = parser.finish().map_err(|_| AttemptError::Protocol)?;
-        let bytes = response.checkpoint().map_err(|_| AttemptError::Exhausted)?;
+        let response = parser.finish().map_err(protocol)?;
+        let bytes = response
+            .checkpoint()
+            .map_err(|_| (AttemptError::Exhausted, None))?;
         waiting
             .record(waiting.request(), waiting.attempt(), &bytes)
-            .map_err(|_| AttemptError::Protocol)
+            .map_err(|_| {
+                (
+                    AttemptError::Protocol,
+                    Some("the response could not be recorded".into()),
+                )
+            })
     }
 }
 
@@ -407,6 +448,36 @@ mod tests {
         );
         assert_eq!(attempt.take_rejection().unwrap().status, 529);
         assert!(attempt.take_rejection().is_none(), "taken once");
+    }
+
+    #[test]
+    fn a_protocol_error_keeps_its_reason() {
+        let waiting = self::waiting("openai-chat-completions");
+        // Mid-reply: the provider's own error, after text began.
+        let mut attempt = WireAttempt::new(&waiting, false, false).unwrap();
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            "data: {\"error\":{\"code\":\"server_error\",\"message\":\"try\\nagain\"}}\n\n",
+        );
+        assert_eq!(
+            attempt.push(stream.as_bytes()).unwrap_err(),
+            AttemptError::Protocol
+        );
+        let reason = attempt.take_failure().unwrap();
+        assert!(
+            reason.contains("server_error") && reason.contains("try"),
+            "{reason}"
+        );
+        assert!(!reason.contains('\n'), "one line: {reason}");
+        assert!(attempt.take_failure().is_none(), "taken once");
+        // At the end: a stream that stops before it is complete.
+        let mut attempt = WireAttempt::new(&waiting, false, false).unwrap();
+        attempt
+            .push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n")
+            .unwrap();
+        let (error, reason) = attempt.finish_explained(&waiting, &|_| {}).unwrap_err();
+        assert_eq!(error, AttemptError::Protocol);
+        assert!(reason.unwrap().contains("unexpected EOF"));
     }
 
     #[test]

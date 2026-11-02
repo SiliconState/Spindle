@@ -294,7 +294,11 @@ fn answer(mut stream: TcpStream) {
             ),
             chunk(json!({}), json!("tool_calls")),
         ]
-    } else if last["role"] == "tool" || request.get("tools").is_none() {
+    } else if last["role"] == "tool"
+        || request.get("tools").is_none()
+        // A message saying SKIP (after a stop) is answered, never run.
+        || (last["role"] == "user" && last["content"].to_string().contains("SKIP"))
+    {
         vec![
             chunk(
                 json!({"role": "assistant", "content": "All done."}),
@@ -2038,7 +2042,7 @@ fn an_app_answer_whose_state_cannot_be_kept_is_answered_without_it() {
 
 #[test]
 #[cfg(unix)]
-fn a_state_step_waits_for_a_turn_cut_off_in_the_middle_of_a_step() {
+fn a_state_step_goes_between_the_steps_of_a_turn_stopped_in_a_command() {
     let port = fake_provider();
     let root = scratch("state-mid-step");
     let dir = root.join("work");
@@ -2056,18 +2060,12 @@ fn a_state_step_waits_for_a_turn_cut_off_in_the_middle_of_a_step() {
     std::thread::sleep(Duration::from_millis(300));
     api.ok("stop", json!({"dir": dir}));
     api.wait(sleeper);
-    // Stopped in the middle of the command: no step of its own goes there.
-    let refused = api.call("state_set", json!({"dir": dir, "patch": {"mode": "a"}}));
-    assert_eq!(refused["error"]["data"]["code"], "conflict", "{refused}");
-    assert!(
-        refused["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("middle of a step"),
-        "{refused}"
-    );
-    let resumed = api.call("continue", json!({"dir": dir}));
-    assert!(resumed.get("error").is_none(), "{resumed}");
+    // The stop recorded the command as stopped: the turn rests between its steps, where
+    // a state step goes, and a message would go on with it.
+    let status = api.ok("status", json!({"dir": dir}));
+    assert_eq!(status["phase"], "after_tools", "{status}");
+    assert_eq!(status["accepts_message"], true, "{status}");
+    assert_eq!(status["accepts_prompt"], false, "{status}");
     let set = api.send("state_set", json!({"dir": dir, "patch": {"mode": "a"}}));
     let reply = api.wait(set);
     assert!(reply["result"]["revision"].is_u64(), "{reply}");
@@ -2077,6 +2075,19 @@ fn a_state_step_waits_for_a_turn_cut_off_in_the_middle_of_a_step() {
         "{:?}",
         api.event_types(set)
     );
+    // A message goes on with the stopped turn: read after the stopped command, which
+    // never runs again.
+    let said = api.send("prompt", json!({"dir": dir, "text": "SKIP that one"}));
+    let reply = api.wait(said);
+    assert!(reply.get("error").is_none(), "{reply}");
+    let types = api.event_types(said);
+    assert!(types.iter().any(|t| t == "steered"), "{types:?}");
+    assert!(
+        !types.iter().any(|t| t == "tool_call"),
+        "nothing runs again: {types:?}"
+    );
+    let status = api.ok("status", json!({"dir": dir}));
+    assert_eq!(status["complete"], true, "{status}");
 }
 
 #[test]

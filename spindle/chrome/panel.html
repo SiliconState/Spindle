@@ -88,6 +88,7 @@
       <span class="grow"></span>
       <button id="model-chip" type="button" aria-haspopup="dialog"><span id="model-words"></span></button>
     </div>
+    <div id="asking" hidden></div>
     <div id="carry" class="box-line" hidden><span id="carry-text"></span><button id="carry-drop" type="button" class="line-icon" aria-label="Start without those files" title="Start without those files"></button></div>
     <div id="queued" class="box-line" hidden><span id="queued-text"></span><button id="queued-back" type="button" class="link-like" title="Put it back in the box, to change or send it">Take back</button></div>
     <div id="attached" hidden></div>
@@ -185,13 +186,16 @@
       <summary><span class="fold-title">Pages</span><span class="fold-state" id="pages-summary"></span></summary>
       <div class="fold-body padded">
         <div class="switch-row">
-          <div><strong id="page-reading-label">Read pages</strong><small>Tabs, page text, parts and HTML</small></div>
+          <div><strong id="page-reading-label">Read pages</strong><small>Tabs, page text, parts and HTML; what a thread reads goes to its model provider</small></div>
           <button id="page-reading" type="button" role="switch" class="switch" aria-labelledby="page-reading-label"></button>
         </div>
         <div class="switch-row">
           <div><strong id="page-actions-label">Act on pages</strong><small title="Go to addresses, click, type, choose, press keys, scroll, wait, picture pages, close tabs and watch a tab's network. Chrome shows that Spindle is debugging a tab while it acts on it; closing that bar stops it there.">Open, click, type, scroll, picture, network</small></div>
           <button id="page-actions" type="button" role="switch" class="switch" aria-labelledby="page-actions-label"></button>
         </div>
+        <div class="field act-confirm-field"><span class="field-label" id="act-confirm-heading">Before acting</span>
+          <div id="act-confirm" class="seg seg-3" role="radiogroup" aria-labelledby="act-confirm-heading"><button type="button" role="radio" data-value="full" aria-checked="true">Full</button><button type="button" role="radio" data-value="auto" aria-checked="false">Auto</button><button type="button" role="radio" data-value="ask" aria-checked="false">Ask</button></div>
+          <p class="field-note" id="act-confirm-note"></p></div>
         <p class="warn-note" role="note"><span class="warn-icon" data-icon="warning"></span><span>Acting threads are signed in as you, and a page's text can try to steer them.</span></p>
         <div id="site-rules" hidden></div>
         <p class="note" id="site-access"></p>
@@ -231,6 +235,14 @@
           <div class="field"><span class="field-label" id="site-access-heading">Scripts may</span>
             <div id="site-access-kind" class="seg seg-2" role="radiogroup" aria-labelledby="site-access-heading"><button type="button" role="radio" data-value="read" aria-checked="true" title="GET">Read it</button><button type="button" role="radio" data-value="write" aria-checked="false" title="GET, POST, PUT, PATCH, DELETE">Read and change it</button></div>
             <p class="field-note" id="site-access-note">GET requests only.</p></div>
+          <div class="field site-secret-field"><span class="field-label">Secret header (optional)</span>
+            <div class="pair">
+              <label>Header<input id="site-header" placeholder="Authorization" spellcheck="false" autocomplete="off"></label>
+              <label>Value<input id="site-secret" type="password" placeholder="Bearer …" spellcheck="false" autocomplete="off"></label>
+            </div>
+            <p class="field-note">Sealed with your keys, and sent only over HTTPS (or to this computer). Spindle adds it to
+            each request scripts make here and takes it out of what comes back, so scripts never see it. Adding a listed
+            address again updates it.</p></div>
           <div class="confirm-actions"><button class="primary">Add site</button></div>
         </form>
       </div>
@@ -238,12 +250,20 @@
     <details class="fold" data-fold="host">
       <summary><span class="fold-title">Your Spindle host</span><span class="fold-state" id="host-summary"></span></summary>
       <div class="fold-body padded">
-        <p class="fold-note tight">Connected, a thread can run its commands in your host's sandbox instead (choose Host in the
-        thread's model page). Make a token on the host: <code>spindle --dir HOST token new chrome --runner</code> (it runs commands and reaches nothing else there).</p>
+        <p class="fold-note tight">Connected, a thread can run on your host (Run on my host, in the thread's menu): your
+        host's model, programs and sandbox run it, and this panel still shows and drives it. A thread here can also run
+        only its commands in your host's sandbox (choose Host in the thread's model page).</p>
         <form id="host-form" autocomplete="off">
           <label>Address<input id="host-url" placeholder="http://localhost:8790" spellcheck="false"></label>
-          <label>Runner token<input id="host-token" type="password" autocomplete="off" spellcheck="false"></label>
-          <div class="confirm-actions"><button id="host-disconnect" type="button" class="danger">Disconnect</button><button class="primary">Connect</button></div>
+          <p class="field-note">Connect opens your host's own page in a tab: approve this browser there (it asks for your
+          host's pairing key first if that tab is not paired yet).</p>
+          <div class="confirm-actions"><button id="host-disconnect" type="button" class="danger">Disconnect</button><button id="host-connect" class="primary">Connect</button></div>
+        </form>
+        <form id="host-token-form" autocomplete="off">
+          <label>Or paste a token<input id="host-token" type="password" autocomplete="off" spellcheck="false"></label>
+          <p class="field-note">Made on the host: <code>spindle --dir HOST token new NAME --browser</code> (threads and
+          commands) or <code>--runner</code> (commands only, and nothing else there).</p>
+          <div class="confirm-actions"><button class="primary">Use the token</button></div>
         </form>
         <p id="host-state" class="note"></p>
       </div>
@@ -264,7 +284,7 @@
       <div class="fold-body padded">
         <p class="field-label" id="theme-heading">Theme</p>
         <div id="theme-choice" class="seg" role="group" aria-labelledby="theme-heading">
-          <button type="button" data-mode="paper">Paper</button><button type="button" data-mode="light">Light</button><button type="button" data-mode="dark">Dark</button><button type="button" data-mode="system">System</button>
+          <button type="button" data-mode="paper">Paper</button><button type="button" data-mode="light">Light</button><button type="button" data-mode="dim">Dim</button><button type="button" data-mode="system">System</button>
         </div>
         <p class="field-label" id="texture-heading">Background</p>
         <div id="texture-choice" class="seg seg-2" role="group" aria-labelledby="texture-heading">
@@ -301,8 +321,20 @@
     <button id="menu-fresh" type="button"><span data-icon="plus"></span><span>New thread with these files<small>its workspace, without the conversation</small></span></button>
     <button id="menu-export" type="button"><span data-icon="download"></span><span>Move to a file<small>.spindle; continue it with spindle import-session</small></span></button>
     <button id="menu-copy" type="button"><span data-icon="copy"></span><span>Export a copy<small>.spindle; this thread stays here</small></span></button>
+    <button id="menu-host" type="button" hidden><span data-icon="monitor"></span><span>Run on my host<small>your Spindle host runs it; this panel still drives it</small></span></button>
+    <button id="menu-back" type="button" hidden><span data-icon="browser"></span><span>Bring back to this browser<small>it runs here again, its history and files with it</small></span></button>
   </nav>
   <button id="menu-delete" type="button" class="danger-line"><span data-icon="trash"></span>Delete this thread</button>
+</dialog>
+
+<dialog id="host-dialog" aria-labelledby="host-dialog-title">
+  <form method="dialog">
+    <p class="eyebrow">Your Spindle host</p>
+    <h2 id="host-dialog-title">Run this thread on your host?</h2>
+    <p id="host-dialog-text"></p>
+    <label id="host-model-field" hidden>Your host's model<select id="host-model"></select></label>
+    <div class="confirm-actions"><button value="" type="submit">Cancel</button><button id="host-dialog-yes" value="yes" class="primary" type="submit">Move it</button></div>
+  </form>
 </dialog>
 
 <dialog id="confirm-dialog">

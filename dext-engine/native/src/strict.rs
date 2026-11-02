@@ -1437,6 +1437,16 @@ impl StrictExecutor {
             {
                 return Err(failure(error.kind(), error.to_string(), &stdout, &stderr));
             }
+            // A stop ends the run like its own bounds do: the candidate is discarded, and
+            // what it printed until then goes with the failure, so a host can record it.
+            Err(_) if interrupt.load(Ordering::SeqCst) => {
+                return Err(failure(
+                    std::io::ErrorKind::Interrupted,
+                    "the run was stopped before it finished".into(),
+                    &stdout,
+                    &stderr,
+                ));
+            }
             Err(error) => return Err(error),
         };
         if stdout.len() > MAX_OUTPUT || stderr.len() > MAX_OUTPUT {
@@ -2853,18 +2863,30 @@ fn cpu_allowance(timeout: Duration) -> u64 {
         .saturating_add(10)
 }
 
+/// Private writable memory one process of a run may map (RLIMIT_DATA). The kernel counts
+/// what a process maps, not what it touches, and allocators map per thread (glibc's arena
+/// heaps, every thread's stack): Blender rendering with Cycles on 24 cores maps 4.2 GiB and
+/// touches 430 MB, so a fixed 4 GiB made it fail with as many threads as cores. The cap is
+/// a backstop against one runaway process: three quarters of physical memory, as Windows
+/// jobs and the runs cgroup have it, and never below the old fixed caps.
+#[cfg(unix)]
+fn data_limit(toolchain: bool) -> u64 {
+    let floor: u64 = if toolchain { 16 << 30 } else { 4 << 30 };
+    #[cfg(target_os = "linux")]
+    let physical = crate::cgroup::memory_total();
+    #[cfg(not(target_os = "linux"))]
+    let physical: Option<u64> = None;
+    physical.map_or(floor, |total| (total / 4 * 3).max(floor))
+}
+
 #[cfg(unix)]
 impl ProcessLimits {
     fn for_run(toolchain: bool, timeout: Duration, pids_capped: bool) -> Self {
-        let (file_size, data) = if toolchain {
-            (4 << 30, 16 << 30)
-        } else {
-            (SANDBOX_TMP, 4 << 30)
-        };
+        let file_size = if toolchain { 4 << 30 } else { SANDBOX_TMP };
         Self {
             file_size,
             address_space: 256 << 30,
-            data,
+            data: data_limit(toolchain),
             cpu_seconds: cpu_allowance(timeout),
             processes: (!pids_capped).then(|| user_tasks().saturating_add(run_tasks(toolchain))),
         }
@@ -4223,9 +4245,16 @@ mod tests {
     fn runtimes_keep_their_address_space_while_committed_memory_stays_bounded() {
         let toolchain = ProcessLimits::for_run(true, Duration::from_secs(600), false);
         assert!(toolchain.address_space >= 48 << 30);
-        assert_eq!(toolchain.data, 16 << 30);
+        assert!(toolchain.data >= 16 << 30);
         let plain = ProcessLimits::for_run(false, Duration::from_secs(30), true);
-        assert_eq!((plain.address_space, plain.data), (256 << 30, 4 << 30));
+        assert_eq!(plain.address_space, 256 << 30);
+        // Mapped, not touched, memory is what RLIMIT_DATA counts: the machine's share.
+        assert!(plain.data >= 4 << 30);
+        #[cfg(target_os = "linux")]
+        if let Some(total) = crate::cgroup::memory_total() {
+            assert_eq!(plain.data, (total / 4 * 3).max(4 << 30));
+            assert_eq!(toolchain.data, (total / 4 * 3).max(16 << 30));
+        }
         assert_eq!(plain.file_size, SANDBOX_TMP);
         assert!(plain.cpu_seconds >= 30 && plain.processes.is_none());
         let long = ProcessLimits::for_run(false, Duration::from_secs(MAX_RUN_SECS), false);

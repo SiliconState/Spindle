@@ -46,6 +46,8 @@ const jwt = (claims) => `${b64url('{"alg":"none"}')}.${b64url(JSON.stringify(cla
 const ACCOUNT = `acct-${randomBytes(4).toString('hex')}`;
 const EMAIL = 'tester@example.com';
 const apiKey = `sk-vault-${randomBytes(12).toString('hex')}`;
+/** A site's secret (its Authorization header's token). */
+const siteToken = `sk-site-${randomBytes(12).toString('hex')}`;
 const legacyKey = `sk-legacy-${randomBytes(12).toString('hex')}`;
 
 // A free port where nothing listens: the sign-in's registered loopback redirect.
@@ -197,6 +199,7 @@ const rawKeys = () => panel.eval(`new Promise((done) => {
 })`);
 const unfoldProviders = () => panel.eval(`document.querySelector('[data-fold="providers"]').open = true; document.querySelector('[data-fold="vault"]').open = true`);
 const row = (id) => `.provider[data-provider="${id}"]`;
+const unfoldSites = () => panel.eval(`for (const name of ['commands', 'sites']) { const fold = document.querySelector('[data-fold="' + name + '"]'); if (fold) fold.open = true; }`);
 async function choose(provider) {
   // From the thread list: the chip there sets new threads' model.
   await panel.click('#home');
@@ -300,6 +303,26 @@ try {
     assert.equal(seen.chat.at(-1).authorization, `Bearer ${apiKey}`);
   });
 
+  // 3b. A site's secret header is sealed like a key, and listed by its site, not as a
+  //     provider's.
+  await panel.click('#settings');
+  await unfoldSites();
+  await panel.type('#site-url', `${origin}/api/`);
+  await panel.type('#site-secret', `Bearer ${siteToken}`);
+  await panel.click('#site-form button.primary');
+  const siteName = await panel.until(`(spindlePanel.engine.sites?.[0]?.secret?.length && (spindlePanel.engine.vault.sites ?? []).length && spindlePanel.engine.sites[0].name) || null`, { what: 'the site and its secret' });
+  const siteRecords = await rawKeys();
+  const siteVault = await vaultState();
+  const siteKept = await panel.eval('spindlePanel.engine.sites[0]');
+  await panel.eval(`document.querySelector('#settings-dialog').close()`);
+  check("a site's secret header is sealed like a key, and listed by its site", () => {
+    const record = siteRecords.find((kept) => kept.name === `:site:${siteName}`);
+    assert.ok(record?.sealed && record.text === null && record.kind === 'site', JSON.stringify(siteRecords));
+    assert.deepEqual(siteVault.sites, [siteName]);
+    assert.ok(!(`:site:${siteName}` in siteVault.kinds), 'not a provider');
+    assert.deepEqual(siteKept.secret, ['Authorization'], 'the header Settings names when none is typed');
+  });
+
   // 4. A passphrase.
   await panel.click('#settings');
   await unfoldProviders();
@@ -320,6 +343,18 @@ try {
     assert.match(lockedNote, /unlock/i);
     assert.equal(seen.chat.length, chatBefore);
     for (const record of lockedRecords) assert.ok(record.sealed, JSON.stringify(record));
+  });
+  // Locked, no secret header can be kept: the site is not added either.
+  await unfoldSites();
+  await panel.type('#site-url', `${origin}/other/`);
+  await panel.type('#site-secret', `Bearer ${siteToken}-other`);
+  await panel.click('#site-form button.primary');
+  const lockedSite = await panel.until(`(() => { const t = document.querySelector('#toast')?.textContent ?? ''; return t.includes('locked') ? t : null; })()`, { what: 'the refusal' });
+  const lockedSites = await panel.eval('spindlePanel.engine.sites.length');
+  await panel.eval(`for (const id of ['site-url', 'site-header', 'site-secret']) document.getElementById(id).value = ''`);
+  check('while the keys are locked, no secret header is kept (nor its site)', () => {
+    assert.match(lockedSite, /locked/);
+    assert.equal(lockedSites, 1);
   });
   await unfoldProviders();
   await panel.type('#vault input[aria-label="Passphrase"]', 'not the passphrase');
@@ -359,12 +394,14 @@ try {
   await panel.type('#vault input[aria-label="Current passphrase"]', 'a different passphrase');
   await panel.click('#vault [data-vault="remove"]');
   await panel.until(`spindlePanel.engine.vault.mode === 'device' || null`, { timeout: 60_000, what: 'the passphrase removed' });
+  const resealed = await rawKeys();
   await panel.eval(`document.querySelector('#settings-dialog').close()`);
   const deviceTurn = await newThreadSays('Back to the device key.');
   check('a restarted engine is locked; the passphrase changes and comes off; keys still read', () => {
     assert.ok(unlockedOverflow <= 0, `the dialog scrolls ${unlockedOverflow}px sideways`);
     assert.ok(deviceTurn.answer.includes('Key works.'), deviceTurn.answer);
     assert.equal(seen.chat.at(-1).authorization, `Bearer ${apiKey}`);
+    assert.ok(resealed.some((kept) => kept.name === `:site:${siteName}` && kept.sealed), `the site's secret stays: ${JSON.stringify(resealed)}`);
   });
 
   // 5. A sign-in whose refresh fails: while its token is still good, a token endpoint that
@@ -408,9 +445,12 @@ try {
   await panel.until(`spindlePanel.engine.vault.mode === 'device' && !spindlePanel.engine.vault.locked || null`, { timeout: 60_000, what: 'the reset' });
   const afterReset = await rawKeys();
   const threadsAfter = await panel.eval('spindlePanel.threads.size');
-  check('a forgotten passphrase deletes the saved keys (after asking); threads stay', () => {
+  await unfoldSites();
+  const goneMark = await panel.until(`document.querySelector('#sites .site-secret.lost')?.textContent || null`, { what: "the site's secret marked gone" });
+  check('a forgotten passphrase deletes the saved keys and secret headers (after asking); threads stay', () => {
     assert.deepEqual(afterReset, []);
     assert.equal(threadsAfter, threadsBefore);
+    assert.match(goneMark, /Authorization header gone/);
   });
 } finally {
   await browser.close().catch(() => {});
@@ -418,7 +458,7 @@ try {
 }
 
 // Nothing in the profile's files holds a secret as text (Chrome has closed them).
-const secrets = [apiKey, legacyKey, 'refresh-1', 'refresh-2'];
+const secrets = [apiKey, legacyKey, 'refresh-1', 'refresh-2', siteToken];
 const leaks = [];
 const walk = (dir) => {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {

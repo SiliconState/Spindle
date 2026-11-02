@@ -1,8 +1,10 @@
-// Secrets at rest: providers' API keys and browser sign-ins, and the token of the user's
-// Spindle host (its URL stays readable in kv/host). Each record in the 'keys'
-// store is sealed with AES-GCM (256-bit) under the vault key, its provider bound in as
-// additional data, so no secret is plain text on disk and no record can be moved to
-// another provider. The vault key is one of two kinds:
+// Secrets at rest: providers' API keys and browser sign-ins, the token of the user's
+// Spindle host (its URL stays readable in kv/host) and the secret headers of sites
+// scripts may call (their addresses stay readable in kv/sites, the headers' names in
+// kv/site-secrets). Each record in the 'keys' store is sealed with AES-GCM (256-bit)
+// under the vault key, its provider (or site) bound in as additional data, so no secret
+// is plain text on disk and no record can be moved to another provider. The vault key
+// is one of two kinds:
 //
 //   device      a non-extractable key in this extension's IndexedDB. Nothing to type;
 //               secrets are never written as text. Whoever copies the whole Chrome
@@ -22,6 +24,9 @@ const ROUNDS = 600_000;
 /** The record of the user's Spindle host's token: not a provider's (no provider ID has a
  * colon), so no provider's secret takes its place and the panel lists it apart. */
 const HOST = ':host';
+/** The records of sites' secret headers, by site name (`:site:NAME`): no provider's
+ * either. */
+const SITE = ':site:';
 const MIN_PASSPHRASE = 8;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -117,15 +122,20 @@ async function resealed(from, to) {
  * refresh in progress never holds it up. */
 export async function state() {
   const kept = await read('kv', 'vault');
-  if (!kept) return { mode: 'device', locked: false, kinds: {}, accounts: {}, ended: {} };
+  if (!kept) return { mode: 'device', locked: false, kinds: {}, accounts: {}, ended: {}, sites: [] };
   const key = current ?? (kept.mode === 'device' ? kept.key : null);
   const kinds = {};
   const accounts = {};
   const ended = {};
   let host = false;
+  const sites = [];
   for (const [provider, record] of await entriesOf('keys')) {
     if (provider === HOST) {
       host = true;
+      continue;
+    }
+    if (provider.startsWith(SITE)) {
+      sites.push(provider.slice(SITE.length));
       continue;
     }
     kinds[provider] = typeof record === 'string' ? 'key' : record?.kind ?? 'key';
@@ -135,7 +145,7 @@ export async function state() {
       if (held.ended) ended[provider] = true;
     }
   }
-  return { mode: kept.mode, locked: !key, kinds, accounts, ended, host };
+  return { mode: kept.mode, locked: !key, kinds, accounts, ended, host, sites };
 }
 
 /** Refreshes in progress, by provider: one at a time each, outside the queue. */
@@ -196,6 +206,24 @@ export function keepHost(token, also = []) {
 
 export function forgetHost(also = []) {
   return exclusive(() => writeTogether([['keys', HOST, undefined], ...also]));
+}
+
+/** The secret headers kept for site `name` (`{kind: 'site', url, headers}`: the address
+ * they were saved for, and each header's value), or undefined (`locked` thrown while a
+ * passphrase vault is). */
+export function siteSecret(name) {
+  return secret(`${SITE}${name}`);
+}
+
+/** Keeps site `name`'s secret headers (`{url, headers}`) sealed, `also` (writeTogether
+ * changes) in the same transaction. */
+export function keepSite(name, held, also = []) {
+  const id = `${SITE}${name}`;
+  return exclusive(async () => writeTogether([['keys', id, await seal(await usable(), id, { kind: 'site', ...held })], ...also]));
+}
+
+export function forgetSite(name, also = []) {
+  return exclusive(() => writeTogether([['keys', `${SITE}${name}`, undefined], ...also]));
 }
 
 /** Seals keys saved before records were sealed (an update from such a build). */

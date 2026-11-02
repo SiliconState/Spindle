@@ -914,7 +914,10 @@ directory's portable files, so a session can move where no directory is shared.
 | Checksum | SHA-256 of everything before it |
 
 - **Paths**: `(tasks/<20 hex>/)*` (at most 16 levels) followed by `store/authority.sqlite`,
-  `session.json`, or, inside a task, `task.json`. At most 4096 files. Nothing else is
+  `session.json`, `pack-session-id` (a native host's session pack id, so a pack keeps
+  its session across moves), or, inside a task, `task.json`. At most 4096 files. A
+  bundle without `pack-session-id` imports as before; a build older than this one
+  refuses a bundle that carries it. Nothing else is
   carried: no WAL files, no `cache/`, no separate usage sidecar; the ledger in store
   metadata travels with it.
 - **Checks on write and read**: every path valid and unique; every store passes
@@ -933,8 +936,9 @@ directory's portable files, so a session can move where no directory is shared.
 
 `spindle export-session FILE` (`Session::export_session`) opens every task's store (so no
 other owner runs it meanwhile), refuses while a background task is running, images every
-store, and writes the bundle (`0600`, synced). Unless `--keep` is given, the session then
-**moves**: `Store::seal_moved` rewrites this copy's fence to
+store, and writes the bundle (`0600`, synced), then reads it back and checks it. Unless
+`--keep` is given, the session then **moves** only once the disk holds exactly the bundle
+that was checked: `Store::seal_moved` rewrites this copy's fence to
 `spindle-moved: exported at head N to PATH` and leaves it in place when the store closes, and
 the handle refuses further work. Task copies are sealed too. If this copy cannot be sealed,
 the bundle is removed and nothing moves. With `--keep`, both copies remain usable and only one

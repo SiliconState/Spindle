@@ -396,7 +396,10 @@ export function wantsV86(result) {
   if (result.code === 127 && /(^|\n)(sh: )?[^\n]*: (not found|applet not found)\s*(\n|$)/.test(output)) return true;
   // How busybox's sh and its applets (env, timeout, xargs…) say a program is not there.
   if (result.code === 127 && /can't execute '[^'\n]+': No such file or directory|(^|\n)xargs: [^:\n]+: No such file or directory/.test(output)) return true;
+  // A program it may not run: a file a command saved (its workspace and scratch are data
+  // only here) or one built for another machine.
   if (result.code === 126 && /(^|\n)(sh: )?[^\n]*: (Permission denied|Exec format error)\s*(\n|$)/.test(output)) return true;
+  if (result.code === 126 && /can't execute '[^'\n]+': (Permission denied|Exec format error)/.test(output)) return true;
   if (/(^|\n)sh: [^\n]*syntax error/.test(output)) return true;
   // A busybox program refusing an option GNU's takes (grep -P, find -printf, date -d):
   // v86 has GNU coreutils, grep, sed and findutils.
@@ -404,7 +407,8 @@ export function wantsV86(result) {
   // GNU date reads dates busybox's does not (`yesterday`, `next friday`).
   if (/(^|\n)date: invalid date /.test(output)) return true;
   // Python: a module the wasm Linux's Python lacks (v86's may have it: pip installs
-  // there), or a program its subprocess found nowhere.
+  // there), or a program its subprocess found nowhere or may not run (a saved one).
   if (/(^|\n)ModuleNotFoundError: No module named /.test(output)) return true;
-  return /subprocess\.py", line \d+/.test(output) && /(^|\n)FileNotFoundError: \[Errno 2\] No such file or directory: /.test(output);
+  return /subprocess\.py", line \d+/.test(output)
+    && /(^|\n)(FileNotFoundError: \[Errno 2\] No such file or directory|PermissionError: \[Errno 13\] Permission denied): /.test(output);
 }

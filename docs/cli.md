@@ -183,7 +183,11 @@ Sends the next prompt to the session in `DIR`. It accepts the same options as `n
 except `--import`, plus `--no-network` and `--no-toolchain`. Settings change only
 between turns: `say` works only when the last turn finished. If it stopped early,
 rewind to a target first; if it is still in progress, run `continue`. The new settings
-are saved before the prompt runs.
+are saved before the prompt runs. One exception: a turn that a Stop cut off part way (the
+web UI's, or the API's `stop`) takes a message with no setting changes and no
+attachments, and goes on with it; the model reads that the step was stopped, then the
+message. A command the Stop ended is recorded as stopped, with its output, and never runs
+again.
 
 - Without `--provider`, the saved settings are kept and only the options given change.
   `--model M` alone switches the model on the current provider.
@@ -313,7 +317,7 @@ uses it to prove that a candidate can start a host. Everything about the host is
 ### `token`
 
 ```text
-spindle --dir HOST token new NAME [--runner] | list | revoke NAME
+spindle --dir HOST token new NAME [--runner | --browser] | list | revoke NAME
 ```
 
 Named bearer tokens for the host's `/v1` HTTP API ([API.md](API.md)). `HOST` is the host
@@ -321,13 +325,13 @@ directory and the commands work while the host runs.
 
 | Subcommand | Effect |
 | --- | --- |
-| `new NAME [--runner]` | Creates a token and prints it once on standard output (a note goes to standard error). `NAME` is 1–40 letters, digits, `-`, `_` or `.`, not starting with `-`; at most 16 tokens exist at once. `--runner` must follow the name. If `HOST` has no host yet, it is created as `serve` would create it. |
-| `list` | Each token's name, creation and last-use time; restricted tokens are marked `(runner)`. |
+| `new NAME [--runner \| --browser]` | Creates a token and prints it once on standard output (a note goes to standard error). `NAME` is 1–40 letters, digits, `-`, `_` or `.`, not starting with `-` (a browser token's name is 1–64 characters, no control characters, no white space at either end); at most 16 tokens exist at once. The option must follow the name. If `HOST` has no host yet, it is created as `serve` would create it. |
+| `list` | Each token's name, creation and last-use time; restricted tokens are marked `(runner)` or `(browser)`. |
 | `revoke NAME` | Deletes the token. |
 
 Only the token's SHA-256 is stored. Tokens are listed beside paired browsers in the
 host's Settings and can be revoked there too; new pairings never evict them. A name
-can hold only one token, of either kind.
+can hold only one token, of any kind.
 
 `--runner` grants only `GET /v1`, `/v1/runner`, `/v1/run` and a named run's status
 and stop routes. Other API routes return `403 forbidden`; putting it in a cookie
@@ -335,6 +339,12 @@ does not grant the phone UI's `/api` access. Use it for an embedded app's remote
 command runner, not a full host token. Remote runs may carry a `run` id, with
 `GET /v1/run/ID` and `POST /v1/run/ID/stop`; see [API.md](API.md#routes) and the
 implementation in [`serve/v1.rs`](../spindle/store/src/serve/v1.rs).
+
+`--browser` makes the token an app such as Spindle for Browser gets by one-click
+connect ([host.md](host.md#pairing-and-device-tokens)): the runner's routes, the host's
+models and providers, and the threads it brings (`POST /v1/threads`) and their
+commands, nothing else. Minting a browser token under a name that already has one
+replaces it at once (the old one stops working) and keeps that name's threads.
 
 ## JSON-RPC over stdio
 

@@ -80,7 +80,15 @@ error rather than having the option silently dropped.
 
 | stdio `info.features` | HTTP `GET /v1` `features` |
 | --- | --- |
-| `events`, `expected_head`, `steering`, `attachments`, `import`, `revisions`, `export`, `doctor`, `usage`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `session_transfer`, `capabilities` | `commands`, `receipts`, `expected_head`, `events`, `steering`, `attachments`, `revisions`, `archive`, `targets`, `providers`, `bearer_tokens`, `usage`, `preview`, `preview_github`, `models`, `self_edit`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `runner`, `run_stop`, `runner_tokens`, `preview_scripts`, `preview_contained` |
+| `events`, `expected_head`, `steering`, `attachments`, `import`, `revisions`, `export`, `doctor`, `usage`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `session_transfer`, `capabilities` | `commands`, `receipts`, `expected_head`, `events`, `steering`, `attachments`, `revisions`, `archive`, `targets`, `providers`, `bearer_tokens`, `usage`, `preview`, `preview_github`, `models`, `self_edit`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `runner`, `run_stop`, `targeted_stop`, `runner_tokens`, `threads`, `connect`, `preview_scripts`, `preview_contained` |
+
+Some HTTP features name a group of additions: `runner` is `/v1/runner` and `/v1/run`;
+`run_stop` is a named run's status and stop routes; `runner_tokens` is
+`token new NAME --runner`; `targeted_stop` is `target_request` on the `stop` command and
+`running_request` on the session object; `threads` is `POST /v1/threads`, the export
+route, the `moved` state and browser tokens
+([Bringing threads to the host](#bringing-threads-to-the-host)); `connect` is
+[one-click connect](#one-click-connect).
 
 ### Session addressing
 
@@ -93,7 +101,8 @@ error rather than having the option silently dropped.
   and `task_wait`, or `dir` in `tasks`).
 - **HTTP** names a session by its id (1 to 80 letters, digits, `-` or `_`), assigned
   by the host when a `new` command is admitted and returned as the receipt's
-  `session`. Session directories stay private to the host.
+  `session`, or when a thread is brought in with `POST /v1/threads`. Session
+  directories stay private to the host.
 
 ### Revisions and `expected_head`
 
@@ -110,23 +119,49 @@ operation.
 
 ### HTTP authentication
 
-Every `/v1` route, including `GET /v1`, needs a credential:
+Every `/v1` route, including `GET /v1`, needs a credential, except
+`POST /v1/connect/token`, where a one-time code stands in for one (see
+[One-click connect](#one-click-connect)):
 
 - `Authorization: Bearer TOKEN`, where `TOKEN` is a paired device's token or a named
-  API token minted with `spindle --dir HOST token new NAME` (also `token list` and
-  `token revoke NAME`; at most 16 named tokens). The host's pairing key is never
-  accepted as a token. `token new NAME --runner` mints a restricted token: only
-  `GET /v1`, `/v1/runner`, `/v1/run` and a named run's status and stop routes are
-  reachable. Other `/v1` routes and the phone UI's `/api` refuse it with `403
-  forbidden`, even as a cookie. Token names are 1–40 letters, digits, `-`, `_` or
-  `.`, and cannot start with `-`; `token list` marks restricted tokens `(runner)`.
+  token minted with `spindle --dir HOST token new NAME [--runner | --browser]` (also
+  `token list` and `token revoke NAME`). The host's pairing key is never accepted as a
+  token.
 - Or a paired browser's cookie. A cookie-authenticated `POST` must also carry an
   `Origin` header equal to the host's origin and `X-Spindle: 1`; otherwise it is
   refused with `403 forbidden`. Bearer requests need neither.
 
-A revoked device or token also loses its open event streams (checked at each
-heartbeat). Pairing, token storage and public-origin checks are described in
-[host.md](host.md).
+| Kind | Made by | `token list` shows | Reaches |
+| --- | --- | --- | --- |
+| API token | `token new NAME` | `NAME` | All of `/v1`. |
+| Runner token | `token new NAME --runner` (feature `runner_tokens`) | `NAME (runner)` | `GET /v1`, `GET /v1/runner`, `POST /v1/run`, and a named run's status and stop routes. |
+| Browser token | [one-click connect](#one-click-connect), or `token new NAME --browser` (feature `threads`) | `NAME (browser)` | What a runner token reaches, `GET /v1/models`, `GET /v1/providers`, `GET /v1/sessions`, `POST /v1/threads`, and the sessions it brought: their routes, commands and receipts. |
+| Device token | pairing a browser with the host (see [host.md](host.md)) | not listed | All of `/v1`, and the phone UI's `/api`. |
+
+A runner or browser token is refused with `403 forbidden` on any other route, and as a
+cookie it opens no screen: `/api` refuses it with `403` too. For a browser token, a
+session it did not bring answers `404 not_found`, as if it were absent;
+`GET /v1/sessions` lists only its own; `GET /v1/receipts/:request_id` tells only its own
+sessions' receipts; and a `new` command is `403 forbidden` (a browser token brings
+threads, it starts none). A paired screen sees every session, those a browser token
+brought included.
+
+Token names: an API or runner token's is 1 to 40 letters, digits, `-`, `_` or `.`, not
+starting with `-`. A browser token's is the client's own name: 1 to 64 characters, none
+of them a control character, with no white space at either end (on the command line it
+also may not start with `-`). A name is one token of any kind: minting an API or runner
+token under a name that is taken is refused, and `token revoke NAME` revokes the token
+of that name, whatever its kind. At most 16 named tokens exist, of all three kinds
+together.
+
+Minting a browser token under its name again (by a connect, or by the command)
+replaces it in one transaction: the old token stops working at once, and the sessions
+it brought stay with the name. Minting a browser token is refused while a token of
+another kind has its name.
+
+A revoked device or token, or a browser token replaced under its name, also loses its
+open event streams (checked at each heartbeat, every 10 seconds). Pairing, token
+storage and public-origin checks are described in [host.md](host.md).
 
 ## The stdio protocol
 
@@ -250,8 +285,8 @@ equivalent route or command kind (see [HTTP API](#http-api)).
 | [`settings`](#settings) | read or write | existing (idle to change) | command `settings`; read in `GET /v1/sessions/:id` |
 | [`doctor`](#doctor) | maintenance | idle | none |
 | [`export`](#export) | maintenance | idle | `GET /v1/sessions/:id/archive` (as a tar) |
-| [`export_session`](#export_session) | maintenance | idle | none |
-| [`import_session`](#import_session) | lifecycle | absent | none |
+| [`export_session`](#export_session) | maintenance | idle | `POST /v1/sessions/:id/export` (the bundle is the response body) |
+| [`import_session`](#import_session) | lifecycle | absent | `POST /v1/threads` (the bundle is the request body) |
 | [`task_wait`](#task_wait) | tasks | existing | `POST /v1/sessions/:id/tasks/:task/wait` |
 | [`task_stop`](#task_stop) | tasks | existing | `POST /v1/sessions/:id/tasks/:task/stop` |
 | [`tasks`](#tasks) | tasks | existing | `GET /v1/sessions/:id/tasks` |
@@ -395,28 +430,34 @@ Result: the [status object](#status-object).
 
 ### `prompt`
 
-Starts a turn with a new prompt and answers when the turn ends.
+Starts a turn with a new prompt and answers when the turn ends. When the head's turn
+was stopped part way (`accepts_message` true while `accepts_prompt` is false), `prompt`
+goes on with that turn instead: `text` is its next user message (see
+[After a stop](#after-a-stop)).
 
 | Param | Type | Required | Notes |
 | --- | --- | --- | --- |
 | `dir` | string | yes | |
-| `text` | string | yes | 1 byte to 4 MiB, not blank. |
-| `files` | array | no | [File params](#file-params) added to the workspace first; a path already there is replaced. |
-| `state` | object | no | A JSON merge patch (at most 1 MiB) applied to the app state in the same commit as the prompt's first step. |
+| `text` | string | yes | 1 byte to 4 MiB, not blank; at most 65536 bytes for a turn stopped part way. |
+| `files` | array | no | [File params](#file-params) added to the workspace first; a path already there is replaced. Refused (`failed`) for a turn stopped part way. |
+| `state` | object | no | A JSON merge patch (at most 1 MiB) applied to the app state in the same commit as the prompt's first step. For a turn stopped part way, a step of its own just before the message. |
 | `expected_head` | integer | no | See [`expected_head`](#revisions-and-expected_head). |
 
 Result: the [turn result](#turn-result). Events: `prompt`, then the turn's events,
-ending with `stopped`.
+ending with `stopped`. A message that goes on with a stopped turn is reported by a
+`steered` event instead of `prompt`.
 
 ### `continue`
 
 Resumes an interrupted or stopped turn: adopts recorded replies and results without
 sending them again, asks the app again for unanswered app tool calls, records a tool
-interrupted mid-run as not completed, and gives a turn stopped at its step limit a
-fresh step budget (`extended`). A model request whose outcome is unknown is sent
-again only when the session has `resend_unknown`; otherwise `continue` fails and
+call an earlier owner left running as not completed, and gives a turn stopped at its
+step limit a fresh step budget (`extended`). A model request whose outcome is unknown
+is sent again only when the session has `resend_unknown`; otherwise `continue` fails and
 says to run `retry`. When the turn has already stopped for another reason, it emits
-`nothing_to_continue`.
+`nothing_to_continue`. After a stop in a tool call, `continue` sends the next model
+request with the stopped result in it; nothing runs again by itself (see
+[After a stop](#after-a-stop)).
 
 | Param | Type | Required | Notes |
 | --- | --- | --- | --- |
@@ -433,6 +474,12 @@ before it (it may be billed twice). When the session's first request is the one 
 question there is nothing to rewind to: the old store is kept aside as
 `store.abandoned-N` and a fresh store restarts the same prompt over the same files
 (event `retrying_first`). `stop` and `steer` reach the restarted turn.
+
+On a turn resting after a stop in a tool call, `retry` goes back to the point before
+the request whose reply made the stopped call and asks the model again (that request
+may be billed again). When that reply answered the session's first request there is no
+such point (and, as the session has done work since, no fresh store stands in for it):
+`retry` is refused, and `continue` goes on instead (see [After a stop](#after-a-stop)).
 
 | Param | Type | Required |
 | --- | --- | --- |
@@ -504,6 +551,53 @@ Asks the running turn-like operation to stop, and stops the session's tasks.
 Result: `{session, stopping: true}`. The running operation's own request is then
 answered (often with error `stopped`, `-32006`). Errors: `not_running` when nothing
 runs or the session is not open here.
+
+#### After a stop
+
+Where the turn rests depends on what the stop cut off. The HTTP `stop` command leaves
+the same states.
+
+- **A tool call** (`bash`, `run_code`, a file or job tool) ends and is recorded at once
+  as a failed result (`failed: true`): what it printed until then, bounded as any
+  output is, and a line saying the user stopped it. The workspace keeps only the
+  changes the call's runner reports: a native host's sandbox discards a run it did not
+  finish, so none. What a script's calls did outside the workspace is not undone. The
+  stopped call is a known outcome, so nothing runs it again, neither `continue` nor a
+  reopen. Calls of the same reply that had not started are recorded as not run
+  (`tool_refused` with `Not run: the user stopped the turn before this call
+  started.`). The turn then rests between its steps (`phase` `after_tools`), and a
+  `rewind` works at once, since no call is left without a result.
+- **A model request** keeps an unknown outcome (it may have been billed, and usage
+  counts it as `unknown`), as after any interrupted request. The turn rests at
+  `phase` `model_wait`.
+- **An app tool call**: nothing is recorded, and the next `continue` asks the app again
+  with `again: true` (see [App tool call](#app-tool-call)).
+
+From a turn stopped in a tool call, three ways go on:
+
+- **A message**: [`prompt`](#prompt) (HTTP `say`) with text alone. It is committed as
+  the turn's next user message, read after the stopped result, and the turn goes on
+  (event `steered`). The model reads that the step was stopped, then the message, so a
+  stop followed by a message is a way to steer. A message with files is refused with
+  the reason; send the files with the next message.
+- **[`continue`](#continue)**: the model reads the stopped result and decides what to
+  do. Nothing runs again by itself.
+- **[`retry`](#retry)**: back to the point before the request whose reply made the
+  stopped call, and the model is asked again (that request may be billed again). A call
+  made by the reply to the session's first request has no such point, and `retry` is
+  refused with a message that says so.
+
+After a stop in a model request, a message (text alone) goes back to the point before
+that request, as `retry` does, and the request is made again with the message read;
+the cut request stays counted. The message is refused when that request's reply is
+already saved (`continue` reads it in; then send the message) and when it is the
+session's first request (there is no point before it). `continue` and `retry` work as
+after any interrupted request.
+
+`accepts_message` in the [head state](#head-state) says whether a message (text alone)
+is taken now. A host that stops between a user's stop and the record of the stopped
+call leaves the call reserved; `continue` then records it as not completed
+(`tool_interrupted`) and never runs it.
 
 ### `steer`
 
@@ -577,6 +671,13 @@ Errors: `bad_request`, `busy` (32 changes already waiting, `expected_head` while
 a turn runs, or a `rewind` or `task_start` running), `head_moved`, `conflict` (the
 state cannot be kept now; before the first turn there is no step to keep it with, so
 it goes with the first prompt's `state`).
+
+A state step goes only between steps. After a stop that cut a model request off, the
+turn is in the middle of a step, and `state_set` is refused (`conflict`) until
+`continue`, `retry` or a rewind settles it; a change queued for such a turn is refused
+with `state_refused`, and a message sent there with a `state` fails. A stop in a tool
+call leaves the turn between its steps, where `state_set` works (see
+[After a stop](#after-a-stop)).
 
 ### `history`
 
@@ -828,16 +929,16 @@ history is what `history` returns.
 | `provider_retry` | `status`, `seconds`, `attempt`, `compacting` | The provider refused a request before generating anything (HTTP `status`); it is sent again after `seconds`, after compacting the history when `compacting`. |
 | `tool_call` | `id`, `name`, `input` | A tool call is shown before it runs. |
 | `tool_skipped` | none | The repeat guard skipped a tool call. |
-| `tool_refused` | `reason` | A tool call was refused before it ran. |
+| `tool_refused` | `reason` | A tool call was refused before it ran, or recorded as not run because the user stopped the turn before it started. |
 | `tool_reused` | none | A recorded tool result was adopted without running. |
-| `tool_interrupted` | none | A tool call interrupted by a stop was recorded as not completed. |
+| `tool_interrupted` | none | A tool call an earlier owner left running (it stopped before the result was recorded) was recorded as not completed. A call the user's stop ends is recorded with its output instead (a failed `tool_result`; see [After a stop](#after-a-stop)). |
 | `unisolated` | `reason` | Commands in this session run directly on the host, without isolation; sent once, before the first such command. |
 | `output` | `stream`, `data` | A chunk of live process output: `stream` is `stdout` or `stderr`, `data` is standard base64. |
 | `output_end` | none | Live output for the current call has ended. |
 | `display` | `display` | The cards a `show` call put in the chat (`[{path, kind, title, size, revision}]`), sent just before its `tool_result`. Not sent over HTTP, which puts them on the `tool_result` (see below). |
 | `tool_result` | `content`, `failed` | The recorded result of a tool call. Over HTTP, a `show` result also carries `display`. |
 | `nested` | `label` | A nested call made by a running script, or a task's progress note. |
-| `steered` | `text` | A message sent while the turn ran was given to the model. |
+| `steered` | `text` | A message was given to the model: one sent while the turn ran, or a message that goes on with a turn stopped part way. |
 | `reply_cut` | none | The reply being written was cut so a message sent with `now` is read first; the request is prepared again with it (the cut reply may still be billed). |
 | `reply_not_cut` | none | A `now` message could not cut the reply (no earlier point to prepare the request from); it is read once the reply ends. |
 | `pack_view` | `pack`, `title`, `markdown` | A session pack showed a view. |
@@ -908,7 +1009,7 @@ session's own report merged with its [head state](#head-state).
 | `abandoned` | integer or null | Requests abandoned by rewinds; null while a turn runs. |
 | `rejected` | integer or null | Requests the provider refused before generating anything; null while a turn runs. |
 | `isolation`, `effort` | string | From the settings. |
-| `phase`, `stop`, `stop_text`, `complete`, `accepts_prompt`, `recorded`, `rejection`, `wake` | | See [head state](#head-state). While a turn runs, `wake` is `{work: "running", why: null}`. |
+| `phase`, `stop`, `stop_text`, `complete`, `accepts_prompt`, `accepts_message`, `recorded`, `rejection`, `wake` | | See [head state](#head-state). While a turn runs, `wake` is `{work: "running", why: null}`. |
 | `activity` | string | `stopping`, `waiting_app`, `model`, `tools` or `running` during a turn; `blocked`, `resumable` or `idle` between turns. `wake.why` explains a block. Both hosts report these codes. |
 | `background` | integer | Embedded only: how many background tasks run. Its activity is `waiting_tasks` while a finished turn waits for their reports, or `background` between turns while tasks still run. |
 | `busy` | boolean | A turn-like operation runs in this process. |
@@ -930,6 +1031,7 @@ session object and each `tasks` entry.
 | `stop_text` | string or null | The stop as a sentence. |
 | `complete` | boolean | The turn finished. |
 | `accepts_prompt` | boolean | A new prompt can start a turn (before the first turn, or after a finished one). |
+| `accepts_message` | boolean | A message (text alone) is taken now: true when `accepts_prompt` is, and for a turn stopped part way that goes on with a message: one resting between its steps (`ready`, `after_tools`, `final_review`), or waiting on a model request whose reply is not saved and that is not the session's first. A running turn passes through these phases too: a message is taken only once nothing runs. See [After a stop](#after-a-stop). |
 | `prompts` | integer | Prompts in the history. |
 | `files` | integer | Workspace file count. |
 | `recorded` | boolean | For a waiting model step: its reply is already recorded (`continue` adopts it without sending). |
@@ -943,7 +1045,7 @@ session object and each `tasks` entry.
 | `empty` | No turn yet (revision 0). |
 | `model_wait` | A model request is pending. |
 | `tools_wait` | Tool calls are pending. |
-| `ready`, `preparing`, `after_tools`, `final_review` | Between steps. |
+| `ready`, `preparing`, `after_tools`, `final_review` | Between steps. A stop in a tool call leaves the turn at `after_tools`. |
 | `stopped` | The turn stopped; `stop` says why. |
 
 | Stop code | `stop_text` |
@@ -1189,9 +1291,13 @@ client-chosen request ids and durable receipts; events come from a per-session
 [event stream](#event-stream); and sessions are named by id. The host's `/api/...`
 routes (cookie-only, with their own error envelope) are not part of this contract.
 
-The host accepts `GET` and `POST`. Request bodies are JSON (an upload's body is raw
-bytes). Successful responses are JSON except `file` (raw bytes), `archive` (tar) and
-`events` (SSE). Errors use the [v1 envelope](#http-errors).
+The host accepts `GET` and `POST`. Request bodies are JSON (an upload's body and a
+thread's bundle are raw bytes). Successful responses are JSON except `file` (raw
+bytes), `archive` (tar), `export` (a session bundle) and `events` (SSE). Errors use the
+[v1 envelope](#http-errors).
+
+`RemoteClient` in [`clients/js/remote.mjs`](../spindle/clients/js/remote.mjs) is a
+fetch-only JavaScript client of these routes; see [clients.md](clients.md).
 
 ### Discovery
 
@@ -1214,26 +1320,29 @@ engine, auth, limits}`. `auth` is `bearer` or `cookie`, as this request authenti
 | `receipt_days` | 7. |
 | `events_retained` | 1024 events in a session's stream window. |
 | `event_bytes` | 524288 bytes in that window. |
+| `thread_bytes` | 2 GiB (2147483648): a thread's bundle sent to `POST /v1/threads`. |
 
 `POST /v1/run` takes bodies up to 64 MiB plus 64 KiB. Limits not reported in
 `limits`: 48 connections at once; the request head (at most 16 KiB) must arrive
 within 10 seconds overall. After authorization, the body has its own 10-second
 deadline, or 2 minutes for an upload or `/v1/run`. Each individual read and write
-has at most 10 seconds. See [`serve/http.rs`](../spindle/store/src/serve/http.rs).
+has at most 10 seconds. A thread's bundle has 2 minutes plus one second per MiB of its
+`Content-Length`, and each read of it may wait up to 30 seconds. See
+[`serve/http.rs`](../spindle/store/src/serve/http.rs).
 
 ### Routes
 
 Auth: **T** means a bearer token or a paired cookie; for `POST` with a cookie, the
-`Origin` and `X-Spindle: 1` headers are also required (see
-[HTTP authentication](#http-authentication)). Most known routes called with the
-other method answer `405 method_not_allowed`; the `usage`, `runner`, `run`,
+`Origin` and `X-Spindle: 1` headers are also required. Runner and browser tokens reach
+only some routes (see [HTTP authentication](#http-authentication)). Most known routes
+called with the other method answer `405 method_not_allowed`; the `usage`, `runner`, `run`,
 `recovery` and `tasks` routes answer `404 not_found` instead, as does an unknown
 route.
 
 | Method | Path | Auth | Answers | Corresponds to |
 | --- | --- | --- | --- | --- |
 | `GET` | `/v1` | T | Discovery. | `info` |
-| `GET` | `/v1/sessions` | T | `{sessions: [{id, name, status}]}`; `status.state` is a code: `running`, `stopping`, `empty`, `done`, `stopped`, `reply_saved`, `needs_attention`, `missing` or `unreadable`. | `list` |
+| `GET` | `/v1/sessions` | T | `{sessions: [{id, name, status}]}`, newest first; `status` is `{state, at}`: `state` is a code (`running`, `stopping`, `empty`, `done`, `stopped`, `reply_saved`, `needs_attention`, `missing`, `unreadable` or `moved`), `at` ms since the Unix epoch (absent for `missing`). A browser token sees only the sessions it brought. | `list` |
 | `GET` | `/v1/providers` | T | `{providers: [provider entry]}`. | `providers` |
 | `GET` | `/v1/models` | T | `{providers: [{id, name, signed_in, subscription, models, default_model}]}`: each model `{id, label, efforts, default_effort, image, context, price}`. | none |
 | `GET` | `/v1/usage?tz=MINUTES` | T | Spend across the host's sessions; `tz` (minutes east of UTC, up to 1080 either way) sets what "today" counts. | none |
@@ -1257,6 +1366,9 @@ route.
 | `POST` | `/v1/sessions/:id/steer` | T | Body `{text, now}`: `202 {queued}`. `409 not_running`, `409 nothing_waiting` (`now` alone), `429 rate_limited`. | `steer` |
 | `POST` | `/v1/sessions/:id/app_tool_result` | T | Body: `call` plus an [answer](#app-tool-answer): `200 {accepted: true}`; `409 conflict` when the call is not waiting. | `app_tool_result` |
 | `POST` | `/v1/sessions/:id/upload` | T | Raw body (1 byte to 8 MiB): `{digest, size}`, for a later `say`'s `attachments`. Uploads older than a day are cleared. | none |
+| `POST` | `/v1/sessions/:id/export` | T | Body `{keep?}` (or empty): the thread's session bundle, `application/octet-stream`. Without `keep` the thread moves back to its client. See [Bringing threads to the host](#bringing-threads-to-the-host). | `export_session` |
+| `POST` | `/v1/threads` | T | Raw session bundle with an `Idempotency-Key` header: `201 {session, fit, replayed: false}`, a new session of this host's. See [Bringing threads to the host](#bringing-threads-to-the-host). | `import_session` |
+| `POST` | `/v1/connect/token` | none | Body `{code, verifier}`: `{token, client}`, a browser token. See [One-click connect](#one-click-connect). | none |
 | `POST` | `/v1/sessions/:id/preview` | T | Body `{revision, network?, scripts?, contained?}`: `network` is `none` or `github`; `scripts` is false, true or one page's workspace path; `contained` is boolean. Result `{token, url, revision, expires_in, network, scripts, contained}`. Scripts default off unless `network: "github"`; `preview_scripts` and `preview_contained` advertise the new fields. See [Static-site previews](#static-site-previews). | none |
 | `GET` | `/v1/runner` | T | `{helper, isolated, implementation}`: this host's sandbox for remote runs; `503 unavailable` without one. | none |
 | `POST` | `/v1/run` | T | Runs one command for an embedded session over a workspace sent with it: body `{command, timeout_s, network, files: [{path, base64, executable}], links, directories, run?}`, result `{output, success, writes, deletes, links, directories, failure, helper}`. See [embedded.md](embedded.md). | none |
@@ -1320,6 +1432,7 @@ state](#head-state) plus:
 | --- | --- |
 | `id`, `name` | The session. |
 | `busy` | A command's worker runs (then `wake` is `{work: "running"}`). |
+| `running_request` | The `request_id` of the command whose worker runs now, or null. A `stop` can name it as `target_request` (feature `targeted_stop`). |
 | `stopping` | A stop was requested for the running command. |
 | `activity` | The stable activity code described in [Status object](#status-object). |
 | `since` | When the running command was admitted (ms since the Unix epoch), or null. |
@@ -1329,6 +1442,7 @@ state](#head-state) plus:
 | `app_tool` | The first app tool call waiting for an answer (its `app_tool` event), or null. |
 | `app_tools` | Every waiting call. |
 | `self_edit` | Self-edit state of a thread holding Spindle's source (see [host.md](host.md)), or null. |
+| `moved` | True once the thread moved back to its client (feature `threads`; see [Bringing threads to the host](#bringing-threads-to-the-host)). |
 
 Before a new session's store exists, `phase` is `starting` (while its command runs)
 or `missing`.
@@ -1352,6 +1466,12 @@ A receipt is `{request_id, session, kind, state, error, admitted_at}`. `state` i
 it is never re-dispatched). `admitted_at` is ms since the Unix epoch. Receipts are
 kept 7 days, up to 8192.
 
+A `202` or `200` says that the command was admitted, not that it succeeded: clients
+check the receipt's `state`. `rename`, `delete` and a `settings` change are carried out
+at admission, so their receipt is already `completed` or `failed` (with `error`) in a
+`202` answer; `stop` is `completed` once the stop is requested; the other kinds end
+later, with a `command_done` event.
+
 For kinds that act on the head (`say`, `continue`, `retry`, `rewind`, `settings`,
 `state`, `task_start`), `expected_head` is checked before admission; a stale one is
 refused with `409 head_moved` and the current `head`. Without it, the head read at
@@ -1360,11 +1480,11 @@ admission is used.
 | `kind` | Fields besides `request_id` and `kind` | Effect |
 | --- | --- | --- |
 | `new` | `text` (required), `provider` (required), `name`, `model`, `network`, `toolchain`, `effort`, `compaction`, `max_usd`, `tools`, `builtin_tools`, `instructions`, `resend_unknown`, `tasks`, `state` | Creates a session (isolation `required`) and runs `text` as its first prompt. `name` defaults to the first non-blank line of `text` (60 characters). The receipt's `session` is the new id. |
-| `say` | `session`, `text`, `attachments`, `state`, `expected_head` | A prompt. `attachments` is `[{path, digest}]` of earlier uploads. |
+| `say` | `session`, `text`, `attachments`, `state`, `expected_head` | A prompt. `attachments` is `[{path, digest}]` of earlier uploads. On a turn stopped part way, a message that goes on with it, as stdio `prompt` does: with `attachments` it fails (see [After a stop](#after-a-stop)). |
 | `continue` | `session`, `until`, `expected_head` | As stdio `continue`; `until` may only be `"unknown"`. |
 | `retry` | `session`, `expected_head` | As stdio `retry`. |
 | `rewind` | `session`, `revision`, `expected_head` | As stdio `rewind`. |
-| `stop` | `session` | Stops the running command and the session's tasks. `409 not_running` when none runs. |
+| `stop` | `session`, `target_request` | Stops the running command and the session's tasks. `409 not_running` when none runs. With `target_request` (feature `targeted_stop`), only that command. |
 | `state` | `session`, `patch`, `expected_head` | A state change as a step of its own, between turns. |
 | `settings` | `session`, `provider`, `model`, `network`, `toolchain`, `effort`, `compaction`, `max_usd`, `tools`, `builtin_tools`, `instructions`, `resend_unknown`, `tasks`, `expected_head` | Changes settings; queued while a turn runs (app settings are refused then). |
 | `task_start` | `session`, `task`, `prompt`, `settings`, `model`, `effort`, `files`, `report`, `expected_head` | As stdio `task_start`; the result arrives as a `task_started` event. |
@@ -1377,6 +1497,21 @@ report through the event stream (`command_done`) and their receipt. At most 4
 sessions run at once (`409 busy` beyond that); a session already running refuses
 another command with `409 busy`, except `stop` and a `settings` change, which is
 queued.
+
+**Targeted stop** (feature `targeted_stop`). `target_request` names the command to
+stop, by its `request_id` (the session object's `running_request`). The host checks it
+under the same locks that admit the stop: when that command is not running, is
+already stopping, or another command runs in its place, the stop is refused with
+`409 not_running` and stops nothing, so a stop that arrives late never stops a newer
+turn. A `target_request` that is not a valid `request_id` is `400 bad_request`. Like
+any command, a stop sent again with the same `request_id` and body returns its first
+receipt and does nothing more. A host without the feature refuses `target_request` as
+a field that does not apply (`400 bad_request`).
+
+On a thread that [moved back to its client](#bringing-threads-to-the-host), `say`,
+`continue`, `retry`, `rewind`, `settings`, `state` and `task_start` are refused with
+`409 moved`; `rename` and `delete` still work. A browser token's command for a session
+it did not bring is `404 not_found`, and its `new` is `403 forbidden`.
 
 ### Event stream
 
@@ -1396,6 +1531,140 @@ after that event while the window (1024 events, 512 KiB) still holds the next on
 A cursor from another host process, or one that fell out of the window, starts over
 with a snapshot. The host ends each stream after 5 minutes; clients reconnect with
 their last id.
+
+### Bringing threads to the host
+
+Feature `threads`. A client that keeps sessions of its own can hand one to the host as
+a session bundle (the format of `export_session` and `import_session`; see
+[store.md](store.md#session-bundles)). The host runs it as one of its own sessions, in
+its sandbox and with its own provider credentials; the client drives it through the
+routes above, and one export hands it back. The thread keeps its identity both ways.
+Spindle for Browser does this with a browser token (see
+[chrome.md](chrome.md#moving-threads-to-and-from-a-native-host)). Source:
+[`serve/threads.rs`](../spindle/store/src/serve/threads.rs).
+
+#### Bring a thread in
+
+`POST /v1/threads`, with the bundle's bytes as the body.
+
+- The body is the bundle's bytes (`application/octet-stream`), sent with its
+  `Content-Length` (the host takes no chunked body and no `Expect: 100-continue`). An
+  empty body is `400 bad_request`; one over `limits.thread_bytes` (2 GiB) is
+  `413 too_large`, refused before any of it is read. The host streams the body to a
+  private file; it is never held in memory.
+- The `Idempotency-Key` header is required: 16 to 128 of `A-Z`, `a-z`, `0-9`, `-` and
+  `_`, chosen by the client for each thread and move (for example from the thread's
+  identity and head). Keys are kept per credential; a browser token's per its name.
+- Query, optional, nothing else: `name` (control characters removed, cut to 80
+  characters, not blank; default `Imported thread`), and `provider` with `model` (both
+  or neither) to run the thread on that model of this host's instead of its own. A
+  provider or model this host does not know is `400 bad_request`.
+- The host reads and checks the whole bundle before it writes a session. A bundle it
+  cannot read (damaged, cut short, of a schema this build does not read, with a path a
+  session does not hold, or without settings) is `400 bad_bundle`, with the reason.
+  Otherwise it imports the bundle as a new session with a new `id`, owned by the
+  credential that brought it.
+- `201 {session, fit, replayed: false}`. `session` is the
+  [session object](#session-object); its `head` is the bundle's. `fit` is
+  `{changes, notes}`: `changes` maps each setting the host changed to its new value,
+  and `notes` lists `{setting, from, to, why}` for each of them, and for a `max_usd`,
+  which carries over. The fit applies to the thread and to each of its tasks:
+  `isolation` becomes `required` (every command runs in the host's sandbox),
+  `builtin_tools` `files` becomes `all`, `runner` becomes `none`, `sources` becomes
+  `[]` (the host mounts its directories only for threads it made) and `self_edit`
+  becomes false. `provider` and `model` change only as the query asks, and an `effort`
+  the model does not take becomes `default`.
+- The same key again with the same bytes (compared by SHA-256): `200 {session, fit,
+  replayed: true}`, the same session as it is now and the same `fit`; nothing is
+  imported again. The same key with other bytes: `409 conflict`. A key whose import is
+  still running: `409 busy`; send it again when that ends.
+- `409 no_credentials`: this host cannot send to the thread's provider and model (after
+  the query's choice), and nothing was imported. `GET /v1/models` lists the host's
+  models and whether each provider is `signed_in`; send `provider` and `model` to pick
+  one.
+- `409 conflict` (`session limit reached`) when the host already holds
+  `limits.sessions` sessions, checked before the upload and again before the session
+  is registered; also `409 conflict` while an upgrade or restart is in progress.
+- A refusal that comes before the body is read (`401`, `403`, `400` for the key or the
+  query, `413`, `409`) is sent at once; the host then reads and discards what the client
+  still sends for up to 2 seconds before it closes the connection. A client still
+  sending a large body may see the connection reset instead of the answer: check
+  `limits.thread_bytes` and the session count first, and after a reset send the same
+  request again (it is idempotent).
+- A client that disconnects during the upload leaves nothing behind: no session, no
+  record, no file.
+
+No stop of the host, a crash or power cut included, loses a thread brought in this way
+or leaves it registered twice. The upload is synced before anything else, and the key
+is recorded as pending. The session is staged in a private directory, synced, and
+renamed into place, and only then registered: its registry row, its owner and the key's
+record commit in one transaction, and the session is live from that moment. A host that
+stopped before that commit finds the pending record when it opens again and removes the
+half-made session. So after any stop, the same request gets one consistent answer: the
+session, if the commit happened, or a fresh import, if it did not.
+
+#### Take a thread back
+
+`POST /v1/sessions/:id/export`, with body `{keep?}` (an empty body is `{}`).
+
+- Without `keep` (or with `keep: false`) the thread moves back to its client. With
+  `keep: true` the host sends a copy and keeps the thread; continue only one of the
+  copies.
+- `200`, `application/octet-stream`: the bundle, with `Content-Length` its size,
+  `X-Spindle-Head` its head and `X-Spindle-Identity` the thread's identity. Import it as
+  any session bundle; the head and identity are the thread's.
+- `409 busy` while a command or another export runs in the thread, or one of its
+  background tasks runs. `409 moved` for `keep: true` on a thread that already moved.
+  `409 conflict` during an upgrade or restart.
+- A move writes the bundle into the thread's directory, syncs it, reads it back and
+  checks it, and only then seals the thread. From then on the thread is moved:
+  `GET /v1/sessions` lists it with state `moved`, its session object has `moved: true`,
+  and commands that would work on it are `409 moved` (see
+  [Commands and receipts](#commands-and-receipts)). Every later export without `keep`,
+  after a host restart too, sends the very same bytes until the thread is deleted, so a
+  client whose answer was lost asks again. A host that stopped after writing the file
+  but before sealing leaves the thread live, and the next export writes a new bundle.
+- Once the client holds the thread durably, it deletes the host's copy with the
+  `delete` command. That also removes the kept bundle, the owner and the key's record,
+  so bringing the thread back later is a new import.
+
+### One-click connect
+
+Feature `connect`. An app gets a browser token for itself through a page of the host,
+without any token passing through a URL (PKCE, RFC 7636, `S256` only). Source:
+[`serve/connect.rs`](../spindle/store/src/serve/connect.rs).
+
+1. The app makes a random `verifier` (43 to 128 of `A-Z`, `a-z`, `0-9`, `-`, `.`, `_`
+   and `~`), its `challenge` (the unpadded base64url of the verifier's SHA-256, 43
+   characters) and a `state` (1 to 128 of the same characters as the verifier). It
+   opens `GET /connect?client=NAME&challenge=C&state=S`, values percent-encoded, as a
+   page of its own (a tab, not a frame). NAME is the browser token's name, by the rules
+   in [HTTP authentication](#http-authentication). A link that breaks these rules gets a
+   `400` page.
+2. The page needs a paired screen: a browser that is not paired is asked for the
+   host's pairing key first, as the phone UI asks. The page then shows NAME and what
+   the app may do (run commands in the host's sandbox, bring its threads to the host
+   and run them there, read the host's providers and models), with Allow and Deny. The
+   page sends the answer to the host (`POST /api/connect`, the page's own request), and
+   the host answers with the address the tab goes to next:
+   `/connect/done?code=CODE&state=S` when allowed, or
+   `/connect/done?error=denied&state=S` when denied.
+3. The app watches the tab for that address, checks that `state` is its own, and reads
+   the code. The `GET /connect/done` page only says "Connected." or "Not connected."
+   and shows nothing secret.
+4. The app trades the code with `POST /v1/connect/token`, body `{code, verifier}`, no
+   credential. `200 {token, client}`: a browser token named `client` (NAME), minted now,
+   replacing NAME's earlier browser token. `400 bad_code`: an unknown, used or expired
+   code, or the wrong verifier, which also uses the code up. `409 conflict`: NAME is
+   the name of a token of another kind, or 16 named tokens already exist.
+   `400 bad_request`: the body is not `{code, verifier}`.
+
+A code is 256 random bits, kept by the host only as its hash and only in memory (a
+host restart forgets it: connect again), good for one trade within 120 seconds, and
+bound to the NAME and challenge it was issued for. At most 16 codes are outstanding;
+another one retires the oldest. After 10 failed trades within a minute, across the
+host, every trade is `429 rate_limited` until fewer than 10 fall within the last
+minute.
 
 ## Errors
 
@@ -1430,17 +1699,22 @@ with `head_moved`).
 | Status | `code` | When |
 | --- | --- | --- |
 | 400 | `bad_request` | Malformed body, invalid field, field not applicable to the command kind, bad `revision` query. |
+| 400 | `bad_bundle` | `POST /v1/threads`: the body is not a session bundle this host reads; the message says why. |
+| 400 | `bad_code` | `POST /v1/connect/token`: an unknown, used or expired code, or the wrong verifier. |
 | 401 | `unauthorized` | Missing, malformed, unknown or revoked credential; the pairing key. |
-| 403 | `forbidden` | A cookie-authenticated `POST` without the same-origin headers. |
-| 404 | `not_found` | No such session, route, revision, file, task or receipt. |
+| 403 | `forbidden` | A cookie-authenticated `POST` without the same-origin headers; a runner or browser token outside its routes; a browser token's `new` command. |
+| 404 | `not_found` | No such session, route, revision, file, task or receipt; for a browser token, a session it did not bring. |
 | 405 | `method_not_allowed` | Wrong method for a known route (most of them; see [Routes](#routes)). |
-| 409 | `busy` | The session runs a command, or 4 sessions already run. |
+| 409 | `busy` | The session runs a command, or 4 sessions already run; an export of the thread runs; an import under the same `Idempotency-Key` still runs. |
 | 409 | `head_moved` | `expected_head` is stale; `head` is the current head. |
 | 409 | `request_id_reused` | The request id was admitted with a different body. |
-| 409 | `not_running` | `stop`, `steer` or a state change with nothing running. |
+| 409 | `not_running` | `stop`, `steer` or a state change with nothing running; a `stop` whose `target_request` is not the running command. |
 | 409 | `nothing_waiting` | `steer` with `now` alone and no message waiting. |
-| 409 | `conflict` | Any other refusal (an app tool call not waiting, limits reached, ...). |
-| 429 | `rate_limited` | 32 messages or state changes already waiting. |
+| 409 | `moved` | The thread moved back to its client: it is only exported again, renamed or deleted. |
+| 409 | `no_credentials` | `POST /v1/threads`: this host cannot send to the thread's provider and model. |
+| 409 | `conflict` | Any other refusal (an app tool call not waiting, limits reached, an `Idempotency-Key` used for another bundle, ...). |
+| 413 | `too_large` | `POST /v1/threads`: the bundle is over `limits.thread_bytes`. |
+| 429 | `rate_limited` | 32 messages or state changes already waiting; 48 connections already open; 10 failed connect trades within the last minute. |
 | 500 | `outcome_unknown` | From `POST /v1/commands`: the command may or may not have been admitted; resend the same `request_id`. |
 | 500 | `internal` | Any other server failure. |
 | 503 | `unavailable` | The remote runner has no sandbox on this host. |
@@ -1464,6 +1738,10 @@ stdio methods are thin wrappers over it:
 | `task_start` | `Session::start_task` |
 | `export`, `export_session`, `import_session` | `Session::export`, `Session::export_session`, `agent::import_session` |
 | `history`, `files`, `read`, `state`, `usage`, `recover` | `api::messages_at`, `api::files_at`, `api::read_at`, `api::state_at`, `api::usage_json`, `api::recovery` |
+
+`Session::accepts_prompt` says whether `prompt` would start a turn now, and
+`Session::accepts_message` whether a prompt of text alone is taken now, which also goes
+on with a turn stopped part way (see [After a stop](#after-a-stop)).
 
 Events reach an `Observer` (`event(Event)`, called once per event, in order); the JSON
 form of each is `Event::to_json`. App tool calls reach the `AppTools` returned by

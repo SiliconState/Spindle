@@ -1019,7 +1019,7 @@ fn bundle_tasks(
             path: format!("{at}{STORE}"),
             bytes: store.image().map_err(store_error)?,
         });
-        for name in ["session.json", "task.json"] {
+        for name in ["session.json", "task.json", crate::bundle::PACK_SESSION] {
             if let Ok(bytes) = std::fs::read(place.join(name)) {
                 files.push(BundleFile {
                     path: format!("{at}{name}"),
@@ -1033,12 +1033,38 @@ fn bundle_tasks(
     Ok(())
 }
 
+/// Whether the file at `path` reads back as exactly `bytes` (compared by SHA-256,
+/// read in chunks).
+fn same_on_disk(path: &Path, bytes: &[u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut digest = Sha256::new();
+    let mut chunk = vec![0u8; 1024 * 1024];
+    let mut size = 0u64;
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                digest.update(&chunk[..count]);
+                size += count as u64;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    size == bytes.len() as u64 && digest.finalize() == Sha256::digest(bytes)
+}
+
 /// Imports the session bundle at `source` into `dir` (absent, or an empty directory):
 /// see `import_bundle`.
 pub fn import_session(source: &Path, dir: &Path) -> Result<Value> {
-    let bytes = std::fs::read(source)
+    let mut file = std::fs::File::open(source)
         .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
-    let bundle = crate::bundle::read(&bytes)?;
+    // Read in two passes, so the bundle is never in memory beside its files.
+    let bundle = crate::bundle::read_file(&mut file)?;
+    drop(file);
     import_bundle(&bundle, dir)
 }
 
@@ -1721,6 +1747,10 @@ impl Session {
     }
 
     fn prompt_inner(&mut self, text: &str) -> Result<()> {
+        // A turn stopped part way goes on with the message (read after what it has).
+        if driver::Driver::takes_message(&mut self.store)? {
+            return self.say_inner(text);
+        }
         let start = match self.initial_files.take() {
             Some(files) => Start::Import(files, vec![], vec![]),
             // A session whose first turn never started (its creator stopped first) still
@@ -1746,6 +1776,9 @@ impl Session {
     fn prompt_with_files_inner(&mut self, text: &str, files: Vec<File>) -> Result<()> {
         if files.is_empty() {
             return self.prompt_inner(text);
+        }
+        if driver::Driver::takes_message(&mut self.store)? {
+            return Err(driver::STOPPED_TEXT_ONLY.into());
         }
         let first = self.store.snapshot().map_err(store_error)?.revision == 0;
         let start = match self.initial_files.take() {
@@ -1801,6 +1834,18 @@ impl Session {
             files: vec![],
             ..tree
         })
+    }
+
+    /// Goes on with a turn stopped part way, `text` its next message (`Driver::say`):
+    /// a state sent with it is a step of its own just before it.
+    fn say_inner(&mut self, text: &str) -> Result<()> {
+        if let Some(StartState::Patch(patch)) = self.start_state.take() {
+            self.driver.set_state(&mut self.store, &patch)?;
+        }
+        self.restart_tasks()?;
+        self.driver.begin_run();
+        let need = self.driver.say(&mut self.store, text.to_string())?;
+        self.drive_from(Some(need))
     }
 
     /// Resume an interrupted run.
@@ -1992,6 +2037,12 @@ impl Session {
     /// Whether a new prompt can start a turn now (the last turn completed).
     pub fn accepts_prompt(&mut self) -> bool {
         self.ensure_idle().is_ok()
+    }
+
+    /// Whether a message (text alone) is taken now: it starts a turn after a completed
+    /// one, or goes on with a turn stopped part way (`prompt` does either).
+    pub fn accepts_message(&mut self) -> bool {
+        self.accepts_prompt() || driver::Driver::takes_message(&mut self.store).unwrap_or(false)
     }
 
     /// A new turn may start (and the session config change) only after a completed one.
@@ -2240,12 +2291,20 @@ impl Session {
             Err(Error::Model(crate::ModelError::Http(_))) => self.transport.take_rejection(),
             _ => None,
         };
+        let unparsed = match &outcome {
+            Err(Error::Model(crate::ModelError::Protocol)) => self.transport.take_failure(),
+            _ => None,
+        };
         Ok(driver::ModelSent {
             outcome: outcome.map_err(|error| match error {
                 Error::Model(crate::ModelError::Http(status)) => driver::ModelFailure::Http(status),
                 Error::Model(
                     error @ (crate::ModelError::Transport | crate::ModelError::Deadline),
                 ) => driver::ModelFailure::Dropped(model_error(error)),
+                // What was wrong with the stream, so the failure says.
+                Error::Model(crate::ModelError::Protocol) => {
+                    driver::ModelFailure::Failed(driver::unreadable(unparsed.as_deref()))
+                }
                 other => driver::ModelFailure::Failed(store_error(other)),
             }),
             streamed: streamed.load(Ordering::SeqCst),
@@ -3213,11 +3272,13 @@ impl Session {
             path: STORE.into(),
             bytes: self.store.image().map_err(store_error)?,
         }];
-        if let Ok(bytes) = std::fs::read(self.dir.join("session.json")) {
-            files.push(BundleFile {
-                path: "session.json".into(),
-                bytes,
-            });
+        for name in ["session.json", crate::bundle::PACK_SESSION] {
+            if let Ok(bytes) = std::fs::read(self.dir.join(name)) {
+                files.push(BundleFile {
+                    path: name.into(),
+                    bytes,
+                });
+            }
         }
         let mut tasks = Vec::new();
         bundle_tasks(&self.dir, "", &mut files, &mut tasks)?;
@@ -3249,6 +3310,17 @@ impl Session {
         if let Err(error) = saved {
             let _ = std::fs::remove_file(target);
             return Err(format!("cannot write {}: {error}", target.display()));
+        }
+        // A move goes on only from this file: it is read back from the disk and must
+        // be the bytes just checked before this copy is sealed.
+        if !keep && !same_on_disk(target, &written.bytes) {
+            let _ = std::fs::remove_file(target);
+            let _ = crate::durable::sync_parent(target);
+            return Err(format!(
+                "{} did not read back as written, so the session did not move and the \
+                 bundle was removed",
+                target.display()
+            ));
         }
         let mut warnings = Vec::new();
         if !keep {
@@ -3756,6 +3828,40 @@ mod tests {
             body(&openai, Effort::Max)["max_output_tokens"],
             MAX_OUTPUT_TOKENS + 65536
         );
+        // OpenAI's API over chat completions (a providers.json can choose that contract)
+        // caps output with max_completion_tokens: its reasoning models refuse max_tokens.
+        // Other chat completions servers keep max_tokens.
+        let catalog = provider::default_provider_catalog();
+        let mut chat = provider::find_provider_profile(&catalog, "openai").unwrap();
+        chat.request_contract = Some(RequestContract::OpenAiChatCompletions);
+        let chat = route_for(chat, Some("gpt-5")).unwrap();
+        assert_eq!(chat.contract, RequestContract::OpenAiChatCompletions);
+        for effort in [Effort::Default, Effort::High, Effort::Max] {
+            let sent = body(&chat, effort);
+            assert!(sent.get("max_tokens").is_none(), "{effort:?}: {sent}");
+            assert!(
+                sent["max_completion_tokens"].as_u64().unwrap() > 0,
+                "{effort:?}"
+            );
+        }
+        let nested = crate::shape::code_model_request(
+            &json!({"prompt": "p", "max_tokens": 900}),
+            &chat,
+            "s",
+            &|| vec![],
+        )
+        .unwrap();
+        assert!(nested["body"].get("max_tokens").is_none(), "{nested}");
+        assert!(nested["body"]["max_completion_tokens"].as_u64().unwrap() >= 900);
+        assert!(
+            crate::spend::allowed_output(&nested["body"]) >= 900,
+            "a budget still counts it"
+        );
+        assert!(
+            body(&deepseek, Effort::Default)
+                .get("max_completion_tokens")
+                .is_none()
+        );
         // Claude Opus 5.5 refuses a thinking budget: adaptive thinking with an effort.
         let claude = builtin("anthropic", "claude-opus-5-5");
         let max = body(&claude, Effort::Max);
@@ -3879,6 +3985,51 @@ mod tests {
             serde_json::from_slice(&subscription_body(high.clone(), "go", "s").unwrap()).unwrap();
         assert!(shaped["thinking"].get("block_binding").is_none());
         assert_eq!(shaped["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn gpt_efforts_are_only_what_each_openai_model_takes() {
+        let prompt = TranscriptCheckpoint {
+            route_binding: ROUTE.into(),
+            messages: vec![text("user", "go")],
+        };
+        let body = |route: &Route, effort| {
+            request_body(route, &route.model, "s", false, false, effort, &prompt)
+        };
+        // GPT-4.1 and GPT-4o do not reason: OpenAI refuses `reasoning_effort` for them,
+        // so only the provider default is offered and an effort is refused here.
+        for model in ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"] {
+            assert_eq!(
+                catalog::valid_efforts("openai", model),
+                ["default"],
+                "{model}"
+            );
+            let route = builtin("openai", model);
+            assert!(
+                body(&route, Effort::Default)
+                    .unwrap()
+                    .get("reasoning_effort")
+                    .is_none()
+            );
+            assert!(body(&route, Effort::High).is_err(), "{model}");
+        }
+        assert!(catalog::valid_efforts("openai", "o3").contains(&"high"));
+        // GPT-6 Sol and Luna list `none`: "off" sends it, on both OpenAI routes.
+        for provider in ["openai", "chatgpt"] {
+            for model in ["gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"] {
+                let off = body(&builtin(provider, model), Effort::Off).unwrap();
+                assert_eq!(
+                    off["reasoning"],
+                    json!({"effort": "none"}),
+                    "{provider} {model}"
+                );
+            }
+            // GPT-6.1 Sol and Astra list no `none`: there is no off.
+            for model in ["gpt-6.1-sol", "gpt-6-astra"] {
+                assert!(body(&builtin(provider, model), Effort::Off).is_err());
+                assert!(!catalog::valid_efforts(provider, model).contains(&"off"));
+            }
+        }
     }
 
     #[test]

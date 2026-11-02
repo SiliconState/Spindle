@@ -71,7 +71,7 @@ if (fragmented) writeFileSync(join(site, 'test', 'fragmented.spindle'), fragment
 async function run(phase) {
   const url = `${pathToFileURL(join(site, 'test', 'index.html'))}?phase=${phase}`;
   const chrome = spawn(browser, [
-    '--headless', '--no-sandbox', '--disable-gpu', '--no-first-run',
+    '--headless', '--no-sandbox', '--disable-gpu', '--no-first-run', '--password-store=basic',
     '--allow-file-access-from-files', '--remote-debugging-pipe', `--user-data-dir=${profile}`, url,
   ], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
   const [write, read] = [chrome.stdio[3], chrome.stdio[4]];

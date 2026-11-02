@@ -226,7 +226,42 @@ impl Driver {
             _ => step.next_need(revision, &state),
         }
     }
-    /// Retries only an unresolved model request. Replacing a first store is host I/O.
+    /// A message for a turn stopped part way (`Step::say`): it goes on with it, the
+    /// message read first. A completed turn takes a prompt instead (`start`).
+    pub fn say(&mut self, store: &mut Store, text: String) -> Result<Need> {
+        self.retries = 0;
+        self.step(store).say(text)
+    }
+    /// Whether a message goes on with the head's turn (`say`) rather than starting one:
+    /// a turn stopped part way, resting between its steps or in a model request whose
+    /// reply was not saved.
+    pub fn takes_message(store: &mut Store) -> Result<bool> {
+        let snapshot = store.snapshot().map_err(store_error)?;
+        if snapshot.revision == 0 {
+            return Ok(false);
+        }
+        let state = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
+        Ok(match state.control().phase() {
+            Phase::Ready | Phase::AfterTools | Phase::FinalReview => true,
+            // Not a session's first request (its prompt alone): nothing is before it.
+            Phase::ModelWait if after_first(&state)? => {
+                match state.pending_effects().map_err(turn_error)?.first() {
+                    Some(Effect::Model { id, .. }) => {
+                        match store.attempt_for(id).map_err(store_error)? {
+                            Some(attempt) => {
+                                store.receipt(&attempt.id).map_err(store_error)?.is_none()
+                            }
+                            None => true,
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        })
+    }
+    /// Retries an unresolved model request, or a stopped turn's last step (back to the
+    /// point before its request). Replacing a first store is host I/O.
     pub fn retry(&mut self, store: &mut Store) -> Result<Retry> {
         self.retries = 0;
         let mut step = self.step(store);
@@ -248,6 +283,15 @@ impl Driver {
                 .is_none(),
             None => false,
         };
+        // A turn the user stopped between its steps: its last step is asked again.
+        if model.is_none()
+            && matches!(
+                state.control().phase(),
+                Phase::Ready | Phase::AfterTools | Phase::FinalReview
+            )
+        {
+            return step.retry_step(&state);
+        }
         if !unresolved {
             return Err(match (model, attempt.is_some()) {
                 (Some(_), true) => {
@@ -379,6 +423,12 @@ impl Driver {
             }
         }
     }
+}
+
+/// Whether the head's model request comes after more than the session's first prompt
+/// (so a point before it can be gone back to).
+pub(crate) fn after_first(state: &TurnContinuation) -> Result<bool> {
+    Ok(state.transcript_ref().map_err(turn_error)?.messages.len() > 1)
 }
 
 pub enum Retry {

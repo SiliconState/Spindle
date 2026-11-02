@@ -23,21 +23,6 @@
       "usd": 0.0
     },
     {
-      "id": "call_1",
-      "input": {
-        "command": "printf should-not-run > marker"
-      },
-      "name": "bash",
-      "type": "tool_call"
-    },
-    {
-      "reason": "isolation is off for this session",
-      "type": "unisolated"
-    },
-    {
-      "type": "output_end"
-    },
-    {
       "type": "output_end"
     },
     {

@@ -44,6 +44,7 @@ flowchart LR
 | --- | --- |
 | [`clients/js/spindle.mjs`](../spindle/clients/js/spindle.mjs) | `StdioClient`, `HttpClient`, `API_VERSION`, and re-exports of `SpindleError`, `Tools`, `answerOf` and `refusedAnswer` |
 | [`clients/js/common.mjs`](../spindle/clients/js/common.mjs) | Pieces shared with the embedded client, with no Node imports: `SpindleError`, `Tools`, `answerOf`, `refusedAnswer`, `Emitter` |
+| [`clients/js/remote.mjs`](../spindle/clients/js/remote.mjs) | `RemoteClient`, a host's `/v1` over `fetch` only, for pages, workers and extensions (see [RemoteClient](#remoteclient)), with `EventParser`, `requestId` and `worthRepeating` |
 | [`clients/js/example.mjs`](../spindle/clients/js/example.mjs) | Runs one prompt in a session directory and prints what happens |
 | [`clients/js/smoke_test.mjs`](../spindle/clients/js/smoke_test.mjs) | End-to-end test against a build, using a scripted loopback provider |
 | [`clients/python/spindle_client.py`](../spindle/clients/python/spindle_client.py) | `StdioClient`, `HttpClient`, `Tools`, `SpindleError`, `API_VERSION` |
@@ -263,6 +264,67 @@ snapshot cannot be built. To resume after a disconnect, pass the last id seen as
 `lastEventId` / `last_event_id`, which is sent as `Last-Event-ID`. A useful pattern, used by the smoke
 tests: subscribe first, read the snapshot's `head`, then send a command with
 `expected_head` set to it, and read the stream until `command_done`.
+
+## RemoteClient
+
+[`remote.mjs`](../spindle/clients/js/remote.mjs) is a second JavaScript client for the `/v1`
+routes of `spindle serve`, built on `fetch` alone with no Node imports, so it runs in a page,
+a worker or a browser extension (and in Node 20 or newer). Spindle for Browser drives threads
+that live on a connected host with it (see
+[chrome.md](chrome.md#running-a-thread-on-your-spindle-host)). Copy it together with
+`common.mjs`. Routes and their bodies are in [API.md](API.md#http-api).
+
+```js
+import { RemoteClient } from './remote.mjs';
+const host = new RemoteClient({ url, token, fetch });   // fetch defaults to globalThis.fetch
+```
+
+`token` may be an API token, a runner token or a browser token; with `null` the client sends
+no `Authorization` header. Every request is sent with `credentials: 'omit'`,
+`cache: 'no-store'` and `redirect: 'error'`, and counts as unanswered after 30 seconds unless
+a method says otherwise. Methods take a trailing options object; `signal` aborts a call.
+
+| Method | Route |
+| --- | --- |
+| `info()` | `GET /v1` |
+| `models()`, `providers()` | `GET /v1/models`, `GET /v1/providers` |
+| `sessions()` | `GET /v1/sessions`, returning the `sessions` array (a browser token sees its own) |
+| `session(id)`, `messages(id, revision)`, `files(id, revision)`, `targets(id)`, `usage(id)`, `tasks(id)` | The session's `GET` routes |
+| `read(id, path, revision)` | `GET /v1/sessions/{id}/file?path=`, returning a `Uint8Array` |
+| `taskStop(id, task)` | `POST /v1/sessions/{id}/tasks/{task}/stop` |
+| `steer(id, text, { now })` | `POST /v1/sessions/{id}/steer` |
+| `upload(id, bytes)` | `POST /v1/sessions/{id}/upload` (150 seconds), returning `{ digest, size }` |
+| `appToolResult(id, call, answer)` | `POST /v1/sessions/{id}/app_tool_result` |
+| `command(kind, fields, { requestId, attempts = 4 })` | `POST /v1/commands`, returning the receipt |
+| `receipt(requestId)`, `settled(requestId, { every = 300, timeout = 120_000 })` | `GET /v1/receipts/{request_id}`; `settled` asks every `every` ms until the command is no longer `running` |
+| `importThread(bytes, { key, name, provider, model })` | `POST /v1/threads`: a session bundle sent with `key` as its `Idempotency-Key`; resolves with `{ session, fit, replayed }` |
+| `exportThread(id, { keep })` | `POST /v1/sessions/{id}/export` (10 minutes): `{ bytes, head, identity }`; without `keep` the thread moves back and the host seals its copy |
+| `connectToken(code, verifier)` | `POST /v1/connect/token`, sent without a token: trades a one-click connect code and its PKCE verifier for `{ token, client }` |
+| `events(id, { lastEventId })` | `GET /v1/sessions/{id}/events` as an async iterator of `{ id, kind, data }` |
+| `follow(id, { lastEventId, onFrame, onState })` | The event stream, reopened from the last frame's id until aborted |
+| `request(method, path, { body, headers, raw, timeout })` | Any route |
+
+**Sending again.** `command` sends `{request_id, kind, ...fields}` with a fresh `requestId()`
+unless one is given. When the request may not have reached the host (no answer, HTTP 502 to
+504, or `outcome_unknown`; `worthRepeating(error)` says which), it sends the same body under the
+same request ID again, up to `attempts` times in all, pausing 0.5, 1 and 2 seconds between
+them (longer pauses, up to 15 seconds, with more attempts); the host admits it once.
+`importThread` with the same key and bytes answers with the same session, so after any
+failure the same call is safe to make again; it allows 150 seconds plus one second per MiB of
+the bundle.
+
+**Event streams.** `EventParser` reads server-sent events as the HTML standard does (any line
+ending, `data` lines joined, comments and heartbeats dropped, the `id` kept). `events` treats
+a stream that says nothing for 35 seconds as cut. `follow` passes each frame to `onFrame` in
+order, stops when `onFrame` returns `false` or the session is deleted, reopens a stream that
+ends or breaks with `Last-Event-ID` after a pause that grows to 15 seconds, and reports
+`onState('open' | 'waiting', error)`. A 401, 403 or 404 rejects. It resolves with the last
+frame's id and why it ended (`deleted`, `done` or `aborted`).
+
+**Errors.** A refusal rejects with a `SpindleError` whose `kind` is the host's stable code (or
+`http_STATUS` when the body has none) and whose `status` is the HTTP status. A host that could
+not be reached, or did not answer in time, gives kind `unreachable` and status 0. A bundle
+from `exportThread` that came cut short is refused with kind `cut`: ask again.
 
 ## App tools
 

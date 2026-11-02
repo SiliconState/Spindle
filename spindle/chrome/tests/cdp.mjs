@@ -10,6 +10,8 @@ export async function launch(binary, { profile, downloads, headless = true, args
   const child = spawn(binary, [
     ...(headless ? ['--headless=new'] : []),
     '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--window-size=1200,900',
+    // Throwaway profiles: never ask the desktop keyring (a locked one prompts to unlock).
+    '--password-store=basic',
     '--remote-debugging-pipe', '--enable-unsafe-extension-debugging', `--user-data-dir=${profile}`, ...args, 'about:blank',
   ], { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] });
   const [write, read] = [child.stdio[3], child.stdio[4]];
@@ -18,9 +20,10 @@ export async function launch(binary, { profile, downloads, headless = true, args
   let next = 0;
   let buffer = '';
   let exited = null;
-  child.stderr.resume();
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8192); });
   child.on('exit', (code, signal) => {
-    exited = `Chrome exited (${signal ?? code})`;
+    exited = `Chrome exited (${signal ?? code})${signal && signal !== 'SIGKILL' ? `: ${stderr.slice(-3000)}` : ''}`;
     for (const { reject } of waiting.values()) reject(new Error(exited));
     waiting.clear();
   });
@@ -114,6 +117,11 @@ export async function launch(binary, { profile, downloads, headless = true, args
 /** Opens `url` in a new tab (or window) and returns a handle to drive it. */
 export async function open(browser, url, { newWindow = false } = {}) {
   const { targetId } = await browser.send('Target.createTarget', { url, newWindow });
+  return attach(browser, targetId);
+}
+
+/** A handle to drive the tab `targetId` (one a page or the extension opened). */
+export async function attach(browser, targetId) {
   const { sessionId } = await browser.send('Target.attachToTarget', { targetId, flatten: true });
   const send = (method, params) => browser.send(method, params, sessionId);
   await send('Runtime.enable');

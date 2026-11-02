@@ -2,6 +2,7 @@ mod access;
 mod app_tool;
 mod attention;
 mod auth;
+mod connect;
 mod disk;
 mod http;
 mod pack_ui;
@@ -10,6 +11,7 @@ mod selfedit;
 mod skin;
 mod sync;
 mod tar;
+mod threads;
 mod v1;
 pub use v1::token;
 
@@ -90,6 +92,7 @@ struct Live {
     stopping: bool,
     deleted: bool,
     busy: bool,
+    command: Option<String>,
     /// A promotion or rollback has installed its binary; Stop no longer applies.
     installed: bool,
     /// The running command is a promotion (the snapshot's `self_edit.installing`).
@@ -131,6 +134,7 @@ impl Live {
             stopping: false,
             deleted: false,
             busy: false,
+            command: None,
             installed: false,
             installing: false,
             display: None,
@@ -277,6 +281,7 @@ impl Drop for Idle<'_> {
         // A worker that panicked never drained it: later changes are refused, not lost.
         live.app_state = None;
         live.busy = false;
+        live.command = None;
         live.stopping = false;
         live.installed = false;
         live.installing = false;
@@ -327,6 +332,11 @@ struct Host {
     attention: Mutex<attention::Attention>,
     /// Sessions whose commands were running when the host last stopped.
     interrupted: Vec<String>,
+    /// Outstanding one-click connect codes (connect.rs).
+    connect: Mutex<connect::Codes>,
+    /// Points where a test stops a thread import as a stopped host would (threads.rs).
+    #[cfg(test)]
+    cuts: Mutex<Vec<&'static str>>,
     _lock: File,
 }
 /// A worker's observer: events to the thread's streams, and the thread's host for the
@@ -921,6 +931,9 @@ impl Host {
             CREATE TABLE IF NOT EXISTS command_times(id TEXT PRIMARY KEY,at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,hash TEXT NOT NULL UNIQUE,label TEXT NOT NULL,created INTEGER NOT NULL,seen INTEGER NOT NULL,issued INTEGER NOT NULL);
             UPDATE commands SET state='interrupted',error='Host restarted. Outcome may be committed; inspect the session. This command will not be re-dispatched.' WHERE state='running';").map_err(err)?;
+        db.execute_batch(threads::TABLES).map_err(err)?;
+        // Before sessions are listed: imports cut before their commit are taken away.
+        threads::recover(&root, &db)?;
         // Receipts from before command_times start their retention window now.
         db.execute(
             "INSERT OR IGNORE INTO command_times SELECT id,?1 FROM commands",
@@ -999,8 +1012,20 @@ impl Host {
             self_edit: selfedit::Cache::default(),
             attention: Mutex::new(attention::Attention::new()),
             interrupted,
+            connect: Mutex::default(),
+            #[cfg(test)]
+            cuts: Mutex::default(),
             _lock: lock,
         })
+    }
+    /// Whether a test stops a thread import at `point` (never outside tests).
+    #[cfg(test)]
+    fn cut(&self, point: &str) -> bool {
+        lock(&self.cuts).contains(&point)
+    }
+    #[cfg(not(test))]
+    fn cut(&self, _point: &str) -> bool {
+        false
     }
 
     /// `serve --resume known`: continues each session a stop of the host interrupted
@@ -1351,6 +1376,14 @@ impl Host {
                 "an upgrade or restart is in progress; wait for the host to reconnect".into(),
             );
         }
+        // A thread that moved back to its client takes no more work here: it is only
+        // exported again (its kept bundle), renamed or deleted.
+        if !matches!(kind, "new" | "delete" | "rename" | "stop" | "rollback")
+            && !id.is_empty()
+            && threads::moved(&self.dir(id))
+        {
+            return Err(threads::MOVED_AWAY.into());
+        }
         // Self-edit commands need Spindle's source in the thread at its head: a legacy
         // self-edit thread, or a checkout (selfedit.rs), checked below once the head is read.
         let self_edit = matches!(kind, "promote" | "update");
@@ -1436,6 +1469,19 @@ impl Host {
                 }
             }
         }
+        if kind == "stop"
+            && let Some(target) = data.get("target_request")
+            && target.as_str().filter(|target| id_ok(target)).is_none()
+        {
+            return Err(bad("target_request must name a command request_id"));
+        }
+        if kind == "stop"
+            && data["target_request"]
+                .as_str()
+                .is_some_and(|target| state.command.as_deref() != Some(target))
+        {
+            return Err("no unstopped worker is running".into());
+        }
         if kind == "stop" && state.installed {
             return Err("the new binary is already installed and the host is restarting; Stop no longer applies".into());
         }
@@ -1514,6 +1560,7 @@ impl Host {
             recorded?;
         } else {
             state.busy = true;
+            state.command = Some(request.clone());
             state.stopping = false;
             state.installed = false;
             state.installing = kind == "promote";
@@ -1661,7 +1708,16 @@ impl Host {
                             return Err(err(error));
                         }
                     }
-                    let removed = db.execute("DELETE FROM sessions WHERE id=?1", [id]);
+                    // Its owner and import record go with its row, in one transaction.
+                    let removed = db.unchecked_transaction().and_then(|tx| {
+                        let removed = tx.execute("DELETE FROM sessions WHERE id=?1", [id])?;
+                        tx.execute("DELETE FROM owners WHERE session=?1", [id])?;
+                        tx.execute("DELETE FROM threads WHERE session=?1", [id])?;
+                        if removed == 1 {
+                            tx.commit()?;
+                        }
+                        Ok(removed)
+                    });
                     if !matches!(removed, Ok(1)) {
                         let error = match removed {
                             Ok(_) => "session registry deletion did not remove one row".into(),
@@ -2661,6 +2717,11 @@ impl Host {
         let Some(stamp) = stamp(&store) else {
             return json!({"state":"missing"});
         };
+        // Sealing changes no store file: asked before the cached summary.
+        if threads::moved(&self.dir(id)) {
+            let at = (stamp[0].1.max(stamp[1].1) / 1_000_000) as u64;
+            return json!({"state":"moved","at":at});
+        }
         if let Some((seen, value)) = lock(&self.summaries).get(id)
             && *seen == stamp
         {
@@ -3114,7 +3175,15 @@ fn route(
     // A preview's own requests come from its sandboxed (opaque-origin) document, which
     // browsers report as cross-site; the token in the path authorizes them (preview.rs).
     let preview = request.path.starts_with(preview::PREFIX);
+    // One-click connect's pages open in a tab of their own, from the app that asks (an
+    // extension): a top-level navigation the browser counts as cross-site. Only that,
+    // never in a frame; the page shows nothing secret and asks again same-origin.
+    let connecting = request.method == "GET"
+        && matches!(request.path.as_str(), "/connect" | "/connect/done")
+        && request.headers.get("sec-fetch-mode").map(String::as_str) == Some("navigate")
+        && request.headers.get("sec-fetch-dest").map(String::as_str) == Some("document");
     if !preview
+        && !connecting
         && request
             .headers
             .get("sec-fetch-site")
@@ -3151,6 +3220,13 @@ fn route(
         http::respond(stream, 200, mime, &body, "").map_err(err)?;
         return Ok(());
     }
+    // One-click connect's pages: who asks, and where the answer lands (connect.rs).
+    if request.method == "GET" && request.path == "/connect" {
+        return connect::page(host, stream, &request, public);
+    }
+    if request.method == "GET" && request.path == "/connect/done" {
+        return connect::done(stream, &request);
+    }
     if request.path == "/api/pair" && request.method == "POST" {
         http::read_body(stream, &mut request).map_err(bad)?;
         let data: Value = serde_json::from_slice(&request.body).map_err(|e| bad(err(e)))?;
@@ -3182,11 +3258,11 @@ fn route(
     let Some(device) = device else {
         return Err(Refused(401, "Pair this device first".into()));
     };
-    // A runner token runs commands through /v1 and is no screen's credential.
-    if v1::runner_only(&device) {
+    // A runner or browser token works through /v1 and is no screen's credential.
+    if v1::scoped(&device) {
         return Err(Refused(
             403,
-            "this token only runs commands (/v1/runner, /v1/run)".into(),
+            "this token works only through /v1 (runner and browser tokens open no screen)".into(),
         ));
     }
     // The body is read only for a paired device (an upload can be 8 MiB).
@@ -3312,6 +3388,11 @@ fn route(
             let id = data["session"].as_str().unwrap_or_default().to_string();
             let receipt = host.submit(&id, data)?;
             return send_json(stream, 202, &receipt, extra);
+        }
+        // A paired screen's answer to a client asking to connect (connect.rs).
+        ("POST", "/api/connect") => {
+            let answer = connect::answer(host, &json_body()?)?;
+            return send_json(stream, 200, &answer, extra);
         }
         // Sign-in is Dext's own (same flows and credential store as `dext auth`). A
         // credential travels only in this request: never logged, admitted or retained.
@@ -3957,6 +4038,10 @@ fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
         "/terminal.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("../../ui/terminal.js"),
+        ),
+        "/connect.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../ui/connect.js"),
         ),
         "/text.js" => (
             "text/javascript; charset=utf-8",
@@ -4909,6 +4994,10 @@ mod tests {
             assert!(file.file_type().unwrap().is_file());
             let name = file.file_name();
             let name = name.to_str().unwrap();
+            // Templates of the connect pages, filled in by /connect and /connect/done.
+            if matches!(name, "connect.html" | "connect-done.html") {
+                continue;
+            }
             let path = if name == "index.html" {
                 "/".into()
             } else {

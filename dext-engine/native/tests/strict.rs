@@ -118,6 +118,42 @@ fn strict_runtimes_reserving_address_space_still_start() {
 }
 
 #[test]
+fn strict_programs_mapping_more_than_they_touch_still_run() {
+    // RLIMIT_DATA counts private writable memory a process maps, not what it touches:
+    // Blender's Cycles on 24 cores maps 4.2 GiB and touches 430 MB, and failed under a
+    // fixed 4 GiB cap. 5 GiB mapped privately, one page touched.
+    let total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|info| {
+            let line = info
+                .lines()
+                .find_map(|line| line.strip_prefix("MemTotal:"))?;
+            line.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()
+        })
+        .map(|kib| kib * 1024);
+    if !Path::new("/usr/bin/python3").exists() || total.is_none_or(|total| total / 4 * 3 < 6 << 30)
+    {
+        eprintln!("skipped: no python3, or under 8 GiB of memory");
+        return;
+    }
+    let script = "import mmap; m = mmap.mmap(-1, 5 << 30, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS); m[0:1] = b'x'; print('mapped')";
+    let output = executor()
+        .execute(
+            &BTreeMap::new(),
+            &["/usr/bin/python3".into(), "-c".into(), script.into()],
+            Duration::from_secs(20),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(
+        output.success(),
+        "{}",
+        String::from_utf8_lossy(output.stderr())
+    );
+    assert_eq!(output.stdout(), b"mapped\n");
+}
+
+#[test]
 fn strict_exec_does_not_inherit_ambient_file_descriptors() {
     use std::os::fd::AsRawFd;
     let host = std::fs::File::open("/etc/passwd").unwrap();
@@ -352,6 +388,41 @@ fn killed_runs_keep_the_output_printed_before_the_kill() {
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert_eq!(run_failure(&error).unwrap().stdout, b"started\n");
+}
+
+/// A stop ends the run as its own bounds do: nothing it wrote is kept, and what it printed
+/// until then comes back with the failure, so a host can record the stopped call with it.
+#[test]
+fn stopped_runs_keep_the_output_printed_before_the_stop() {
+    let interrupt = AtomicBool::new(false);
+    let streams = std::sync::atomic::AtomicU8::new(0);
+    let observe = |stream: u8, _: &[u8]| {
+        let bit = 1 << stream;
+        if streams.fetch_or(bit, Ordering::SeqCst) | bit == 6 {
+            interrupt.store(true, Ordering::SeqCst);
+        }
+    };
+    let error = executor()
+        .execute_with(
+            &BTreeMap::new(),
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo started; echo warned >&2; printf x > kept; sleep 20".into(),
+            ],
+            Duration::from_secs(10),
+            &interrupt,
+            RunOptions {
+                observe: Some(&observe),
+                ..RunOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+    let failure = run_failure(&error).expect("contained failure");
+    assert_eq!(failure.stdout, b"started\n");
+    assert_eq!(failure.stderr, b"warned\n");
+    assert!(failure.reason.contains("stopped"), "{}", failure.reason);
 }
 
 #[test]

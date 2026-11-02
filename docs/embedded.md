@@ -212,6 +212,7 @@ overlap, and each returns a Promise of its result. `prompt`, `resume`, `retry`,
 | `pool` | none | `storage: 'opfs'`: an async function that opens the slot pool, such as `() => openOpfsPool()` |
 | `catalog` | the built-in providers | Providers in Dext's catalog format |
 | `credentials` | none | `async (facts) => key \| { key } \| headers`. Called before every new model request, before it is reserved. Throwing refuses the request, and nothing is sent |
+| `grantHeaders` | none | `async ({ grant, url, method, names }) => ({ [name]: value })`: the values of the headers an HTTP grant adds, asked before each script request under it (see [Script calls](#script-calls-code-mode-bridge)). Throwing refuses the request, and nothing is sent |
 | `fetch` | `globalThis.fetch` | Sends model requests and script HTTP requests |
 | `runner` | none | Runs `bash`: `{ app, remote }` (each optional), or a single runner. A `remoteRunner(...)` serves `runner: 'remote'` sessions, and any other runner serves `runner: 'app'` sessions |
 | `deadlines` | `{ firstByte: 180000, idle: 180000, total: 600000 }` | Milliseconds for model requests: until the response starts, between body chunks, and overall |
@@ -286,6 +287,7 @@ app that drives the wasm module directly must do the same.
 | `event` | `{session, request, event}` | A session event |
 | `work` | `{session, id, work}` | Something the app must do for a running operation. `session` is the session's `dir`, or `dir#<task key>` for a task |
 | `work_cancel` | `{session, id}` | The operation stopped waiting for that work. The app ends it, and a later answer changes nothing |
+| `work_stop` | `{session, id}` | The user stopped the command that `run` work runs. The app stops it and still answers, with what it printed (see [the app runner](#app-runner)) |
 
 | `work.kind` | Fields | The app does | Answer |
 | --- | --- | --- | --- |
@@ -405,9 +407,12 @@ through the VFS.
   VFS claims no atomic-write or power-safe-overwrite guarantees and reports a 4096-byte
   sector size.
 - **Locks.** No byte-range locks are taken. The store's owner holds
-  `<dir>/store/authority.sqlite.lock`, created with `wx` (which fails if the file
-  exists). It contains `spindle-embed: <note>`, is fsynced along with its directory,
-  and is removed when the store closes after SQLite. A second owner (another client,
+  `<dir>/store/authority.sqlite.lock`. The owner writes its note
+  (`spindle-embed: <note>`) whole to a draft beside it (created with `wx`, fsynced) and
+  hard-links the draft into place, which fails if the lock file exists, as an exclusive
+  create does; then the directory is fsynced. A crash therefore leaves no lock file or
+  a whole one, never an empty one. The file system must support hard links: there is
+  no in-place fallback. The lock file is removed when the store closes after SQLite. A second owner (another client,
   another process or a native host) is refused, and its call fails with "another spindle
   process or connection is using this session's store; ... (held by: <note>)". A lock
   file left
@@ -518,8 +523,13 @@ const runner = {
 what changed: `writes` (each with `content` as a string or `Uint8Array`, or `base64`,
 plus `executable`), `deletes`, `links`, `directories`, and `failure` when the run could
 not start or finish (its changes are then not kept). A runner that throws is recorded
-as a failed run. `signal` aborts when the operation stops waiting. If the client has
-no app runner, the run fails with "this app has no command runner".
+as a failed run. `signal` aborts when the operation stops waiting, and when the user
+stops the command (a session `stop` while it runs). After a stop the runner stops the
+command and still answers, with what it printed until then: the package records the
+command as stopped, with that output, and it never runs again. A runner that has not
+answered 15 seconds after the stop is answered for: the command is recorded as stopped
+without its output. If the client has no app
+runner, the run fails with "this app has no command runner".
 
 An app runner without `identity()` isolates nothing as far as Spindle can tell. Its
 runs are labelled with the host runner's identity, and the session emits an
@@ -539,7 +549,9 @@ the command in its sandbox, over a copy of the workspace sent with the request, 
 returns the output and the changed files. The embedded store records them as the
 call's result and new workspace, so a rewind still covers what the command did. The
 host keeps no workspace from a run. The client gives each run a `run` id and, when
-its signal aborts, posts `/v1/run/ID/stop` with a separate 10-second deadline.
+its signal aborts (the operation stopped waiting, or the user stopped the command),
+posts `/v1/run/ID/stop` with a separate 10-second deadline and returns that run's
+answer.
 The host retains a stop that overtakes the upload. Against an older host returning
 404 for the stop route, the remote command runs out its timeout. `GET /v1/run/ID`
 reports the run's state to its starting token only. The original request still
@@ -588,10 +600,19 @@ native code mode does, and the client performs the I/O
 - **Tool calls** go to the registered app tool handlers. A request that includes a
   tool call runs all its children one at a time.
 - **HTTP calls** are allowed only where a grant from `setHttpGrants` covers them
-  (URL prefix, methods, timeout, response size). Grants hold no headers, and a grant
-  with `headers` is refused. The client sends these requests with `credentials:
-  'omit'`, `redirect: 'manual'` and `cache: 'no-store'`. A redirect is answered as an
-  error, not followed.
+  (URL prefix, methods, timeout, response size). The package keeps no secrets, so a
+  grant's `headers` may only name headers the app adds as it sends, each
+  `{"app": true}` (for example `{"Authorization": {"app": true}}`); any other value is
+  refused, and a script may not set such a header itself. Before each request under
+  that grant the client asks its `grantHeaders({grant, url, method, names})` option
+  for the values (throwing refuses the request: nothing is sent, a known outcome).
+  Each value must be visible ASCII and goes only in that request; every echo of it (or
+  of an auth scheme's credentials in it), as is, JSON-escaped, percent-encoded or in
+  base64, is replaced with `[redacted]` in the response's headers and body and in error
+  text before the package journals it or the script sees it. A value whose secret is
+  under 4 characters, which could not be found reliably, is refused. The client sends
+  these requests with `credentials: 'omit'`, `redirect: 'manual'` and
+  `cache: 'no-store'`. A redirect is answered as an error, not followed.
 - All children of one request are reserved before any runs. Otherwise model and HTTP
   children run up to 4 at a time. Per command, a script may make at most 128 calls and 32 model
   calls, within a nested-model allowance of 1048576 (input bytes plus requested output

@@ -46,7 +46,10 @@ const FEATURES: &[&str] = &[
     "tasks",
     "runner",
     "run_stop",
+    "targeted_stop",
     "runner_tokens",
+    "threads",
+    "connect",
 ];
 /// Command kinds v1 admits (`/api` also has the self-edit `promote`, `rollback` and
 /// `update`).
@@ -74,7 +77,7 @@ const HEADED: [&str; 7] = [
     "task_start",
 ];
 /// The host's own refusals that v1 names more precisely than by status.
-const BUSY: &str = "session busy; wait or stop the run";
+pub(super) const BUSY: &str = "session busy; wait or stop the run";
 const REUSED: &str = "request_id reused with different payload";
 const MOVED: &str = "session changed; refresh before submitting";
 const IDLE: &str = "no unstopped worker is running";
@@ -90,7 +93,7 @@ const RUN_KEPT: Duration = Duration::from_secs(600);
 const EARLY_STOP: Duration = Duration::from_secs(60);
 const MAX_RUNS: usize = 256;
 const MAX_ENDED: usize = 1024;
-const MAX_TOKENS: i64 = 16;
+pub(super) const MAX_TOKENS: i64 = 16;
 /// Bounds of the stable event ring (the UI's has the same).
 const MAX_EVENTS: usize = 1024;
 const MAX_BYTES: usize = 512 * 1024;
@@ -162,14 +165,14 @@ pub(super) fn path(path: &str) -> bool {
 }
 
 /// A v1 refusal: HTTP status, stable code, message and extra fields.
-struct Failure {
+pub(super) struct Failure {
     status: u16,
     code: &'static str,
     message: String,
     extra: Map<String, Value>,
 }
 impl Failure {
-    fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
+    pub(super) fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
             code,
@@ -188,7 +191,7 @@ fn bad(message: impl Into<String>) -> Failure {
 fn missing(message: impl Into<String>) -> Failure {
     Failure::new(404, "not_found", message)
 }
-fn internal(error: impl std::fmt::Display) -> Failure {
+pub(super) fn internal(error: impl std::fmt::Display) -> Failure {
     Failure::new(500, "internal", error.to_string())
 }
 /// A host refusal in v1 terms. Below 500 nothing was admitted; a 500 from a command
@@ -199,6 +202,7 @@ fn classify(Refused(status, message): Refused, command: bool) -> Failure {
         (409, REUSED) => "request_id_reused",
         (409, MOVED) => "head_moved",
         (409, IDLE) => "not_running",
+        (409, super::threads::MOVED_AWAY) => "moved",
         (409, text) if text.starts_with("four sessions") => "busy",
         (400, _) => "bad_request",
         (401, _) => "unauthorized",
@@ -325,6 +329,32 @@ pub(super) fn runner_only(device: &str) -> bool {
     device.starts_with(RUNNER_PREFIX)
 }
 
+/// Whether `device` is a browser token (`api:browser:NAME`, connect.rs): the runner's
+/// routes, the host's models and providers, and the threads it brought.
+pub(super) fn browser(device: &str) -> bool {
+    device.starts_with(super::connect::BROWSER_PREFIX)
+}
+
+/// Whether `device` is a token limited to part of v1 (a runner or browser token): no
+/// screen's credential, no `/api`.
+pub(super) fn scoped(device: &str) -> bool {
+    runner_only(device) || browser(device)
+}
+
+/// The routes a browser token reaches; session routes, commands and receipts only for
+/// the threads it owns (checked in `dispatch`).
+fn browser_route(method: &str, path: &str) -> bool {
+    let parts: Vec<&str> = path.trim_end_matches('/').split('/').skip(2).collect();
+    runner_route(method, path)
+        || matches!(
+            (method, parts.as_slice()),
+            ("GET", ["models" | "providers" | "sessions"])
+                | ("POST", ["threads" | "commands"])
+                | ("GET", ["receipts", _])
+                | (_, ["sessions", _, ..])
+        )
+}
+
 /// The routes a runner token reaches: discovery and the runner's own.
 fn runner_route(method: &str, path: &str) -> bool {
     let parts: Vec<&str> = path.trim_end_matches('/').split('/').skip(2).collect();
@@ -348,6 +378,12 @@ pub(super) fn route(
     origin: &str,
 ) -> std::result::Result<(), Refused> {
     let answer = (|| -> Answer {
+        // A connect code is its own credential (connect.rs).
+        if request.method == "POST" && request.path == "/v1/connect/token" {
+            http::read_body(stream, &mut request).map_err(bad)?;
+            let token = super::connect::trade(host, &request.body)?;
+            return send(stream, 200, &token, extra);
+        }
         let device = authenticate(host, &request, extra, public, origin)?;
         // Refused before its body is read.
         if runner_only(&device) && !runner_route(&request.method, &request.path) {
@@ -356,6 +392,29 @@ pub(super) fn route(
                 "forbidden",
                 "this token only runs commands (/v1/runner, /v1/run)",
             ));
+        }
+        if browser(&device) && !browser_route(&request.method, &request.path) {
+            return Err(Failure::new(
+                403,
+                "forbidden",
+                "a browser token reaches the runner, the host's models and providers, and \
+                 the threads it brought",
+            ));
+        }
+        // A thread's bundle is streamed to a file, never read into memory here.
+        if request.method == "POST" && request.path == http::THREADS {
+            let imported = super::threads::import(host, stream, &mut request, &device)?;
+            let body = json!({
+                "session": session(host, &imported.id)?,
+                "fit": imported.fit,
+                "replayed": imported.replayed,
+            });
+            return send(
+                stream,
+                if imported.replayed { 200 } else { 201 },
+                &body,
+                extra,
+            );
         }
         if request.method == "POST" {
             http::read_body(stream, &mut request).map_err(bad)?;
@@ -367,6 +426,10 @@ pub(super) fn route(
         body.insert("error".into(), json!(failure.message));
         body.insert("code".into(), json!(failure.code));
         let _ = super::send_json(stream, failure.status, &Value::Object(body), extra);
+        // A bundle refused before it was read (too large, a full host...).
+        if request.unread() {
+            http::linger(stream);
+        }
     }
     Ok(())
 }
@@ -448,6 +511,16 @@ fn dispatch(
         .map(|text| text.parse::<u64>())
         .transpose()
         .map_err(|_| bad("revision must be a non-negative integer"))?;
+    // A browser token's threads: the sessions it owns (others are as if absent).
+    let owner = browser(device).then_some(device);
+    let mine =
+        |id: &str| owner.is_none_or(|owner| super::threads::owned(&lock(&host.db), id, owner));
+    // A bearer token's own row: a token replaced under the same name ends its streams.
+    let credential = request
+        .headers
+        .get("authorization")
+        .and_then(|header| header.strip_prefix("Bearer "))
+        .map(|token| hash(token.trim().as_bytes()));
     match (request.method.as_str(), parts.as_slice()) {
         ("GET", []) => send(stream, 200, &discovery(host, request), extra),
         ("GET", ["sessions"]) => {
@@ -455,6 +528,7 @@ fn dispatch(
                 .sessions()
                 .map_err(internal)?
                 .into_iter()
+                .filter(|row| row["id"].as_str().is_some_and(mine))
                 .map(|row| {
                     // The list's states as codes: "reply saved" is reply_saved.
                     let mut status = row["status"].clone();
@@ -559,7 +633,7 @@ fn dispatch(
             send(stream, 200, &models, extra)
         }
         ("POST", ["commands"]) => {
-            let (status, receipt) = command(host, &request.body)?;
+            let (status, receipt) = command(host, &request.body, owner)?;
             send(stream, status, &receipt, extra)
         }
         ("GET", ["usage"]) => {
@@ -573,13 +647,15 @@ fn dispatch(
             send(stream, 200, &host.usage(offset).map_err(internal)?, extra)
         }
         ("GET", ["receipts", id]) => match receipt(host, id)? {
-            Some(receipt) => send(stream, 200, &receipt, extra),
-            None => Err(missing(
+            Some(receipt) if receipt["session"].as_str().is_some_and(mine) => {
+                send(stream, 200, &receipt, extra)
+            }
+            _ => Err(missing(
                 "request_id not admitted (or its receipt has expired)",
             )),
         },
         (_, ["sessions", id, rest @ ..]) => {
-            if !id_ok(id) || host.live(id).is_err() {
+            if !id_ok(id) || host.live(id).is_err() || !mine(id) {
                 return Err(missing("session not found"));
             }
             let dir = host.dir(id);
@@ -708,7 +784,36 @@ fn dispatch(
                     };
                     send(stream, 200, &json!({ "targets": targets }), extra)
                 }
-                (true, ["events"]) => events(host, stream, id, request, extra, device),
+                (true, ["events"]) => events(
+                    host,
+                    stream,
+                    id,
+                    request,
+                    extra,
+                    (device, credential.as_deref()),
+                ),
+                // Moves the thread back to its client (or copies it): its bundle.
+                (false, ["export"]) => {
+                    let data: Value = if request.body.is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_slice(&request.body)
+                            .map_err(|e| bad(format!("body: {e}")))?
+                    };
+                    let Value::Object(fields) = &data else {
+                        return Err(bad("the body is a JSON object: {keep?}"));
+                    };
+                    if let Some(unknown) = fields.keys().find(|key| *key != "keep") {
+                        return Err(bad(format!("`{unknown}` does not apply to export")));
+                    }
+                    let keep = match &data["keep"] {
+                        Value::Null => false,
+                        Value::Bool(keep) => *keep,
+                        _ => return Err(bad("keep must be true or false")),
+                    };
+                    let exported = super::threads::export(host, id, keep)?;
+                    super::threads::send(stream, &exported, extra)
+                }
                 (false, ["steer"]) => {
                     let queued = steer(host, id, &request.body)?;
                     send(stream, 202, &json!({ "queued": queued }), extra)
@@ -734,13 +839,22 @@ fn dispatch(
                     send(stream, 200, &granted, extra)
                 }
                 (_, ["messages" | "files" | "file" | "archive" | "targets" | "events"] | [])
-                | (_, ["steer" | "upload" | "preview" | "app_tool_result"]) => Err(not_allowed()),
+                | (_, ["steer" | "upload" | "preview" | "app_tool_result" | "export"]) => {
+                    Err(not_allowed())
+                }
                 _ => Err(missing("no such route")),
             }
         }
-        (_, [] | ["sessions"] | ["providers"] | ["models"] | ["commands"] | ["receipts", _]) => {
-            Err(not_allowed())
-        }
+        (
+            _,
+            []
+            | ["sessions"]
+            | ["providers"]
+            | ["models"]
+            | ["commands"]
+            | ["receipts", _]
+            | ["threads"],
+        ) => Err(not_allowed()),
         _ => Err(missing("no such route")),
     }
 }
@@ -780,6 +894,7 @@ fn discovery(host: &Host, request: &http::Request) -> Value {
             "receipt_days": super::KEEP_RECEIPTS / (24 * 3600 * 1000),
             "events_retained": MAX_EVENTS,
             "event_bytes": MAX_BYTES,
+            "thread_bytes": super::threads::MAX_THREAD,
         },
     })
 }
@@ -794,10 +909,10 @@ fn head(host: &Host, id: &str) -> std::result::Result<u64, Failure> {
 
 /// `GET /v1/sessions/:id`: where a thread stands.
 fn session(host: &Host, id: &str) -> std::result::Result<Value, Failure> {
-    let (busy, stopping, since) = {
+    let (busy, stopping, since, command) = {
         let live = host.live(id).map_err(missing)?;
         let live = live.lock();
-        (live.busy, live.stopping, live.since)
+        (live.busy, live.stopping, live.since, live.command.clone())
     };
     let name: Option<String> = lock(&host.db)
         .query_row("SELECT name FROM sessions WHERE id=?1", [id], |row| {
@@ -821,6 +936,7 @@ fn session(host: &Host, id: &str) -> std::result::Result<Value, Failure> {
     value["id"] = json!(id);
     value["name"] = json!(name);
     value["busy"] = json!(busy);
+    value["running_request"] = json!(command);
     // While the host runs it, nothing was left unfinished by a stopped owner.
     if busy {
         value["wake"] = json!({"work": "running", "why": null});
@@ -834,6 +950,8 @@ fn session(host: &Host, id: &str) -> std::result::Result<Value, Failure> {
         .map(|usage| usage.to_json())
         .unwrap_or(Value::Null);
     value["pending_settings"] = agent::pending_settings(&dir).unwrap_or(Value::Null);
+    // Moved back to its client: sealed here, only exported again or deleted.
+    value["moved"] = json!(super::threads::moved(&dir));
     let live = host.live(id).map_err(missing)?;
     // A call waiting for the app's answer, so a client that connects late can answer it.
     let pending: Vec<Value> = live
@@ -934,6 +1052,7 @@ fn fields(kind: &str) -> &'static [&'static str] {
         "retry" => &["session", "expected_head"],
         "rewind" => &["session", "revision", "expected_head"],
         "rename" => &["session", "name"],
+        "stop" => &["session", "target_request"],
         "settings" => &[
             "session",
             "provider",
@@ -961,7 +1080,11 @@ fn task_key(dir: &std::path::Path, task: &str) -> std::result::Result<String, Fa
 /// `POST /v1/commands`: admits a command (202) or returns the receipt of an already
 /// admitted request ID (200). The host checks `expected_head` under its own locks;
 /// without one, the head read here is what the command is admitted against.
-fn command(host: &Arc<Host>, body: &[u8]) -> std::result::Result<(u16, Value), Failure> {
+fn command(
+    host: &Arc<Host>,
+    body: &[u8],
+    owner: Option<&str>,
+) -> std::result::Result<(u16, Value), Failure> {
     let body: Value = serde_json::from_slice(body).map_err(|e| bad(format!("body: {e}")))?;
     let Value::Object(fields_given) = &body else {
         return Err(bad("the body is a JSON object"));
@@ -979,6 +1102,20 @@ fn command(host: &Arc<Host>, body: &[u8]) -> std::result::Result<(u16, Value), F
         !matches!(key.as_str(), "request_id" | "kind") && !allowed.contains(&key.as_str())
     }) {
         return Err(bad(format!("`{unknown}` does not apply to `{kind}`")));
+    }
+    // A browser token acts only on the threads it brought (before any receipt is told).
+    if let Some(owner) = owner {
+        if kind == "new" {
+            return Err(Failure::new(
+                403,
+                "forbidden",
+                "a browser token starts no thread here; it brings one (POST /v1/threads)",
+            ));
+        }
+        let session = body["session"].as_str().unwrap_or_default();
+        if !super::threads::owned(&lock(&host.db), session, owner) {
+            return Err(missing("session not found"));
+        }
     }
     if kind == "continue" && !body["until"].is_null() && body["until"] != "unknown" {
         return Err(bad("until must be unknown"));
@@ -1134,7 +1271,7 @@ fn events(
     id: &str,
     request: &http::Request,
     extra: &str,
-    device: &str,
+    (device, credential): (&str, Option<&str>),
 ) -> Answer {
     let live = host.live(id).map_err(missing)?;
     http::headers(
@@ -1218,8 +1355,9 @@ fn events(
             }
         }
         if heartbeat.elapsed() >= super::HEARTBEAT {
-            // A revoked device or token loses its open stream too.
-            if !host.paired(device) {
+            // A revoked device or token (or one replaced under its name) loses its
+            // open stream too.
+            if !host.paired(device) || credential.is_some_and(|hash| !current(host, device, hash)) {
                 return Ok(());
             }
             out.push_str(": heartbeat\n\n");
@@ -1236,13 +1374,28 @@ fn events(
     Ok(())
 }
 
-/// `spindle --dir HOST token new NAME [--runner] | list | revoke NAME`: named API tokens
-/// for the host's HTTP API. A token is a device row (its SHA-256 only) with id
-/// `api:NAME` (`api:run:NAME` with `--runner`: it reaches only the remote runner); it is
-/// printed once, works as `Authorization: Bearer TOKEN`, is never evicted by new
-/// pairings, and shows (and can be revoked) under Settings > Host like any screen.
+/// Whether the token with SHA-256 `hash` is still `device`'s (a browser token minted
+/// again under its name replaces the row's hash).
+fn current(host: &Host, device: &str, hash: &str) -> bool {
+    lock(&host.db)
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1 AND hash=?2)",
+            [device, hash],
+            |row| row.get(0),
+        )
+        .unwrap_or(false)
+}
+
+/// `spindle --dir HOST token new NAME [--runner | --browser] | list | revoke NAME`: named
+/// API tokens for the host's HTTP API. A token is a device row (its SHA-256 only) with
+/// id `api:NAME` (`api:run:NAME` with `--runner`: it reaches only the remote runner;
+/// `api:browser:NAME` with `--browser`: the runner, the host's models and the threads it
+/// brings, minted again to replace it, as one-click connect does); it is printed once,
+/// works as `Authorization: Bearer TOKEN`, is never evicted by new pairings, and shows
+/// (and can be revoked) under Settings > Host like any screen.
 pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
-    const USAGE: &str = "usage: spindle --dir HOST token new NAME [--runner] | list | revoke NAME";
+    const USAGE: &str =
+        "usage: spindle --dir HOST token new NAME [--runner | --browser] | list | revoke NAME";
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     // Not starting with `-`: `token new --runner` names no token, it misses the name.
     let name_ok = |name: &str| {
@@ -1261,9 +1414,20 @@ pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
             return Err(format!("no spindle host in {}", root.display()));
         }
     }
-    let db = Connection::open(root.join("host.sqlite")).map_err(err)?;
+    let mut db = Connection::open(root.join("host.sqlite")).map_err(err)?;
     db.busy_timeout(Duration::from_secs(5)).map_err(err)?;
     match args.as_slice() {
+        // A browser token's name is the client's (1-64 characters, spaces allowed).
+        ["new", name, "--browser"] if !name.starts_with('-') => {
+            let token = super::connect::mint(&mut db, name)?;
+            println!("{token}");
+            eprintln!(
+                "Browser token `{name}` created (it replaces any earlier one of that name, \
+                 whose threads it keeps). It is shown only this once; send it as \
+                 `Authorization: Bearer TOKEN`."
+            );
+            Ok(())
+        }
         ["new", name, rest @ ..] if name_ok(name) && (rest.is_empty() || rest == ["--runner"]) => {
             let runner = !rest.is_empty();
             let count: i64 = db
@@ -1279,10 +1443,11 @@ pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
             // One name, one token, whichever its kind.
             let taken: i64 = db
                 .query_row(
-                    "SELECT count(*) FROM devices WHERE id IN (?1,?2)",
+                    "SELECT count(*) FROM devices WHERE id IN (?1,?2,?3)",
                     [
                         format!("{TOKEN_PREFIX}{name}"),
                         format!("{RUNNER_PREFIX}{name}"),
+                        format!("{}{name}", super::connect::BROWSER_PREFIX),
                     ],
                     |row| row.get(0),
                 )
@@ -1342,9 +1507,13 @@ pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
             };
             for row in rows {
                 let (id, created, seen) = row.map_err(err)?;
-                let name = match id.strip_prefix(RUNNER_PREFIX) {
-                    Some(name) => format!("{name} (runner)"),
-                    None => id[TOKEN_PREFIX.len()..].to_string(),
+                let name = match (
+                    id.strip_prefix(RUNNER_PREFIX),
+                    id.strip_prefix(super::connect::BROWSER_PREFIX),
+                ) {
+                    (Some(name), _) => format!("{name} (runner)"),
+                    (_, Some(name)) => format!("{name} (browser)"),
+                    _ => id[TOKEN_PREFIX.len()..].to_string(),
                 };
                 println!(
                     "{name:<40} created {:<10} last used {}",
@@ -1357,10 +1526,11 @@ pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
         ["revoke", name] => {
             let removed = db
                 .execute(
-                    "DELETE FROM devices WHERE id IN (?1,?2)",
+                    "DELETE FROM devices WHERE id IN (?1,?2,?3)",
                     [
                         format!("{TOKEN_PREFIX}{name}"),
                         format!("{RUNNER_PREFIX}{name}"),
+                        format!("{}{name}", super::connect::BROWSER_PREFIX),
                     ],
                 )
                 .map_err(err)?;
@@ -1372,7 +1542,7 @@ pub fn token(root: PathBuf, args: Vec<String>) -> Result<()> {
             }
         }
         ["new", _, ..] => Err(
-            "a token name is 1–40 letters, digits, `-`, `_` or `.`, not starting with `-`; the only option is `--runner`, after the name"
+            "a token name is 1–40 letters, digits, `-`, `_` or `.`, not starting with `-` (a browser token's, 1-64 characters); the options are `--runner` and `--browser`, after the name"
                 .into(),
         ),
         _ => Err(USAGE.into()),
@@ -1762,6 +1932,56 @@ mod tests {
             &json!({"command": "true", "run": "r4"}),
         );
         assert_eq!(done["success"], true, "{done}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn targeted_stop_never_cancels_a_later_command() {
+        let (root, host) = temp_host_for_tests("v1-targeted-stop");
+        let (_, device) = host.pair("t").unwrap();
+        let live = thread(&host);
+        let interrupt = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = live.lock();
+            state.busy = true;
+            state.command = Some("original".into());
+            state.cancel = Some(interrupt.clone());
+        }
+        assert_eq!(
+            get(&host, "/v1/sessions/s", &device).1["running_request"],
+            "original"
+        );
+        for target in [json!("other"), json!(null), json!(4)] {
+            let command = json!({"request_id": format!("invalid-{}", target.to_string().len()), "kind": "stop", "session": "s", "target_request": target});
+            assert!(post(&host, "/v1/commands", &device, &command).0 >= 400);
+            assert!(!interrupt.load(Ordering::SeqCst));
+            assert!(!live.lock().stopping);
+        }
+        let stop = json!({"request_id": "stop-original", "kind": "stop", "session": "s", "target_request": "original"});
+        assert_eq!(
+            post(&host, "/v1/commands", &device, &stop).1["state"],
+            "completed"
+        );
+        assert!(interrupt.load(Ordering::SeqCst));
+        interrupt.store(false, Ordering::SeqCst);
+        {
+            let mut state = live.lock();
+            state.stopping = false;
+            state.command = Some("later".into());
+        }
+        assert_eq!(post(&host, "/v1/commands", &device, &stop).0, 200);
+        assert!(
+            !interrupt.load(Ordering::SeqCst),
+            "replaying the Stop receipt cannot stop a later command"
+        );
+        let stale = json!({"request_id": "another-stop", "kind": "stop", "session": "s", "target_request": "original"});
+        let (status, refusal) = post(&host, "/v1/commands", &device, &stale);
+        assert_eq!(
+            (status, refusal["code"].clone()),
+            (409, json!("not_running"))
+        );
+        assert!(!interrupt.load(Ordering::SeqCst));
+        drop(host);
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -6,6 +6,16 @@
 // (which Chrome does not offer as an optional permission, so the extension holds it and
 // the switch decides) types and clicks as the user would, pictures a tab and watches
 // its network. The switches are kept as `pages` ({reading, acting}) in the kv store.
+/** The browser Spindle runs in, as what it says names it (its prompts, its debugging bar,
+ * its access to sites are that browser's): Edge, Brave or Opera by their own name (Brave
+ * gives it only in the brands it lists, not in its user agent), and Chrome for Chrome and
+ * any other Chromium relative. */
+const BRANDS = (globalThis.navigator?.userAgentData?.brands ?? []).map(({ brand }) => brand);
+const AGENT = globalThis.navigator?.userAgent ?? '';
+export const BROWSER = BRANDS.includes('Microsoft Edge') || /\bEdg(e|A|iOS)?\//.test(AGENT) ? 'Edge'
+  : BRANDS.includes('Brave') ? 'Brave'
+  : BRANDS.some((brand) => /^Opera\b/.test(brand)) || /\bOPR\//.test(AGENT) ? 'Opera'
+  : 'Chrome';
 export const PAGE_ACCESS = ['https://*/*', 'http://*/*'];
 /** What Chrome asks of an extension that pictures the tab showing (sites alone do not
  * do): asked the first time the user takes one, and the tool uses it once given. */
@@ -252,4 +262,56 @@ export const ACTING_NAMES = new Set(ACTING.map((tool) => tool.name));
  * is unknown (the model checks before trying again, and a script makes no further calls). */
 export function uncertain(name, why) {
   return PAGE_TOOLS.find((tool) => tool.name === name)?.rerun === 'safe' ? { error: why } : { unknown: true, content: why };
+}
+
+/** Settings, Pages, Before acting: `full` (the default) acts without asking; `auto` asks
+ * before an action that sends or submits something; `ask` before every action that
+ * changes a page or a tab. Observing (screenshots, scrolling, waiting, the network log)
+ * never asks. */
+export const CONFIRM_MODES = ['full', 'auto', 'ask'];
+export const ASKING_NAMES = new Set(['navigate', 'click', 'type', 'select', 'press', 'dialog', 'close_tab']);
+/** A control's words that mean a click sends, commits or spends something. */
+const SENDING_WORDS = /\b(send|submit|post|publish|reply|comment|tweet|share|buy|pay|order|checkout|check out|purchase|confirm|delete|remove|transfer|subscribe|donate|book|apply)\b/i;
+
+/** The mode kept with the Pages switches (anything else reads as the default). */
+export function confirmMode(kept) {
+  return CONFIRM_MODES.includes(kept?.confirm) ? kept.confirm : 'full';
+}
+
+/** Whether `name` with `input` sends or submits something: Enter, typing with submit, a
+ * page dialog accepted, or a click on a submit control or one whose words say it sends
+ * (`target`: what the click lands on, from the page; null when that could not be told,
+ * which counts as sending). */
+export function sends(name, input, target) {
+  if (name === 'type') return input?.submit === true;
+  if (name === 'press') return /(^|\+)\s*(numpad)?enter$/i.test(String(input?.key ?? '').trim());
+  if (name === 'dialog') return input?.accept === true;
+  if (name === 'click') return !target || target.submits === true || SENDING_WORDS.test(target.label ?? '');
+  return false;
+}
+
+/** The action as the user is asked about it ("Click “Send” (button) on mail.example"). */
+export function actionText(name, input, target) {
+  const quote = (text, most = 80) => {
+    const clean = String(text ?? '').replace(/\s+/g, ' ').trim();
+    return `“${clean.length > most ? `${clean.slice(0, most - 1)}…` : clean}”`;
+  };
+  const what = target?.what ?? (input?.ref ? `part ${input.ref}` : 'the page');
+  const where = target?.host ? ` on ${target.host}` : '';
+  switch (name) {
+    case 'click': return `${input?.double ? 'Double-click' : input?.button === 'right' ? 'Right-click' : 'Click'} ${what}${where}`;
+    case 'type': return `Type ${quote(input?.text)} into ${what}${where}${input?.submit ? ', then press Enter' : ''}`;
+    case 'select': return `Choose ${(input?.values ?? []).map((value) => quote(value, 40)).join(', ')} in ${what}${where}`;
+    case 'press': return `Press ${String(input?.key ?? '')}${where}`;
+    case 'navigate': {
+      const action = input?.action ?? 'go';
+      if (action === 'back') return 'Go back a page';
+      if (action === 'forward') return 'Go forward a page';
+      if (action === 'reload') return 'Reload the page';
+      return `${input?.new_tab ? 'Open in a new tab' : 'Go to'} ${String(input?.url ?? '')}`;
+    }
+    case 'dialog': return `${input?.accept ? 'Accept' : 'Dismiss'} the page's dialog${input?.text ? ` with ${quote(input.text)}` : ''}`;
+    case 'close_tab': return `Close tab ${input?.tab}`;
+    default: return name;
+  }
 }

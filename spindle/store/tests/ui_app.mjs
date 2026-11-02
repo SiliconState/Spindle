@@ -41,7 +41,7 @@ const state = (more = {}) => ({head: 10, revision: 10, busy: false, complete: tr
 const response = (value, status = 200) => ({ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(value)});
 async function app(custom = () => undefined, hash = '', globals = {}) {
   const nodes = new Map([...html.matchAll(/id="([^"]+)"/g)].map(m => [m[1], new Node()]));
-  for(const id of ['theme-choice']) for(const mode of ['paper','light','dark','system']) {const button = new Node('button'); button.dataset.mode = mode; nodes.get(id).append(button);}
+  for(const id of ['theme-choice']) for(const mode of ['paper','light','dim','system']) {const button = new Node('button'); button.dataset.mode = mode; nodes.get(id).append(button);}
   for(const mode of ['model','digest']) {const button = new Node('button'); button.dataset.mode = mode; nodes.get('compaction-choice').append(button);}
   const storage = new Map(), calls = [], streams = [], events = {}, timers = [];
   const context = createContext({
@@ -894,6 +894,30 @@ test('two attachments for the same path are refused before sending', async () =>
   a.nodes.get('prompt').value = 'read both'; await a.nodes.get('composer').onsubmit({preventDefault() {}});
   assert.match(a.nodes.get('toast').textContent,/both be written to “notes.md”/);
   assert.equal(a.calls.filter(c => c.path === '/api/commands').length,0);
+});
+
+test('a turn stopped part way takes a message that goes on with it, says so, and offers Continue and Retry', async () => {
+  const a = await app();
+  await a.subject.openThread('a');
+  const messages = [
+    {role:'user',content:[{type:'text',text:'run it'}]},
+    {role:'assistant',content:[{type:'tool_use',id:'t',name:'bash',input:{command:'sleep 100'}}]},
+    {role:'user',content:[{type:'tool_result',tool_use_id:'t',content:'started\n[the user stopped this command before it finished; none of its workspace changes were kept]',is_error:true}]},
+  ];
+  a.subject.render(state({complete:false,phase:'AfterTools',messages}));
+  assert.equal(a.nodes.get('prompt').placeholder,'Message to go on');
+  assert.equal(a.nodes.get('continue').hidden,false);
+  assert.equal(a.nodes.get('retry').hidden,false,'Retry asks again from before the stopped step');
+  assert.match(a.nodes.get('phase-text').textContent,/stopped part way/);
+  assert.match(a.nodes.get('live').children.at(-1).textContent,/You stopped this turn part way[\s\S]*does not run again[\s\S]*Continue[\s\S]*Retry/);
+  a.nodes.get('prompt').value = 'skip that and go on';
+  await a.nodes.get('composer').onsubmit({preventDefault() {}});
+  const sent = a.calls.filter(c => c.path === '/api/commands').at(-1);
+  assert.equal(sent?.data.kind,'say','the message goes, as any message does');
+  assert.equal(sent.data.text,'skip that and go on');
+  // A session's first request cut off has no point before it: no message goes.
+  a.subject.render(state({complete:false,phase:'ModelWait',messages:messages.slice(0,1)}));
+  assert.equal(a.nodes.get('prompt').placeholder,'Not ready for a message');
 });
 
 test('a refused credential says needs sign-in, explains itself at the end of the thread and opens the sign-in', async () => {

@@ -169,7 +169,7 @@ test('real DOM mobile startup, sheets, viewer, history, commands and layout (off
     const page = join(profile,'fixture.html');
     await writeFile(page, html);
     // --headless: a full Chrome needs it (chrome-headless-shell accepts and ignores it).
-    const result = spawnSync(browser,['--headless','--no-sandbox','--disable-gpu','--no-proxy-server',`--user-data-dir=${profile}`,'--window-size=393,852','--virtual-time-budget=2000','--dump-dom',`file://${page}`],{encoding:'utf8',timeout:20000,maxBuffer:2*1024*1024});
+    const result = spawnSync(browser,['--headless','--no-sandbox','--disable-gpu','--no-proxy-server','--password-store=basic',`--user-data-dir=${profile}`,'--window-size=393,852','--virtual-time-budget=2000','--dump-dom',`file://${page}`],{encoding:'utf8',timeout:20000,maxBuffer:2*1024*1024});
     assert.equal(result.error,undefined,result.error?.message);
     assert.equal(result.status,0,result.stderr);
     assert.match(result.stdout, /data-review="passed"/,result.stdout.match(/data-review="[^"]+"/)?.[0] || result.stderr);

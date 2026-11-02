@@ -262,17 +262,23 @@ const STOP_HINTS = {
 };
 // A provider that refuses the credential (expired key, revoked OAuth) needs a sign-in.
 const needsSignin = data => Boolean(data.rejected) && !data.busy && [401,403].includes(Number(data.rejected.status));
+// A turn stopped part way that takes a message: it rests between its steps (the stop
+// recorded the step it cut off), or its model request was cut with no reply saved. The
+// message goes on with it (the model reads the stopped step, then the message).
+const takesMessage = data => !data.busy && !data.complete && Boolean(data.head) && !data.missing && (['Ready','AfterTools','FinalReview'].includes(data.phase) || (data.phase === 'ModelWait' && !data.recorded && data.messages?.length > 1));
+const STOPPED_TEXT_ONLY = 'This turn was stopped part way and takes a message without files: send the text alone (or Continue), then the files with your next message.';
 // Why an idle thread cannot take a message, and what each action would do. Shown at the
 // end of the thread and again when the status is tapped.
 function statusHelp(data) {
   if(data.missing) return 'The host stopped while creating this thread, so it has no store. Delete it from Settings.';
+  if(takesMessage(data) && data.phase !== 'ModelWait') return 'You stopped this turn part way. The step you stopped is recorded as stopped, with what it printed, and does not run again. A message goes on from here: the model reads that you stopped it, then your message (say, skip it and do something else). Or Continue (the model decides what to do next) or Retry (asks it again from before that step).';
   if(data.rejected && !data.busy) {
     const why = `The provider refused the model request (HTTP ${data.rejected.status})${data.rejected.detail ? `: ${data.rejected.detail}` : ''}.`;
     return needsSignin(data) ? `${why} Sign in below, then Retry sends the same request; Continue would meet the same refusal.` : `${why} Fix the cause (sign in, model, settings), then Retry sends it again; Continue would meet the same refusal.`;
   }
   if(data.budget?.blocked && !data.busy) return `${data.budget.blocked}.`;
   if(data.phase?.includes('ModelWait') && !data.busy && data.recorded) return 'The model reply is already saved. Continue records it and carries on; nothing is sent or billed again.';
-  if(data.phase?.includes('ModelWait') && !data.busy) return 'A model request was interrupted. Retry re-runs it from the step before (it may be billed again); Continue only works if it was never sent.';
+  if(data.phase?.includes('ModelWait') && !data.busy) return 'A model request was interrupted. Retry re-runs it from the step before (it may be billed again); Continue only works if it was never sent. A message goes too: the request is made again with your message read first.';
   if(data.stop && !data.complete && !data.busy) return `${STOP_HINTS[data.stop] || data.stop}${data.recover ? '' : ' Open the revision list to pick a rewind point.'}`;
   if(data.complete && data.follow_up && !data.busy) return 'A session pack has a follow-up for this turn that the host stopped before sending. Continue delivers it now; a new message works too.';
   return '';
@@ -299,13 +305,15 @@ function renderBar(data) {
   const followUp = Boolean(data.complete && data.follow_up);
   $('continue').hidden = data.busy || historical || (data.complete && !followUp) || (Boolean(data.stop) && !extendable && !followUp) || !data.head || refused;
   $('continue').classList.toggle('primary', extendable || followUp || Boolean(data.recorded) || Boolean(data.budget?.blocked));
-  $('retry').hidden = data.busy || historical || !data.phase?.includes('ModelWait') || (Boolean(data.recorded) && !refused) || Boolean(data.budget?.blocked);
+  // Retry also asks a stopped step's model again, from before its request.
+  const resting = takesMessage(data) && data.phase !== 'ModelWait';
+  $('retry').hidden = data.busy || historical || !(data.phase?.includes('ModelWait') || resting) || (Boolean(data.recorded) && !refused) || Boolean(data.budget?.blocked);
   $('bar-rewind').hidden = !historical || !data.target;
   $('bar-live').hidden = !historical;
   $('bar-signin').hidden = historical || !needsSignin(data);
   $('retry').classList.toggle('primary', refused && $('bar-signin').hidden);
   $('hist-chip').setAttribute('aria-label', `Revision history, ${$('hist-chip').textContent.replace(' ▾','')}`);
-  $('prompt').placeholder = historical ? `Read-only: viewing r${data.revision}` : data.busy ? 'Steer the run, or: stop' : data.complete || !data.head ? 'Message' : 'Not ready for a message';
+  $('prompt').placeholder = historical ? `Read-only: viewing r${data.revision}` : data.busy ? 'Steer the run, or: stop' : data.complete || !data.head ? 'Message' : takesMessage(data) ? 'Message to go on' : 'Not ready for a message';
   // A crowded row keeps the chip to model · effort.
   $('bar').dataset.actions = String(['bar-signin','recover','continue','retry'].filter(id => !$(id).hidden).length);
   renderChip();
@@ -435,7 +443,7 @@ function render(data) {
   if(!historical) for(const job of data.jobs || []) if(job.running) $('live').append(el('div','meta jobs',`& ${job.command} · ${job.id} · running`));
   // Replayed events name the current step themselves; until then the run is just running.
   if(data.busy) setActivity(!data.replay && (data.pending || [])[0] ? `Running ${data.pending[0].name}` : 'Working on the host');
-  else {activity = {label:'', since:0}; $('phase-text').textContent = data.missing ? 'no store · delete this thread' : needsSignin(data) ? `needs sign-in · ${data.provider || 'provider'}` : data.rejected ? refusal(data.rejected) : data.complete && data.follow_up ? 'pack follow-up waiting · Continue' : data.complete ? 'ready' : data.stop ? data.stop : data.budget?.blocked ? 'budget reached · raise it in the thread menu, then Continue' : data.phase?.includes('ModelWait') ? (data.recorded ? 'reply saved · Continue' : 'interrupted model request · Retry') : data.phase || '';}
+  else {activity = {label:'', since:0}; $('phase-text').textContent = data.missing ? 'no store · delete this thread' : needsSignin(data) ? `needs sign-in · ${data.provider || 'provider'}` : data.rejected ? refusal(data.rejected) : data.complete && data.follow_up ? 'pack follow-up waiting · Continue' : data.complete ? 'ready' : data.stop ? data.stop : data.budget?.blocked ? 'budget reached · raise it in the thread menu, then Continue' : data.phase?.includes('ModelWait') ? (data.recorded ? 'reply saved · Continue' : 'interrupted model request · Retry or a message') : takesMessage(data) ? 'stopped part way · a message goes on' : data.phase || '';}
   // The model under the title; what the thread spent at the right (its limit and usage are
   // in the thread menu), and a hairline under the header of it against the limit.
   const settings = threadSettings(data);
@@ -1743,7 +1751,8 @@ $('composer').onsubmit = async event => {
     if(!snapshot) throw Error('Wait for the thread to load.');
     if(await runIntent(text)) {if(id === selected && current === generation && $('prompt').value.trim() === text) {$('prompt').value = ''; drafts.set(`draft:${id}`,''); fitPrompt();}}
     else if(snapshot.busy && !historical) {inflight = text; await steer(id, text);}
-    else if(!snapshot.complete || historical) toast('This thread is not ready for a new message; the note at its end says why. Your draft is kept.');
+    else if((!snapshot.complete && !takesMessage(snapshot)) || historical) toast('This thread is not ready for a new message; the note at its end says why. Your draft is kept.');
+    else if(!snapshot.complete && attached.length) toast(STOPPED_TEXT_ONLY);
     else {
       if(attached.some(file => !file.digest)) throw Error(attached.some(file => file.error) ? 'Remove the attachments that failed to upload first.' : 'Wait for the attachments to finish uploading.');
       const files = attached.map(file => ({path: file.path.trim(), digest: file.digest}));

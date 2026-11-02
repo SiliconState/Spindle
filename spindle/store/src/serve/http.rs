@@ -12,6 +12,8 @@ pub(super) struct Request {
     /// after `read_body`, all `length` bytes.
     pub body: Vec<u8>,
     length: usize,
+    /// Whether the whole body has been read (`read_body`) or streamed (`stream_body`).
+    whole: bool,
 }
 
 /// Reads the request head (the body is read by `read_body`, once the request has
@@ -43,7 +45,82 @@ pub(super) fn read_body(stream: &mut TcpStream, request: &mut Request) -> Result
         stream,
         request,
         until(Instant::now() + total, "request body too slow"),
-    )
+    )?;
+    request.whole = true;
+    Ok(())
+}
+
+/// The path a thread's bundle is uploaded to: its body has no limit here (the route
+/// refuses one past `MAX_THREAD` with 413 before reading it) and is streamed to a file,
+/// never held in memory (`stream_body`).
+pub(super) const THREADS: &str = "/v1/threads";
+
+/// Streams the rest of the body to `sink`, the bytes that came with the head first,
+/// holding at most 64 KiB of it at a time. Each read may wait 30 s; the whole body
+/// gets two minutes plus a second per MiB (a slow link still finishes, a stalled
+/// client does not hold one of the host's connections for long).
+pub(super) fn stream_body(
+    stream: &mut TcpStream,
+    request: &mut Request,
+    mut sink: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let first = std::mem::take(&mut request.body);
+    sink(&first)?;
+    let mut done = first.len();
+    let deadline = Instant::now()
+        + Duration::from_secs(120)
+        + Duration::from_secs((request.length / (1024 * 1024)) as u64);
+    let mut chunk = vec![0u8; 64 * 1024];
+    while done < request.length {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("request body too slow".into());
+        }
+        stream
+            .set_read_timeout(Some(left.min(Duration::from_secs(30))))
+            .map_err(|e| e.to_string())?;
+        let want = (request.length - done).min(chunk.len());
+        match stream.read(&mut chunk[..want]) {
+            Ok(0) => return Err("incomplete body".into()),
+            Ok(count) => {
+                sink(&chunk[..count])?;
+                done += count;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err("incomplete body".into()),
+        }
+    }
+    request.whole = true;
+    Ok(())
+}
+
+impl Request {
+    /// The body's declared length (Content-Length; 0 without one).
+    pub(super) fn length(&self) -> usize {
+        self.length
+    }
+    /// Whether body bytes the client sent are still unread.
+    pub(super) fn unread(&self) -> bool {
+        !self.whole && self.body.len() < self.length
+    }
+}
+
+/// After a refusal sent before a large body was read: the reply is out, so stop
+/// writing, and read (discarding) what the client still sends for a moment, so the
+/// close does not reset the connection before the client reads the reply.
+pub(super) fn linger(stream: &mut TcpStream) {
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let until = Instant::now() + Duration::from_secs(2);
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut left: usize = 64 * 1024 * 1024;
+    while left > 0 && Instant::now() < until {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => left = left.saturating_sub(count),
+        }
+    }
 }
 
 /// Before each read: a timeout for what is left until `deadline` (at most 10 s for one
@@ -182,7 +259,9 @@ fn parse<S: Read>(
     // Attachment uploads carry a file, an app's answers and state its data; everything
     // else stays small.
     // A remote run carries its workspace (agent::runner::MAX_RUN_TREE, as base64).
-    let limit = if path == "/v1/run" {
+    let limit = if path == THREADS && method == "POST" {
+        usize::MAX
+    } else if path == "/v1/run" {
         64 * 1024 * 1024 + 64 * 1024
     } else if upload(&path) || app_data(&path) {
         8 * 1024 * 1024
@@ -199,6 +278,7 @@ fn parse<S: Read>(
         path,
         query: params,
         headers,
+        whole: body.len() == size,
         body,
         length: size,
     })
@@ -295,6 +375,7 @@ fn head(
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        201 => "Created",
         202 => "Accepted",
         204 => "No Content",
         308 => "Permanent Redirect",
@@ -304,6 +385,7 @@ fn head(
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        413 => "Content Too Large",
         429 => "Too Many Requests",
         503 => "Service Unavailable",
         _ => "Internal Server Error",

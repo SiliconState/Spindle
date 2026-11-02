@@ -25,6 +25,18 @@ if [ -n "$wasm_linux" ] && [ ! -f "$wasm_linux/identity" ]; then
     echo "no wasm Linux in $wasm_linux: build it first (chrome/wasm-linux/build-image.sh)" >&2
     exit 1
 fi
+# What the Chrome Web Store takes of the manifest's names for the extension: it refuses a
+# release whose name is over 75 characters, its short name over 12 or its description over
+# 132 (checked first, so a release build stops before it is made).
+for limit in name:75 short_name:12 description:132; do
+    field=${limit%%:*}
+    most=${limit#*:}
+    value=$(sed -n "s/^  \"$field\": \"\(.*\)\",*$/\1/p" chrome/manifest.json | head -1)
+    if [ "${#value}" -gt "$most" ]; then
+        echo "chrome/manifest.json: its $field is ${#value} characters; the Chrome Web Store takes at most $most" >&2
+        exit 1
+    fi
+done
 want=$(sed -n 's/^wasm-bindgen = "=\(.*\)"$/\1/p' embed/Cargo.toml)
 have=$("$bindgen" --version | awk '{print $2}')
 if [ "$have" != "$want" ]; then
@@ -58,7 +70,7 @@ views=$(grep -c '^let cached.*Memory0' "$out/web/spindle_embed.js" || true)
 cat chrome/glue-drop.js >> "$out/web/spindle_embed.js"
 cp chrome/manifest.json chrome/background.js chrome/engine.html chrome/engine.mjs chrome/engine-worker.mjs \
     chrome/linux-frames.mjs chrome/linux-net.mjs chrome/linux-route.mjs chrome/linux-runner.mjs chrome/linux-worker.mjs chrome/linux-workspace.mjs \
-    chrome/wasm-linux-worker.mjs chrome/page-tools.mjs chrome/shared.mjs chrome/signin.mjs chrome/vault.mjs chrome/panel.html \
+    chrome/wasm-linux-worker.mjs chrome/page-tools.mjs chrome/shared.mjs chrome/signin.mjs chrome/vault.mjs chrome/host-moves.mjs chrome/panel.html \
     chrome/panel.css chrome/panel.mjs chrome/steps.mjs chrome/page.mjs chrome/markdown.mjs chrome/zip.mjs chrome/view.html chrome/view.mjs chrome/preview.html \
     chrome/preview.js "$out/"
 cp -r "$linux" "$out/linux"
@@ -71,7 +83,7 @@ if [ -n "$wasm_linux" ]; then
     cp -r "$wasm_linux/fs.json" "$wasm_linux/flat" "$wasm_linux/vmlinux.wasm" "$wasm_linux/identity" "$out/wasm-linux/"
 fi
 cp chrome/icons/*.png "$out/icons/"
-cp clients/js/common.mjs clients/js/embedded.mjs clients/js/opfs.mjs "$out/clients/"
+cp clients/js/common.mjs clients/js/embedded.mjs clients/js/opfs.mjs clients/js/remote.mjs "$out/clients/"
 cp store/ui/text.js store/ui/theme.js "$out/"
 cp chrome/THIRD-PARTY.md "$out/"
 # What this build is made of (Settings, About shows it; a report of a fault can name

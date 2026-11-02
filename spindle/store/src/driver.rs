@@ -447,8 +447,14 @@ impl Step<'_> {
     ) -> Result<Option<ToolNeed>> {
         let config = self.settings()?;
         let effects = state.pending_effects().map_err(turn_error)?;
+        // After the user's stop no call of the batch starts (each is refused below).
+        let halted = self.inbox.interrupted()
+            || match effects.first() {
+                Some(Effect::Tool { id, .. }) => self.batch_stopped(id)?,
+                _ => false,
+            };
         let mut batch = Vec::new();
-        for effect in &effects {
+        for effect in effects.iter().filter(|_| !halted) {
             let Effect::Tool { id, call } = effect else {
                 break;
             };
@@ -513,6 +519,28 @@ impl Step<'_> {
             let existing = self.store.attempt_for(&id).map_err(store_error)?;
             let config = self.settings()?;
             if existing.is_none() {
+                // The user stopped the turn (now, or before a reopen, as an earlier call of
+                // this batch records): this call never starts, and says so.
+                if halted || self.batch_stopped(&id)? {
+                    let reason = STOPPED_BEFORE.to_string();
+                    let after = state.refuse_tool(&id, &reason).map_err(turn_error)?;
+                    self.commit_action(
+                        format!("refuse-r{revision}"),
+                        &Action::Refuse {
+                            effect: id,
+                            reason: reason.clone(),
+                        },
+                        state,
+                        &after,
+                    )?;
+                    self.emit(Event::ToolCall {
+                        id: &call.id,
+                        name: &call.name,
+                        input: &call.input,
+                    });
+                    self.emit(Event::ToolRefused { reason: &reason });
+                    return Ok(Some(ToolNeed::Committed));
+                }
                 if let Some(after) = state.guard_tool(&id).map_err(turn_error)? {
                     self.commit_action(
                         format!("guard-r{revision}"),
@@ -633,6 +661,40 @@ impl Step<'_> {
             }
             Ok(DispatchOutcome::Reconcile) => {
                 return Err("a command's outcome is unknown; run `spindle continue`".into());
+            }
+            // The user's stop ended the call before anything about it was recorded: its
+            // dispatch has returned, so it is recorded as stopped (a known outcome) and
+            // never runs again; one never reserved did not start at all.
+            Err(Error::Cancelled) if self.inbox.interrupted() => {
+                let reserved = self.store.attempt_for(&id).map_err(store_error)?;
+                match reserved {
+                    Some(attempt) if attempt.id == request.attempt.id => self
+                        .store
+                        .seal_stopped_with_digest(&request, ran.helper)
+                        .map_err(|error| {
+                            format!(
+                                "the stopped tool call could not be recorded: {}. Run \
+                                 `spindle continue` to record it as not completed.",
+                                store_error(error)
+                            )
+                        })?,
+                    Some(_) => return Err("the stopped tool call holds another attempt".into()),
+                    None => {
+                        let (revision, state) = self.head()?;
+                        let reason = STOPPED_BEFORE.to_string();
+                        let after = state.refuse_tool(&id, &reason).map_err(turn_error)?;
+                        self.commit_action(
+                            format!("refuse-r{revision}"),
+                            &Action::Refuse { effect: id, reason },
+                            &state,
+                            &after,
+                        )?;
+                        self.emit(Event::ToolRefused {
+                            reason: STOPPED_BEFORE,
+                        });
+                        return Ok(());
+                    }
+                }
             }
             Err(error) => {
                 return Err(format!(
@@ -917,6 +979,11 @@ impl Step<'_> {
             }
         }
         match state.control().phase() {
+            // The user's stop: the turn rests between its steps, nothing in flight. A
+            // message (`say`) or `continue` takes it on from here.
+            Phase::Ready | Phase::AfterTools if self.inbox.interrupted() => {
+                Err(STOPPED_HERE.into())
+            }
             Phase::Ready | Phase::AfterTools => self.prepare_need(revision, state),
             Phase::ModelWait => self
                 .model_need(revision, state)
@@ -1193,6 +1260,33 @@ impl Step<'_> {
             command = format!("{base}-{next}");
         }
         Ok(command)
+    }
+
+    /// Whether the user's stop ended a call before `id` in its batch: its recorded
+    /// result carries `STOPPED_STATUS`. Read from the store, so a reopened session
+    /// decides as the stopped one did.
+    fn batch_stopped(&mut self, id: &str) -> Result<bool> {
+        let Some((model, position)) = id.rsplit_once("/t/") else {
+            return Ok(false);
+        };
+        let Ok(position) = position.parse::<usize>() else {
+            return Ok(false);
+        };
+        for earlier in 0..position {
+            let effect = format!("{model}/t/{earlier}");
+            let Some(attempt) = self.store.attempt_for(&effect).map_err(store_error)? else {
+                continue;
+            };
+            let Some(bytes) = self.store.receipt(&attempt.id).map_err(store_error)? else {
+                continue;
+            };
+            if let Ok(Block::ToolResult { metadata, .. }) = serde_json::from_slice(&bytes)
+                && metadata.status.as_deref() == Some(crate::broker::STOPPED_STATUS)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn steer_queued(&mut self, revision: u64, state: &TurnContinuation) -> Result<bool> {
@@ -1739,6 +1833,27 @@ impl Step<'_> {
     /// for queued messages names that point (`redo_point`) and nothing else will do;
     /// there they are read first, or, re-sending a turn's prompt, join it.
     pub fn retry_in_place(&mut self, cut: Option<u64>) -> Result<Need> {
+        let targets = self.store.rewind_targets(SCOPE).map_err(store_error)?;
+        let Some(target) = targets.first().copied() else {
+            return Err(
+                "the session's first request cannot be re-sent automatically; run `spindle retry`"
+                    .into(),
+            );
+        };
+        if cut.is_some_and(|point| point != target.revision) {
+            return Err(
+                "the reply was cut, but the point before its request cannot be restored; \
+                 the request has an unknown outcome (it may have been billed); run `spindle retry`"
+                    .into(),
+            );
+        }
+        self.retry_to(target, cut.is_some())
+    }
+
+    /// Goes back to `target` and goes on from there: a mid-turn point prepares its
+    /// request again; a settled one starts the turn again with its prompt (a `cut`
+    /// joins the messages waiting to it, as the user would have written them).
+    fn retry_to(&mut self, target: crate::rewind::RewindTarget, cut: bool) -> Result<Need> {
         let (revision, state) = self.head()?;
         let prompt = state
             .transcript()
@@ -1748,26 +1863,11 @@ impl Step<'_> {
             .rev()
             .find(|message| is_prompt(message))
             .map(|message| text_of(&message.content));
-        let targets = self.store.rewind_targets(SCOPE).map_err(store_error)?;
-        let Some(target) = targets.first().copied() else {
-            return Err(
-                "the session's first request cannot be re-sent automatically; run `spindle retry`"
-                    .into(),
-            );
-        };
-        match cut {
-            Some(point) if point != target.revision => {
-                return Err(
-                    "the reply was cut, but the point before its request cannot be restored; \
-                     the request has an unknown outcome (it may have been billed); run `spindle retry`"
-                        .into(),
-                );
-            }
-            Some(_) => {}
-            None => self.emit(Event::Retrying {
+        if !cut {
+            self.emit(Event::Retrying {
                 target: target.revision,
                 head: revision,
-            }),
+            });
         }
         // A turn's first request re-sends its prompt from the end of the turn before; the
         // files it brought (attachments) are in the workspace the request saw.
@@ -1786,8 +1886,8 @@ impl Step<'_> {
             // A turn starts with one message: the waiting ones join the prompt they
             // followed, as the user would have written it.
             let joined = match cut {
-                Some(_) => self.inbox.take_steering(),
-                None => vec![],
+                true => self.inbox.take_steering(),
+                false => vec![],
             }
             .into_iter()
             .filter(|text| !text.trim().is_empty() && text.len() <= MAX_STEER)
@@ -1803,6 +1903,142 @@ impl Step<'_> {
             })));
         }
         Ok(Need::Continue)
+    }
+}
+
+impl Step<'_> {
+    /// A message for a turn stopped part way. Resting between its steps (the user's stop
+    /// recorded the call it cut off), the turn takes it as its next user message, read
+    /// after the results it has, and goes on. Stopped in its model request (never sent,
+    /// refused, or cut off with an unknown outcome that stays counted as possibly billed),
+    /// it goes back to the point before that request, as `retry` does, and reads the
+    /// message there. Committed as any steering update is: admitted, then committed.
+    pub(crate) fn say(&mut self, text: String) -> Result<Need> {
+        if text.trim().is_empty() || text.len() > MAX_STEER {
+            return Err(format!("a message is 1-{MAX_STEER} bytes"));
+        }
+        let (revision, state) = self.head()?;
+        match state.control().phase() {
+            Phase::Ready | Phase::AfterTools | Phase::FinalReview => {
+                self.commit_steer(revision, &state, text)?;
+                Ok(Need::Continue)
+            }
+            Phase::ModelWait => {
+                let Some(Effect::Model { id, .. }) = state
+                    .pending_effects()
+                    .map_err(turn_error)?
+                    .into_iter()
+                    .next()
+                else {
+                    return Err("no pending model request".into());
+                };
+                let attempt = self.store.attempt_for(&id).map_err(store_error)?;
+                if let Some(attempt) = &attempt
+                    && self
+                        .store
+                        .receipt(&attempt.id)
+                        .map_err(store_error)?
+                        .is_some()
+                {
+                    return Err("the reply to this turn's last request is saved: continue \
+                                reads it in, then send the message"
+                        .into());
+                }
+                let targets = self.store.rewind_targets(SCOPE).map_err(store_error)?;
+                let Some(target) = targets.first().copied() else {
+                    return Err("this is the session's first request, with no point before \
+                                it to go back to: retry it, or take it back"
+                        .into());
+                };
+                if attempt.is_some() {
+                    self.emit(Event::Retrying {
+                        target: target.revision,
+                        head: revision,
+                    });
+                }
+                if target.kind == RewindTargetKind::Settled {
+                    // The turn starts again with its prompt and the message joined to it.
+                    self.inbox.return_steering(vec![text]);
+                    return self.retry_to(target, true);
+                }
+                self.retry_to(target, true)?;
+                let (revision, state) = self.head()?;
+                self.commit_steer(revision, &state, text)?;
+                Ok(Need::Continue)
+            }
+            Phase::ToolsWait => Err("a tool call of this turn has no recorded result yet: \
+                                     continue settles it first, then send the message"
+                .into()),
+            Phase::Stopped(Stop::Complete) => {
+                Err("the turn is complete; send the message as a prompt".into())
+            }
+            Phase::Stopped(stop) => Err(format!(
+                "the last turn stopped ({}); rewind to a target first (`spindle targets`)",
+                stop_text(stop)
+            )),
+            Phase::Preparing => Err("unexpected turn phase".into()),
+        }
+    }
+
+    /// Commits `text` as the user's next message at the resting head `revision`. A
+    /// message an earlier owner admitted here and never committed goes first.
+    fn commit_steer(
+        &mut self,
+        mut revision: u64,
+        state: &TurnContinuation,
+        text: String,
+    ) -> Result<()> {
+        let mut state = state.clone();
+        loop {
+            let command = format!("steer-r{revision}");
+            let admitted = match self.store.admitted(SCOPE, &command).map_err(store_error)? {
+                Some(payload) => match Action::decode(&payload).map_err(store_error)? {
+                    Action::Steer { text } => Some(text),
+                    _ => {
+                        return Err(format!(
+                            "`{command}` holds another command; run `spindle doctor`"
+                        ));
+                    }
+                },
+                None => None,
+            };
+            let next = admitted.clone().unwrap_or_else(|| text.clone());
+            let after = state.steer(next.clone()).map_err(turn_error)?;
+            self.commit_action(
+                command,
+                &Action::Steer { text: next.clone() },
+                &state,
+                &after,
+            )?;
+            self.emit(Event::Steered { text: &next });
+            if admitted.is_none_or(|earlier| earlier == text) {
+                return Ok(());
+            }
+            (revision, state) = self.head()?;
+        }
+    }
+
+    /// `retry` at a turn resting between its steps (a stop recorded the call it cut off):
+    /// back to the point before the request whose reply made its last calls, asked again
+    /// (a request that may be billed again), or the turn started again with its prompt.
+    pub(crate) fn retry_step(&mut self, state: &TurnContinuation) -> Result<Retry> {
+        let ordinal = state.control().request_ordinal();
+        if ordinal == 0 {
+            return Err("no model step of this turn to retry; continue sends its request".into());
+        }
+        let request = format!("{}/m/{ordinal}", state.execution());
+        let prepared = self
+            .store
+            .intent_revision(&request)
+            .map_err(store_error)?
+            .ok_or("the turn's last request was not found")?;
+        let targets = self.store.rewind_targets(SCOPE).map_err(store_error)?;
+        match targets.iter().find(|target| target.revision < prepared) {
+            Some(target) => self.retry_to(*target, false).map(Retry::InPlace),
+            // Its step came from the session's first request: nothing is before it, and
+            // the session has done work since, so no fresh store stands in for it.
+            None => Err(FIRST_STEP_RETRY.into()),
+        }
     }
 }
 
@@ -2035,6 +2271,17 @@ fn planned_tree(mut tree: Tree, files: &[File]) -> Tree {
     tree
 }
 
+/// The result of a call of a batch the user stopped before that call started.
+pub const STOPPED_BEFORE: &str = "Not run: the user stopped the turn before this call started.";
+/// Why `retry` cannot redo a stopped step that the session's first request made.
+pub const FIRST_STEP_RETRY: &str = "this step came from the session's first request, which \
+has no point before it to go back to: take that message back to start again, or continue";
+/// Why files cannot go with a message for a turn stopped part way.
+pub const STOPPED_TEXT_ONLY: &str = "this turn was stopped part way and takes a message \
+without files: send the text alone (or continue it), then the files with the next message";
+/// Why a turn the user stopped ends where it is: it rests between its steps.
+pub const STOPPED_HERE: &str = "stopped by the user; the turn rests here: send a message to go \
+on with it, or continue, retry or rewind it";
 /// Why a turn stops when the provider keeps saying the request is too long.
 const OVERFLOW_STUCK: &str = "the provider says the request does not fit the model's context \
      window, and the history cannot be compacted further; rewind to an earlier point \
@@ -2118,6 +2365,25 @@ pub(crate) fn store_error(error: Error) -> String {
         Error::Model(error) => model_error(error),
         error @ Error::TooLarge { .. } => error.to_string(),
         other => format!("store refused the step ({other:?})"),
+    }
+}
+
+/// A reply that could not be read, saying why when the parser said (`why`): an error
+/// the provider streamed after its reply began is the provider's own, not unreadable.
+pub(crate) fn unreadable(why: Option<&str>) -> String {
+    let failed = model_error(crate::ModelError::Protocol);
+    let Some(why) = why else {
+        return failed;
+    };
+    // The parser words a streamed error `provider stream error [contract]: …`.
+    let said = why
+        .strip_prefix("provider stream error [")
+        .and_then(|rest| rest.split_once("]: "))
+        .map(|(_, said)| said)
+        .filter(|said| !said.trim().is_empty());
+    match said {
+        Some(said) => format!("the provider ended its reply with an error ({said})"),
+        None => format!("{failed} ({why})"),
     }
 }
 

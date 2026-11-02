@@ -143,8 +143,8 @@ and navigation through large trees; `linux_warm.mjs` checks lazy v86 starts;
 `review_browser.mjs` covers contained/static previews and version choices,
 template/reparse sanitizing, WebRTC and DNS leakage checks with a positive netlog
 control, background task cards/reports, queued file messages, reset backup cleanup,
-one copy per moved thread and Storage > Free. These tests use scripted services,
-not provider accounts.
+one copy per moved thread, move and index updates sharing one strict transaction, and
+Storage > Free. These tests use scripted services, not provider accounts.
 
 ## Local engine benchmarks
 

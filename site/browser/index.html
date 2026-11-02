@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Spindle for Browser: an agent that lives in your browser</title>
-<meta name="description" content="From open tabs to finished work, with a workspace you can rewind and take with you. Spindle for Browser researches across pages, runs Python and JavaScript in a Linux inside your browser, and keeps going with the panel closed. For Chrome and Edge. Open source, MIT.">
+<meta name="description" content="From open tabs to finished work, with a workspace you can rewind and take with you. Spindle for Browser researches across pages, runs Python and JavaScript in a Linux inside your browser, and keeps going with the panel closed. For Chrome, Edge and Brave. Open source, MIT.">
 <meta property="og:title" content="Spindle for Browser: an agent that lives in your browser">
 <meta property="og:description" content="From open tabs to finished work, with a workspace you can rewind and take with you. Open source, MIT.">
 <meta property="og:type" content="website">
@@ -51,8 +51,8 @@
           <a class="button" href="#install">Install guide</a>
         </div>
         <p class="trust">Open source. Bring your own model. No required desktop app or backend.</p>
-        <p class="note">Tested on Chrome and Edge, version 116 or later, on desktop. Not in the Chrome Web Store
-          or Edge Add-ons yet.</p>
+        <p class="note">Tested on Chrome, Edge and Brave (Chromium 116 or later), on desktop. Not in the Chrome
+          Web Store yet.</p>
       </div>
       <div class="panel" role="img" aria-label="A sketch of the Spindle side panel: a request, three steps, a folded workspace card, then the answer.">
         <div class="bar-top">
@@ -120,8 +120,9 @@
           Continue never resends it; Retry sends it once more, on your word.</p></li>
         <li><h3>Go back to before a message.</h3><p>The conversation and the workspace's files return together,
           so nothing from the undone future is left behind.</p></li>
-        <li><h3>Take a thread with you.</h3><p>Move it to a <code>.spindle</code> file and go on with native
-          Spindle on your machine, in its sandbox with its full tools. Then bring it back.</p></li>
+        <li><h3>Take a thread with you.</h3><p>Move it to your Spindle host with one click, or to a
+          <code>.spindle</code> file, and go on with native Spindle on your machine, in its sandbox with its full
+          tools. Then bring it back.</p></li>
       </ol>
     </div>
   </section>
@@ -161,10 +162,10 @@
         <table>
           <thead><tr><th scope="col"></th><th scope="col">Spindle for Browser</th><th scope="col">Spindle on your machine</th></tr></thead>
           <tbody>
-            <tr><td>Runs</td><td>In Chrome or Edge: a side panel and a worker that outlives it</td><td>A native binary: your terminal, <code>spindle serve</code> for your phone, or inside your app</td></tr>
+            <tr><td>Runs</td><td>In Chrome, Edge or Brave: a side panel and a worker that outlives it</td><td>A native binary: your terminal, <code>spindle serve</code> for your phone, or inside your app</td></tr>
             <tr><td>Commands</td><td>A Linux inside the browser, or a Spindle host you connect</td><td>A bubblewrap sandbox on Linux, with your Rust toolchain read-only if you ask</td></tr>
             <tr><td>Your tabs</td><td>Reads and acts on them, once you switch that on</td><td>No</td></tr>
-            <tr><td>Spending limit</td><td>A dollar limit per thread, on its model page</td><td><code>--max-usd</code> per thread</td></tr>
+            <tr><td>Spending limit</td><td>An optional dollar limit per thread, its tasks included, on its model page</td><td><code>--max-usd</code> per thread</td></tr>
             <tr><td>Setup</td><td>Load the extension, add a key or sign in</td><td>Build one binary, <code>spindle login</code></td></tr>
             <tr><td>Best for</td><td>Work that starts on a page, or a machine with nothing installed</td><td>Real repositories, long builds, servers</td></tr>
           </tbody>
@@ -190,6 +191,13 @@
         <div class="card"><span class="tag">Precise</span><h3>Clicks land where they aim.</h3>
           <p>If something covers the target, such as a banner or a dialog, nothing is clicked or typed, and the
             agent is told what is in the way. Two threads never type into one tab at once.</p></div>
+        <div class="card"><span class="tag">Before acting</span><h3>You choose when it asks.</h3>
+          <p>Full, the default, works start to end without asking. Auto asks before anything that sends: Enter, a
+            submit, a button that posts, pays or deletes. Ask asks before every click, key and page it opens. A No
+            means it is not done.</p></div>
+        <div class="card"><span class="tag">Steer</span><h3>Stop, then say what to do.</h3>
+          <p>Stop ends a running command. It is kept as stopped, with what it printed, and never runs again. Your
+            reply goes on with the turn: the agent reads that you stopped it, then what you want instead.</p></div>
         <div class="card"><span class="tag">Never by itself</span><h3>No repeat clicks.</h3>
           <p>Spindle never repeats a click, a keystroke or a navigation on its own after an interruption. Reading
             tools may rerun; acting tools never do.</p></div>
@@ -197,8 +205,9 @@
           <p>Network for commands is off for each thread until you turn it on. Through the browser, it reaches
             public sites only: local and private addresses are refused, and requests carry no cookies.</p></div>
         <div class="card"><span class="tag">Sealed</span><h3>Keys never sit as text.</h3>
-          <p>Every key is sealed. Set a passphrase, and what is sealed from then on is useless in a copy of your
-            browser profile without it.</p></div>
+          <p>Every key is sealed, and so is a site's API token: scripts that call that site never see it. Set a
+            passphrase, and what is sealed from then on is useless in a copy of your browser profile without
+            it.</p></div>
       </div>
       <div class="callout warn">
         <strong>What it cannot promise.</strong>
@@ -211,6 +220,8 @@
             names, so a public name that points into your own network is not caught. A relay you set up
             reaches whatever it can reach.</li>
           <li>Without a passphrase, the key that seals your keys lives in the same browser profile.</li>
+          <li>A site's sealed token is kept from scripts, not from use: any script may make the requests that
+            site's listing allows with it. List the narrowest address and give the token the least scope.</li>
         </ul>
         <a href="https://github.com/SiliconState/Spindle/blob/main/SECURITY.md">Security notes</a>
       </div>
@@ -245,7 +256,7 @@
       <div class="head">
         <span class="num">07 &mdash; INSTALL</span>
         <h2 id="install-h">Download, load, sign in.</h2>
-        <p>Spindle for Browser is not in the Chrome Web Store or Edge Add-ons yet. Each release is a zip built and
+        <p>Spindle for Browser is not in the Chrome Web Store yet. Each release is a zip built and
           checked by the repository's own workflow; you load it as an unpacked extension.</p>
       </div>
       <ol class="steps">
@@ -255,7 +266,8 @@
             folder you will keep. To check it, use the <code>.sha256</code> file beside it on the release, or
             <code>gh attestation verify</code> with the zip and <code>-R SiliconState/Spindle</code>.</p></div></li>
         <li><div><h3>Load it.</h3>
-          <p>Open <code>chrome://extensions</code> (in Edge, <code>edge://extensions</code>), turn on
+          <p>Open <code>chrome://extensions</code> (in Edge, <code>edge://extensions</code>; in Brave,
+            <code>brave://extensions</code>), turn on
             <strong>Developer mode</strong>, click <strong>Load unpacked</strong> and choose the folder. Pin Spindle
             to the toolbar.</p></div></li>
         <li><div><h3>Open the panel and connect a model.</h3>
@@ -321,11 +333,11 @@ chrome/build.sh         <span class="c"># the extension, into chrome/dist</span>
         <h2 id="faq-h">Asked before installing.</h2>
       </div>
       <details class="qa"><summary>Which browsers does it work in?</summary>
-        <div><p>Chrome and Edge, version 116 or later, on desktop; both are tested. It is a Manifest V3 extension
-          with a side panel. Other Chromium browsers are untested.</p></div></details>
+        <div><p>Chrome, Edge and Brave (Chromium 116 or later), on desktop; all three are tested. It is a Manifest
+          V3 extension with a side panel. Other Chromium browsers are untested.</p></div></details>
       <details class="qa"><summary>Do I need Spindle on my computer too?</summary>
-        <div><p>No. Connecting a native Spindle host is optional, and only adds a second place for commands to
-          run.</p></div></details>
+        <div><p>No. Connecting a native Spindle host is optional. It adds a second place for commands to run, and
+          a thread can move there to keep going on your machine (Run on my host), then come back.</p></div></details>
       <details class="qa"><summary>Where do my keys go?</summary>
         <div><p>They are sealed in the extension's IndexedDB and opened only by its engine, for a request to the
           provider they were saved for. If a provider list later points that provider at another address, the
@@ -338,8 +350,13 @@ chrome/build.sh         <span class="c"># the extension, into chrome/dist</span>
           Continue goes on and never resends a request whose fate is unknown; Retry sends it once more if you
           choose.</p></div></details>
       <details class="qa"><summary>What does it cost?</summary>
-        <div><p>Spindle is free (MIT). Your provider bills model use to your key or plan. Threads in the browser
-          have no spending limit of their own; native Spindle has <code>--max-usd</code>.</p></div></details>
+        <div><p>Spindle is free and open source (MIT), with no account and nothing in between: you pay your model
+          provider directly, on your own API key, or within your plan if you sign in with ChatGPT.</p>
+          <p>To cap a thread, give it a spending limit in US dollars on its model page; its tasks and its scripts'
+          model calls count too. Before each request, Spindle adds what the thread has spent to the most that
+          request could cost, and sends nothing that would go over. It is Spindle's own safeguard, not a cap your
+          provider enforces. Leave the field empty for no limit. Native Spindle has the same as
+          <code>--max-usd</code>.</p></div></details>
       <details class="qa"><summary>Can I use my ChatGPT or Claude subscription?</summary>
         <div><p>ChatGPT, yes: <strong>Sign in</strong> in Settings. Claude, through an Anthropic API key; signing in
           with a Claude subscription is not offered.</p></div></details>
@@ -358,7 +375,7 @@ chrome/build.sh         <span class="c"># the extension, into chrome/dist</span>
         <a class="button" href="#install">Install guide</a>
         <a class="button" href="https://github.com/SiliconState/Spindle">Source on GitHub</a>
       </div>
-      <p class="note">For Chrome and Edge 116 or later, on desktop. Release notes, checksums and earlier versions are
+      <p class="note">For Chrome, Edge and Brave (Chromium 116 or later), on desktop. Release notes, checksums and earlier versions are
         on <a href="https://github.com/SiliconState/Spindle/releases">the releases page</a>.</p>
     </div>
   </section>
@@ -371,6 +388,7 @@ chrome/build.sh         <span class="c"># the extension, into chrome/dist</span>
       <a href="../">Spindle</a>
       <a href="https://github.com/SiliconState/Spindle/blob/main/docs/chrome.md">Documentation</a>
       <a href="https://github.com/SiliconState/Spindle/blob/main/SECURITY.md">Security</a>
+      <a href="../privacy/">Privacy</a>
       <a href="https://github.com/SiliconState/Spindle">GitHub</a>
     </nav>
   </div>

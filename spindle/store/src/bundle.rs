@@ -8,7 +8,9 @@
 //! the session's head and identity, and each file's path, size and SHA-256), the
 //! files' bytes in manifest order, and the SHA-256 of everything before it. Reading
 //! checks all of it, and every store as a full open would, before a host writes any
-//! file; a bundle names only paths a session directory has.
+//! file; a bundle names only paths a session directory has. A place's MCP pack
+//! session id (`pack-session-id`) travels too, so a pack keeps its session across a
+//! move; bundles written before it simply lack the file.
 use crate::{ImageFacts, check_image};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -19,6 +21,8 @@ pub const MAGIC: &[u8; 16] = b"spindle-session\n";
 pub const FORMAT: u32 = 1;
 /// A session's own store, as a bundle names it.
 pub const STORE: &str = "store/authority.sqlite";
+/// The file a native host keeps a place's MCP pack session id in (`code_host`).
+pub const PACK_SESSION: &str = "pack-session-id";
 const MAX_MANIFEST: usize = 1024 * 1024;
 const MAX_FILES: usize = 4096;
 const MAX_SIDECAR: usize = 4 * 1024 * 1024;
@@ -48,7 +52,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Whether `path` is one a session directory holds and a bundle may carry:
 /// `(tasks/<key>/)*` (a key is 20 lowercase hex digits), then `store/authority.sqlite`,
-/// `session.json`, or (in a task) `task.json`.
+/// `session.json`, `pack-session-id`, or (in a task) `task.json`.
 pub fn valid_path(path: &str) -> bool {
     let mut rest = path;
     let mut depth = 0;
@@ -65,7 +69,19 @@ pub fn valid_path(path: &str) -> bool {
         }
         rest = tail;
     }
-    rest == STORE || rest == "session.json" || (depth > 0 && rest == "task.json")
+    rest == STORE
+        || rest == "session.json"
+        || rest == PACK_SESSION
+        || (depth > 0 && rest == "task.json")
+}
+
+/// Whether `bytes` are a pack session id as `code_host` keeps one: 8-64 letters,
+/// digits or `-` (surrounding whitespace aside).
+fn pack_session_ok(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok_and(|text| {
+        let id = text.trim();
+        (8..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
 }
 
 /// The directory part of `path` (`""` for the session's own files, `tasks/<key>/...`).
@@ -94,10 +110,21 @@ fn order(files: &mut [BundleFile]) {
     });
 }
 
-/// Checks a sidecar's bytes: JSON (an object for a task's identity record).
+/// Checks a sidecar's bytes: JSON (an object for a task's identity record), or a pack
+/// session id.
 fn check_sidecar(file: &BundleFile) -> Result<(), String> {
     if file.bytes.len() > MAX_SIDECAR {
         return Err(format!("{} is too large for a sidecar", file.path));
+    }
+    if file.path.ends_with(PACK_SESSION) {
+        return if pack_session_ok(&file.bytes) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} in the bundle is not a pack session id",
+                file.path
+            ))
+        };
     }
     let value: Value = serde_json::from_slice(&file.bytes)
         .map_err(|_| format!("{} in the bundle is not JSON", file.path))?;
@@ -233,7 +260,6 @@ fn written(mut files: Vec<BundleFile>, whole: bool) -> Result<Written, String> {
 /// Reads and checks a bundle: its framing and digests, its manifest, every path and
 /// every store. Nothing is written anywhere.
 pub fn read(bytes: &[u8]) -> Result<Bundle, String> {
-    let refused = |why: &str| format!("not a session bundle this build reads: {why}");
     if bytes.len() < MAGIC.len() + 8 + 32 || !bytes.starts_with(MAGIC) {
         return Err(refused("no bundle header"));
     }
@@ -243,19 +269,78 @@ pub fn read(bytes: &[u8]) -> Result<Bundle, String> {
             "its checksum does not match (damaged or cut short)",
         ));
     }
-    let word = |at: usize| u32::from_le_bytes(body[at..at + 4].try_into().expect("4 bytes"));
+    parse(&mut &body[..], body.len())
+}
+
+/// `read` for a bundle in a file: the same checks, in two passes (the checksum over
+/// the file first, then the files themselves), so only the files are held in memory,
+/// never the bundle as well.
+pub fn read_file(file: &mut std::fs::File) -> Result<Bundle, String> {
+    use std::io::{Read, Seek};
+    let failed = |error: std::io::Error| format!("cannot read the bundle: {error}");
+    let length = usize::try_from(file.metadata().map_err(failed)?.len())
+        .map_err(|_| refused("it is too large"))?;
+    if length < MAGIC.len() + 8 + 32 {
+        return Err(refused("no bundle header"));
+    }
+    let body = length - 32;
+    file.seek(std::io::SeekFrom::Start(0)).map_err(failed)?;
+    let mut head = [0u8; 16];
+    file.read_exact(&mut head).map_err(failed)?;
+    if &head != MAGIC {
+        return Err(refused("no bundle header"));
+    }
+    file.seek(std::io::SeekFrom::Start(0)).map_err(failed)?;
+    let mut digest = Sha256::new();
+    let mut left = body;
+    let mut chunk = vec![0u8; 1024 * 1024];
+    while left > 0 {
+        let want = left.min(chunk.len());
+        file.read_exact(&mut chunk[..want]).map_err(failed)?;
+        digest.update(&chunk[..want]);
+        left -= want;
+    }
+    let mut sum = [0u8; 32];
+    file.read_exact(&mut sum).map_err(failed)?;
+    if digest.finalize().as_slice() != sum {
+        return Err(refused(
+            "its checksum does not match (damaged or cut short)",
+        ));
+    }
+    drop(chunk);
+    file.seek(std::io::SeekFrom::Start(0)).map_err(failed)?;
+    let mut reader = std::io::BufReader::new(Read::take(&mut *file, body as u64));
+    parse(&mut reader, body)
+}
+
+fn refused(why: &str) -> String {
+    format!("not a session bundle this build reads: {why}")
+}
+
+/// Parses a bundle's `body` (`length` bytes: everything before its checksum, which
+/// the caller has checked) and checks its manifest, paths and stores.
+fn parse(reader: &mut impl std::io::Read, length: usize) -> Result<Bundle, String> {
+    let mut take = |count: usize| -> Result<Vec<u8>, String> {
+        let mut bytes = vec![0u8; count];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|_| refused("it is cut short"))?;
+        Ok(bytes)
+    };
+    let head = take(MAGIC.len() + 8)?;
+    let word = |at: usize| u32::from_le_bytes(head[at..at + 4].try_into().expect("4 bytes"));
     let format = word(MAGIC.len());
     if format != FORMAT {
         return Err(refused(&format!(
             "format {format} (this build reads {FORMAT})"
         )));
     }
-    let length = word(MAGIC.len() + 4) as usize;
+    let manifest_length = word(MAGIC.len() + 4) as usize;
     let start = MAGIC.len() + 8;
-    if length > MAX_MANIFEST || start + length > body.len() {
+    if manifest_length > MAX_MANIFEST || start + manifest_length > length {
         return Err(refused("its manifest does not fit"));
     }
-    let manifest: Value = serde_json::from_slice(&body[start..start + length])
+    let manifest: Value = serde_json::from_slice(&take(manifest_length)?)
         .map_err(|_| refused("its manifest is not JSON"))?;
     let schema = manifest["schema"].as_i64().unwrap_or(-1);
     if schema != i64::from(crate::CAPABILITIES.schema) && schema != crate::PREVIOUS_SCHEMA {
@@ -270,7 +355,7 @@ pub fn read(bytes: &[u8]) -> Result<Bundle, String> {
     if listed.len() > MAX_FILES {
         return Err(refused("too many files"));
     }
-    let mut at = start + length;
+    let mut at = start + manifest_length;
     let mut files = Vec::with_capacity(listed.len());
     for entry in listed {
         let (Some(path), Some(size), Some(digest)) = (
@@ -282,11 +367,12 @@ pub fn read(bytes: &[u8]) -> Result<Bundle, String> {
         ) else {
             return Err(refused("a file entry is incomplete"));
         };
+        // Checked before anything is allocated for it.
         let end = at
             .checked_add(size)
-            .filter(|end| *end <= body.len())
+            .filter(|end| *end <= length)
             .ok_or_else(|| refused("a file runs past the end"))?;
-        let bytes = body[at..end].to_vec();
+        let bytes = take(size)?;
         if hex(&Sha256::digest(&bytes)) != digest {
             return Err(refused(&format!("{path} does not match its digest")));
         }
@@ -296,7 +382,7 @@ pub fn read(bytes: &[u8]) -> Result<Bundle, String> {
         });
         at = end;
     }
-    if at != body.len() {
+    if at != length {
         return Err(refused("bytes follow its last file"));
     }
     let main = check_files(&mut files, true)?;
@@ -313,6 +399,32 @@ pub fn read(bytes: &[u8]) -> Result<Bundle, String> {
     })
 }
 
+/// The head and identity a bundle's manifest names, read from its first bytes only
+/// (nothing else is checked: for a bundle this host wrote and checked itself).
+pub fn manifest_facts(reader: &mut impl std::io::Read) -> Result<(u64, String), String> {
+    let mut head = [0u8; 24];
+    reader
+        .read_exact(&mut head)
+        .map_err(|_| refused("no bundle header"))?;
+    if &head[..16] != MAGIC {
+        return Err(refused("no bundle header"));
+    }
+    let length = u32::from_le_bytes(head[20..24].try_into().expect("4 bytes")) as usize;
+    if length > MAX_MANIFEST {
+        return Err(refused("its manifest does not fit"));
+    }
+    let mut manifest = vec![0u8; length];
+    reader
+        .read_exact(&mut manifest)
+        .map_err(|_| refused("its manifest does not fit"))?;
+    let manifest: Value =
+        serde_json::from_slice(&manifest).map_err(|_| refused("its manifest is not JSON"))?;
+    match (manifest["head"].as_u64(), manifest["identity"].as_str()) {
+        (Some(head), Some(identity)) => Ok((head, identity.to_string())),
+        _ => Err(refused("its manifest names no head")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +438,8 @@ mod tests {
             format!("tasks/{key}/{STORE}"),
             format!("tasks/{key}/task.json"),
             format!("tasks/{key}/tasks/{key}/session.json"),
+            PACK_SESSION.into(),
+            format!("tasks/{key}/{PACK_SESSION}"),
         ] {
             assert!(valid_path(&good), "{good}");
         }
@@ -339,8 +453,27 @@ mod tests {
             "tasks/0123/session.json".into(),
             format!("tasks/{key}/usage.json"),
             format!("{}{STORE}", format!("tasks/{key}/").repeat(17)),
+            format!("{PACK_SESSION}/x"),
         ] {
             assert!(!valid_path(&bad), "{bad}");
+        }
+        // A pack session id is what code_host keeps, never anything else.
+        let id = |bytes: &[u8]| {
+            check_sidecar(&BundleFile {
+                path: PACK_SESSION.into(),
+                bytes: bytes.to_vec(),
+            })
+        };
+        assert!(id(b"1761990000-4242-a1b2c3d4e5f6").is_ok());
+        assert!(id(b"dir-a1b2c3d4e5f6\n").is_ok());
+        for bad in [
+            &b"short"[..],
+            b"has space inside",
+            b"{}",
+            &[b'a'; 65],
+            b"\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8",
+        ] {
+            assert!(id(bad).is_err(), "{bad:?}");
         }
     }
 

@@ -14,6 +14,8 @@
 // do name lookups (over DNS-over-HTTPS) while a command with network runs; meanwhile a
 // command without network gets made-up answers that lead nowhere.
 
+import { BROWSER } from './page-tools.mjs';
+
 const ROUTER = '192.168.86.1';
 export const GATEWAY_PORT = 3128;
 /** A request's head, and its body, are at most this long. */
@@ -441,14 +443,14 @@ function serve(conn, scheme, gone) {
         const store = storeRefusal(url);
         if (store) reply(403, `${store}.`, close);
         else {
-          reply(502, `Chrome could not fetch ${url.href}: ${error.message}. If Spindle may not reach websites, `
-            + "turn the thread's network on again in Spindle (Chrome asks for access to sites).", close);
+          reply(502, `${BROWSER} could not fetch ${url.href}: ${error.message}. If Spindle may not reach websites, `
+            + `turn the thread's network on again in Spindle (${BROWSER} asks for access to sites).`, close);
         }
       }
       return;
     }
     if (response.type === 'opaqueredirect') {
-      reply(502, `${url.href} answered with a redirect whose target Chrome hides. The gateway does not follow it: `
+      reply(502, `${url.href} answered with a redirect whose target ${BROWSER} hides. The gateway does not follow it: `
         + 'ask for the final public address directly.', close);
       return;
     }

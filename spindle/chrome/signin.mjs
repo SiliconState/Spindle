@@ -99,6 +99,79 @@ export async function signInInTab(profile) {
   return { code, verifier, redirect: flow.redirect_uri };
 }
 
+/** A PKCE pair and a state for one sign-in or connect, `{verifier, challenge, state}`:
+ * S256, the challenge base64url(SHA-256(verifier)) without padding (RFC 7636). */
+export async function pkce() {
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))));
+  const state = base64url(crypto.getRandomValues(new Uint8Array(16)));
+  return { verifier, challenge, state };
+}
+
+/** What a connect tab's address says: null while it is not the host's
+ * `/connect/done`; there, `{code}` when the host connected this browser, and a refusal
+ * (thrown) when the user denied it or the answer is for another request (`state`). */
+export function connectAnswer(address, base, state) {
+  let at;
+  try {
+    at = new URL(address);
+  } catch {
+    return null;
+  }
+  if (at.origin !== new URL(base).origin || at.pathname !== '/connect/done') return null;
+  const params = at.searchParams;
+  if (params.get('state') !== state) throw new Error('the connect came back for another request; try again');
+  if (params.get('error')) throw Object.assign(new Error('your host was not connected: it was denied on its page'), { kind: 'denied' });
+  const code = params.get('code');
+  if (!code) throw new Error('the connect came back without a code');
+  return { code };
+}
+
+/** One-click connect to a Spindle host (panel only): opens the host's own page for
+ * `client` (this browser's name there) in a tab, where the user approves (pairing that
+ * tab first if needed), catches the tab reaching `/connect/done`, checks it answers this
+ * request, and closes it. Resolves with what the engine trades for a browser token,
+ * `{code, verifier}`; no token passes through a URL or this page. */
+export async function connectInTab(base, client) {
+  const { verifier, challenge, state } = await pkce();
+  const url = new URL('/connect', base);
+  for (const [name, value] of Object.entries({ client, challenge, state })) url.searchParams.set(name, value);
+  const tab = await chrome.tabs.create({ url: 'about:blank' });
+  const code = await new Promise((resolve, reject) => {
+    const end = (outcome) => {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(updated);
+      chrome.tabs.onRemoved.removeListener(removed);
+      outcome();
+    };
+    const updated = (tabId, change, now) => {
+      const address = change.url ?? now?.url;
+      if (tabId !== tab.id || !address) return;
+      let answer;
+      try {
+        answer = connectAnswer(address, base, state);
+      } catch (error) {
+        chrome.tabs.remove(tab.id).catch(() => {});
+        return end(() => reject(error));
+      }
+      if (!answer) return;
+      chrome.tabs.remove(tab.id).catch(() => {});
+      end(() => resolve(answer.code));
+    };
+    const removed = (tabId) => {
+      if (tabId === tab.id) end(() => reject(Object.assign(new Error('the connect tab was closed'), { kind: 'cancelled' })));
+    };
+    const timer = setTimeout(() => {
+      chrome.tabs.remove(tab.id).catch(() => {});
+      end(() => reject(new Error('connecting took too long; try again')));
+    }, SIGN_IN_MS);
+    chrome.tabs.onUpdated.addListener(updated);
+    chrome.tabs.onRemoved.addListener(removed);
+    chrome.tabs.update(tab.id, { url: url.href }).catch((error) => end(() => reject(error)));
+  });
+  return { code, verifier };
+}
+
 /** A JWT's payload, or null. */
 function payloadOf(token) {
   try {

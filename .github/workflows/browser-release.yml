@@ -95,12 +95,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > "$RUNNER_TEMP/notes.md" <<EOF
-          Spindle for Browser $VERSION, for Chrome and Edge, built from this tag by the browser release workflow.
+          Spindle for Browser $VERSION, for Chrome, Edge and Brave, built from this tag by the browser release workflow.
 
-          **Install** (Chrome or Edge, 116 or later, on desktop):
+          **Install** (Chrome, Edge or Brave, Chromium 116 or later, on desktop):
 
           1. Download \`$ASSET\` and unzip it into a folder you will keep.
-          2. Open \`chrome://extensions\` (in Edge, \`edge://extensions\`), turn on **Developer mode**, click **Load unpacked** and choose that folder.
+          2. Open \`chrome://extensions\` (in Edge, \`edge://extensions\`; in Brave, \`brave://extensions\`), turn on **Developer mode**, click **Load unpacked** and choose that folder.
           3. Pin Spindle, open its panel, and in **Settings** add a key or **Sign in**.
 
           **Update:** unzip the new version over the same folder and click **Reload** on Spindle's card in the extensions page. The browser names an unpacked extension by its folder, so a different folder is a separate install with its own threads.

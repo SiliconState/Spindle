@@ -125,6 +125,38 @@ try {
   }
   console.log('ok workspace history after several turns');
 
+  // Move progress and thread updates share one strict read/modify/write transaction.
+  const atomic = await page.eval(`(async () => {
+    const shared = await import('./shared.mjs');
+    const id = 'atomic-review';
+    await shared.write('threads', id, { title: 'before', state: 'idle' });
+    const merge = shared.update('threads', id, (thread) => ({ ...thread, moving: null }), {
+      durability: 'strict', changes: [['kv', 'atomic-sibling', { done: true }]],
+    });
+    const turn = shared.update('threads', id, (thread) => ({ ...thread, title: 'latest', state: 'running' }));
+    await Promise.all([merge, turn]);
+    const merged = await shared.read('threads', id);
+    let refused = false;
+    try {
+      await shared.update('threads', id, (thread) => ({ ...thread, title: 'must roll back' }), {
+        durability: 'strict', changes: [['kv', 'atomic-sibling', { done: false }], ['bundles', 'unclonable', () => {}]],
+      });
+    } catch { refused = true; }
+    const after = await shared.read('threads', id);
+    const sibling = await shared.read('kv', 'atomic-sibling');
+    const absent = await shared.update('threads', 'missing-review', () => ({}), { changes: [['kv', 'atomic-missing', true]], durability: 'strict' });
+    const missing = await shared.read('kv', 'atomic-missing');
+    await shared.remove('threads', id);
+    await shared.remove('kv', 'atomic-sibling');
+    return { merged, after, sibling, refused, absent: absent === undefined, missing: missing === undefined };
+  })()`);
+  assert.equal(atomic.merged.title, 'latest');
+  assert.equal(atomic.merged.state, 'running');
+  assert.deepEqual(atomic.after, atomic.merged, 'a refused sibling write rolls back the thread update too');
+  assert.deepEqual(atomic.sibling, { done: true });
+  assert.ok(atomic.refused && atomic.absent && atomic.missing);
+  console.log('ok strict move/index transactions merge with concurrent updates and abort atomically');
+
   // A delayed permission answer must neither duplicate a send nor eat a newer draft.
   await page.click(`#threads .thread-row[data-id="${id}"]`);
   await page.until(`spindlePanel.current === '${id}' && spindlePanel.status`);

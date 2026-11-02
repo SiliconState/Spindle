@@ -74,42 +74,44 @@
   --warn-bg: #fdf2dd;
   --warn-line: #e6c68c;
 }
-:root[data-theme="dark"], :root[data-theme="dark"] dialog, :root[data-theme="dark"] #toast {
+/* Dim: the dark theme, a soft warm charcoal rather than near-black, green only in the
+   accent; every label keeps WCAG AA (4.5:1) on every surface. */
+:root[data-theme="dim"], :root[data-theme="dim"] dialog, :root[data-theme="dim"] #toast {
   color-scheme: dark;
-  --page: #111511;
-  --chrome: #161c14;
-  --surface: #171d15;
-  --soft: #1c241a;
-  --input: #141a12;
-  --ink: #dfe4d6;
-  --ink-2: #c3cab8;
-  --muted: #a4b194;
-  --line: #3a4730;
-  --edge: #2b3524;
-  --hair: #232c1e;
-  --track: #2f3a28;
-  --rule: #46553a;
-  --steer: #232b1e;
-  --danger: #b4442e;
+  --page: #262624;
+  --chrome: #2c2c2a;
+  --surface: #30302d;
+  --soft: #363633;
+  --input: #2a2a28;
+  --ink: #ebe7df;
+  --ink-2: #d3cfc5;
+  --muted: #aaa69c;
+  --line: #4d4c47;
+  --edge: #42413d;
+  --hair: #383835;
+  --track: #464540;
+  --rule: #5f5d57;
+  --accent: #a7c78a;
+  --accent-soft: #363d2f;
+  --on-accent: #1b2214;
+  --terminal: #1f1f1e;
+  --code: #cbd8b9;
+  --error: #f0aa98;
+  --error-line: #7d5448;
+  --danger: #c4503a;
   --on-danger: #ffffff;
-  --warn: #f0c27a;
-  --warn-ink: #f5dcb0;
-  --warn-bg: #2a2213;
-  --warn-line: #6d5427;
-  --accent: #b9e07f;
-  --accent-soft: #233019;
-  --on-accent: #16200d;
-  --terminal: #0d110b;
-  --code: #c3d3ab;
-  --error: #f3b3a0;
-  --error-line: #7f5443;
-  --shadow: #0006;
-  --grain: #ffffff08;
-  --red: #f09f91;
-  --green: #b9e07f;
-  --yellow: #e2d388;
-  --blue: #a2c6e8;
-  --mark: #6b5a1c;
+  --warn: #e9bf7c;
+  --warn-ink: #f3ddb6;
+  --warn-bg: #3b3122;
+  --warn-line: #6f5b36;
+  --shadow: #00000059;
+  --grain: #ffffff07;
+  --steer: #353532;
+  --red: #f2a194;
+  --green: #a7c78a;
+  --yellow: #e3d38f;
+  --blue: #a9c8e8;
+  --mark: #6b5c26;
 }
 * { box-sizing: border-box; }
 pre { tab-size: 4; }
@@ -523,8 +525,8 @@ details.more label:first-of-type { margin-top: 4px; }
 
 /* ---- Chip, sheets, inline display, change card ---- */
 /* Dark primary actions take the accent (ink on near-black read as disabled). */
-:root[data-theme="dark"] button.primary, :root[data-theme="dark"] #bar button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-:root[data-theme="dark"] button.primary:hover { background: var(--ink); border-color: var(--ink); color: var(--page); }
+:root[data-theme="dim"] button.primary, :root[data-theme="dim"] #bar button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+:root[data-theme="dim"] button.primary:hover { background: var(--ink); border-color: var(--ink); color: var(--page); }
 /* The model chip in the status row: model · effort; the provider only when the name does not say it. */
 /* The status text yields space first, then the provider, then the model name; the effort stays. */
 #bar #phase { flex: 1 1 0; min-width: 40px; }
@@ -793,3 +795,15 @@ button.diff-link { flex-shrink: 0; min-width: 30px; min-height: 30px; padding: 0
 /* A notice with an action (Undo) sits above the composer, dark, in a thumb's reach. */
 #toast.actionable { inset: auto 14px calc(var(--dock-h, 110px) + 10px); display: flex; align-items: center; gap: 12px; background: var(--ink); color: var(--page); border: 0; padding: 4px 4px 4px 14px; font-size: 13px; }
 .toast-action { min-height: 44px; padding: 0 16px; margin-left: auto; border: 1px solid var(--muted); background: transparent; color: var(--page); font-weight: 700; flex-shrink: 0; }
+/* The connect page (GET /connect, /connect/done): one card, centred, scrolling when tall. */
+body.connect-page { height: auto; min-height: 100dvh; overflow: auto; align-items: center; justify-content: center; padding: 24px 14px; }
+.connect-card { color: var(--ink); background: var(--surface); border: 1px solid var(--rule); padding: 26px; max-width: 460px; width: 100%; box-shadow: 0 10px 40px var(--shadow); }
+.connect-card h2 { margin: 10px 0 14px; font-size: 22px; overflow-wrap: anywhere; }
+.connect-card p:not(.eyebrow), .connect-card li { font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; }
+.connect-card ul { padding-left: 20px; }
+.connect-card label { display: flex; flex-direction: column; gap: 6px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-top: 18px; }
+.connect-card input { width: 100%; font-size: 16px; color: var(--ink); }
+.connect-card strong, #connect-name { color: var(--ink); }
+.connect-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px; }
+.connect-actions button { min-width: 110px; }
+.connect-card [role="alert"] { color: var(--error); }

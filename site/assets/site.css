@@ -127,6 +127,13 @@ section.block { padding: clamp(56px, 8vw, 96px) 0; border-top: 1px solid var(--l
 .card.link:hover { border-color: var(--ink); }
 .card.link .more { display: inline-block; margin-top: 14px; color: var(--accent); font-weight: 600; font-size: 15px; }
 
+/* A page of prose (the privacy policy): one readable column. */
+.prose { max-width: 76ch; }
+.prose h2 { font-size: clamp(1.3rem, 2.4vw, 1.6rem); margin: 34px 0 10px; }
+.prose h2:first-child { margin-top: 0; }
+.prose ul { padding-left: 20px; margin: 0 0 14px; }
+.prose li { margin-bottom: 10px; }
+
 /* Principles: numbered, with a rule between. */
 .principles { list-style: none; padding: 0; margin: 0; counter-reset: p; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); border-top: 1px solid var(--line); }
 .principles.four { grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); }

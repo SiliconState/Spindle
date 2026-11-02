@@ -161,12 +161,12 @@ test('Paper is default even on a dark system; selection persists', () => {
   const current = theme(null, true);
   assert.equal(current.root.dataset.theme, 'paper');
   assert.equal(current.meta.content, '#ece6d8');
-  current.api.set('dark');
-  assert.equal(current.root.dataset.theme, 'dark');
-  assert.equal(current.meta.content, '#161c14');
+  current.api.set('dim');
+  assert.equal(current.root.dataset.theme, 'dim');
+  assert.equal(current.meta.content, '#2c2c2a');
   current.api.set('system');
   assert.equal(current.storage.get('spindle-theme'), 'system');
-  assert.equal(current.root.dataset.theme, 'dark', 'System follows the dark system');
+  assert.equal(current.root.dataset.theme, 'dim', 'System follows the dark system with Dim');
   current.media.matches = false;
   current.media.change();
   assert.equal(current.root.dataset.theme, 'light', 'System follows the light system with Light, not Paper');
@@ -178,7 +178,9 @@ test('Paper is default even on a dark system; selection persists', () => {
   assert.equal(current.root.dataset.theme, 'light', 'Light chosen stays light on a dark system');
   current.api.set('paper');
   assert.equal(current.storage.get('spindle-theme'), 'paper');
-  assert.equal(theme('dark').root.dataset.theme, 'dark');
+  assert.equal(theme('dim').root.dataset.theme, 'dim');
+  // A screen that saved the old Dark theme shows Dim, which replaced it.
+  assert.equal(theme('dark').root.dataset.theme, 'dim');
   assert.equal(theme('invalid').root.dataset.theme, 'paper');
 });
 
@@ -188,22 +190,22 @@ test('the background is textured unless this screen chose plain, in any theme', 
   current.api.setTexture('plain');
   assert.equal(current.root.dataset.texture, 'plain');
   assert.equal(current.storage.get('spindle-texture'), 'plain');
-  current.api.set('dark');
+  current.api.set('dim');
   assert.equal(current.root.dataset.texture, 'plain', 'a theme change keeps the background');
   current.api.setTexture('bogus');
   assert.equal(current.api.texture(), 'plain');
-  assert.equal(theme('dark', false, 'plain').root.dataset.texture, 'plain');
+  assert.equal(theme('dim', false, 'plain').root.dataset.texture, 'plain');
   assert.equal(theme(null, false, 'invalid').root.dataset.texture, 'textured');
 });
 
 test('settings screen can select a theme directly through the shared setter', () => {
   const current = theme(null, false);
   assert.equal(typeof current.api.set, 'function');
-  current.api.set('dark');
-  assert.equal(current.root.dataset.theme, 'dark');
-  assert.equal(current.api.get(), 'dark');
+  current.api.set('dim');
+  assert.equal(current.root.dataset.theme, 'dim');
+  assert.equal(current.api.get(), 'dim');
   current.api.set('bogus');
-  assert.equal(current.api.get(), 'dark');
+  assert.equal(current.api.get(), 'dim');
 });
 
 test('mobile shell exposes accessible theme, timeline and composer', async () => {

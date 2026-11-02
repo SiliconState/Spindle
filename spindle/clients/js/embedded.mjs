@@ -16,6 +16,11 @@ export const API_VERSION = 1;
 const DEADLINES = { firstByte: 180_000, idle: 180_000, total: 600_000 };
 /** Longest refusal body read (as the native transport keeps it). */
 const MAX_REFUSAL = 4096;
+/** How long a stopped command's runner has to answer (with what it printed) before the
+ * client answers for it, as stopped without its output. */
+const STOP_GRACE_MS = 15_000;
+/** How long a remote runner waits for a stopped command's own answer from its host. */
+const REMOTE_STOP_MS = 10_000;
 /** Anthropic's Messages API refuses a request a browser sends (it carries an Origin)
  * unless the request says it means to call the API from there; this client may run in
  * one, and the header changes nothing elsewhere. */
@@ -29,12 +34,95 @@ function base64ToBytes(text) {
   return bytes;
 }
 
-function bytesToBase64(bytes) {
+/** Bytes as a string of one character per byte (and back), so byte patterns can be
+ * found with string search. */
+function binaryOf(bytes) {
   let binary = '';
   for (let i = 0; i < bytes.length; i += 0x8000) {
     binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   }
-  return btoa(binary);
+  return binary;
+}
+
+function bytesOfBinary(binary) {
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function bytesToBase64(bytes) {
+  return btoa(binaryOf(bytes));
+}
+
+/** A header value the app adds for a grant: visible ASCII, spaces and tabs (so the bytes
+ * sent are the text's own, and an echo of them can be found), at most 8 KiB. */
+const ADDED_VALUE = /^[\t\x20-\x7e]{1,8192}$/;
+/** The shortest secret (a value, or an auth scheme's credentials in it) the client
+ * looks for in what comes back, as native code mode does. */
+const MIN_SECRET = 4;
+const REDACTED = '[redacted]';
+
+/** What of each added header value is secret: the value, and an auth scheme's
+ * credentials (`Bearer TOKEN`: TOKEN too), so an echo of either is found. */
+function secretsOf(values) {
+  const out = [];
+  for (const value of values) {
+    out.push(value);
+    const scheme = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]+(\S[\s\S]*)$/.exec(value);
+    if (scheme) out.push(scheme[1]);
+  }
+  return out;
+}
+
+/** The forms a secret is commonly echoed in, as native code mode finds them
+ * (store/src/code_http.rs, `needles`): as is, JSON-escaped (also with `\/`),
+ * percent-encoded (either hex case) and base64 (standard and URL-safe, at each of the
+ * three alignments it can have inside a longer encoding). Longest first. The secrets
+ * are ASCII, so each character is one byte. */
+function needlesOf(secrets) {
+  const out = new Set();
+  for (const secret of secrets) {
+    if (secret.length < MIN_SECRET) continue;
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    const percent = (upper) => [...secret].map((ch) => {
+      if (/[A-Za-z0-9._~-]/.test(ch)) return ch;
+      const hex = ch.charCodeAt(0).toString(16).padStart(2, '0');
+      return `%${upper ? hex.toUpperCase() : hex}`;
+    }).join('');
+    const forms = [secret, escaped, escaped.replaceAll('/', '\\/'), percent(true), percent(false)];
+    for (let shift = 0; shift < 3; shift++) {
+      const encoded = btoa('\0'.repeat(shift) + secret);
+      // Characters that depend only on the secret's own bytes.
+      const start = shift === 0 ? 0 : 4;
+      const end = Math.floor((shift + secret.length) / 3) * 4;
+      if (end >= start + 8) {
+        const core = encoded.slice(start, end);
+        forms.push(core, core.replaceAll('+', '-').replaceAll('/', '_'));
+      }
+    }
+    for (const form of forms) if (form.length >= MIN_SECRET) out.add(form);
+  }
+  return [...out].sort((a, b) => b.length - a.length);
+}
+
+/** `text` (one character per byte) with every echo of a secret replaced. */
+function scrubbed(text, needles) {
+  for (const needle of needles) if (text.length >= needle.length) text = text.split(needle).join(REDACTED);
+  return text;
+}
+
+/** How much of the end of `text` begins `needle` (its longest such prefix): a body cut
+ * short can end partway into a secret. */
+function partialEnd(text, needle) {
+  const joined = `${needle}\uffff${text.slice(-(needle.length - 1))}`;
+  const longest = new Int32Array(joined.length);
+  for (let i = 1; i < joined.length; i++) {
+    let k = longest[i - 1];
+    while (k > 0 && joined[i] !== joined[k]) k = longest[k - 1];
+    if (joined[i] === joined[k]) k += 1;
+    longest[i] = k;
+  }
+  return longest[joined.length - 1];
 }
 
 /** A runner's file write as the package takes it: `{path, base64, executable}`. */
@@ -62,24 +150,30 @@ export function remoteRunner({ url, token, fetch = globalThis.fetch }) {
       return body.helper;
     },
     async run({ command, timeoutS, network, files, links, directories, read, signal }) {
+      if (signal?.aborted) return { output: '', success: false, failure: 'the command was stopped before it ran' };
       const upload = files.map((file) => ({ path: file.path, base64: bytesToBase64(read(file.object)), executable: file.executable }));
-      // The run's name: a Stop ends this wait and tells the host to stop the command
-      // (a host that predates /v1/run/ID/stop says 404, and the command runs out its
-      // time there). Whether it stopped is the host's to tell: GET /v1/run/ID.
+      // The run's name: a Stop tells the host to stop the command, whose own answer then
+      // says what it printed until then (a host that predates /v1/run/ID/stop says 404,
+      // and the command runs out its time there). That answer is waited for
+      // REMOTE_STOP_MS at most. Whether it stopped is the host's to tell: GET /v1/run/ID.
       const run = crypto.randomUUID();
+      const ended = new AbortController();
+      let waited = null;
       const stop = () => {
         fetch(`${base}/v1/run/${run}/stop`, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(10_000) }).catch(() => {});
+        waited = setTimeout(() => ended.abort(), REMOTE_STOP_MS);
       };
       signal?.addEventListener('abort', stop, { once: true });
       try {
         const response = await fetch(`${base}/v1/run`, {
-          method: 'POST', headers, signal,
+          method: 'POST', headers, signal: ended.signal,
           body: JSON.stringify({ command, timeout_s: timeoutS, network, files: upload, links, directories, run }),
         });
         const body = await response.json().catch(() => ({}));
         if (!response.ok) return { output: '', success: false, failure: refusal(body) || `the runner answered HTTP ${response.status}` };
         return body;
       } finally {
+        clearTimeout(waited);
         signal?.removeEventListener('abort', stop);
       }
     },
@@ -127,13 +221,24 @@ function claimOf(key, path, provider) {
  *                authentication headers, `auth`, which the package derives from its
  *                catalog), or headers to add as given. Asked before every fresh model
  *                request, before it is reserved; throwing refuses it (nothing is sent).
- *   fetch        the fetch to send model requests with (default globalThis.fetch).
+ *   grantHeaders async ({ grant, url, method, names }) => { [name]: value } for each of
+ *                `names`: the values of the headers an HTTP grant adds (`setHttpGrants`),
+ *                asked before each request a script makes under it. Each value is
+ *                visible ASCII; it goes only in that request, and every echo of it (or
+ *                of an auth scheme's credentials in it) is taken out of what comes back
+ *                before the package or the script sees it (one whose secret is under 4
+ *                characters, which could not be found, is refused). Throwing refuses
+ *                the request (nothing is sent).
+ *   fetch        the fetch to send model requests, and scripts' requests to their
+ *                grants, with (default globalThis.fetch).
  *   runner       runs `bash`: `{ app, remote }`, each optional, or one runner (a
  *                `remoteRunner(...)` serves `runner: 'remote'` sessions, any other
  *                `runner: 'app'` ones). A runner is { run: async ({ command, timeoutS,
  *                network, files, links, directories, read, signal }) => ({ output,
  *                success, writes, deletes, links, directories, failure }) };
- *                `read(object)` gives a file's bytes. An app runner that sandboxes its
+ *                `read(object)` gives a file's bytes. `signal` ends when the user stops
+ *                the command: stop it and still answer, with what it printed until then
+ *                (that answer is recorded as stopped). An app runner that sandboxes its
  *                commands says so with `identity()` (64 hex digits, as a remote
  *                runner's): they then count as isolated. `connectRunner` changes them.
  *   deadlines    { firstByte, idle, total } in ms for model requests. */
@@ -147,7 +252,7 @@ export class EmbeddedClient extends Emitter {
   #closed = null;
   #opfs = null;
 
-  constructor({ wasm, storage = 'memory', storageOptions = {}, fs, platform, pool, catalog, credentials, fetch = globalThis.fetch, runner, deadlines = {}, resolveDir = (dir) => dir } = {}) {
+  constructor({ wasm, storage = 'memory', storageOptions = {}, fs, platform, pool, catalog, credentials, grantHeaders, fetch = globalThis.fetch, runner, deadlines = {}, resolveDir = (dir) => dir } = {}) {
     super();
     if (!wasm?.Embedded) throw new TypeError('EmbeddedClient needs the spindle-embed wasm module');
     if (storage === 'node') {
@@ -160,7 +265,7 @@ export class EmbeddedClient extends Emitter {
     }
     this.#wasm = wasm;
     this.#embedded = new wasm.Embedded(storage, JSON.stringify(storageOptions), catalog ? JSON.stringify(catalog) : undefined);
-    Object.assign(this, { credentials, fetchImpl: fetch, resolveDir });
+    Object.assign(this, { credentials, grantHeaders, fetchImpl: fetch, resolveDir });
     this.deadlines = { ...DEADLINES, ...deadlines };
     this.tools = new Tools();
     this.runners = {};
@@ -181,9 +286,12 @@ export class EmbeddedClient extends Emitter {
   }
 
   /** The sites scripts' `http()` may reach: grants as a native code policy's `http`
-   * list ({name, url, risk, methods?, timeout_seconds?, max_response_bytes?}; no
-   * headers). The package checks each request against them; this client sends it with
-   * `fetch`, following no redirect. `[]` grants none, as by default. */
+   * list ({name, url, risk, methods?, timeout_seconds?, max_response_bytes?,
+   * headers?}). The package checks each request against them; this client sends it with
+   * `fetch`, following no redirect. A grant's `headers` name those the app adds, each
+   * `{"app": true}` (`{"Authorization": {"app": true}}`): their values come from
+   * `grantHeaders` as each request goes, never from the package, and a script may not
+   * set them. `[]` grants none, as by default. */
   setHttpGrants(grants) {
     try {
       this.#embedded.setHttpGrants(JSON.stringify(grants ?? []));
@@ -277,6 +385,8 @@ export class EmbeddedClient extends Emitter {
         this.#work(frame.params);
       } else if (frame.method === 'work_cancel') {
         this.#cancel(frame.params.session, frame.params.id);
+      } else if (frame.method === 'work_stop') {
+        this.#stopRun(frame.params.session, frame.params.id);
       } else if (frame.id != null && this.#pending.has(frame.id)) {
         const waiting = this.#pending.get(frame.id);
         this.#pending.delete(frame.id);
@@ -315,6 +425,21 @@ export class EmbeddedClient extends Emitter {
     this.#works.delete(key);
     work.controller.abort();
     clearTimeout(work.timer);
+  }
+
+  /** The user stopped the command a work runs: its runner is told (its signal ends)
+   * and its answer, with what the command printed until then, still goes to the
+   * package, which records the command as stopped. A runner that has not answered
+   * STOP_GRACE_MS after the stop is answered for, as stopped without its output. */
+  #stopRun(session, id) {
+    const work = this.#works.get(`${session}\u0000${id}`);
+    if (!work || work.kind !== 'run' || work.stopping) return;
+    work.stopping = true;
+    work.controller.abort();
+    work.timer = setTimeout(() => this.#deliver(session, id, {
+      kind: 'ran', output: '', success: false,
+      failure: `its runner had not answered ${STOP_GRACE_MS / 1000} s after the stop`,
+    }), STOP_GRACE_MS);
   }
 
   #work({ session, id, work }) {
@@ -433,57 +558,111 @@ export class EmbeddedClient extends Emitter {
     }
   }
 
+  /** The values of the headers `child`'s grant adds (`app_headers` names them), from
+   * `grantHeaders`: `{ added, needles }` (the forms their secrets are found in), or
+   * `{ refused }`, and then nothing is sent. */
+  async #added(child) {
+    const names = Array.isArray(child.app_headers) ? child.app_headers : [];
+    if (!names.length) return { added: {}, needles: [] };
+    const grant = child.grant ?? '?';
+    if (typeof this.grantHeaders !== 'function') {
+      return { refused: `grant ${grant} adds headers (${names.join(', ')}) that this app does not supply` };
+    }
+    let given;
+    try {
+      given = await this.grantHeaders({ grant, url: child.url, method: child.method, names: [...names] });
+    } catch (error) {
+      return { refused: String(error?.message ?? error) };
+    }
+    const byName = new Map(Object.entries(given ?? {}).map(([name, value]) => [name.toLowerCase(), value]));
+    const added = {};
+    for (const name of names) {
+      const value = byName.get(name.toLowerCase());
+      const text = typeof value === 'string' ? value.trim() : '';
+      if (!ADDED_VALUE.test(text)) return { refused: `the app gave no value it can send for header ${name} of grant ${grant}` };
+      // What it cannot find in what comes back, it does not send.
+      if (secretsOf([text]).some((part) => part.length < MIN_SECRET)) {
+        return { refused: `the value for header ${name} of grant ${grant} is too short to keep out of what comes back` };
+      }
+      added[name] = text;
+    }
+    return { added, needles: needlesOf(secretsOf(Object.values(added))) };
+  }
+
   /** A request a grant allows, as the package froze it: no cookies, no redirect
    * followed (one is reported as the server's answer), the grant's timeout, at most
-   * its response size. */
+   * its response size, with the headers the grant adds; every echo of their values
+   * is taken out of what comes back. */
   async #codeHttp(child, signal) {
     if (child.body != null && (child.method === 'GET' || child.method === 'HEAD')) {
       return { error: `a ${child.method} request carries no body here; nothing was sent`, sent: false };
     }
     if (signal?.aborted) return { error: 'stopped before it was sent', sent: false };
+    const { added, needles, refused } = await this.#added(child);
+    if (refused) return { error: `${refused}; nothing was sent`, sent: false };
+    if (signal?.aborted) return { error: 'stopped before it was sent', sent: false };
+    const hide = (text) => (needles.length ? scrubbed(String(text), needles) : String(text));
+    // Checked before sending (as fetch would check them), so headers it would refuse are
+    // refused with nothing sent; given to `fetch` as a plain object, as before.
+    let headers;
+    try {
+      const checked = new Headers(child.headers ?? {});
+      for (const [name, value] of Object.entries(added)) checked.set(name, value);
+      headers = Object.fromEntries(checked);
+    } catch (error) {
+      return { error: `the request's headers cannot be sent (${hide(error?.message ?? error)}); nothing was sent`, sent: false };
+    }
     const deadline = AbortSignal.timeout(child.timeout_seconds * 1000);
     let response;
     try {
       response = await this.fetchImpl(child.url, {
-        method: child.method, headers: child.headers ?? {}, credentials: 'omit', redirect: 'manual', cache: 'no-store',
+        method: child.method, headers, credentials: 'omit', redirect: 'manual', cache: 'no-store',
         body: child.body == null ? undefined : new TextEncoder().encode(child.body),
         signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
       });
     } catch (error) {
-      return { error: `the request failed: ${error?.message ?? error}`, sent: true };
+      return { error: `the request failed: ${hide(error?.message ?? error)}`, sent: true };
     }
     if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400 && response.headers.has('location'))) {
       response.body?.cancel().catch(() => {});
       return { error: 'the server answered with a redirect, which is not followed here; ask for the address it leads to', answered: true };
     }
     const limit = child.max_response_bytes;
+    // A secret is taken out whole before the body is cut, so it is read this far past.
+    const look = needles[0]?.length ?? 0;
     const parts = [];
     let size = 0;
-    let truncated = false;
     let cut = null;
     const reader = response.body?.getReader();
     try {
-      while (reader && size <= limit) {
+      while (reader && size <= limit + look) {
         const { value, done } = await reader.read();
         if (done) break;
         parts.push(value);
         size += value.length;
       }
-      if (size > limit) truncated = true;
     } catch (error) {
       // The body was cut off (a timeout, a stop): what came is the answer.
-      truncated = true;
-      cut = `the response body was cut off: ${error?.message ?? error}`;
+      cut = `the response body was cut off: ${hide(error?.message ?? error)}`;
     }
     reader?.cancel().catch(() => {});
-    const body = new Uint8Array(Math.min(size, limit));
+    // Read short of its end (the limit, or a cut): it may end partway into a secret.
+    const short = size > limit + look || cut !== null;
+    let body = new Uint8Array(size);
     let at = 0;
     for (const part of parts) {
-      if (at >= body.length) break;
-      body.set(part.subarray(0, body.length - at), at);
-      at += Math.min(part.length, body.length - at);
+      body.set(part, at);
+      at += part.length;
     }
-    return { status: response.status, headers: Object.fromEntries(response.headers), body_base64: bytesToBase64(body), truncated, ...(cut && { body_error: cut }) };
+    if (needles.length) {
+      let text = scrubbed(binaryOf(body), needles);
+      if (short) text = text.slice(0, text.length - Math.max(0, ...needles.map((needle) => partialEnd(text, needle))));
+      body = bytesOfBinary(text);
+    }
+    const truncated = short || body.length > limit;
+    const headersBack = {};
+    for (const [name, value] of response.headers) headersBack[hide(name)] = hide(value);
+    return { status: response.status, headers: headersBack, body_base64: bytesToBase64(body.subarray(0, limit)), truncated, ...(cut && { body_error: cut }) };
   }
 
   /** An app tool for a script, until its answer or the command's end (then uncertain:
@@ -598,6 +777,7 @@ export class EmbeddedClient extends Emitter {
       result = { output: '', success: false, failure: `the runner failed: ${error?.message ?? error}` };
     }
     if (entry.cancelled) return;
+    clearTimeout(entry.timer);
     this.#deliver(session, id, {
       kind: 'ran',
       output: String(result.output ?? ''),

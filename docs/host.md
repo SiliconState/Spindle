@@ -145,7 +145,9 @@ Every request passes these checks in order (`route` in [`mod.rs`](../spindle/sto
    `spindle --dir HOST token new NAME --runner` reaches only `GET /v1`,
    `/v1/runner`, `/v1/run` and a named run's status and stop; everything else is
    `403 forbidden`, including `/api` with that token as a cookie. `token list`
-   marks it `(runner)`. See [API.md](API.md).
+   marks it `(runner)`. A browser token (`token new NAME --browser`, or one-click
+   connect below) reaches the runner's routes, the host's models and providers, and
+   the threads it brought; `token list` marks it `(browser)`. See [API.md](API.md).
 6. **Same-origin commands.** Every other `POST` must carry `Origin` equal to the expected
    origin and the custom header `X-Spindle: 1`.
 7. **Embedded UI files** are served without pairing.
@@ -196,6 +198,18 @@ sequenceDiagram
 
 Named API tokens for non-browser clients are device rows whose id starts with `api:`;
 they are created with `spindle --dir HOST token new NAME` ([cli.md](cli.md#token)).
+
+**One-click connect.** An app such as Spindle for Browser gets a browser token of its
+own without a token passing through a URL. It opens `GET /connect` on the host with its
+name and a PKCE challenge. The page asks a screen that is not paired to pair first
+(the pairing key, as for the UI), then shows the app's name and what it may do (run
+commands in the host's sandbox; bring its threads here, run them and take them back;
+read the host's providers and models) with Allow and Deny. Allow sends
+`POST /api/connect` and the tab goes to `/connect/done` with a one-use code, which the
+app trades for its token at `POST /v1/connect/token` within 120 seconds. Connecting
+again under the same name replaces that name's token and keeps its threads. The token
+is listed under Settings, Screens, where Revoke ends it. The exchange is specified in
+[API.md](API.md).
 
 ## Remote access through a reverse proxy
 
@@ -283,6 +297,19 @@ inspects the recovery report of each such thread and submits a `continue` for th
 whose remaining work is ready and has no unknown outcome; when four threads are already
 running it waits up to 30 minutes for room. Every other thread waits for a person.
 
+**Threads a browser brings.** With a browser token, an app hands the host a thread
+as a session bundle (`POST /v1/threads`) and drives it with the same commands as any
+thread; an export (`POST /v1/sessions/ID/export`) hands it back. The host imports it
+as one of its own threads and always fits its settings: every command in the sandbox,
+the full tool set, no runner, no host source directories, no self-edit; it runs on the
+host's own credentials, on another model only when the request names one. The upload
+goes to `HOST/incoming/` and is checked whole before anything is written; the thread is
+registered, with its owner and the request's idempotency key, in one `host.sqlite`
+transaction, and anything half-made is removed when the host opens. A thread that moved
+back keeps its checked bundle (`moved.spindle`) and refuses new work (every command
+but rename, delete and stop) until its app deletes it. A browser token sees only the threads it brought;
+the phone UI sees every thread.
+
 Like every native entry point, the host refuses an embedded-owned or moved store
 and writes no metadata into it, including while the package closes SQLite to
 replace a compacted store. The fence is checked by
@@ -318,7 +345,7 @@ served wrapped in a CSS `base` layer so a [skin](#host-skin) layer can sit over 
 | [`commands.js`](../spindle/store/ui/commands.js) | Typed commands recognized in the composer. |
 | [`terminal.js`](../spindle/store/ui/terminal.js) | Bounded ANSI renderer for live command output. |
 | [`text.js`](../spindle/store/ui/text.js) | Search, line diff, Markdown export and labels. |
-| [`theme.js`](../spindle/store/ui/theme.js) | Paper, Light, Dark or System theme (System is Light or Dark as the device is) and textured or plain background, remembered per screen. |
+| [`theme.js`](../spindle/store/ui/theme.js) | Paper, Light, Dim or System theme (System is Light or Dim as the device is) and textured or plain background, remembered per screen. Dim is the dark theme, a soft charcoal; a screen that chose the old Dark gets Dim. |
 | [`sw.js`](../spindle/store/ui/sw.js) | Service worker that only shows run notifications; no fetch handler, nothing cached, no push server. |
 | [`manifest.webmanifest`](../spindle/store/ui/manifest.webmanifest), [`icon.svg`](../spindle/store/ui/icon.svg) | Home-screen installation. |
 
@@ -328,7 +355,7 @@ Screens and features:
 | --- | --- |
 | Thread list | Running, Needs you, Today and Earlier groups, state shapes as well as colours, activity, spend and search; a composer starts a thread. Delete hides it immediately with Undo before the delete is sent. Refreshed every 20 seconds while visible. |
 | Thread view | A header with back, name, model and spend, and a budget hairline. Consecutive tool calls fold into a “Ran N steps” row with failures counted; steering is a right-hand bubble, checked when read, with long text folded until tapped. Streamed text and command output remain uncommitted previews. |
-| Dock | One composer box: revision, activity, model button and the action that applies now above the message. With a turn running and no text written, Stop takes Send's place. Continue, Retry, Recover and Sign in appear when needed. |
+| Dock | One composer box: revision, activity, model button and the action that applies now above the message. With a turn running and no text written, Stop takes Send's place. Continue, Retry, Recover and Sign in appear when needed. After a Stop cut a turn off part way, a message goes on with it (text alone; files wait for the next message): the model reads what was stopped, then the message. |
 | Model picker | Provider and model search, effort with the model's own default outlined and named when none is chosen, Network and Rust toolchain switches labelled On or Off, and for a new thread its name, compaction mode and budget. |
 | Thread menu | Rename, spend and budget, compaction, the Spindle change card, Files, History, Find, Note for next turn, Download workspace (`.tar`), Export transcript (`.md`), Delete. |
 | Files and viewer | A workspace tree whose folders stay shut until tapped, changes marked on files and their folders, per-file diffs, Markdown, images, sandboxed HTML, Open in a tab, Run scripts where needed, GitHub access, and Shelf. |
@@ -336,7 +363,7 @@ Screens and features:
 | Settings (gear) | Appearance and host skin, Sign-ins (Dext's flows; credentials go to the host's credential store, never to the browser), Screens, Notifications, Shelf, Code tools (a read-only summary of the code policy), Usage, and Spindle: version, build, schema, engine, uptime, disk use, Roll back binary, Restart host. |
 
 Settings, Files and History open as full pages on a phone, with a way back rather
-than a small floating sheet. Light is neutral rather than tinted; Paper, Dark and
+than a small floating sheet. Light is neutral rather than tinted; Paper, Dim and
 System remain available. The page's `theme-color` follows the header background.
 The layout and interactions are in [`app.js`](../spindle/store/ui/app.js),
 [`style.css`](../spindle/store/ui/style.css) and
@@ -592,9 +619,10 @@ failures go to standard error.
 | --- | --- |
 | `pairing.key` | The pairing key, 64 hex characters, mode 0600. |
 | `serve.lock` | Locked by the running `serve`; one host per directory. |
-| `host.sqlite` (with `-wal`, `-shm`) | Mode 0600. Tables `sessions` (thread id, name, legacy self-edit flag), `commands` (request id, thread, payload digest, state, error), `submissions` (payloads), `command_times`, and `devices` (device and API-token hashes, labels, times). |
-| `sessions/ID/` | One session directory per thread: `store/` and settings ([store.md](store.md)), plus `uploads/`, `install-request.json` and `host-sync/` when used. |
+| `host.sqlite` (with `-wal`, `-shm`) | Mode 0600. Tables `sessions` (thread id, name, legacy self-edit flag), `commands` (request id, thread, payload digest, state, error), `submissions` (payloads), `command_times`, `devices` (device and API-token hashes, labels, times), `owners` (which browser token brought a thread) and `threads` (each brought thread's idempotency key, bundle digest, state and fit). |
+| `sessions/ID/` | One session directory per thread: `store/` and settings ([store.md](store.md)), plus `uploads/`, `install-request.json`, `host-sync/` and, for a thread that moved back to its browser, `moved.spindle` when used. |
 | `trash/ID/` | A deleted thread's directory until it is removed. |
+| `incoming/` | Thread bundles being uploaded and imports being staged; emptied when the host opens. |
 | `skin/` | `active.css`, `staged.css` and `versions/`. |
 | `shelf/` | Operator notes. |
 | `access-keys.json` | Cached Cloudflare Access signing keys. |
@@ -613,6 +641,8 @@ The UI's own routes; all `POST`s need the same-origin header, and all but the UI
 | --- | --- | --- |
 | GET | `/`, `/style.css`, `/app.js`, `/commands.js`, `/terminal.js`, `/text.js`, `/theme.js`, `/sw.js`, `/icon.svg`, `/manifest.webmanifest` | Embedded UI. `/?safe` without skin, `/?preview` with the staged skin. |
 | POST | `/api/pair` | Exchange the pairing key for a device cookie. |
+| GET | `/connect`, `/connect/done`, `/connect.js` | The one-click connect page an app opens, and the page its tab lands on. |
+| POST | `/api/connect` | A paired screen's answer to a connect request (Allow or Deny); returns where the tab goes next. |
 | POST | `/api/unpair` | Revoke this device and clear its cookie. |
 | GET, POST | `/api/devices` | List paired devices and API tokens; revoke one. |
 | GET | `/api/sessions` | Threads with status and spend, ready providers, whether self-edit is configured, and the boot id. |

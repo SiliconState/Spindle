@@ -3,7 +3,8 @@
 // copy of their thread's workspace and their writes come back; exit statuses; commands of
 // several threads at once; a thread's next command sees its last one's files; a timeout;
 // scripts' Spindle calls (the `spindle` command) arrive numbered and get their replies;
-// what a command may reach (no other copy, its own processes, no network); and a loop
+// what a command may reach (no other copy, its own processes, no network, no program it
+// saved); and a loop
 // that never calls the kernel, which only a restart ends, after which commands run again.
 // Times are printed.
 //
@@ -146,6 +147,22 @@ const home = await run('b', 'touch "$HOME/x" && mkdir -p "$HOME/.cache/a" && sta
 assert.ok(home.success && home.output === 'spindle\nhome-ok\n', fail('home', home));
 const nul = await run('b', 'echo one\u0000echo two');
 assert.ok(!nul.success && /NUL/.test(nul.output), fail('NUL', nul));
+
+// What a command writes is data, never a program: the image's own busybox copied into its
+// workspace, its scratch or its home does not run (exit 126: the runner sends such a
+// command to v86), /run takes nothing, and a script still runs through sh.
+const saved = await run('b', [
+  'cp /bin/busybox ./bb && chmod +x ./bb && ./bb echo ran; echo "ws $?"',
+  'cp /bin/busybox /tmp/bb && chmod +x /tmp/bb && /tmp/bb echo ran; echo "tmp $?"',
+  'cp /bin/busybox "$HOME/bb" && chmod +x "$HOME/bb" && "$HOME/bb" echo ran; echo "home $?"',
+  'touch /run/x 2>&1 | head -1',
+  'printf "echo script-ok\\n" > s.sh && chmod +x s.sh && sh s.sh',
+  '/bin/busybox echo image-ok',
+].join('; '));
+for (const [where, said] of [['ws', /ws 126/], ['tmp', /tmp 126/], ['home', /home 126/], ['run', /\/run\/x: Permission denied/], ['script', /script-ok/], ['image', /image-ok/]]) {
+  assert.match(saved.output, said, fail(`a saved program (${where})`, saved));
+}
+assert.ok(!/(^|\n)ran(\n|$)/.test(saved.output), fail('a saved program ran', saved));
 
 // Scripts' Spindle calls.
 calls.length = 0;

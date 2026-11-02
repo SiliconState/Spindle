@@ -146,7 +146,31 @@ pub(crate) fn listing(policy: &Value) -> String {
 }
 
 /// Checks the policy's `http` list when the policy is loaded.
+#[cfg(feature = "agent")]
 pub(crate) fn validate(policy: &Value) -> Result<()> {
+    check(policy, false)
+}
+
+/// Checks an embedded app's grants: as a policy's, but a header's value is only ever
+/// `{"app": true}`, which the app supplies as it sends (the package keeps no secrets).
+#[cfg(feature = "embedded")]
+pub(crate) fn validate_app(policy: &Value) -> Result<()> {
+    check(policy, true)
+}
+
+/// The names of the headers the app supplies for `grant`, as the grant spells them.
+#[cfg(feature = "embedded")]
+pub(crate) fn app_headers(policy: &Value, grant: &str) -> Vec<String> {
+    grants(policy)
+        .iter()
+        .find(|known| known["name"] == grant)
+        .and_then(|known| known["headers"].as_object())
+        .map(|headers| headers.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// `app`: an embedded app's grants, whose header values the app supplies.
+fn check(policy: &Value, app: bool) -> Result<()> {
     let Some(list) = policy.get("http") else {
         return Ok(());
     };
@@ -226,9 +250,22 @@ pub(crate) fn validate(policy: &Value) -> Result<()> {
             if headers.len() > MAX_HEADERS {
                 return Err(format!("http grant {name}: at most {MAX_HEADERS} headers"));
             }
+            let mut seen = std::collections::BTreeSet::new();
             for (header, value) in headers {
                 if !token(header) || RESERVED.contains(&header.to_ascii_lowercase().as_str()) {
                     return Err(format!("http grant {name}: header {header} is not allowed"));
+                }
+                if app {
+                    // One value per name, as the app sends it (header names ignore case).
+                    if !seen.insert(header.to_ascii_lowercase()) {
+                        return Err(format!("http grant {name}: header {header} is named twice"));
+                    }
+                    if value != &json!({"app": true}) {
+                        return Err(format!(
+                            "http grant {name}: header {header} must be {{\"app\":true}} here: the app supplies its value as it sends (the package keeps no secrets)"
+                        ));
+                    }
+                    continue;
                 }
                 let valid = match value {
                     Value::String(text) => header_value(text),
@@ -1061,6 +1098,8 @@ mod tests {
             json!({"http":[{"name":"a","url":"https://x/","risk":"read","timeout_seconds":601}]}),
             json!({"http":[{"name":"a","url":"https://x/","risk":"read","headers":{"A":"b\u{1}c"}}]}),
             json!({"http":[{"name":"a","url":"https://x/","risk":"read","headers":{"A":{"env":"X","prefix":"\u{7f}"}}}]}),
+            // Only an embedded app supplies a header itself.
+            json!({"http":[{"name":"a","url":"https://x/","risk":"read","headers":{"A":{"app":true}}}]}),
         ] {
             assert!(validate(&bad).is_err(), "{bad}");
         }
@@ -1140,5 +1179,49 @@ mod tests {
         assert_eq!(data["truncated"], true);
         assert_eq!(data["body_base64"].as_str().unwrap().len() % 4, 0);
         assert!(json_size(&data) <= REPLY_ROOM);
+    }
+}
+
+#[cfg(all(test, feature = "embedded"))]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn an_apps_grants_only_name_the_headers_it_supplies() {
+        let policy = json!({"http":[{"name":"api","url":"https://api.example.com/v1/","risk":"read",
+            "headers":{"Authorization":{"app":true}}}]});
+        validate_app(&policy).unwrap();
+        assert_eq!(app_headers(&policy, "api"), ["Authorization"]);
+        assert!(app_headers(&policy, "other").is_empty());
+        // No value of its own in the package, in any form a native policy takes.
+        for value in [
+            json!("Bearer x"),
+            json!({"env":"X"}),
+            json!({"credential":"glm"}),
+            json!({"app":true,"prefix":"Bearer "}),
+            json!({"app":false}),
+        ] {
+            let bad = json!({"http":[{"name":"a","url":"https://x/","risk":"read","headers":{"A":value}}]});
+            let refused = validate_app(&bad).unwrap_err();
+            assert!(refused.contains("the app supplies"), "{value}: {refused}");
+        }
+        for bad in [
+            json!({"http":[{"name":"a","url":"https://x/","risk":"read","headers":{"Host":{"app":true}}}]}),
+            json!({"http":[{"name":"a","url":"https://x/","risk":"read","headers":{"A":{"app":true},"a":{"app":true}}}]}),
+            json!({"http":[{"name":"a","url":"ftp://x/","risk":"read"}]}),
+        ] {
+            assert!(validate_app(&bad).is_err(), "{bad}");
+        }
+        // A script may not set (or override) a header the app adds, in any case.
+        for name in ["Authorization", "authorization", "AUTHORIZATION"] {
+            let refused = prepare(
+                &policy,
+                &json!({"url":"https://api.example.com/v1/x","headers":{name:"Bearer mine"}}),
+            )
+            .unwrap_err();
+            assert!(refused.contains("supplied by grant api"), "{refused}");
+        }
+        let prepared = prepare(&policy, &json!({"url":"https://api.example.com/v1/x"})).unwrap();
+        assert_eq!(prepared["headers"], json!({}));
     }
 }

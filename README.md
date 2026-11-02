@@ -49,7 +49,7 @@ These use the core; none of them is part of it.
 
 | | What it is | Built on | Read |
 | --- | --- | --- | --- |
-| **Spindle for Browser** | The first product: an extension for Chrome and Edge. Threads keep going with the panel closed, read and act on your tabs once you allow it, and run commands in a Linux inside the browser | `spindle-embed` | [Spindle for Browser](docs/chrome.md), [its page](https://siliconstate.github.io/Spindle/browser/) |
+| **Spindle for Browser** | The first product: an extension for Chrome, Edge and Brave. Threads keep going with the panel closed, read and act on your tabs once you allow it, and run commands in a Linux inside the browser | `spindle-embed` | [Spindle for Browser](docs/chrome.md), [its page](https://siliconstate.github.io/Spindle/browser/) |
 | **The web UI** | `spindle serve` (Unix): a phone-friendly UI over a directory of threads, on loopback, each device paired once and reached from elsewhere through your own authenticating HTTPS proxy | The native binary | [Web UI host](docs/host.md) |
 | **Examples** | A Node script; a browser page with its worker, behind a local relay that keeps the key out of the page; client examples in Node.js and Python | `spindle-embed`, the API clients | [Embedded package](docs/embedded.md), [Clients](docs/clients.md) |
 
@@ -94,7 +94,8 @@ flowchart TB
   With `spindle-embed`, the program around it does; Spindle for Browser is such a program.
 - **Where commands run.** A bubblewrap sandbox or the host itself, a runner the program
   supplies, or in Spindle for Browser a Linux inside the browser (v86, plus a faster wasm
-  Linux when built from source).
+  Linux when built from source) or the sandbox of a Spindle host you connect, which can
+  also take whole threads and hand them back.
 - **Tools.** Only Spindle for Browser has page tools for reading and acting on tabs.
   Only the native binary mounts your Rust toolchain read-only for commands
   (`--toolchain`). Both hosts support a dollar budget (`max_usd`), the same
@@ -141,14 +142,18 @@ Interrupted? `spindle --dir ../demo continue`. The web UI:
 [docs/host.md](docs/host.md#remote-access-through-a-reverse-proxy)). Full walkthrough:
 [docs/getting-started.md](docs/getting-started.md).
 
-**Spindle for Browser 0.1.4.** Download `spindle-browser-0.1.4.zip` from the
+**Spindle for Browser 0.1.5.** Download `spindle-browser-0.1.5.zip` from the
 [latest release](https://github.com/SiliconState/Spindle/releases/latest), unzip it, and load
-the folder with **Load unpacked** in `chrome://extensions` or `edge://extensions`
+the folder with **Load unpacked** in `chrome://extensions`, `edge://extensions` or `brave://extensions`
 ([docs/chrome.md](docs/chrome.md#install-a-release)). Its single-box composer,
 grouped threads, compact steps and task cards share the web UI's design. Workspace
 pages run scripts automatically only when the browser enforces containment;
 otherwise they are static until you allow that version. Settings > Storage can
-return free database pages without deleting history. The native phone UI follows
+return free database pages without deleting history. A thread can move to your Spindle
+host (**Run on my host**, after a one-click Connect) and back; Before acting sets
+whether page actions ask first; a site you list can carry a sealed secret header that
+scripts never see; and a Stop is a way to steer: the stopped step is kept, and your
+reply goes on with the turn. The native phone UI follows
 the same layout, adapted to the smaller screen. Sources:
 [`panel.mjs`](spindle/chrome/panel.mjs), [`page.mjs`](spindle/chrome/page.mjs) and
 [`app.js`](spindle/store/ui/app.js).

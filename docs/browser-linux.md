@@ -33,7 +33,7 @@ journaled by the embedded package, as native code mode journals its calls.
 | --- | --- | --- |
 | What it is | Alpine Linux, 32-bit x86, run by the v86 emulator (compiled to wasm) | Linux for the `wasm` architecture (`arch/wasm`), compiled to WebAssembly; one kernel instance per task, each in a worker, all on one shared memory |
 | Sources | [`chrome/linux/`](../spindle/chrome/linux/), [`linux-worker.mjs`](../spindle/chrome/linux-worker.mjs), [`linux-net.mjs`](../spindle/chrome/linux-net.mjs), [`linux-frames.mjs`](../spindle/chrome/linux-frames.mjs) | [`chrome/wasm-linux/`](../spindle/chrome/wasm-linux/), [`wasm-linux-worker.mjs`](../spindle/chrome/wasm-linux-worker.mjs) |
-| Shell and programs | bash, coreutils, findutils, grep, sed, gawk, diffutils, patch, tar, gzip, xz, Python 3 with pip, Node with npm, git, curl, openssl, jq, ripgrep, file, less | busybox (with hush as `sh`), Python 3.13 (no `ssl` or `ctypes`, and no loadable C extensions: there is no `dlopen`) |
+| Shell and programs | bash, coreutils, findutils, grep, sed, gawk, diffutils, patch, tar, gzip, xz, Python 3 with pip, Node with npm, git, curl, openssl, jq, ripgrep, file, less | busybox (with hush as `sh`), Python 3.13 (no `ssl` or `ctypes`, and no loadable C extensions: there is no `dlopen`); only the programs the image was built with run (see [Programs a command saved](#programs-a-command-saved)) |
 | Network | Through Chrome or a relay, for threads with network on | None |
 | Agent | [`guest/agent.py`](../spindle/chrome/linux/guest/agent.py) with the static [`spindle-sandbox`](../spindle/chrome/linux/command/src/sandbox.rs) | [`guest/src/agent.rs`](../spindle/chrome/wasm-linux/guest/src/agent.rs) (`spindle-agent`, agent and sandbox in one program) |
 | Agent channel | Serial line `/dev/ttyS0`; payloads over 16 KiB go as files on the share | Virtio console `/dev/hvc1` (`hvc0` is the kernel's) |
@@ -66,7 +66,8 @@ Chrome 153, and keeps the median of five runs:
 | First command after install (v86 boots and saves its state once) | 21 s | 0.54 s | about 39x |
 
 v86 resumes its saved state on later starts, so the last row is a one-time cost. What the wasm
-Linux cannot run (bash, Node, git, the network, C extensions) stays on v86.
+Linux cannot run (bash, Node, git, the network, C extensions, programs a command saved) stays
+on v86.
 
 ## Routing a command
 
@@ -93,7 +94,7 @@ flowchart TD
   stopped -- yes --> result(["Result to the package"])
   stopped -- no --> wants{"wantsV86 on the result"}
   wants -->|"no: success, a Spindle call was made,<br/>timeout or other failure"| result
-  wants -->|"yes: wasm Linux unavailable, program not found,<br/>sh syntax error, GNU-only option, missing Python module"| v86
+  wants -->|"yes: wasm Linux unavailable, program not found or saved,<br/>sh syntax error, GNU-only option, missing Python module"| v86
   v86 --> result
 ```
 
@@ -126,15 +127,28 @@ when:
 | --- | --- |
 | `unavailable` | the wasm Linux could not start, the command never reached its agent, or the wasm worker failed |
 | exit 127 with "not found" or "applet not found", or `can't execute '...': No such file or directory` | a program the image lacks |
-| exit 126 with "Permission denied" or "Exec format error" | a binary it cannot run |
+| exit 126 with "Permission denied" or "Exec format error" (also as `can't execute '...'`) | a program a command saved, or a binary built for another machine |
 | `sh: ... syntax error` | syntax hush does not take |
 | `unrecognized option`, `invalid option`, or a BusyBox usage text | `grep -P`, `find -printf` |
 | `date: invalid date` | `date -d yesterday` |
 | `ModuleNotFoundError: No module named` | a module only v86's Python has, or one pip would install there |
-| Python `subprocess` raising `FileNotFoundError` | a program Python tried to start |
+| Python `subprocess` raising `FileNotFoundError` or `PermissionError` | a program Python tried to start that the image lacks or may not run |
 
 A rerun is safe because each command works on a copy of its thread's workspace, and that copy
 counts only when its result is returned to the package (see [Workspace sync](#workspace-sync)).
+
+### Programs a command saved
+
+The wasm Linux runs only the programs its image was built with. What a command writes, in its
+workspace, `/tmp`, `/var/tmp`, `/dev/shm` or its home, is data there and never a program: the
+agent mounts each of them `noexec`, `nosuid` and `nodev` (`DATA_ONLY` in
+[`agent.rs`](../spindle/chrome/wasm-linux/guest/src/agent.rs)), and `/sbin/init` mounts `/run`
+the same way and writable by root alone. So nothing a command saved, or fetched on v86, is ever
+compiled and run as WebAssembly by the extension. A command that names such a program directly
+(`./tool`) goes to v86 from the start, since the name is not one of the image's programs. One
+that starts it some other way (a Python script's `subprocess`, say) is refused there with exit
+126 or a `PermissionError`, and runs again on v86. A script still runs when the image's own
+`sh` or `python3` reads it (`sh build.sh`, `python3 tool.py`).
 
 ### When the wasm Linux is disabled
 
@@ -211,7 +225,7 @@ sandbox CPUS WORKDIR SOCKET COMMAND`. The helper:
 | --- | --- | --- |
 | Namespaces | mount, PID, IPC; network for threads without network | mount, PID, IPC, UTS, network |
 | Network namespace | Without network: a fresh namespace with only loopback up, prepared while the agent is idle. With network: the Linux's own network | Always a fresh one with only loopback (the wasm Linux has no network card) |
-| Mounts | the command's workspace copy bind-mounted at `/workspace`; fresh tmpfs at `/tmp`, `/var/tmp`, `/dev/shm` and the `spindle` user's home; its own `/proc`; a new `devpts` instance; its own Spindle socket at `/run/spindle.sock` | the same (tmpfs is ramfs on this no-MMU kernel) |
+| Mounts | the command's workspace copy bind-mounted at `/workspace`; fresh tmpfs at `/tmp`, `/var/tmp`, `/dev/shm` and the `spindle` user's home; its own `/proc`; a new `devpts` instance; its own Spindle socket at `/run/spindle.sock` | the same (tmpfs is ramfs on this no-MMU kernel), with the workspace and every scratch mount `noexec`, `nosuid` and `nodev` |
 | User | `spindle` (uid and gid 1000), supplementary groups dropped | the same |
 | Shell | `/bin/bash --noprofile --norc -o pipefail -c COMMAND` in `/workspace`, in a session of its own | `/bin/sh -c 'set -o pipefail; COMMAND'` in `/workspace`, pinned to two CPUs |
 | Environment | `HOME` (the `spindle` user's home), `LANG=C.UTF-8`, `TERM=dumb`, `USER`, `LOGNAME`, `PATH`; plus the proxy variables for network through Chrome | the same, without proxy variables |
@@ -348,7 +362,9 @@ the relay restarts the v86 machine once no command is running.
 [The code bridge](#the-code-bridge)) that the engine sends with `fetch` for sites the user listed
 under Settings, Sites scripts may call. It therefore works whatever the thread's network setting. The package
 checks each request against the grants (address prefix and methods), and the request carries no
-cookies and follows no redirect.
+cookies and follows no redirect. A site saved with a secret header gets that header added to
+each such request; the script never sees its value, and echoes of it in the answer read
+`[redacted]` (see [chrome.md](chrome.md#secret-headers-for-sites)).
 
 ## The code bridge
 
@@ -438,8 +454,8 @@ command. A Linux worker that has run nothing for 10 minutes is terminated
   irqaffinity=0 nohz_full=1-8`. Its devices are two virtio consoles, the 9p root share, and a
   virtio entropy source fed from `crypto.getRandomValues`. Every kernel task (a CPU, kernel
   thread, process or thread) runs in a worker of its own ([`task.mjs`](../spindle/chrome/wasm-linux/task.mjs)),
-  and 8 workers are kept started ahead. `/sbin/init` mounts `/proc`, `/dev` and `/run` and
-  `exec`s `spindle-agent`. The boot fails after 60 s without `READY 0`.
+  and 8 workers are kept started ahead. `/sbin/init` mounts `/proc`, `/dev` and `/run` (root's
+  alone, `noexec`) and `exec`s `spindle-agent`. The boot fails after 60 s without `READY 0`.
 - **Heartbeat.** While commands run, the runner pings the agent every 2 s. After 20 s without a
   word from the agent, the machine is ended; commands it cuts off run again once on the next
   machine, under the rules in [Per-command isolation](#per-command-isolation).
@@ -562,8 +578,8 @@ need a built image or its parts. See also
 | Test | Usage | Checks |
 | --- | --- | --- |
 | [`linux_node.mjs`](../spindle/chrome/tests/linux_node.mjs) | `node chrome/tests/linux_node.mjs LINUX_DIST` | The v86 Linux in Node: commands with bash, Python and Node over a 9p workspace, writes coming back, timeouts, commands side by side in their own namespaces, the workspace kept between commands, the code bridge from all three interfaces, resuming with the browser's clock, and the network: none without it; HTTP and HTTPS through the gateway from curl, Python, Node, pip and git; never a local address; a test WISP relay. The network checks need the internet. |
-| [`linux_route.mjs`](../spindle/chrome/tests/linux_route.mjs) | `node chrome/tests/linux_route.mjs` | `wasmCanRun` and `wantsV86`. |
-| [`wasm_linux_runner.mjs`](../spindle/chrome/tests/wasm_linux_runner.mjs) | `VMLINUX_WASM USERLAND_ROOT GUEST_BIN [CPUS]` | `WasmLinux` as a runner: workspaces, exit statuses, threads side by side, Spindle calls, timeouts, Stop, isolation, and a runaway loop that only a restart ends. |
+| [`linux_route.mjs`](../spindle/chrome/tests/linux_route.mjs) | `node chrome/tests/linux_route.mjs` | `wasmCanRun` and `wantsV86`, including a saved program refused on the wasm Linux. |
+| [`wasm_linux_runner.mjs`](../spindle/chrome/tests/wasm_linux_runner.mjs) | `VMLINUX_WASM USERLAND_ROOT GUEST_BIN [CPUS]` | `WasmLinux` as a runner: workspaces, exit statuses, threads side by side, Spindle calls, timeouts, Stop, isolation (no program a command saved in its workspace, `/tmp` or home runs, `/run` takes nothing, a script run through `sh` does), and a runaway loop that only a restart ends. |
 | [`wasm_linux_python.mjs`](../spindle/chrome/tests/wasm_linux_python.mjs) | `[DIST]` | Python from the built image: C modules, threads, files, `subprocess` via `posix_spawn`, asyncio, Unix sockets, the `spindle` module. |
 | [`wasm_linux_rust.mjs`](../spindle/chrome/tests/wasm_linux_rust.mjs) | `VMLINUX_WASM STD_CHECK LAYOUT_C LAYOUT_RUST [CPUS]` | Rust `std` on the target, and C and Rust struct layouts agreeing ([`wasm-linux/tests/`](../spindle/chrome/wasm-linux/tests/)). |
 | [`wasm_linux_shares.mjs`](../spindle/chrome/tests/wasm_linux_shares.mjs) | `VMLINUX_WASM USERLAND_ROOT [CPUS]` | A 9p root and a second share at `/workspace`; the entropy device. |

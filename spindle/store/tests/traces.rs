@@ -771,14 +771,20 @@ fn a_builtin_reserved_by_an_older_owner_is_never_run_again() {
         None,
         plain,
         |mut session, dir, recorder| {
-            let stop = session.interrupt_handle();
+            // The owner dies as the call is dispatched (a user's stop would record the
+            // call as stopped instead), and a later one reserves it, as one that died
+            // between the reservation and the run leaves it.
             *recorder.on_event.lock().unwrap() = Some(Box::new(move |event| {
                 if event["type"] == "tool_call" {
-                    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    panic!("the owner dies here");
                 }
             }));
-            assert!(session.prompt("[t:reopen-tool] run something").is_err());
+            let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.prompt("[t:reopen-tool] run something")
+            }));
+            assert!(died.is_err());
             drop(session);
+            recorder.on_event.clear_poison();
             *recorder.on_event.lock().unwrap() = None;
             let mut store =
                 spindle_store::Store::open(&dir.join("store")).map_err(|e| e.to_string())?;

@@ -1,6 +1,6 @@
 # Spindle for Browser
 
-Spindle running inside your browser, tested on Chrome and Edge: a side-panel extension
+Spindle running inside your browser, tested on Chrome, Edge and Brave: a side-panel extension
 (Manifest V3; Chrome's names below cover Edge's too) whose threads are sessions of
 Spindle's embedded package (`embed/`), kept in the browser's private storage (OPFS).
 No server and no relay: the extension calls your provider directly with your key.
@@ -83,10 +83,39 @@ No server and no relay: the extension calls your provider directly with your key
   read, or read and change). Chrome asks once for each. Requests are journaled like
   every Spindle call, carry no cookies, follow no redirect, and anything outside a listed
   prefix (or a method it does not allow) is refused, naming what is allowed.
-- **Or your Spindle host's sandbox:** connect your host in Settings, Your Spindle host (its
-  address and a runner token from `spindle --dir HOST token new chrome --runner`, which
-  runs commands and reaches nothing else there), and choose it for
-  a thread in the model page (Commands run in: Host).
+- **A site's secret header:** a site you list can carry one (its API token, as
+  `Authorization: Bearer ...`, or a key header such as `X-Api-Key`), for an `https://`
+  address (or one of this computer's own). It is sealed in the vault with your provider
+  keys (a passphrase locks it too), and Spindle adds it to each request a script makes to
+  that address and nowhere else. Scripts never see it: they may not set that header
+  themselves, it is never journaled, and an echo of it in what comes back (headers, body,
+  errors; as is, JSON-escaped, percent-encoded or in base64) reads `[redacted]` before the
+  script or the thread sees it. Adding a listed address again updates it; removing the
+  site removes it.
+- **Run on my host:** Settings, Your Spindle host, **Connect** opens your host's own
+  approval page. Once allowed, **Run on my host** in a thread's menu moves its history
+  and workspace there; the host supplies its model credentials, programs and required
+  sandbox. Choose a host model first if this thread's model is not signed in there.
+  The panel still drives the thread and answers its page tools while the browser engine
+  is open. Closing or restarting that engine does not stop the hosted turn.
+  **Bring back to this browser** moves it back, applying the browser's settings fit.
+  A pending move shows its next step and resumes after a crash or reconnection; checked
+  copies stay until the destination holds the thread durably. Unconfirmed messages keep
+  their request ID across restarts; page actions keep their answers and never silently
+  repeat an action whose outcome is unknown. The Connect token reaches only threads
+  this browser brought, host models and the runner, not your phone's threads. Once an
+  upload's answer is uncertain, the copy here stays held even if a later retry is
+  refused; it resumes with the same key and bytes, never by unlocking another live
+  copy. Bring back can finish locally while host cleanup waits; another move waits
+  for that cleanup. Failed delete/settings receipts are reported rather than treated
+  as success. Stop requests for hosted turns are saved with their exact command ID:
+  an offline/restarted browser retries that Stop, never a Stop of a later turn. The
+  host must advertise `targeted_stop`; an older host asks to be updated and keeps the
+  Stop pending, without an unsafe fallback. A new turn or move waits for that Stop.
+  Page actions waiting on storage or approval are fenced by Stop/disconnect too.
+- **Or only your host's sandbox for commands:** paste a runner token from
+  `spindle --dir HOST token new chrome --runner` in Settings and choose Host in a
+  thread's model page. A runner token cannot move threads or run their model turns.
 - **Page reading** (a switch in Settings, Pages; off until you turn it on, when Chrome
   asks for access to sites): threads can list your
   tabs and read the page you are looking at with `list_tabs` and `read_page`, see its
@@ -108,7 +137,8 @@ No server and no relay: the extension calls your provider directly with your key
   type) and goes as the next turn the moment this one ends (Take back puts it in the box
   again). It is kept there, saying
   why, when the thread cannot take it then: an unknown outcome needs you first, or the
-  turn did not finish (you stopped it, say) and waits for Retry, Continue or Take back.
+  turn did not finish and waits for Retry, Continue or Take back (a turn you stopped part
+  way takes the text alone: send it without the files).
 - **Page actions** (a second switch, off until you turn it on; Chrome's debugger, which
   Chrome does not offer as an optional permission, so the extension holds it and the
   switch decides): threads browse as
@@ -119,6 +149,19 @@ No server and no relay: the extension calls your provider directly with your key
   any tab (through the debugger) and `network` (record a tab's requests, list them, read
   a response). Clicks, keys and typing go through Chrome's debugger, so pages see them
   as real input; Chrome shows that Spindle is debugging a tab while it acts on it.
+- **Before acting** (Settings, Pages): **Full**, the default, acts without asking, the
+  whole task start to end. **Auto** asks you first before what sends or submits: Enter
+  (pressed, or after typing), a click on a submit button or one whose words say it sends,
+  posts, buys, pays, deletes and the like, and accepting a page's dialog. **Ask** asks
+  before every click, keystroke, choice, page it opens and tab it closes (looking, waiting,
+  scrolling, pictures and the network log never ask). The question shows above the
+  thread's message box (Allow, Deny) and on its row in the list; a thread waits up to ten
+  minutes for your answer. Deny, no answer, or Stop: the action is not done, which the
+  thread is told (a known outcome, not an unknown one). Opening a file of the workspace
+  for you never asks.
+- **Your browser's name:** in Edge, Brave or Opera, the panel and the messages it shows
+  say that browser's name where they would say Chrome (its prompts, its debugging bar and
+  its access to sites are that browser's). What threads are told keeps saying Chrome.
 - **Files in and out:** attach files to a message (the + beside the box, or drop them on
   the panel) and they land in the thread's workspace. What a thread makes shows in the
   conversation as a card under the step that wrote it: a web page shows in a preview
@@ -199,6 +242,15 @@ No server and no relay: the extension calls your provider directly with your key
   shows as the task's, folded; one that stops (or could not go on, saying why) tells the
   thread so, and the thread goes on.
   Their spend counts against the thread's limit.
+- **Stop, then say what to do:** Stop while a command runs ends it, and the thread keeps
+  it as stopped by you, with what it printed: it never runs again, not even
+  on Continue. Then type a reply, as you would after any answer ("skip that, do X"): the
+  turn goes on, and the model reads that you stopped the step, then your reply. Stopping
+  is a way to steer. Continue lets the model decide what to do next; Retry asks it again
+  from before that step (a step of the thread's first request starts the turn over); Take
+  back returns your message to the box. A reply goes alone: files wait for the next one.
+  Stopped while the model writes, a reply makes its request again with your message read
+  first (the cut request may have been billed, and counts so).
 - **Durable:** a turn cut off by closing Chrome, a crash or Stop says so; Retry sends the
   cut request again (Continue goes on when Spindle knows where it stopped). A turn that
   stopped before it finished (a provider refusing the key, say) can also be started over
@@ -248,9 +300,9 @@ No server and no relay: the extension calls your provider directly with your key
   that still has its sealed store (one moved by an earlier version) frees it once its
   file checks whole. **Remove** takes the Linux snapshot away: the next command for v86
   boots it afresh (under a minute).
-- **Appearance:** the native UI's Paper, Light, Dark or System (Light or Dark as the
-  system is) theme, with a Textured or Plain
-  background.
+- **Appearance:** the native UI's Paper, Light, Dim or System (Light or Dim as the
+  system is) theme, with a Textured or Plain background. Dim is the dark theme: a soft
+  warm charcoal rather than near-black (a panel that chose the old Dark shows Dim).
 
 ## Build and install
 
@@ -264,6 +316,9 @@ chrome/linux/build.sh                                 # into chrome/linux/dist
 chrome/build.sh /path/to/wasm-bindgen                 # into chrome/dist
 chrome/build.sh /path/to/wasm-bindgen /mnt/c/Users/YOU/spindle-chrome   # a Windows folder, from WSL
 ```
+
+A release build stops when the manifest's name is over 75 characters, its short name
+over 12 or its description over 132: the Chrome Web Store refuses those.
 
 The wasm Linux is built apart (a toolchain from source first: about half an hour, once;
 see `chrome/wasm-linux/`, each script's header) and carried with `SPINDLE_WASM_LINUX`:
@@ -344,10 +399,15 @@ The UI's look, its Markdown and text helpers (`store/ui/text.js`) and its theme 
 line) and drives the panel with real clicks and typing: bash in the browser Linux (and
 what the model wrote before the call staying on screen while the turn goes on), a
 script there making Spindle calls (a nested model and a page tool), a site added in
-Settings reached by a script (and a change it does not allow refused), TypeScript, and,
+Settings reached by a script (and a change it does not allow refused), a site's secret
+header added to a script's request, redacted from its reply, refused when the script
+sets it, never kept as text and removed with the site, TypeScript, Before acting (Ask
+asks and No does nothing; Auto asks only before Enter), and,
 with `SPINDLE_BIN`, bash in a Spindle host's sandbox; `read_page` refused while page
 reading is off and reading the page once it is on, steering, a turn finishing while no
-panel is open, Stop / Continue / Retry, Chrome killed mid-turn and restarted, a move to
+panel is open, Stop / Continue / Retry, a command stopped while it runs (kept as stopped
+with what it printed) and a reply going on after it, Chrome killed mid-turn and
+restarted, a move to
 native Spindle (without the page tools, with native's full tool set, a native turn and
 budget) and back (page tools again, the budget kept and said), saving a moved thread's
 file again, a copy,
@@ -368,16 +428,20 @@ timeouts, Stop, runaways), `wasm_linux_python.mjs` (Python from the built image)
 `linux_route.mjs`; `linux_bench.mjs DIST` times the same commands on both Linuxes in
 Chrome. `panel_long_run.mjs DIST [SHOTS]` drives one long turn (34 steps, failures, a
 retry, a message sent mid-run, a page written) through the panel in each theme (Paper,
-Light, Dark, Auto light and dark) and checks how it shows: groups, labels, Stop, Latest,
+Light, Dim, Auto light and dark) and checks how it shows: groups, labels, Stop, Latest,
 the workspace page, labels' contrast; `panel_steps.mjs` checks the step labels.
 `signin_vault.mjs DIST` checks browser sign-in and the key vault against scripted OAuth and
 model services (no account): the tab and its redirect, the code exchange, a refresh, the
-account header, sealed records, a passphrase locking and unlocking, and that Settings fits
-a side panel.
+account header, sealed records (a site's secret header among them, refused while locked,
+deleted by Forgot it), a passphrase locking and unlocking, and that Settings fits a side
+panel.
 
-`review_regressions.mjs` checks engine ordering, reset rollback, early Stop, page-step
-cancellation, gateway redirect/buffer bounds, IPv6 checks, and dotted CDP request IDs
-without a browser. `review_browser.mjs DIST` uses a disposable real Chrome profile and
+`review_regressions.mjs` checks engine ordering, reset rollback, early Stop, a turn stopped
+part way taking a reply (text alone; files wait) and Retry after a stopped step, page-step
+cancellation, gateway redirect/buffer bounds, IPv6 checks, dotted CDP request IDs, a
+site's secret header (what Settings may save, HTTPS only, names bound to the address),
+Before acting (what each mode asks about; an answer through the engine's own operations)
+and the theme (the old Dark shows Dim) without a browser. `review_browser.mjs DIST` uses a disposable real Chrome profile and
 a scripted provider to check permission/send races, camera gating, interrupted-reset
 and sealed-move recovery (no reset backup kept after), a moved thread keeping one copy,
 Storage freeing a thread's free space (a store fragmented under Node by the build's own
@@ -419,7 +483,9 @@ The test's work folder, whose Chrome profile holds the key, is always removed;
   sandbox has none of these gateway limits.
 - The wasm Linux has no bash, Node, git or network, Python without ssl, ctypes or C
   extensions, and no `fork` (programs start others with posix_spawn); routing keeps
-  what needs those on the emulated Linux. A program that computes without ever calling
+  what needs those on the emulated Linux. It runs only the programs it was built with:
+  what a command writes (its workspace, `/tmp`, its home) is data there, never a
+  program, so a command that runs a saved program runs again on the emulated Linux. A program that computes without ever calling
   the kernel cannot be interrupted there: stopping it (or its timeout) restarts that
   machine in under a second, and commands it cuts off run again.
 - Code mode here is bash plus the `spindle` calls (Python 3, Node, TypeScript and bash
@@ -428,6 +494,13 @@ The test's work folder, whose Chrome profile holds the key, is always removed;
   `spindle` calls (the bridge is the browser Linux's). A site you list receives whatever
   a script sends it; removing it from the list does not take back Chrome's access to it
   (Chrome's extension settings do).
+- A site's secret header keeps the token from scripts, not its use: any script can make
+  the requests the site's address and access allow with it, and send on what comes
+  back. List the narrowest address, Read where reading is enough, and a token with the
+  least scope. Redaction finds the forms a server commonly echoes a token in, not every
+  transformation of it. While the keys are locked such requests are refused; **Forgot
+  it** deletes these headers with the keys (the site then refuses requests until you add
+  it again with one).
 - Browser sign-in is offered for providers whose catalog entry has a standard OAuth flow
   with a loopback redirect (ChatGPT among the built-ins). Anthropic takes an API key here.
 - Without a passphrase, keys are sealed with a key kept in the same Chrome profile: they

@@ -2,8 +2,9 @@
 //! out as a native host lays them out (`<dir>/store/authority.sqlite` with its
 //! `owner.lock`, `<dir>/session.json`, a task's in `<dir>/tasks/<task>/` with its
 //! `task.json`), each store behind its own lock file, so a native host opens them in
-//! place; or (browser) in OPFS under the same paths, keeping only stores and task
-//! identities (sessions leave OPFS by bundle), owned by the session's Web Lock.
+//! place; or (browser) in OPFS under the same paths, keeping only stores, task
+//! identities and a native host's pack session id (sessions leave OPFS by bundle), owned
+//! by the session's Web Lock.
 use spindle_store::embedded::{MemoryStorage, Places, Storage};
 
 /// Memory sessions: they last while the app keeps them open.
@@ -387,6 +388,11 @@ mod node {
         }
     }
 
+    /// The sidecars an OPFS place keeps (see `OpfsStorage::sidecar`).
+    fn kept_in_opfs(name: &str) -> bool {
+        name == "task.json" || name == spindle_store::bundle::PACK_SESSION
+    }
+
     impl Storage for OpfsStorage {
         fn label(&self) -> String {
             self.dir.clone()
@@ -432,17 +438,19 @@ mod node {
                 lock: self.lock.clone(),
             })
         }
-        /// Only a task's identity is kept: no native host opens an OPFS directory in place
-        /// (a session leaves by bundle, which rebuilds the settings mirror from its store
-        /// and gives a native store directory its `owner.lock`), and every file takes one
-        /// of the pool's few slots.
+        /// Only a task's identity and a native host's MCP pack session id are kept: no
+        /// native host opens an OPFS directory in place (a session leaves by bundle, which
+        /// rebuilds the settings mirror from its store and gives a native store directory
+        /// its `owner.lock`), and every file takes one of the pool's few slots. The pack
+        /// session id is the place's own (no store holds it): kept, it goes on with the
+        /// session when it moves to a native host again.
         fn sidecar(&self, name: &str) -> Option<Vec<u8>> {
-            (name == "task.json")
+            kept_in_opfs(name)
                 .then(|| node::read_file(&format!("{}/{name}", self.dir)))
                 .flatten()
         }
         fn keep_sidecar(&self, name: &str, bytes: &[u8]) -> spindle_store::Result<()> {
-            if name != "task.json" {
+            if !kept_in_opfs(name) {
                 return Ok(());
             }
             node::write_file(&format!("{}/{name}", self.dir), bytes)

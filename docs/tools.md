@@ -161,6 +161,8 @@ A failed run ends with a closing line that says what was kept:
 | `the script failed, so none of its workspace changes were kept` (`DISCARDED_SCRIPT`) | A `run_code` script exited unsuccessfully. |
 | `The session store is full, so this tool call was not run...` (`STORE_FULL`) | The store could not reserve room for the step. Nothing ran. |
 | `The tool call did not complete: the runner stopped before its result was saved...` | The owner process stopped during the run. The attempt is sealed as interrupted on resume and is never run again. |
+| `[the user stopped this command before it finished; none of its workspace changes were kept]` (`STOPPED_RUN`) | A Stop ended the run. What it printed until then comes first; the result's status is `interrupted`, and the call never runs again. A runner that reports the changes it made before the stop ends the text with `STOPPED_RUN_KEPT` instead, and those changes are kept. A stopped `run_code` script ends with `STOPPED_SCRIPT`, which adds that calls it made may have run. |
+| `Not run: the user stopped the turn before this call started.` (`STOPPED_BEFORE`) | A Stop came before this call of the same reply started. |
 
 ## File tools and workspace revisions
 
@@ -223,10 +225,11 @@ Each run goes through the [`StrictExecutor`](../dext-engine/native/src/strict.rs
 manifest. Unchanged files keep their existing objects.
 
 Output appears live through observer events while the command runs. That preview is
-not authoritative: only the sealed receipt is adopted. If a run is interrupted, for
-example when the session is stopped, its process is ended and its copy discarded. On
-resume, the call is recorded as not completed and is never run again
-([`seal_interrupted_strict`](../spindle/store/src/broker.rs)).
+not authoritative: only the sealed receipt is adopted. If a run is stopped, its process
+is ended and its copy discarded, and the call is recorded at once as stopped, with what
+it printed (`STOPPED_RUN` above). If the owner process dies during a run instead, the
+call is recorded as not completed on resume
+([`seal_interrupted_strict`](../spindle/store/src/broker.rs)). Neither is ever run again.
 
 ## Isolation
 

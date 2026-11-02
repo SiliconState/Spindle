@@ -28,6 +28,8 @@ enum Reply {
     Refused,
     /// The connection closes with no reply (an unknown outcome).
     HangUp,
+    /// The reply begins, then the provider streams an error with this message.
+    StreamError(&'static str),
 }
 
 fn chunks(delta: Value, index: usize) -> String {
@@ -73,6 +75,11 @@ fn wire(reply: &Reply, index: usize) -> Option<(u16, Option<&'static str>, Strin
             r#"{"error":{"message":"rate limited","type":"rate_limit"}}"#.into(),
         )),
         Reply::HangUp => None,
+        Reply::StreamError(message) => {
+            let began = json!({"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hel"},"finish_reason":null}]});
+            let error = json!({"error": {"code": "server_error", "message": message}});
+            Some((200, None, format!("data: {began}\n\ndata: {error}\n\n")))
+        }
     }
 }
 
@@ -365,6 +372,10 @@ struct Run {
     replies: Vec<Value>,
     works: Vec<Value>,
     cancelled: Vec<Value>,
+    /// Commands the host asked the app to stop (`work_stop`).
+    stopping: Vec<Value>,
+    /// Runner calls left unanswered (the runner gave null): (session, work id).
+    held: Vec<(String, u64)>,
 }
 
 /// An app driving `Embedded`: performs works with `script` (per session label, in
@@ -453,6 +464,7 @@ impl<'a> App<'a> {
                     pending.extend(more);
                 }
                 Some("work_cancel") => self.run.cancelled.push(frame["params"].clone()),
+                Some("work_stop") => self.run.stopping.push(frame["params"].clone()),
                 _ => self.run.replies.push(frame),
             }
         }
@@ -515,6 +527,11 @@ impl<'a> App<'a> {
                 let mut work = work.clone();
                 work["session"] = json!(session);
                 let answer = (self.runner)(&work, &read);
+                // A runner that gives null is still running it (answered later, or never).
+                if answer.is_null() {
+                    self.run.held.push((session.to_string(), id));
+                    return vec![];
+                }
                 deliver(answer)
             }
             "wait" => deliver(json!({"kind": "waited"})),
@@ -1066,6 +1083,108 @@ fn a_script_reaches_only_what_the_apps_http_grants_allow() {
     assert!(
         redirected.get("unknown").is_none(),
         "answered: {redirected}"
+    );
+}
+
+#[test]
+fn a_grants_secret_headers_are_named_to_the_app_and_never_set_by_scripts() {
+    let host = embedded(Box::new(MemoryPlaces));
+    // A value the package would hold is refused: the app supplies it as it sends.
+    for value in [json!("Bearer x"), json!({"env": "TOKEN"})] {
+        let refused = host
+            .set_http_grants(
+                &json!([{"name": "api", "url": "https://api.example/", "risk": "read",
+                "headers": {"Authorization": value}}]),
+            )
+            .unwrap_err();
+        assert!(
+            refused.message.contains("the app supplies"),
+            "{}",
+            refused.message
+        );
+    }
+    host.set_http_grants(
+        &json!([{"name": "api", "url": "https://api.example/v1/", "risk": "read",
+        "headers": {"Authorization": {"app": true}}}]),
+    )
+    .unwrap();
+    let direct = |method: &str, params: Value| -> Value {
+        let line = json!({"jsonrpc": "2.0", "id": 78, "method": method, "params": params});
+        host.handle(line.to_string().as_bytes())
+            .into_iter()
+            .find(|frame| frame["id"] == 78)
+            .expect("a reply")
+    };
+    let script = |request: Value| direct("code_call", json!({"dir": "keyed", "request": request}));
+    let seen = std::cell::RefCell::new(BTreeMap::new());
+    let mut app = App::new(&host).script(
+        "keyed",
+        vec![
+            Reply::Call(
+                "bash",
+                json!({"command": "spindle http https://api.example/v1/me"}),
+            ),
+            Reply::Text("done"),
+        ],
+    );
+    app.runner = Box::new(|_, _| {
+        let mut seen = seen.borrow_mut();
+        let asked = script(
+            json!({"method": "http", "id": 0, "input": {"url": "https://api.example/v1/me"}}),
+        );
+        seen.insert("children", asked.clone());
+        let body = spindle_store::protocol::base64_encode(b"{\"me\":1}");
+        let call = asked["result"]["call"].clone();
+        seen.insert(
+            "answered",
+            direct(
+                "code_answer",
+                json!({"dir": "keyed", "call": call, "index": 0, "answer": {"status": 200,
+                    "headers": {"content-type": "application/json"}, "body_base64": body}}),
+            ),
+        );
+        // The script may not set the header itself, whatever its case: nothing is reserved.
+        seen.insert(
+            "own",
+            script(
+                json!({"method": "http", "id": 1, "input": {"url": "https://api.example/v1/me",
+                "headers": {"authorization": "Bearer guessed"}}}),
+            ),
+        );
+        json!({"kind": "ran", "output": "scripted\n", "success": true})
+    });
+    app.call(
+        "create",
+        json!({"dir": "keyed", "provider": "fake", "runner": "app"}),
+    );
+    let reply = app.call("prompt", json!({"dir": "keyed", "text": "[t:keyed] go"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    drop(app);
+    let seen = seen.into_inner();
+    let child = &seen["children"]["result"]["children"][0];
+    assert_eq!(child["grant"], "api", "{child}");
+    assert_eq!(
+        child["app_headers"],
+        json!(["Authorization"]),
+        "the app is told what to add"
+    );
+    assert_eq!(
+        child["headers"],
+        json!({}),
+        "and the script sent none of it"
+    );
+    assert_eq!(
+        seen["answered"]["result"]["reply"]["data"]["json"],
+        json!({"me": 1})
+    );
+    let own = &seen["own"]["result"];
+    assert!(own.get("children").is_none(), "nothing to send: {own}");
+    assert!(
+        own["reply"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("supplied by grant api"),
+        "{own}"
     );
 }
 
@@ -3032,5 +3151,756 @@ fn a_stop_during_the_summary_request_leaves_the_digest_and_stops_the_turn() {
     assert!(
         first.contains(COMPACTED) && first.contains("User asked: [t:"),
         "the digest stands in: {first}"
+    );
+}
+
+#[test]
+fn a_reply_that_cannot_be_read_says_what_was_wrong() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host);
+    for dir in ["why1", "why2", "why3"] {
+        app.call("create", json!({"dir": dir, "provider": "fake"}));
+    }
+    let began = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n";
+    app.hook = Some(Box::new(move |host, session, id, index| {
+        let mut frames = vec![];
+        match index {
+            // The provider's own error, streamed after the reply began.
+            1 => {
+                let stream = format!(
+                    "{began}data: {{\"error\":{{\"code\":\"server_error\",\"message\":\"overloaded, try again\"}}}}\n\n"
+                );
+                frames.extend(host.chunk(session, id, stream.as_bytes()).0);
+            }
+            // A 200 that is not an event stream.
+            2 => {}
+            // A stream that stops before it is complete.
+            _ => frames.extend(host.chunk(session, id, began.as_bytes()).0),
+        }
+        if index >= 2 {
+            let content_type = if index == 2 {
+                "application/json"
+            } else {
+                "text/event-stream"
+            };
+            let answer = json!({"kind": "response", "status": 200, "content_type": content_type});
+            frames.extend(
+                host.deliver(session, id, answer_of(&answer).unwrap())
+                    .unwrap(),
+            );
+        }
+        Some(frames)
+    }));
+    let said = |reply: &Value| {
+        reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let failed = app.call("prompt", json!({"dir": "why1", "text": "hello"}));
+    let message = said(&failed);
+    assert!(
+        message.contains("the provider ended its reply with an error")
+            && message.contains("overloaded, try again")
+            && !message.contains("could not be parsed"),
+        "{failed}"
+    );
+    let failed = app.call("prompt", json!({"dir": "why2", "text": "hello"}));
+    assert!(
+        said(&failed)
+            .contains("could not be parsed (the reply was application/json, not an event stream)"),
+        "{failed}"
+    );
+    let failed = app.call("prompt", json!({"dir": "why3", "text": "hello"}));
+    assert!(
+        said(&failed).contains("could not be parsed (") && said(&failed).contains("unexpected EOF"),
+        "{failed}"
+    );
+}
+
+#[test]
+fn an_error_streamed_mid_reply_is_said_alike_by_both_hosts() {
+    let script = vec![Reply::StreamError("overloaded, try again")];
+    let (_, _, outcome) = native("midreply", script.clone(), |_| {}, None, None, "go");
+    let native = outcome.unwrap_err().to_string();
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host).script("midreply", script);
+    app.call(
+        "create",
+        json!({"dir": "midreply", "provider": "fake", "model": "fake-model"}),
+    );
+    let reply = app.call(
+        "prompt",
+        json!({"dir": "midreply", "text": "[t:midreply] go"}),
+    );
+    let embedded = reply["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    for said in [&native, &embedded] {
+        assert!(
+            said.contains("the provider ended its reply with an error")
+                && said.contains("overloaded, try again"),
+            "native: {native}\nembedded: {embedded}"
+        );
+    }
+}
+
+// ---- a command the user stops ----------------------------------------------------------
+
+/// The text a stopped command's result ends with.
+const STOPPED: &str = "the user stopped this command before it finished";
+
+/// A session `dir` whose turn runs `echo started; sleep 100` in the app's runner, which
+/// holds it; `before` are the replies before that call, `after` the ones after it. The
+/// prompt (request id 1) is sent; the runner's calls are counted in `runs`.
+fn running_command<'a>(
+    host: &'a Embedded,
+    dir: &str,
+    before: Vec<Reply>,
+    after: Vec<Reply>,
+    runs: &'a std::cell::Cell<usize>,
+) -> App<'a> {
+    let mut script = before;
+    script.push(Reply::Call(
+        "bash",
+        json!({"command": "echo started; sleep 100"}),
+    ));
+    script.extend(after);
+    let mut app = App::new(host).script(dir, script);
+    app.runner = Box::new(move |_, _| {
+        runs.set(runs.get() + 1);
+        Value::Null
+    });
+    app.call(
+        "create",
+        json!({"dir": dir, "provider": "fake", "runner": "app"}),
+    );
+    host.set_runner(None);
+    let line = json!({"jsonrpc": "2.0", "id": 1, "method": "prompt",
+        "params": {"dir": dir, "text": format!("[t:{dir}] run it")}});
+    let frames = host.handle(line.to_string().as_bytes());
+    app.drive(frames);
+    assert_eq!(
+        app.run.held.len(),
+        1,
+        "the command runs: {:?}",
+        app.run.replies
+    );
+    app
+}
+
+/// Stops the held command: the app is asked to stop it (not to drop it), and its answer
+/// (what it printed) ends the turn, recorded as stopped.
+fn stop_command(host: &Embedded, app: &mut App<'_>, dir: &str) -> Value {
+    let stopped = app.call("stop", json!({"dir": dir}));
+    assert_eq!(stopped["result"]["stopping"], true, "{stopped}");
+    let (session, id) = app.run.held.pop().unwrap();
+    assert_eq!(
+        app.run.stopping,
+        [json!({"session": session, "id": id})],
+        "the app is asked to stop the command"
+    );
+    assert!(app.run.cancelled.is_empty(), "{:?}", app.run.cancelled);
+    assert!(
+        !app.run.replies.iter().any(|r| r["id"] == 1),
+        "the turn waits for the stopped command's answer"
+    );
+    let frames = host
+        .deliver(
+            &session,
+            id,
+            answer_of(
+                &json!({"kind": "ran", "output": "started\n", "success": false,
+                "failure": "the command was stopped"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    app.drive(frames);
+    let ended = app
+        .run
+        .replies
+        .iter()
+        .find(|r| r["id"] == 1)
+        .unwrap()
+        .clone();
+    assert_eq!(kind(&ended), Some("stopped"), "{ended}");
+    let result = app
+        .run
+        .events
+        .iter()
+        .rfind(|e| e["type"] == "tool_result")
+        .unwrap()
+        .clone();
+    let content = result["content"].as_str().unwrap();
+    assert!(content.starts_with("started\n"), "{content}");
+    assert!(content.contains(STOPPED), "{content}");
+    assert_eq!(result["failed"], true);
+    let status = app.call("status", json!({"dir": dir}))["result"].clone();
+    assert_eq!(status["phase"], "after_tools", "{status}");
+    assert_eq!(status["accepts_message"], true, "{status}");
+    assert_eq!(status["accepts_prompt"], false, "{status}");
+    result
+}
+
+#[test]
+fn a_stopped_command_is_recorded_and_a_message_goes_on_with_the_turn() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let runs = std::cell::Cell::new(0);
+    let mut app = running_command(&host, "sm", vec![], vec![Reply::Text("skipped")], &runs);
+    stop_command(&host, &mut app, "sm");
+    // A message (no Continue first) goes on with the turn: its next request carries the
+    // stopped result, then the message.
+    let reply = app.call(
+        "prompt",
+        json!({"dir": "sm", "text": "skip that and say skipped"}),
+    );
+    assert!(reply.get("result").is_some(), "{reply}");
+    assert_eq!(app.run.requests.len(), 2);
+    let next = &app.run.requests[1];
+    let stopped = next.find(STOPPED).expect("the stopped result is sent");
+    let said = next
+        .find("skip that and say skipped")
+        .expect("the message is sent");
+    assert!(stopped < said, "the result, then the message: {next}");
+    assert_eq!(runs.get(), 1, "the stopped command never runs again");
+    assert!(app.run.events.iter().any(|e| e["type"] == "steered"));
+    let status = app.call("status", json!({"dir": "sm"}))["result"].clone();
+    assert_eq!(status["complete"], true, "{status}");
+    // Files cannot go with such a message: it says so, and nothing changes.
+    let runs2 = std::cell::Cell::new(0);
+    let mut other = running_command(&host, "sf", vec![], vec![], &runs2);
+    stop_command(&host, &mut other, "sf");
+    let refused = other.call(
+        "prompt",
+        json!({"dir": "sf", "text": "with a file", "files": [{"path": "a.txt", "base64": "eA=="}]}),
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("takes a message without files"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn continue_after_a_stopped_command_never_runs_it_again() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let runs = std::cell::Cell::new(0);
+    let mut app = running_command(&host, "sc", vec![], vec![Reply::Text("went on")], &runs);
+    stop_command(&host, &mut app, "sc");
+    let continued = app.call("continue", json!({"dir": "sc"}));
+    assert!(continued.get("result").is_some(), "{continued}");
+    assert_eq!(
+        runs.get(),
+        1,
+        "Continue does not run the stopped command again"
+    );
+    assert_eq!(app.run.requests.len(), 2);
+    assert!(
+        app.run.requests[1].contains(STOPPED),
+        "the model reads it was stopped"
+    );
+}
+
+#[test]
+fn the_rest_of_a_stopped_batch_is_not_run() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let runs = std::cell::Cell::new(0);
+    // Two calls in one reply: the first is stopped, the second never starts.
+    let mut app = App::new(&host).script("sb", vec![Reply::Text("unused")]);
+    app.runner = Box::new(|_, _| {
+        runs.set(runs.get() + 1);
+        Value::Null
+    });
+    app.call(
+        "create",
+        json!({"dir": "sb", "provider": "fake", "runner": "app"}),
+    );
+    host.set_runner(None);
+    let two = {
+        let calls = json!({"tool_calls": [
+            {"index": 0, "id": "call_a", "type": "function", "function": {"name": "bash",
+                "arguments": json!({"command": "sleep 100"}).to_string()}},
+            {"index": 1, "id": "call_b", "type": "function", "function": {"name": "write_file",
+                "arguments": json!({"path": "b.txt", "content": "b"}).to_string()}}]});
+        let chunk = |delta: Value, finish: Value| {
+            json!({"id": "c", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+        };
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            chunk(calls, Value::Null),
+            chunk(json!({}), json!("tool_calls"))
+        )
+    };
+    app.hook = Some(Box::new(move |host, session, id, index| {
+        (index == 1).then(|| {
+            let (mut frames, _) = host.chunk(session, id, two.as_bytes());
+            frames.extend(
+                host.deliver(
+                    session,
+                    id,
+                    answer_of(&json!({"kind": "response",
+                "status": 200, "content_type": "text/event-stream"}))
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            frames
+        })
+    }));
+    let line = json!({"jsonrpc": "2.0", "id": 1, "method": "prompt",
+        "params": {"dir": "sb", "text": "[t:sb] two at once"}});
+    let frames = host.handle(line.to_string().as_bytes());
+    app.drive(frames);
+    assert_eq!(app.run.held.len(), 1);
+    stop_command(&host, &mut app, "sb");
+    let refused = app
+        .run
+        .events
+        .iter()
+        .find(|e| e["type"] == "tool_refused")
+        .expect("the second call is refused");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap()
+            .contains("stopped the turn before")
+    );
+    let files = app.call("files", json!({"dir": "sb"}));
+    assert!(
+        files["result"]["files"].as_array().unwrap().is_empty(),
+        "{files}"
+    );
+    assert_eq!(runs.get(), 1);
+}
+
+#[test]
+fn retry_and_take_back_work_after_a_stopped_command() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let runs = std::cell::Cell::new(0);
+    // A turn before (settled), then one whose second request runs the command.
+    let mut app = App::new(&host).script(
+        "sr",
+        vec![
+            Reply::Text("first done"),
+            Reply::Call("write_file", json!({"path": "w.txt", "content": "w"})),
+            Reply::Call("bash", json!({"command": "echo started; sleep 100"})),
+            Reply::Text("asked again"),
+        ],
+    );
+    app.runner = Box::new(|_, _| {
+        runs.set(runs.get() + 1);
+        Value::Null
+    });
+    app.call(
+        "create",
+        json!({"dir": "sr", "provider": "fake", "runner": "app"}),
+    );
+    host.set_runner(None);
+    let first = app.call("prompt", json!({"dir": "sr", "text": "[t:sr] first"}));
+    assert!(first.get("result").is_some(), "{first}");
+    let line = json!({"jsonrpc": "2.0", "id": 1, "method": "prompt",
+        "params": {"dir": "sr", "text": "write then run"}});
+    let frames = host.handle(line.to_string().as_bytes());
+    app.drive(frames);
+    stop_command(&host, &mut app, "sr");
+    // Retry asks the model again from before the request that made the stopped call:
+    // the same request as then, without the stopped call or its result.
+    let asked = app.run.requests.len();
+    let retried = app.call("retry", json!({"dir": "sr"}));
+    assert!(retried.get("result").is_some(), "{retried}");
+    assert_eq!(app.run.requests.len(), asked + 1);
+    let again = &app.run.requests[asked];
+    assert!(!again.contains(STOPPED), "{again}");
+    assert_eq!(
+        again,
+        &app.run.requests[asked - 1],
+        "the same request again"
+    );
+    assert_eq!(runs.get(), 1);
+    // Taking the turn back works too: no call is left unresolved.
+    let runs2 = std::cell::Cell::new(0);
+    let mut other = running_command(&host, "st", vec![], vec![], &runs2);
+    stop_command(&host, &mut other, "st");
+    let targets = other.call("targets", json!({"dir": "st"}));
+    let target = targets["result"]["targets"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["revision"]
+        .as_u64()
+        .unwrap();
+    let rewound = other.call("rewind", json!({"dir": "st", "revision": target}));
+    assert!(rewound.get("result").is_some(), "{rewound}");
+    // The stopped step came from the session's first request: Retry says what to do.
+    let runs3 = std::cell::Cell::new(0);
+    let mut first = running_command(&host, "sq", vec![], vec![], &runs3);
+    stop_command(&host, &mut first, "sq");
+    let refused = first.call("retry", json!({"dir": "sq"}));
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("first request"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_stopped_command_and_a_message_after_it_survive_a_reopen() {
+    let root = temp_root("stop-reopen");
+    let runs = std::cell::Cell::new(0);
+    {
+        let host = embedded(Box::new(DirPlaces(root.clone())));
+        let mut app = running_command(&host, "so", vec![], vec![], &runs);
+        stop_command(&host, &mut app, "so");
+    }
+    // Another host (the app restarted): the stopped result is in the store, the turn
+    // still rests, and a message goes on with it.
+    let host = embedded(Box::new(DirPlaces(root.clone())));
+    let mut app = App::new(&host).script("so", vec![Reply::Text("after the reopen")]);
+    app.runner = Box::new(|_, _| {
+        runs.set(runs.get() + 1);
+        Value::Null
+    });
+    let status = app.call("status", json!({"dir": "so"}))["result"].clone();
+    assert_eq!(status["accepts_message"], true, "{status}");
+    let reply = app.call("prompt", json!({"dir": "so", "text": "go on without it"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    let next = &app.run.requests[0];
+    assert!(
+        next.find(STOPPED).unwrap() < next.find("go on without it").unwrap(),
+        "{next}"
+    );
+    assert_eq!(runs.get(), 1);
+}
+
+#[test]
+fn a_runner_that_does_not_answer_a_stop_is_recorded_as_stopped_on_a_second_stop() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let runs = std::cell::Cell::new(0);
+    let mut app = running_command(&host, "sn", vec![], vec![Reply::Text("ok")], &runs);
+    let first = app.call("stop", json!({"dir": "sn"}));
+    assert_eq!(first["result"]["stopping"], true, "{first}");
+    assert!(!app.run.replies.iter().any(|r| r["id"] == 1));
+    // Asked again: recorded as stopped without the runner's answer, which is dropped.
+    let second = app.call("stop", json!({"dir": "sn"}));
+    assert!(second.get("result").is_some(), "{second}");
+    let ended = app
+        .run
+        .replies
+        .iter()
+        .find(|r| r["id"] == 1)
+        .unwrap()
+        .clone();
+    assert_eq!(kind(&ended), Some("stopped"), "{ended}");
+    assert_eq!(app.run.cancelled.len(), 1, "the app drops the command now");
+    let result = app
+        .run
+        .events
+        .iter()
+        .rfind(|e| e["type"] == "tool_result")
+        .unwrap();
+    assert!(
+        result["content"].as_str().unwrap().contains(STOPPED),
+        "{result}"
+    );
+    let reply = app.call("prompt", json!({"dir": "sn", "text": "never mind"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    assert_eq!(runs.get(), 1);
+}
+
+// ---- the native host: a command the user stops -----------------------------------------
+
+/// Records events and stops the session's turn once its command prints `started`.
+struct StopOnOutput {
+    events: Mutex<Vec<Value>>,
+    stop: Mutex<Option<Arc<AtomicBool>>>,
+}
+impl Observer for StopOnOutput {
+    fn event(&self, event: Event<'_>) {
+        let json = event.to_json();
+        if json["type"] == "output"
+            && let Some(stop) = &*self.stop.lock().unwrap()
+        {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.events.lock().unwrap().push(json);
+    }
+}
+
+/// A native session `name` (unisolated runs, the fake model) whose prompt runs a command
+/// that counts its runs in `<dir>/../<name>.count`, prints `started` and sleeps; the user
+/// stops it as it prints. Returns the session's dir and the observer.
+fn native_stopped(
+    name: &str,
+    before: Vec<Reply>,
+    after: Vec<Reply>,
+) -> (PathBuf, Arc<StopOnOutput>) {
+    let fake = fake();
+    let dir = fake.root.join(name);
+    let count = fake.root.join(format!("{name}.count"));
+    let mut script = before.clone();
+    script.push(Reply::Call(
+        "bash",
+        json!({"command": format!("echo run >> {}; echo started; sleep 30", count.display())}),
+    ));
+    script.extend(after);
+    fake.scripts
+        .lock()
+        .unwrap()
+        .insert(name.into(), (script, vec![]));
+    let observer = Arc::new(StopOnOutput {
+        events: Mutex::default(),
+        stop: Mutex::default(),
+    });
+    let mut settings = Settings::resolve("fake", Some("fake-model".into())).unwrap();
+    settings.isolation = agent::Isolation::Off;
+    settings.compaction = agent::Compaction::Digest;
+    let mut session = Session::create(&dir, settings, vec![], observer.clone()).unwrap();
+    for _ in &before {
+        // A turn before the one that runs the command (each answered by one reply).
+        session.prompt(&format!("[t:{name}] warm up")).unwrap();
+    }
+    *observer.stop.lock().unwrap() = Some(session.interrupt_handle());
+    let started = std::time::Instant::now();
+    let stopped = session.prompt(&format!("[t:{name}] run it")).unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the stop ended it"
+    );
+    assert!(stopped.contains("stopped by the user"), "{stopped}");
+    let result = observer
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "tool_result")
+        .unwrap()
+        .clone();
+    let content = result["content"].as_str().unwrap();
+    assert!(
+        content.starts_with("started\n"),
+        "what it printed is kept: {content}"
+    );
+    assert!(content.contains(STOPPED), "{content}");
+    assert!(!session.accepts_prompt());
+    assert!(session.accepts_message());
+    *observer.stop.lock().unwrap() = None;
+    (dir, observer)
+}
+
+fn runs_of(name: &str) -> usize {
+    std::fs::read_to_string(fake().root.join(format!("{name}.count")))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+fn requests_of(name: &str) -> Vec<String> {
+    fake().scripts.lock().unwrap()[name].1.clone()
+}
+
+#[test]
+fn native_a_stopped_command_is_recorded_and_a_message_goes_on_after_a_reopen() {
+    let (dir, observer) = native_stopped("nm", vec![], vec![Reply::Text("skipped")]);
+    // A fresh owner, as `spindle serve` opens one per command.
+    let mut session = Session::open(&dir, observer).unwrap();
+    assert!(session.accepts_message());
+    session.prompt("skip that and say skipped").unwrap();
+    let requests = requests_of("nm");
+    assert_eq!(requests.len(), 2);
+    let next = &requests[1];
+    assert!(
+        next.find(STOPPED).unwrap() < next.find("skip that and say skipped").unwrap(),
+        "{next}"
+    );
+    assert_eq!(runs_of("nm"), 1, "the stopped command never runs again");
+    assert!(session.accepts_prompt());
+}
+
+#[test]
+fn native_continue_after_a_stopped_command_never_runs_it_again() {
+    let (dir, observer) = native_stopped("nc", vec![], vec![Reply::Text("went on")]);
+    let mut session = Session::open(&dir, observer).unwrap();
+    session.resume().unwrap();
+    let requests = requests_of("nc");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains(STOPPED));
+    assert_eq!(runs_of("nc"), 1);
+}
+
+#[test]
+fn native_retry_and_rewind_work_after_a_stopped_command() {
+    let (dir, observer) = native_stopped(
+        "nr",
+        vec![Reply::Text("warmed")],
+        vec![Reply::Text("asked again")],
+    );
+    let session = Session::open(&dir, observer.clone()).unwrap();
+    // Its request was the turn's first: the turn starts again with its prompt.
+    session.retry().unwrap();
+    let requests = requests_of("nr");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2], requests[1],
+        "the stopped step's request, asked again"
+    );
+    assert_eq!(runs_of("nr"), 1);
+    let (dir, observer) = native_stopped("nw", vec![Reply::Text("warmed")], vec![]);
+    let mut session = Session::open(&dir, observer).unwrap();
+    let settled = session
+        .targets()
+        .unwrap()
+        .into_iter()
+        .find(|target| target.kind == spindle_store::rewind::RewindTargetKind::Settled)
+        .unwrap();
+    session.rewind(settled.revision).unwrap();
+    assert!(session.accepts_prompt());
+}
+
+#[test]
+fn a_message_after_a_cut_reply_asks_again_from_before_it_and_the_cut_stays_counted() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host).script(
+        "sk",
+        vec![
+            Reply::Call("write_file", json!({"path": "a.txt", "content": "a"})),
+            Reply::Text("cut, never read"),
+            Reply::Text("used the message"),
+        ],
+    );
+    app.call("create", json!({"dir": "sk", "provider": "fake"}));
+    // The second request is sent and its reply never comes: the user stops it.
+    app.hold = 2;
+    let line = json!({"jsonrpc": "2.0", "id": 1, "method": "prompt",
+        "params": {"dir": "sk", "text": "[t:sk] write a"}});
+    let frames = host.handle(line.to_string().as_bytes());
+    app.drive(frames);
+    app.call("stop", json!({"dir": "sk"}));
+    let ended = app
+        .run
+        .replies
+        .iter()
+        .find(|r| r["id"] == 1)
+        .unwrap()
+        .clone();
+    assert_eq!(kind(&ended), Some("stopped"), "{ended}");
+    let status = app.call("status", json!({"dir": "sk"}))["result"].clone();
+    assert_eq!(status["phase"], "model_wait", "{status}");
+    assert_eq!(status["accepts_message"], true, "{status}");
+    let unknown =
+        |app: &mut App<'_>| app.call("usage", json!({"dir": "sk"}))["result"]["unknown"].clone();
+    assert_eq!(unknown(&mut app), 1, "the cut request may have been billed");
+    // A message: the request is made again from before it, the message read first.
+    app.hold = 0;
+    let reply = app.call("prompt", json!({"dir": "sk", "text": "and also write b"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    assert_eq!(app.run.requests.len(), 3);
+    let again = &app.run.requests[2];
+    assert!(again.contains("and also write b"), "{again}");
+    // What the cut request carried (the write's result), then the message.
+    let written = again
+        .rfind("\"role\":\"tool\"")
+        .expect("the write's result");
+    assert!(written < again.find("and also write b").unwrap(), "{again}");
+    assert!(!again.contains("cut, never read"), "{again}");
+    assert!(app.run.events.iter().any(|e| e["type"] == "retrying"));
+    assert_eq!(unknown(&mut app), 1, "the cut request stays counted");
+    let status = app.call("status", json!({"dir": "sk"}))["result"].clone();
+    assert_eq!(status["complete"], true, "{status}");
+    // A saved reply is read in first: a message then is refused, saying so.
+    let first = embedded(Box::new(MemoryPlaces));
+    let mut cut = App::new(&first).script("sf1", vec![Reply::Text("x")]);
+    cut.call("create", json!({"dir": "sf1", "provider": "fake"}));
+    cut.hold = 1;
+    let line = json!({"jsonrpc": "2.0", "id": 1, "method": "prompt",
+        "params": {"dir": "sf1", "text": "[t:sf1] first"}});
+    let frames = first.handle(line.to_string().as_bytes());
+    cut.drive(frames);
+    cut.call("stop", json!({"dir": "sf1"}));
+    // The session's first request has no point before it: Retry or Take back, so status
+    // says no message is taken, and one is refused.
+    let status = cut.call("status", json!({"dir": "sf1"}))["result"].clone();
+    assert_eq!(status["phase"], "model_wait", "{status}");
+    assert_eq!(status["accepts_message"], false, "{status}");
+    let refused = cut.call("prompt", json!({"dir": "sf1", "text": "never mind"}));
+    assert!(refused.get("error").is_some(), "{refused}");
+    assert_eq!(cut.run.requests.len(), 1, "nothing is sent again");
+}
+
+/// Stops the session's turn as its first tool call is about to run.
+struct StopOnCall {
+    events: Mutex<Vec<Value>>,
+    stop: Mutex<Option<Arc<AtomicBool>>>,
+}
+impl Observer for StopOnCall {
+    fn event(&self, event: Event<'_>) {
+        let json = event.to_json();
+        if json["type"] == "tool_call"
+            && let Some(stop) = self.stop.lock().unwrap().take()
+        {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.events.lock().unwrap().push(json);
+    }
+}
+
+#[test]
+fn native_a_stop_before_a_call_starts_records_it_as_not_run() {
+    let fake = fake();
+    let name = "nb";
+    let marker = fake.root.join("nb.ran");
+    fake.scripts.lock().unwrap().insert(
+        name.into(),
+        (
+            vec![
+                Reply::Call(
+                    "bash",
+                    json!({"command": format!("touch {}", marker.display())}),
+                ),
+                Reply::Text("did something else"),
+            ],
+            vec![],
+        ),
+    );
+    let observer = Arc::new(StopOnCall {
+        events: Mutex::default(),
+        stop: Mutex::default(),
+    });
+    let dir = fake.root.join(name);
+    let mut settings = Settings::resolve("fake", Some("fake-model".into())).unwrap();
+    settings.isolation = agent::Isolation::Off;
+    let mut session = Session::create(&dir, settings, vec![], observer.clone()).unwrap();
+    *observer.stop.lock().unwrap() = Some(session.interrupt_handle());
+    let stopped = session.prompt("[t:nb] touch it").unwrap_err();
+    assert!(stopped.contains("stopped by the user"), "{stopped}");
+    let refused = observer
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "tool_refused")
+        .cloned()
+        .expect("the call is recorded as not run");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap()
+            .contains("before this call started")
+    );
+    assert!(session.accepts_message());
+    drop(session);
+    let mut session = Session::open(&dir, observer).unwrap();
+    session.prompt("do something else instead").unwrap();
+    assert!(!marker.exists(), "the stopped call never ran");
+    let next = &requests_of(name)[1];
+    assert!(
+        next.find("before this call started").unwrap() < next.find("do something else").unwrap(),
+        "{next}"
     );
 }

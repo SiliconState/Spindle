@@ -12,7 +12,7 @@
 //     their folders; next and previous walk files in shut folders too;
 //   - how long the list takes to draw (scratch files shown: every file listed).
 //
-// Screenshots (Light and Dark, the card and the page) go to SHOTS_DIR.
+// Screenshots (Light and Dim, the card and the page) go to SHOTS_DIR.
 //
 //   SPINDLE_BROWSER=/path/to/chrome node chrome/tests/panel_tree.mjs DIST [SHOTS_DIR]
 //
@@ -282,8 +282,8 @@ check('a long folder draws a few hundred rows at a time; "Show more" moves the f
 check('nothing on the panel console', () => assert.deepEqual(panelSaid, []));
 
 // ---- Screenshots: the card with a folder open, the page with the environment open.
-for (const mode of ['light', 'dark']) {
-  await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: mode }] });
+for (const mode of ['light', 'dim']) {
+  await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: mode === 'dim' ? 'dark' : mode }] });
   await panel.eval(`spindleTheme.set(${JSON.stringify(mode)}); spindleTheme.setTexture('plain')`);
   await panel.eval(`(() => { const card = document.querySelector('#history .workspace-card'); card.open = true; card.scrollIntoView({ block: 'start' }); })()`);
   await new Promise((done) => setTimeout(done, 300));

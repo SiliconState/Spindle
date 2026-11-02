@@ -609,6 +609,13 @@ pub(crate) fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
             {
                 spec.capabilities.reasoning = Some(false);
             }
+            // GPT-4o answers at most 16,384 tokens: OpenAI refuses a larger ask with a
+            // 400, and a thread's first request has nothing to send it again from.
+            if matches!(provider_id.as_str(), "openai" | "chatgpt")
+                && normalized.starts_with("gpt-4o")
+            {
+                spec.max_output_tokens.get_or_insert(16_384);
+            }
             profile.model_specs.insert(normalized, spec);
         }
     }
@@ -696,8 +703,10 @@ pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             display_name: "ChatGPT".to_string(),
             api_provider: ApiProvider::ChatGpt,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-            // The ChatGPT backend refuses gpt-5.4 for ChatGPT accounts.
             default_model: CHATGPT_DEFAULT_MODEL.to_string(),
+            // Only what the backend serves a ChatGPT account: it refuses every older
+            // model (gpt-5.5 and before, gpt-4.1, gpt-4o, o3, o4-mini) with HTTP 400
+            // model_not_found ("not supported when using Codex with a ChatGPT account").
             models: vec![
                 "gpt-6.1-sol".to_string(),
                 "gpt-6-astra".to_string(),
@@ -706,20 +715,6 @@ pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 "gpt-5.6-sol".to_string(),
                 "gpt-5.6-terra".to_string(),
                 "gpt-5.6-luna".to_string(),
-                "gpt-5.4".to_string(),
-                "gpt-5.4-mini".to_string(),
-                "gpt-5.5".to_string(),
-                "gpt-5.3-codex".to_string(),
-                "gpt-5.3-codex-spark".to_string(),
-                "gpt-5-codex".to_string(),
-                "gpt-5".to_string(),
-                "gpt-5-mini".to_string(),
-                "gpt-4.1".to_string(),
-                "gpt-4o".to_string(),
-                "gpt-4o-mini".to_string(),
-                "o3".to_string(),
-                "o3-mini".to_string(),
-                "o4-mini".to_string(),
             ],
             env_vars: vec!["CHATGPT_ACCESS_TOKEN".to_string()],
             requires_api_key: true,
@@ -739,13 +734,7 @@ pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                     .to_string(),
             ),
             context_window: Some(272_000),
-            model_context_windows: {
-                let mut m = HashMap::new();
-                m.insert("gpt-4.1".to_string(), 1_000_000);
-                m.insert("gpt-4o".to_string(), 128_000);
-                m.insert("gpt-4o-mini".to_string(), 128_000);
-                m
-            },
+            model_context_windows: HashMap::new(),
             model_effort_levels: HashMap::new(),
             request_contract: Some(RequestContract::ChatGptResponses),
             model_aliases: HashMap::from([(
@@ -778,8 +767,6 @@ pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 "gpt-4o".to_string(),
                 "gpt-4o-mini".to_string(),
                 "o3".to_string(),
-                "o3-mini".to_string(),
-                "o4-mini".to_string(),
             ],
             env_vars: vec!["OPENAI_API_KEY".to_string()],
             requires_api_key: true,

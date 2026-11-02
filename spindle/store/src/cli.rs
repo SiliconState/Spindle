@@ -50,7 +50,8 @@ fn usage() -> &'static str {
   serve [--port 8790] [--origin https://HOST] [--dev-source DIR]
       [--access-team TEAM.cloudflareaccess.com --access-aud AUD]
       [--resume known|none]                             mobile web UI on loopback
-  token new NAME | list | revoke NAME                   named API tokens for serve's /v1
+  token new NAME [--runner|--browser] | list | revoke NAME
+                                                        named API tokens for serve's /v1
                                                         HTTP API (DIR is the host directory)
   api                                                   JSON-RPC 2.0 over stdin/stdout
                                                         (docs/API.md)
@@ -266,8 +267,11 @@ fn run(mut args: Vec<String>) -> Result<()> {
             let files = flags.attachments()?;
             let mut session = Session::open(&dir, Arc::new(Terminal::default()))?;
             // A turn in flight re-derives its next request from the saved config, so
-            // the config may change only between turns.
-            session.set_settings(settings)?;
+            // the config may change only between turns. A turn stopped part way takes the
+            // message as it is set up (unchanged settings are not saved again).
+            if session.accepts_prompt() || settings.to_json()? != Settings::load(&dir)?.to_json()? {
+                session.set_settings(settings)?;
+            }
             session.prompt_with_files(&prompt, files)
         }
         "continue" => {

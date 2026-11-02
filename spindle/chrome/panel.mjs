@@ -2,15 +2,30 @@
 // offscreen document's worker) runs them, and this page asks it over the channel and
 // draws what it reports. Closing the panel never stops a turn.
 import { fileTree, markdown, size } from './text.js';
-import { PAGE_ACCESS, PICTURE_ACCESS, pageSwitches } from './page-tools.mjs';
+import { BROWSER, PAGE_ACCESS, PICTURE_ACCESS, confirmMode, pageSwitches } from './page-tools.mjs';
 import { zip } from './zip.mjs';
 import { containment, kindOf, pageOf, previewFrame, previewNote, saveFile, typeOf } from './page.mjs';
 import { mdNodes } from './markdown.mjs';
 import { CHANNEL, accessFor, keepPreviewChoice, keysOf, previewChoice, read, remove, startEngine, write } from './shared.mjs';
-import { flowOf, signInInTab, signInSites } from './signin.mjs';
+import { connectInTab, flowOf, signInInTab, signInSites } from './signin.mjs';
 import { clock, describe, duration, elapsed, isScratch, isSpan, partsFrom, retried, shownName, tabsFrom, taskTitle } from './steps.mjs';
 
 const $ = (id) => document.getElementById(id);
+// What the panel's page says of the browser names the one it runs in (Edge, Brave or
+// Opera: their prompts and their debugging bar are theirs, not Chrome's).
+if (BROWSER !== 'Chrome') {
+  const said = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  for (let node = said.nextNode(); node; node = said.nextNode()) {
+    if (node.nodeValue.includes('Chrome')) node.nodeValue = node.nodeValue.replaceAll('Chrome', BROWSER);
+  }
+  for (const node of document.querySelectorAll('[title*="Chrome"], [placeholder*="Chrome"], [aria-label*="Chrome"]')) {
+    for (const name of ['title', 'placeholder', 'aria-label']) {
+      const value = node.getAttribute(name);
+      if (value?.includes('Chrome')) node.setAttribute(name, value.replaceAll('Chrome', BROWSER));
+    }
+  }
+}
+
 const el = (tag, cls, text) => {
   const node = document.createElement(tag);
   if (cls) node.className = cls;
@@ -182,7 +197,7 @@ let engine = null;
 
 /** How long an answer may take: moving whole sessions, and freeing space (a whole
  * store read, written and checked; a moved thread's file checked whole), longer. */
-const PATIENCE = { export: 300_000, import: 300_000, catalog: 120_000, compact: 600_000, freeSealed: 300_000 };
+const PATIENCE = { export: 300_000, import: 300_000, catalog: 120_000, compact: 600_000, freeSealed: 300_000, toHost: 300_000, hostConnect: 120_000 };
 
 function ask(op, args = {}, timeout = PATIENCE[op] ?? 60_000) {
   const id = ++next;
@@ -227,7 +242,15 @@ channel.onmessage = ({ data }) => {
   else if (data?.type === 'thread') onThread(data.thread);
   else if (data?.type === 'removed') onRemoved(data.id);
   else if (data?.type === 'turn_end') onTurnEnd(data.thread, data.unsent ?? []);
+  // A thread on the user's host after a gap in its events (or opened at work): drawn
+  // again from what the host holds.
+  else if (data?.type === 'resync') { if (data.thread === current && document.body.dataset.view === 'thread') openThread(current); }
   else if (data?.type === 'queued') { if (data.thread === current) renderQueued(data.queued); }
+  else if (data?.type === 'approvals') {
+    if (engine) engine.approvals = data.approvals;
+    renderThreads();
+    renderAsking();
+  }
   else if (data?.type === 'linux') onLinux(data);
   else if (data?.type === 'host' || data?.type === 'sites' || data?.type === 'relay') {
     if (engine) engine[data.type] = data[data.type];
@@ -239,7 +262,10 @@ channel.onmessage = ({ data }) => {
     if (engine) engine.vault = data.vault;
     keyed = new Set(Object.keys(data.vault?.kinds ?? {}));
     renderBar();
-    if ($('settings-dialog').open) renderProviders();
+    if ($('settings-dialog').open) {
+      renderProviders();
+      renderSites();
+    }
   }
   else if (data?.type === 'ready') {
     if (engine) engineRestarted();
@@ -401,6 +427,15 @@ function since(ms, now = Date.now()) {
 
 /** What a thread's row says it is doing (not which model, but for a thread at rest). */
 function threadDoing(thread) {
+  // Moving to or from the user's host, or there and out of reach: said first.
+  if (thread.moving && thread.moving.step !== 'release') return thread.moving.why ? `${thread.moving.text} · waiting: ${thread.moving.why}` : thread.moving.text;
+  if (thread.home && thread.away) return `On your host · out of reach: ${thread.away}`;
+  const doing = threadState(thread);
+  return thread.home ? `On your host · ${doing}` : doing;
+}
+
+/** What a thread's row says of its state (wherever it runs). */
+function threadState(thread) {
   if (thread.state === 'running') {
     const seenNow = activity.get(thread.id);
     return [seenNow?.text ?? 'Working', seenNow?.of > 1 && `step ${seenNow.step} of ${seenNow.of}`].filter(Boolean).join(' · ');
@@ -438,26 +473,73 @@ function renderThreads() {
 
 /** A thread's row: its state as a shape (a spinner, a warning, an unread dot, nothing at
  * rest), its name and what it is doing, how long ago; ⋯ for more. */
+/** The page actions a thread waits on the user's answer for (Settings, Pages, Before
+ * acting). */
+const askingOf = (id) => (engine?.approvals ?? []).filter((approval) => approval.thread === id);
+
+/** What the asking box shows (the thread and its waiting actions): it is drawn again
+ * only when that changes, so a click is never lost to a button drawn anew under it. */
+let askingShown = '';
+
+/** The open thread's waiting actions, above the message box: Allow or Deny each. */
+function renderAsking() {
+  const box = $('asking');
+  const waiting = current ? askingOf(current) : [];
+  const shown = JSON.stringify([current, waiting.map((approval) => approval.id)]);
+  if (shown === askingShown) return;
+  askingShown = shown;
+  box.replaceChildren();
+  box.hidden = !waiting.length;
+  for (const approval of waiting) {
+    const item = el('div', 'ask-item');
+    const allow = el('button', 'primary', 'Allow');
+    const deny = el('button', '', 'Deny');
+    const answer = (yes) => async () => {
+      // One answer: both buttons rest until the engine has it.
+      allow.disabled = deny.disabled = true;
+      try {
+        const { approvals } = await ask('approve', { approval: approval.id, allow: yes });
+        if (engine) engine.approvals = approvals;
+        renderThreads();
+        renderAsking();
+      } catch (error) {
+        allow.disabled = deny.disabled = false;
+        toast(error.message);
+      }
+    };
+    allow.type = 'button';
+    allow.onclick = answer(true);
+    deny.type = 'button';
+    deny.onclick = answer(false);
+    item.append(icon('warning', 14), el('span', 'ask-text', `Spindle asks before it acts: ${approval.text}`), deny, allow);
+    box.append(item);
+  }
+}
+
 function threadRow(thread, last) {
-  const needs = HALTED.has(thread.state);
+  const asking = askingOf(thread.id);
+  const needs = HALTED.has(thread.state) || asking.length > 0;
   const fresh = unread(thread);
-  const item = el('div', `thread-item${last ? ' last' : ''}${thread.state === 'running' ? ' running' : ''}${needs ? ' needs' : ''}${fresh ? ' unread' : ''}${thread.state === 'moved' ? ' moved' : ''}`);
+  const item = el('div', `thread-item${last ? ' last' : ''}${thread.state === 'running' ? ' running' : ''}${needs ? ' needs' : ''}${fresh ? ' unread' : ''}${thread.state === 'moved' ? ' moved' : ''}${thread.home ? ' hosted' : ''}`);
   const row = el('button', `thread-row state-${thread.state}`);
   row.type = 'button';
   row.dataset.id = thread.id;
   const mark = el('span', 'thread-mark');
   mark.setAttribute('aria-hidden', 'true');
-  if (thread.state === 'running') mark.append(icon('spinner', 14));
+  if (asking.length) mark.append(icon('warning', 16));
+  else if (thread.state === 'running') mark.append(icon('spinner', 14));
   else if (needs) mark.append(icon('warning', 16));
   else if (fresh) mark.append(el('span', 'dot'));
+  // On the user's host: its mark when nothing else is said.
+  else if (thread.home) mark.append(icon('monitor', 14));
   const text = el('span', 'thread-text');
   const top = el('span', 'thread-top');
   top.append(el('span', 'thread-name', thread.title), el('span', 'thread-time', since(thread.updated)));
-  const doing = threadDoing(thread);
+  const doing = asking.length ? `Asks you: ${asking[0].text}` : threadDoing(thread);
   const meta = el('span', 'thread-meta', doing);
   text.append(top, meta);
   row.append(mark, text);
-  row.title = [thread.title, `${nameOf(thread.provider)} · ${thread.model}`, thread.note && explain(thread.note), new Date(thread.updated).toLocaleString()].filter(Boolean).join('\n');
+  row.title = [thread.title, `${nameOf(thread.provider)} · ${thread.model}`, thread.home && `On your Spindle host, ${thread.home.url}`, thread.note && explain(thread.note), new Date(thread.updated).toLocaleString()].filter(Boolean).join('\n');
   row.onclick = () => openThread(thread.id);
   const more = el('button', 'thread-more');
   more.type = 'button';
@@ -547,6 +629,10 @@ $('thread-search').addEventListener('input', renderThreads);
 function onThread(thread) {
   const before = threads.get(thread.id);
   threads.set(thread.id, thread);
+  // A move to or from the user's host ended: said, whichever thread is open.
+  if (before && !before.home && thread.home) toast(`“${thread.title}” runs on your host now.`);
+  else if (before?.home && !thread.home) toast(`“${thread.title}” is back in this browser.`);
+  else if (before?.moving && !thread.moving && before.moving.step !== 'release' && thread.note) toast(thread.note);
   if (thread.state !== 'running') {
     activity.delete(thread.id);
     turnStart.delete(thread.id);
@@ -558,10 +644,15 @@ function onThread(thread) {
   if (thread.id === current) {
     $('title').textContent = thread.title;
     $('subtitle').textContent = `${nameOf(thread.provider)} · ${thread.model}`;
-    if (['state', 'note', 'provider', 'model', 'runner', 'network', 'effort'].some((key) => before?.[key] !== thread[key])) renderBar();
+    if (['state', 'note', 'provider', 'model', 'runner', 'network', 'effort', 'away'].some((key) => before?.[key] !== thread[key])
+      || JSON.stringify(before?.moving) !== JSON.stringify(thread.moving)) renderBar();
     if (before?.state !== thread.state) loadSpend(thread.id);
     // Moved out while open: show what is left here, and the file.
     if (thread.state === 'moved' && before && before.state !== 'moved') openThread(thread.id);
+    // Moved to the user's host or back, or a move began or ended, or the host is in reach
+    // again: drawn from where it lives now.
+    const holding = (one) => Boolean(one?.moving && one.moving.step !== 'release');
+    if (before && (Boolean(before.home) !== Boolean(thread.home) || holding(before) !== holding(thread) || (before.away && !thread.away))) openThread(thread.id);
   }
 }
 
@@ -680,7 +771,7 @@ async function openThread(id) {
   $('title-button').hidden = false;
   $('title').textContent = thread?.title ?? 'Thread';
   $('subtitle').textContent = thread ? `${nameOf(thread.provider)} · ${thread.model}` : '';
-  $('prompt').placeholder = 'Reply, or steer the running turn…';
+  $('prompt').placeholder = 'Reply…';
   $('history').replaceChildren(el('p', 'note opening', 'Opening…'));
   closeAdd();
   renderSpend(null);
@@ -721,9 +812,20 @@ const COMPACTED = '[Earlier conversation compacted';
 /** Draws a thread's history: all of it, or (`from`) only its messages from that index on
  * in place of what was shown of them. False when the view holds no place for `from`
  * (then the whole history is to be drawn). */
-function renderHistory({ thread, history, running, bundle }, { from = 0 } = {}) {
+function renderHistory({ thread, history, running, bundle, moving, away }, { from = 0 } = {}) {
   const box = $('history');
   pendingCards = [];
+  // Moving to or from the user's host (no copy of it is read meanwhile), or on a host
+  // that does not answer now.
+  if (!history && (moving || away)) {
+    box.replaceChildren();
+    const notice = el('div', 'notice state');
+    notice.append(el('p', '', moving
+      ? `${moving.text}.${moving.why ? ` It waits: ${explain(moving.why)}.` : ''} Nothing is lost if ${BROWSER} closes meanwhile: Spindle goes on with it when it starts again.`
+      : `This thread is on your Spindle host, which does not answer now (${explain(away)}). Nothing is lost: it is there, and shows here again once your host answers.`));
+    box.append(notice);
+    return true;
+  }
   if (!history) {
     box.replaceChildren();
     const notice = el('div', 'notice state');
@@ -2051,12 +2153,32 @@ function phase(text, mode = '') {
  * which its start was). */
 const turnStart = new Map();
 
+/** Whether the thread's turn, stopped part way, takes a reply that goes on with it: the
+ * step the stop cut off is recorded (or its model request was cut), nothing waits. */
+function takesReply(thread) {
+  return thread.state === 'stopped' && current === thread.id && Boolean(status?.accepts_message) && !status?.accepts_prompt;
+}
+
+/** What a turn stopped part way says, and what each way on does. */
+function stoppedNote() {
+  const step = status?.phase === 'model_wait'
+    ? 'You stopped the model’s reply. A reply asks it again with your message read first (the cut request may have been billed).'
+    : 'You stopped this step: it is recorded as stopped, with what it printed, and does not run again. A reply goes on from there: the model reads that you stopped it, then your message (say, skip it and do something else).';
+  return `${step}\n\nOr Continue (the model decides what to do next), Retry (asks it again from before that step) or Take back (your message returns to the box).`;
+}
+
 /** The composer's top row: the open thread's state on the left (a pulsing dot and how long
  * its turn has run, its tasks at work, a report waiting with Continue), the model and its
  * effort on the right (the model page). A stopped turn's notice and its buttons go at the
  * end of the conversation. */
 function renderBar() {
+  renderAsking();
   const thread = current ? threads.get(current) : null;
+  // What the box sends: a reply, or a message the running turn reads as it goes.
+  if (thread) $('prompt').placeholder = thread.state === 'running' ? 'Steer the running turn…' : takesReply(thread) ? 'Reply to go on…' : 'Reply…';
+  $('retry').title = thread && takesReply(thread) && status?.phase !== 'model_wait'
+    ? 'Ask the model again from before the step you stopped'
+    : 'Send the last model request again';
   const show = { resume: false, retry: false, takeback: false };
   const notice = $('notice');
   notice.hidden = true;
@@ -2066,6 +2188,14 @@ function renderBar() {
   } else if (!thread) {
     if (chosen().provider) phase('New thread', 'new');
     else phase('No providers yet: add one in Settings');
+  } else if (thread.moving && thread.moving.step !== 'release') {
+    // Moving to or from the user's host: what Spindle does next, and what it waits for.
+    phase(thread.moving.text, 'busy');
+    if (thread.moving.why) {
+      notice.className = 'notice state warning';
+      notice.textContent = `It waits: ${explain(thread.moving.why)}. Spindle tries again by itself, also after ${BROWSER} restarts.`;
+      notice.hidden = false;
+    }
   } else if (thread.state === 'running') {
     if (!$('phase').textContent || $('bar').dataset.mode !== 'busy') phase('Working', 'busy');
   } else if (HALTED.has(thread.state)) {
@@ -2075,9 +2205,11 @@ function renderBar() {
     phase({ stopped: 'Stopped part way', failed: 'Failed', interrupted: 'Cut off part way' }[thread.state], 'stopped');
     notice.className = 'notice state warning';
     const note = explain(thread.note ?? STATES[thread.state]);
-    notice.textContent = /Retry|Continue/.test(note)
-      ? note
-      : `${note}\n\nContinue picks up where it left off; Retry sends the last model request again.`;
+    notice.textContent = takesReply(thread)
+      ? stoppedNote()
+      : /Retry|Continue/.test(note)
+        ? note
+        : `${note}\n\nContinue picks up where it left off; Retry sends the last model request again.`;
     notice.hidden = false;
   } else if (thread.state === 'moved') {
     phase('Moved out');
@@ -2101,6 +2233,12 @@ function renderBar() {
       notice.textContent = explain(thread.note);
       notice.hidden = false;
     }
+  }
+  // On the user's host, which does not answer now: said over anything else.
+  if (thread?.home && thread.away && !thread.moving) {
+    notice.className = 'notice state warning';
+    notice.textContent = `Your host is out of reach: ${explain(thread.away)}.`;
+    notice.hidden = false;
   }
   const goButton = $('status-go');
   goButton.hidden = !go;
@@ -2132,9 +2270,11 @@ function renderBar() {
     networked && (thread ? "This thread's commands reach the web" : "New threads' commands reach the web"),
     'Change the model, its effort, where commands run and their network',
   ].filter(Boolean).join('\n');
-  button.hidden = Boolean(thread && thread.state === 'moved');
-  $('prompt').disabled = Boolean(thread && thread.state === 'moved');
-  $('send').disabled = !engine || Boolean(thread && thread.state === 'moved');
+  // A thread that moved out, or is moving to or from the user's host, takes nothing now.
+  const away = Boolean(thread && (thread.state === 'moved' || (thread.moving && thread.moving.step !== 'release')));
+  button.hidden = away;
+  $('prompt').disabled = away;
+  $('send').disabled = !engine || away;
   renderSend();
   renderTaskChip();
   tickElapsed();
@@ -2242,7 +2382,7 @@ function mayReach(pattern, host) {
   return chrome.permissions.request({ origins }).catch(async (error) => {
     const granted = await chrome.permissions.contains({ origins }).catch(() => false);
     if (!granted) {
-      banner(`Chrome could not ask for ${host} here (${error.message}). Open Spindle in a tab and try there.`, [['Open in a tab', openTab]]);
+      banner(`${BROWSER} could not ask for ${host} here (${error.message}). Open Spindle in a tab and try there.`, [['Open in a tab', openTab]]);
     }
     return granted;
   });
@@ -2305,14 +2445,14 @@ $('attach').onclick = () => $('attach-file').click();
 $('shoot').onclick = () => {
   const asked = mayReach(PICTURE_ACCESS, 'pictures of pages');
   (async () => {
-    if (!(await asked)) throw new Error('Chrome did not let Spindle picture pages');
+    if (!(await asked)) throw new Error(`${BROWSER} did not let Spindle picture pages`);
     const window = await chrome.windows.getCurrent();
     const [tab] = await chrome.tabs.query({ active: true, windowId: window.id });
     let url;
     try {
       url = await chrome.tabs.captureVisibleTab(window.id, { format: 'png' });
     } catch (error) {
-      throw new Error(`Chrome gives no picture of ${tab?.url ? new URL(tab.url).protocol.replace(':', '') + ' pages' : 'this tab'} (${error.message})`);
+      throw new Error(`${BROWSER} gives no picture of ${tab?.url ? new URL(tab.url).protocol.replace(':', '') + ' pages' : 'this tab'} (${error.message})`);
     }
     const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, '').replace('T', '-');
@@ -2367,33 +2507,36 @@ function send() {
   const profile = profileOf(provider);
   const network = thread ? Boolean(thread.network) : Boolean(choice.network);
   const runner = thread ? thread.runner : choice.runner ?? 'app';
-  if (!profile) {
+  // A thread on the user's host runs on the host's credentials: nothing of this
+  // browser's is needed to send to it.
+  const hosted = Boolean(thread?.home);
+  if (!profile && !hosted) {
     toast(provider ? `${provider} is not in your provider list` : 'Choose a provider first');
     return;
   }
-  if (needsKey(profile) && !keyed.has(profile.id)) {
+  if (!hosted && needsKey(profile) && !keyed.has(profile.id)) {
     openSettings(flowOf(profile) ? `Sign in to ${profile.display_name} to send.` : `Add your ${profile.display_name} key to send.`);
     return;
   }
-  if (needsKey(profile) && engine?.vault?.locked) {
+  if (!hosted && needsKey(profile) && engine?.vault?.locked) {
     openSettings('Your keys are locked: unlock them to send.');
     return;
   }
-  if (engine?.vault?.ended?.[profile.id]) {
+  if (!hosted && engine?.vault?.ended?.[profile.id]) {
     openSettings(`Your ${profile.display_name} sign-in has ended: sign in again to send.`);
     return;
   }
-  const sites = network && runner === 'app' && !engine.relay;
+  const sites = !hosted && network && runner === 'app' && !engine.relay;
   const target = current;
   const from = carrying?.id;
   const going = attached;
   sending = sendId;
-  reachable(profile, sites).then(async (granted) => {
+  (hosted ? Promise.resolve(true) : reachable(profile, sites)).then(async (granted) => {
     // Access to sites declined for a thread with network: it still talks to its provider
     // if Spindle may reach that; its commands reach no website until Chrome allows.
     if (!granted && sites && (await chrome.permissions.contains({ origins: [accessFor(profile)] }).catch(() => false))) {
       granted = true;
-      toast("Without Chrome's access to sites, this thread's commands reach no website; Chrome asks again when you send.");
+      toast(`Without ${BROWSER}'s access to sites, this thread's commands reach no website; ${BROWSER} asks again when you send.`);
     }
     if (!granted) {
       toast(`Spindle needs to reach ${new URL(profile.base_url).host} to talk to ${profile.display_name}.`);
@@ -2779,8 +2922,19 @@ function renderRunner() {
       button.disabled = !connected && !sheet.wasRemote;
       button.title = connected ? 'On your Spindle host, in its sandbox' : 'Your Spindle host is not connected: set it up in Settings';
     }
+    // A thread that runs on the user's host runs its commands in the host's sandbox.
+    if (sheet.hosted) button.disabled = true;
   }
   const note = $('runner-note');
+  if (sheet.hosted) {
+    note.textContent = "This thread runs on your Spindle host: its commands run in the host's sandbox until you bring it back to this browser.";
+    $('network-note').textContent = sheet.network ? "From your host's sandbox" : 'Commands reach nothing outside';
+    $('model-network').disabled = false;
+    $('model-network').setAttribute('aria-checked', String(sheet.network));
+    $('model-tasks').setAttribute('aria-checked', String(sheet.tasks));
+    $('model-note').textContent = sheet.scope === 'thread' && !sheet.halted ? 'The next turn uses it.' : '';
+    return;
+  }
   note.replaceChildren(document.createTextNode({
     app: 'Linux in this browser: bash, Python, Node, git.',
     remote: "On your Spindle host, in its sandbox.",
@@ -2802,7 +2956,7 @@ function renderRunner() {
   $('network-note').textContent = off ? 'There are no commands to reach anything'
     : !sheet.network ? 'Commands reach nothing outside'
     : sheet.runner === 'remote' ? "From your host's sandbox"
-    : engine?.relay ? 'Through your relay: any address' : 'Through Chrome';
+    : engine?.relay ? 'Through your relay: any address' : `Through ${BROWSER}`;
   $('model-tasks').setAttribute('aria-checked', String(sheet.tasks));
   $('tasks-note').textContent = 'Helpers that work beside it and report back';
   $('model-tasks').title = sheet.tasks
@@ -2810,7 +2964,7 @@ function renderRunner() {
     : 'Off: it does the work itself.';
   $('model-note').textContent = [
     sheet.scope === 'thread' && !sheet.halted ? 'The next turn uses it.' : '',
-    sheet.runner === 'app' && sheet.network && !engine?.relay ? 'Chrome asks once for access to sites (the same access page reading uses).' : '',
+    sheet.runner === 'app' && sheet.network && !engine?.relay ? `${BROWSER} asks once for access to sites (the same access page reading uses).` : '',
   ].filter(Boolean).join(' ');
 }
 for (const button of $('model-runner').querySelectorAll('button')) {
@@ -2862,6 +3016,7 @@ function loadSheet(scope) {
   });
   if (!['app', 'remote', 'none'].includes(sheet.runner)) sheet.runner = 'app';
   sheet.wasRemote = sheet.runner === 'remote';
+  sheet.hosted = Boolean(thread?.home);
   for (const button of $('model-scope').querySelectorAll('button')) {
     button.setAttribute('aria-checked', String(button.dataset.scope === sheet.scope));
     if (button.dataset.scope === 'thread') {
@@ -2913,7 +3068,8 @@ $('model-apply').onclick = () => {
   if (!profile) return;
   const model = String(modelPicker.value ?? '').trim() || profile.default_model;
   const runner = sheet.runner;
-  const network = runner !== 'none' && sheet.network;
+  // (A thread on the user's host has its network there, whatever runner it names.)
+  const network = (sheet.hosted || runner !== 'none') && sheet.network;
   const thread = sheet.thread ? threads.get(sheet.thread) : null;
   const halted = sheet.halted;
   // A spending limit is dollars, 0 or more (empty: none); anything else changes nothing
@@ -2927,7 +3083,8 @@ $('model-apply').onclick = () => {
   // Asked now, in the click: a thread's next turn uses it, and network through Chrome
   // needs Chrome's access to sites (a new thread asks again when it is sent).
   const sites = network && runner === 'app' && !engine?.relay;
-  const granted = thread || sites ? reachable(profile, sites) : Promise.resolve(true);
+  // A thread on the user's host reaches its model from there: nothing to ask here.
+  const granted = thread?.home ? Promise.resolve(true) : thread || sites ? reachable(profile, sites) : Promise.resolve(true);
   $('model-dialog').close();
   (async () => {
     // The effort the model takes (its list may still have been on its way).
@@ -2938,7 +3095,7 @@ $('model-apply').onclick = () => {
       choice = { provider, model, effort, runner, network, tasks: sheet.tasks, max_usd: budget };
       try { localStorage.setItem('spindle-new', JSON.stringify(choice)); } catch {}
       renderBar();
-      if (!(await granted)) toast("Without Chrome's access to sites, new threads' commands reach no website; Chrome asks again when you send.");
+      if (!(await granted)) toast(`Without ${BROWSER}'s access to sites, new threads' commands reach no website; ${BROWSER} asks again when you send.`);
       else if (current) toast(`New threads start with ${what}.`);
       return;
     }
@@ -2955,7 +3112,7 @@ $('model-apply').onclick = () => {
     const tasksChanged = sheet.tasks !== Boolean(thread.tasks);
     const changes = { provider, model, effort, ...(moved && { runner }), ...(networkChange && { network }), ...(budgetChanged && { max_usd: budget }), ...(tasksChanged && { tasks: sheet.tasks }) };
     const limit = budgetChanged ? (budget == null ? ', no spending limit' : `, a US$${budget} spending limit`) : '';
-    const also = `${moved ? `, ${where}` : ''}${networkChange ? (network ? ', commands with network' : ', commands without network') : ''}${tasksChanged ? (sheet.tasks ? ', tasks on' : ', tasks off') : ''}${limit}.${refused ? " Chrome did not give access to sites, so the thread's network stays off." : ''}`;
+    const also = `${moved ? `, ${where}` : ''}${networkChange ? (network ? ', commands with network' : ', commands without network') : ''}${tasksChanged ? (sheet.tasks ? ', tasks on' : ', tasks off') : ''}${limit}.${refused ? " ${BROWSER} did not give access to sites, so the thread's network stays off." : ''}`;
     if (halted) {
       await ask('restart', { id: thread.id, changes });
       // The conversation as it is now: the stopped turn gone, its message sent again.
@@ -3223,7 +3380,7 @@ function renderVault() {
     return row;
   };
   if (state.mode === 'device') {
-    box.append(el('p', 'note', 'Keys are encrypted in this browser. A passphrase keeps a copy of your Chrome profile from reading them; you unlock them once each time Spindle starts.'));
+    box.append(el('p', 'note', `Keys are encrypted in this browser. A passphrase keeps a copy of your ${BROWSER} profile from reading them; you unlock them once each time Spindle starts.`));
     const one = field('New passphrase');
     const two = field('Same passphrase again');
     box.append(form([one, two], [action('Set passphrase', 'primary', async () => {
@@ -3244,11 +3401,11 @@ function renderVault() {
     ]));
     const forgot = action('Forgot it', 'link-like', async () => {
       const sure = await confirmed('Forget every saved key?',
-        'Without the passphrase they cannot be opened. Every saved key and sign-in is deleted (threads stay), and you add them again.',
+        'Without the passphrase they cannot be opened. Every saved key, sign-in and site secret header is deleted (threads stay), and you add them again.',
         'Delete keys');
       if (!sure) return;
       apply(await ask('resetVault'));
-      toast('Saved keys and sign-ins deleted. Add them again to send.');
+      toast('Saved keys, sign-ins and secret headers deleted. Add them again to send.');
     });
     const line = el('p', 'note');
     line.append(forgot, ': delete every saved key and add them again');
@@ -3313,15 +3470,16 @@ function renderCommands() {
   const relayHost = relay ? new URL(relay).host : null;
   $('network-state').textContent = relay
     ? `through your relay at ${relayHost}: any address, for threads with network on`
-    : 'through Chrome: websites over HTTP and HTTPS, for threads with network on';
+    : `through ${BROWSER}: websites over HTTP and HTTPS, for threads with network on`;
   $('commands-summary').textContent = `Linux ${linux.state === 'ready' ? 'running' : linux.state}${relay ? ' · relay' : ''}`;
   $('relay-summary').textContent = relayHost ?? 'None';
   if (document.activeElement !== $('relay-url')) $('relay-url').value = relay ?? '';
   $('relay-off').hidden = !relay;
   const host = engine?.host ?? {};
   if (host.url && document.activeElement !== $('host-url')) $('host-url').value = host.url;
+  const reaches = { browser: 'threads and commands', runner: 'commands only: press Connect to run threads there too', full: 'an API token' }[host.kind];
   $('host-state').textContent = host.connected
-    ? `Connected to ${host.url}.`
+    ? `Connected to ${host.url}${host.client ? ` as “${host.client}”` : ''}${reaches ? ` (${reaches})` : ''}.${host.error ? ` ${sentence(host.error)}.` : ''}`
     : host.error ? `Not connected: ${host.error}` : 'Not connected.';
   $('host-summary').textContent = host.connected ? 'Connected' : host.url ? 'Not connected' : 'None';
   $('host-disconnect').hidden = !host.url;
@@ -3343,12 +3501,19 @@ $('relay-form').onsubmit = async (event) => {
 $('relay-off').onclick = async () => {
   try {
     apply(await ask('relay', { url: null }));
-    toast('Threads with network reach websites through Chrome again.');
+    toast(`Threads with network reach websites through ${BROWSER} again.`);
   } catch (error) {
     toast(error.message);
   }
   renderCommands();
 };
+
+/** Whether `grant`'s secret header is gone (its sealed record went with a vault reset:
+ * its requests are refused until it is added again with one). */
+function secretLost(grant) {
+  const vaulted = engine?.vault;
+  return Boolean(grant?.secret?.length && vaulted && !vaulted.locked && !vaulted.error && !(vaulted.sites ?? []).includes(grant.name));
+}
 
 function renderSites() {
   const box = $('sites');
@@ -3357,10 +3522,23 @@ function renderSites() {
   for (const grant of sites) {
     const row = el('div', 'site');
     const host = new URL(grant.url).host;
+    const main = el('span', 'site-main');
     const name = el('span', 'site-host', grant.url);
     name.title = grant.url;
+    main.append(name);
     const drop = iconButton('x', `Stop scripts calling ${host}`, () => saveSites({ remove: grant.name }, `Scripts no longer reach ${host}.`));
-    row.append(icon('globe', 14), name, el('span', 'site-kind', grant.risk === 'write' ? 'Read and change' : 'Read'), drop);
+    row.append(icon('globe', 14), main, el('span', 'site-kind', grant.risk === 'write' ? 'Read and change' : 'Read'));
+    const secret = grant.secret?.length ? grant.secret.join(', ') : null;
+    if (secret) {
+      const lost = secretLost(grant);
+      const mark = el('span', `site-secret${lost ? ' lost' : ''}`);
+      mark.append(icon(lost ? 'warning' : 'lock', 12), el('span', 'site-secret-text', lost ? `${secret} header gone` : `${secret} header added`));
+      mark.title = lost
+        ? `Its secret ${secret} header is gone (Spindle's keys were reset): add the site again with it`
+        : `Spindle adds a secret ${secret} header to each request here (sealed with your keys)`;
+      main.append(mark);
+    }
+    row.append(drop);
     box.append(row);
   }
   $('sites-summary').textContent = sites.length ? String(sites.length) : 'None';
@@ -3398,12 +3576,33 @@ $('site-form').onsubmit = (event) => {
   }
   url.hash = '';
   const write = $('site-access-kind').querySelector('[aria-checked="true"]')?.dataset.value === 'write';
+  const value = $('site-secret').value.trim();
+  const named = $('site-header').value.trim();
+  if (named && !value) {
+    toast("Type the secret header's value too, or leave both empty.");
+    return;
+  }
+  const header = value ? { name: named || 'Authorization', value } : null;
+  // As the engine refuses it (asked here first, so Chrome is not asked for nothing).
+  const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) || url.hostname.endsWith('.localhost');
+  if (header && url.protocol !== 'https:' && !loopback) {
+    toast(`A secret header goes only to an https:// address, so no one on the network can read it: use https://${url.host}${url.pathname}`);
+    return;
+  }
+  const listed = (engine?.sites ?? []).find((grant) => grant.url === url.href);
+  let kept = '';
+  if (listed && header) kept = ', with its new secret header';
+  else if (secretLost(listed)) kept = '; its secret header is still gone: type its value to add it back';
+  else if (listed?.secret?.length) kept = ', its secret header kept';
+  const done = listed ? `${url.host} updated${kept}.` : `Scripts may reach ${url.host}${header ? ', with a secret header' : ''}.`;
   mayReach(`${url.origin}/*`, url.host).then(async (granted) => {
     if (!granted) {
-      toast(`Chrome did not let Spindle reach ${url.host}.`);
+      toast(`${BROWSER} did not let Spindle reach ${url.host}.`);
       return;
     }
-    if (await saveSites({ add: { url: url.href, write } }, `Scripts may reach ${url.host}.`)) $('site-url').value = '';
+    if (await saveSites({ add: { url: url.href, write, ...(header && { header }) } }, done)) {
+      for (const id of ['site-url', 'site-header', 'site-secret']) $(id).value = '';
+    }
   });
 };
 
@@ -3423,7 +3622,57 @@ function onLinux(state) {
   }
 }
 
+/** The computer this browser runs on, in a word (a name for it on the user's host). */
+function platformName() {
+  const said = navigator.userAgentData?.platform || navigator.platform || '';
+  if (/win/i.test(said)) return 'Windows';
+  if (/mac/i.test(said)) return 'macOS';
+  if (/cros|chrome ?os/i.test(said)) return 'ChromeOS';
+  if (/linux/i.test(said)) return 'Linux';
+  return 'this computer';
+}
+
+/** Connect: the host's own page, in a tab, gives this browser a token of its own (a
+ * browser token, named for this browser and kept for this profile, so connecting again
+ * keeps its threads); the engine trades and keeps it. */
 $('host-form').onsubmit = (event) => {
+  event.preventDefault();
+  const url = $('host-url').value.trim().replace(/\/+$/, '');
+  let origin;
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    toast('That address is not a URL.');
+    return;
+  }
+  // Asked in the click itself (Chrome needs the gesture): the host's site, whose pages
+  // the tab opens and whose address the connect is caught at.
+  const granted = mayReach(`${origin}/*`, new URL(url).host);
+  const button = $('host-connect');
+  (async () => {
+    if (!(await granted)) {
+      toast(`Spindle needs to reach ${origin} to use your host.`);
+      return;
+    }
+    button.disabled = true;
+    try {
+      const { name } = await ask('hostName', { base: `${BROWSER} on ${platformName()}` });
+      toast(`Approve “${name}” on your host's page, in the tab that opened.`, { ms: 15_000 });
+      const { code, verifier } = await connectInTab(url, name);
+      apply(await ask('hostConnect', { url, code, verifier, client: name }));
+      toast(`Connected to ${url}.`);
+    } catch (error) {
+      if (error.kind !== 'cancelled') toast(`Not connected: ${error.message}`);
+    } finally {
+      button.disabled = false;
+      renderCommands();
+    }
+  })();
+};
+
+/** Or a token made on the host and pasted (a browser token, or a runner token for
+ * commands only). */
+$('host-token-form').onsubmit = (event) => {
   event.preventDefault();
   const url = $('host-url').value.trim();
   const token = $('host-token').value.trim();
@@ -3435,7 +3684,7 @@ $('host-form').onsubmit = (event) => {
     return;
   }
   if (!token) {
-    toast('Paste a runner token from your host (spindle token new NAME --runner).');
+    toast('Paste a token from your host (spindle token new NAME --browser, or --runner).');
     return;
   }
   mayReach(`${origin}/*`, new URL(url).host)
@@ -3481,8 +3730,9 @@ async function renderPages() {
   const access = await chrome.permissions.contains({ origins: PAGE_ACCESS });
   const kept = await read('kv', 'pages').catch(() => null);
   const now = pageSwitches(kept, access);
+  // The switches change together; what Before acting says is kept with them.
   const set = async (next) => {
-    await write('kv', 'pages', next);
+    await write('kv', 'pages', { ...kept, ...next });
     // The service worker lets go of tabs when actions go off.
     chrome.runtime.sendMessage({ type: 'pages' }).catch(() => {});
     renderPages();
@@ -3498,7 +3748,7 @@ async function renderPages() {
       return;
     }
     const asked = access ? Promise.resolve(true) : mayReach(PAGE_ACCESS, 'websites');
-    asked.then((given) => (given ? set({ reading: true, acting: now.acting }) : toast('Chrome did not give Spindle access to sites.')));
+    asked.then((given) => (given ? set({ reading: true, acting: now.acting }) : toast(`${BROWSER} did not give Spindle access to sites.`)));
   };
   acting.onclick = () => {
     if (now.acting) {
@@ -3506,28 +3756,40 @@ async function renderPages() {
       return;
     }
     const asked = access ? Promise.resolve(true) : mayReach(PAGE_ACCESS, 'websites');
-    asked.then((given) => (given ? set({ reading: true, acting: true }) : toast('Chrome did not give Spindle access to sites.')));
+    asked.then((given) => (given ? set({ reading: true, acting: true }) : toast(`${BROWSER} did not give Spindle access to sites.`)));
   };
-  $('pages-summary').textContent = now.acting ? 'Read · act' : now.reading ? 'Read' : 'Off';
+  // Before acting: Full acts without asking (the default); Auto asks before it sends or
+  // submits; Ask before every action that changes a page.
+  const mode = confirmMode(kept);
+  for (const button of $('act-confirm').querySelectorAll('button')) {
+    button.setAttribute('aria-checked', String(button.dataset.value === mode));
+    button.onclick = () => set({ confirm: button.dataset.value });
+  }
+  $('act-confirm-note').textContent = {
+    full: 'Acts without asking: the whole task, start to end.',
+    auto: 'Asks you first before it sends or submits: Enter, a submit or send button, a page dialog it accepts.',
+    ask: 'Asks you first before every click, keystroke, choice, page it opens and tab it closes.',
+  }[mode];
+  $('pages-summary').textContent = now.acting ? (mode === 'full' ? 'Read · act' : `Read · act · ${mode === 'auto' ? 'Auto' : 'Ask'}`) : now.reading ? 'Read' : 'Off';
   // Rules by site (Allow, Ask, Never) wait for the engine to keep and follow them.
   $('site-rules').hidden = !FEATURES.siteRules;
-  $('site-access').textContent = access ? '' : "Chrome asks for access to sites when you turn reading on, or a thread's network.";
+  $('site-access').textContent = access ? '' : `${BROWSER} asks for access to sites when you turn reading on, or a thread's network.`;
   $('site-access').hidden = access;
   $('site-access-remove').hidden = !access;
-  $('site-access-remove').title = "Page tools use Chrome's access to sites while on, and so do threads' commands with network (through Chrome)";
+  $('site-access-remove').title = `Page tools use ${BROWSER}'s access to sites while on, and so do threads' commands with network (through ${BROWSER})`;
   $('site-access-remove').onclick = async () => {
     await chrome.permissions.remove({ origins: [...PAGE_ACCESS, ...PICTURE_ACCESS] }).catch(() => false);
     // Giving the access again later (for a thread's network) turns no switch back on.
-    await write('kv', 'pages', { reading: false, acting: false });
+    await write('kv', 'pages', { ...kept, reading: false, acting: false });
     chrome.runtime.sendMessage({ type: 'pages' }).catch(() => {});
-    toast("Chrome's access to sites is taken back: no page is read or acted on, and commands reach no website through Chrome.");
+    toast(`${BROWSER}'s access to sites is taken back: no page is read or acted on, and commands reach no website through ${BROWSER}.`);
     renderPages();
   };
 }
 
 function renderTheme() {
   const theme = globalThis.spindleTheme;
-  const mode = { paper: 'Paper', light: 'Light', dark: 'Dark', system: 'System' }[theme?.get()] ?? 'Paper';
+  const mode = { paper: 'Paper', light: 'Light', dim: 'Dim', system: 'System' }[theme?.get()] ?? 'Paper';
   $('appearance-summary').textContent = `${mode} · ${theme?.texture() === 'plain' ? 'plain' : 'textured'}`;
   const marks = [['theme-choice', 'mode', theme?.get(), (value) => theme?.set(value)], ['texture-choice', 'texture', theme?.texture(), (value) => theme?.setTexture(value)]];
   for (const [group, key, value, choose] of marks) {
@@ -3547,8 +3809,11 @@ async function renderAbout() {
   const facts = $('about');
   facts.replaceChildren();
   const add = (term, value) => facts.append(el('dt', '', term), el('dd', '', value));
-  if (engine?.info) add('Spindle', `${engine.info.version} · schema ${engine.info.schema}`);
-  $('about-summary').textContent = engine?.info?.version ?? '';
+  // The extension's own version, as the store lists it; the engine's package has its own.
+  const version = chrome.runtime.getManifest().version;
+  add('Version', version);
+  if (engine?.info) add('Engine', `${engine.info.version} · schema ${engine.info.schema}`);
+  $('about-summary').textContent = version;
   add('Threads', String(threads.size));
   // What this build is made of (chrome/build.sh), to name in a report of a fault.
   try {
@@ -3625,7 +3890,7 @@ async function renderStorage() {
   // Freeing space holds the engine, so it waits for every running thread.
   const busy = [...threads.values()].some((thread) => thread.state === 'running');
   const rows = report.threads
-    .map((usage) => ({ usage, thread: threads.get(usage.id), total: usage.bytes + usage.bundle }))
+    .map((usage) => ({ usage, thread: threads.get(usage.id), total: usage.bytes + usage.bundle + (usage.held ?? 0) }))
     .filter(({ thread }) => thread)
     .sort((a, b) => b.total - a.total);
   let freeable = 0;
@@ -3635,6 +3900,16 @@ async function renderStorage() {
     const details = [];
     const actions = [];
     const title = thread.title || 'Untitled';
+    // Moving to or from the user's host: the bytes held here until the other side has it.
+    if (usage.move) {
+      const held = usage.held ? `${size(usage.held)} held here` : '';
+      details.push(usage.move.way === 'to'
+        ? `moving to your host${held ? `: ${held} until your host has it` : ''}`
+        : `coming back from your host${held ? `: ${held} until it is in` : ''}`);
+      if (usage.move.error) details.push(`waits: ${usage.move.error}`);
+    } else if (usage.hosted) {
+      details.push('on your host (only a note of where it went stays here)');
+    }
     if (thread.state === 'moved') {
       details.push(usage.bundle ? `in a file of ${size(usage.bundle)}` : 'moved into a file');
       if (usage.sealed) {
@@ -3751,8 +4026,8 @@ $('settings').onclick = () => openSettings();
 $('open-tab').onclick = openTab;
 $('restart-engine').onclick = async () => {
   $('settings-dialog').close();
-  const busy = [...threads.values()].filter((thread) => thread.state === 'running').length;
-  if (busy && !(await confirmed('Restart the engine?', `${busy} thread(s) are running. Restarting cuts them off; each can be retried after.`, 'Restart'))) return;
+  const busy = [...threads.values()].filter((thread) => thread.state === 'running' && !thread.home).length;
+  if (busy && !(await confirmed('Restart the engine?', `${busy} browser thread(s) are running. Restarting cuts them off; each can be retried after. Threads on your host keep running there.`, 'Restart'))) return;
   await restartEngine();
 };
 
@@ -3994,15 +4269,24 @@ function openThreadMenu() {
   const thread = threads.get(current);
   if (!thread) return;
   $('rename').value = thread.title;
-  const commands = { app: "commands in this browser's Linux", remote: 'commands in your Spindle host' }[thread.runner] ?? 'no commands';
+  const commands = thread.home ? `on your Spindle host, ${thread.home.url}`
+    : { app: "commands in this browser's Linux", remote: 'commands in your Spindle host' }[thread.runner] ?? 'no commands';
   const facts = [`${nameOf(thread.provider)} · ${thread.model}`, commands, `started ${new Date(thread.created).toLocaleString()}`];
   if (status) facts.push(`revision ${status.head}`);
   $('thread-facts').textContent = facts.join(' · ');
   const moved = thread.state === 'moved';
-  $('menu-files').disabled = moved;
-  $('menu-fresh').disabled = moved;
-  $('menu-export').disabled = moved;
-  $('menu-copy').disabled = moved;
+  const hosted = Boolean(thread.home);
+  const moving = Boolean(thread.moving && thread.moving.step !== 'release');
+  $('menu-files').disabled = moved || moving;
+  $('menu-fresh').disabled = moved || hosted || moving;
+  $('menu-export').disabled = moved || hosted || moving;
+  $('menu-copy').disabled = moved || hosted || moving;
+  // Run on my host: with the host connected by Connect (a browser token: a runner token
+  // only runs commands).
+  $('menu-host').hidden = moved || hosted || !engine?.host?.connected || engine.host.kind !== 'browser';
+  $('menu-host').disabled = moving || thread.state === 'running';
+  $('menu-back').hidden = !hosted;
+  $('menu-back').disabled = moving || thread.state === 'running';
   $('thread-dialog').showModal();
 }
 
@@ -4438,6 +4722,90 @@ async function exportThread(keep) {
 }
 
 $('menu-export').onclick = () => exportThread(false);
+$('menu-host').onclick = () => runOnHost();
+$('menu-back').onclick = () => bringBack();
+
+/** Run on my host: on the thread's own model when the host has it signed in, else on one
+ * of the host's the user picks; then the move, which the thread shows as it goes. */
+async function runOnHost() {
+  const id = current;
+  $('thread-dialog').close();
+  if (!id) return;
+  let check;
+  try {
+    check = await ask('hostPreflight', { id });
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+  if (check.why) {
+    toast(`It cannot move to your host: ${check.why}.`);
+    return;
+  }
+  const select = $('host-model');
+  select.replaceChildren();
+  if (!check.fits) {
+    for (const provider of check.providers) {
+      const group = document.createElement('optgroup');
+      group.label = provider.name;
+      for (const model of provider.models) {
+        const option = el('option', '', model.label);
+        option.value = JSON.stringify([provider.id, model.id]);
+        option.selected = model.id === provider.default_model && !select.value;
+        group.append(option);
+      }
+      select.append(group);
+    }
+    if (!select.options.length) {
+      toast(`Your host has no model signed in: sign in to one on your host, then move the thread.`);
+      return;
+    }
+  }
+  $('host-model-field').hidden = check.fits;
+  $('host-dialog-text').textContent = [
+    `It moves to your host at ${check.url} with its history and workspace, and your host runs it from then on: its model,`,
+    `its programs and its sandbox. This panel still shows and drives it, and answers its page tools while ${BROWSER} is open.`,
+    check.fits ? '' : `${check.model} is not signed in there: choose the host's model it runs on.`,
+    'This browser keeps its copy until your host holds the thread, so nothing is lost if either stops meanwhile.',
+    'Bring back to this browser, in its menu, moves it back.',
+  ].filter(Boolean).join(' ');
+  const dialog = $('host-dialog');
+  dialog.returnValue = '';
+  dialog.showModal();
+  const yes = await new Promise((resolve) => dialog.addEventListener('close', () => resolve(dialog.returnValue === 'yes'), { once: true }));
+  if (!yes) return;
+  const [provider, model] = check.fits ? [] : JSON.parse(select.value);
+  try {
+    await ask('toHost', { id, ...(provider && { provider, model }) });
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+/** Bring back to this browser: what changes for it to run here is said first; then the
+ * move, which the thread shows as it goes. */
+async function bringBack() {
+  const id = current;
+  $('thread-dialog').close();
+  if (!id) return;
+  let said = [];
+  try {
+    ({ said } = await ask('backPreview', { id }));
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+  if (!(await confirmed(
+    'Keep this thread here?',
+    `It comes back from your host with its history and workspace${said.length ? `, and to run in this browser it changes: ${said.join('; ')}` : ''}. Your host keeps its copy, sealed, until this browser holds the thread.`,
+    'Bring it back',
+  ))) return;
+  try {
+    await ask('backHere', { id });
+  } catch (error) {
+    toast(error.message);
+  }
+}
 $('menu-copy').onclick = () => exportThread(true);
 $('menu-delete').onclick = () => {
   $('thread-dialog').close();

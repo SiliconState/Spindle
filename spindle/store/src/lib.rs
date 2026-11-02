@@ -360,37 +360,57 @@ fn rewrite_fence(file: &mut File, note: &str) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// Removes fence drafts (`<FENCE>.native-<pid>-draft`) a native owner left when it stopped
+/// between writing one and linking it into place.
+fn remove_fence_drafts(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let prefix = format!("{FENCE}.native-");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with("-draft") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Holds the directory's fence for a native owner that already holds the flock. A
 /// fence a native owner left is taken over (that owner is gone: the flock was free);
 /// any other (the package's, which nothing can prove dead) refuses: `Locked`.
 fn hold_fence(root: &Path) -> Result<std::path::PathBuf> {
-    use std::io::Write;
     let path = root.join(FENCE);
     let note = format!("{NATIVE_FENCE}pid {}\n", process_id());
-    let mut create = OpenOptions::new();
-    create.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        create.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    // What a crash left of an earlier owner's fence making: nobody else makes these
+    // (this owner holds the flock, and the package never names a file so).
+    remove_fence_drafts(root);
+    let draft = root.join(format!("{FENCE}.native-{}-draft", process_id()));
+    // The note is linked into place whole, so a crash leaves no fence or the whole one,
+    // never an empty one: no host could tell that from another owner's half-made fence,
+    // so every host would refuse the store until someone removed it. A link fails where
+    // the fence exists, as an exclusive create does.
+    let placed = write_fence_file(&draft, &note).and_then(|()| std::fs::hard_link(&draft, &path));
+    let removed = std::fs::remove_file(&draft);
+    if placed.is_ok() {
+        removed?;
     }
-    match create.open(&path) {
-        Ok(file) => {
-            // The file closes with this closure, before any removal below.
-            let written = (move || {
-                let mut file = file;
-                file.write_all(note.as_bytes())?;
-                file.sync_all()
-            })()
-            .and_then(|()| sync_dir(root));
-            if let Err(error) = written {
-                // Not left half made: an empty fence would refuse every host.
+    match placed {
+        Ok(()) => {
+            if let Err(error) = sync_dir(root) {
                 let _ = std::fs::remove_file(&path);
                 return Err(error.into());
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let mut file = open_fence(&path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if file.metadata()?.nlink() != 1 {
+                    return Err(Error::Invalid);
+                }
+            }
             let mut kept = Vec::new();
             std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, 4096), &mut kept)?;
             if !kept.starts_with(NATIVE_FENCE.as_bytes()) {
@@ -401,6 +421,27 @@ fn hold_fence(root: &Path) -> Result<std::path::PathBuf> {
         Err(error) => return Err(error.into()),
     }
     Ok(path)
+}
+
+/// Writes and syncs an exclusive draft; failed writes remove only that draft.
+fn write_fence_file(path: &Path, note: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let written = {
+        let mut file = options.open(path)?;
+        file.write_all(note.as_bytes())
+            .and_then(|()| file.sync_all())
+    };
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    written
 }
 
 /// A diagnostic/temp-name component, never an owner or uniqueness guarantee.
@@ -1349,7 +1390,8 @@ impl Store {
                 #[cfg(unix)]
                 Ok(meta) => {
                     use std::os::unix::fs::MetadataExt;
-                    if meta.nlink() != 1 {
+                    // Native drafts are unlinked under the flock in `hold_fence`.
+                    if name != FENCE && meta.nlink() != 1 {
                         return Err(Error::Invalid);
                     }
                 }

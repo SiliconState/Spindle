@@ -105,6 +105,8 @@ export interface RunRequest {
   links: { path: string; target: string }[];
   directories: string[];
   read(object: string): Uint8Array;
+  /** Ends when the user stops the command: stop it and still answer, with what it
+   * printed until then (recorded as stopped). */
   signal: AbortSignal;
 }
 
@@ -146,6 +148,11 @@ export interface EmbeddedOptions {
    * slot they carry (a ChatGPT sign-in's `{account}`) is read from the key itself, a JWT;
    * headers returned as given must carry such values themselves. */
   credentials?(facts: RequestFacts): Promise<string | { key: string } | Record<string, string>> | string | { key: string } | Record<string, string>;
+  /** The values of the headers an HTTP grant adds (named `{"app": true}` in its
+   * `headers`), asked before each request a script makes under it: visible ASCII, sent
+   * only in that request and taken out of what comes back (a secret under 4 characters
+   * is refused). Throwing refuses the request (nothing is sent). */
+  grantHeaders?(asked: { grant: string; url: string; method: string; names: string[] }): Promise<Record<string, string>> | Record<string, string>;
   fetch?: typeof fetch;
   /** Runs `bash`: the app's runner and a remote one, or one runner (a remote runner
    * serves `runner: 'remote'` sessions, any other `runner: 'app'` ones). */
@@ -202,8 +209,9 @@ export declare class EmbeddedClient {
   code(dir: string, request: { method: string; input?: unknown; id?: number }, options?: { signal?: AbortSignal }): Promise<{ ok: boolean; data?: unknown; error?: string; may_have_run?: boolean }>;
   /** Connects (null: disconnects) the runner for `kind` sessions, binding its sandbox. */
   connectRunner(kind: 'app' | 'remote', runner: Runner | null): Promise<void>;
-  /** The sites scripts' `http()` may reach (a code policy's `http` grants, no headers). */
-  setHttpGrants(grants: { name: string; url: string; risk: 'read' | 'write' | 'danger'; methods?: string[]; description?: string; timeout_seconds?: number; max_response_bytes?: number }[]): void;
+  /** The sites scripts' `http()` may reach (a code policy's `http` grants). `headers`
+   * only names those the app adds (`grantHeaders` gives their values as it sends). */
+  setHttpGrants(grants: { name: string; url: string; risk: 'read' | 'write' | 'danger'; methods?: string[]; description?: string; timeout_seconds?: number; max_response_bytes?: number; headers?: Record<string, { app: true }> }[]): void;
   /** The provider catalog the sessions use, in Dext's format (no credentials). */
   catalog(): { active_provider?: string; providers: { id: string; base_url: string; request_contract?: string; default_model?: string; models?: string[] }[] } & Record<string, unknown>;
   /** The efforts `provider`'s `model` takes, `default` first; `label` says what a request on that route asks for. */

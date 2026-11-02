@@ -2,12 +2,12 @@ name: Spindle checks
 
 on:
   # Branches only: a browser-v* tag runs browser-release.yml, which builds and checks what it
-  # publishes. The website (site/, pages.yml) and the release workflow change no code.
+  # publishes. The website (site/, pages.yml, its check) and the release workflow change no code.
   push:
     branches: ["**"]
-    paths-ignore: ["site/**", ".github/workflows/pages.yml", ".github/workflows/browser-release.yml"]
+    paths-ignore: ["site/**", ".github/workflows/pages.yml", ".github/workflows/browser-release.yml", ".github/scripts/check-site.sh"]
   pull_request:
-    paths-ignore: ["site/**", ".github/workflows/pages.yml", ".github/workflows/browser-release.yml"]
+    paths-ignore: ["site/**", ".github/workflows/pages.yml", ".github/workflows/browser-release.yml", ".github/scripts/check-site.sh"]
   workflow_dispatch:
 
 permissions:

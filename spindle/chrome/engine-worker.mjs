@@ -4,12 +4,15 @@
 // panel is open. The thread index (titles, times, states) is the engine's to keep.
 import init, * as firstGlue from './web/spindle_embed.js';
 import { EmbeddedClient, remoteRunner } from './clients/embedded.mjs';
+import { refusedAnswer } from './clients/common.mjs';
+import { RemoteClient, requestId, worthRepeating } from './clients/remote.mjs';
+import { MOVE, STEP_TEXT, Waiting, hostMoves, said as sentence } from './host-moves.mjs';
 import { linuxRunner } from './linux-runner.mjs';
 import { storeRefusal } from './linux-net.mjs';
 import { openOpfsPool } from './clients/opfs.mjs';
 import { titleFrom } from './text.js';
-import { PAGE_TOOLS, uncertain } from './page-tools.mjs';
-import { CHANNEL, keysOf, read, remove, removeDurably, update, valuesOf, write, writeDurably } from './shared.mjs';
+import { ASKING_NAMES, BROWSER, PAGE_TOOLS, actionText, confirmMode, sends, uncertain } from './page-tools.mjs';
+import { CHANNEL, keysOf, read, remove, removeDurably, update, valuesOf, write, writeDurably, writeTogether } from './shared.mjs';
 import { endedText, exchange, flowOf, refreshed } from './signin.mjs';
 import * as vault from './vault.mjs';
 
@@ -83,8 +86,11 @@ function usedV86(id) {
 function warmFor(thread) {
   if (thread?.runner === 'app') linux.warm({ v86: Date.now() - (thread.v86 ?? 0) < V86_LATELY_MS });
 }
-/** The user's Spindle host, when connected (its sandbox runs `runner: remote` threads). */
-let hostState = { url: null, connected: false, error: null };
+/** The user's Spindle host, when connected (its sandbox runs `runner: remote` threads;
+ * with a browser token, `kind: 'browser'`, it also runs threads moved there). */
+let hostState = { url: null, connected: false, error: null, kind: null, client: null };
+/** The connected host's /v1 (null: none), whatever its token reaches. */
+let hostRemote = null;
 /** Host changes, one after another (a slower one never undoes a later one). */
 let hostChanges = Promise.resolve();
 /** Threads moving into a file: they take no new turn meanwhile. */
@@ -125,7 +131,9 @@ async function operate(op, args) {
   const keys = stopping ? [] : [...new Set(threadIds)];
   // A sign-in waits on the provider's token endpoint: in a lane of its own, so `hello`
   // and other settings are not held up behind it.
-  if (!keys.length && !stopping) keys.push(op === 'signIn' ? 'signin' : 'settings');
+  // An answer to a waiting page action waits behind nothing slow either.
+  // So does a connect to the user's host (it waits on the host).
+  if (!keys.length && !stopping) keys.push(op === 'signIn' ? 'signin' : op === 'approve' ? 'approve' : op === 'hostConnect' ? 'connect' : 'settings');
   const work = Promise.all(keys.map((key) => lanes.get(key))).then(() => ops[op](args));
   const settled = work.catch(() => {});
   for (const key of keys) lanes.set(key, settled);
@@ -175,7 +183,8 @@ const GUIDE_START = [
   'Scripts there can ask Spindle for calls, each journaled so a call that was cut off is never sent twice:',
   "from bash, `spindle model PROMPT` prints a model's answer, `spindle tool NAME '{\"json\": \"args\"}'` calls a tool",
   '(such as read_page or list_tabs), `spindle search` lists the tools, `spindle http URL` calls a site the user',
-  'allowed (any other is refused, naming those allowed); in Python, `import spindle` gives',
+  'allowed (any other is refused, naming those allowed; a site the user saved with a secret header, such as a token,',
+  'gets it from Spindle: never set that header or ask for its value); in Python, `import spindle` gives',
   "spindle.model(prompt)['text'], spindle.models([prompts]) (run together), spindle.tool(name, args), spindle.http(url)",
   "and spindle.batch(calls); in Node, require('spindle') or `import ... from 'spindle'` gives the same, synchronously,",
   'and `node file.ts` runs TypeScript (types are stripped, not checked).',
@@ -247,6 +256,13 @@ const EARLIER_GUIDES = [[
   'Prefer one script that loops, filters and aggregates (asking models or tools as it goes) and prints only what you',
   'need over many separate tool calls.',
 ].join(' ')];
+// Every guide as it read before it said Spindle adds a site's secret header.
+const SITES_NOW = 'allowed (any other is refused, naming those allowed; a site the user saved with a secret header, such as a token, ' +
+  'gets it from Spindle: never set that header or ask for its value); in Python';
+const SITES_BEFORE = 'allowed (any other is refused, naming those allowed); in Python';
+EARLIER_GUIDES.push(...[LINUX_GUIDE, ...EARLIER_GUIDES]
+  .filter((guide) => guide.includes(SITES_NOW))
+  .map((guide) => guide.replace(SITES_NOW, SITES_BEFORE)));
 // Every guide as it read before its network sentence named precisely what is refused.
 const NETWORK_NOW = "cookies; the user's computer and local network addresses and names are refused);";
 const NETWORK_BEFORE = "cookies; nothing on the user's computer or local network);";
@@ -311,7 +327,7 @@ function fitForChrome(fit, runner) {
   const said = [];
   for (const { setting, to } of fit.notes ?? []) {
     if (setting === 'runner' && to === 'app') said.push("its commands run in this browser's Linux");
-    if (setting === 'network' && runner === 'app') said.push("commands keep their network (websites through Chrome, or your relay if you set one; Chrome asks for access to sites when you next send)");
+    if (setting === 'network' && runner === 'app') said.push(`commands keep their network (websites through ${BROWSER}, or your relay if you set one; ${BROWSER} asks for access to sites when you next send)`);
     if (setting === 'network' && runner === 'remote') said.push('commands keep their network (on your Spindle host)');
     if (setting === 'toolchain') said.push('the Rust toolchain off');
     if (setting === 'sources') said.push('host folders unmounted');
@@ -374,10 +390,13 @@ function newId() {
 
 function makeClient(saved) {
   const made = new EmbeddedClient({
-    wasm, storage: 'opfs', pool: openPool, catalog: saved, credentials, fetch: reach, runner: { app: linux },
+    wasm, storage: 'opfs', pool: openPool, catalog: saved, credentials, grantHeaders, fetch: reach, runner: { app: linux },
   });
   for (const tool of PAGE_TOOLS) {
-    made.tool({ ...tool, timeoutS: 30, run: (input, call) => pageTool(tool.name, opened(tool.name, input, call?.session), call?.session) });
+    // An action the user is asked about first may wait for them (APPROVAL_WAIT) before
+    // its own 30 s; the engine's own wait (PAGE_TOOL_WAIT) still bounds Chrome's silence.
+    const timeoutS = ASKING_NAMES.has(tool.name) ? 30 + APPROVAL_WAIT / 1000 : 30;
+    made.tool({ ...tool, timeoutS, run: (input, call) => actOnPage(tool.name, opened(tool.name, input, call?.session), call?.session) });
   }
   made.on('event', (event, dir) => {
     const id = idOf(dir);
@@ -455,7 +474,7 @@ async function newClient() {
   catalog = client.catalog();
   await client.ready;
   try {
-    client.setHttpGrants((await read('kv', 'sites')) ?? []);
+    client.setHttpGrants(grantsFor(await sitesKept()));
   } catch (error) {
     console.error('Spindle: the sites scripts may reach are not in use:', error);
   }
@@ -492,28 +511,67 @@ async function connectKeptHost() {
     await disconnectHost(host.url, 'its token is gone (the keys were reset): connect it again');
     return;
   }
-  hostState = { url: host.url, connected: false, error: null };
-  await changeHost({ url: host.url, token });
+  hostState = { url: host.url, connected: false, error: null, kind: null, client: host.client ?? null };
+  await changeHost({ url: host.url, token, client: host.client ?? null });
 }
 
 /** The remote runner let go, the host's URL kept and `why` told. */
 function disconnectHost(url, why) {
   return changeHost(null).finally(() => {
-    hostState = { url, connected: false, error: why };
+    hostState = { url, connected: false, error: why, kind: null, client: null };
     send({ type: 'host', host: hostState });
   });
 }
 
-/** Connects the user's Spindle host (`{url, token}`; null disconnects) as the remote
- * runner, after any change asked before it. A host that does not answer leaves the one
- * connected before as it was. Panels hear of the outcome. */
+/** What a host token reaches: 'runner' (commands only), 'browser' (the runner, the
+ * host's models and the threads it brings there) or 'full' (an API token's whole v1).
+ * A host that does not answer is refused, as before. */
+async function tokenKind(host) {
+  try {
+    await host.models();
+  } catch (error) {
+    if (error.status === 0) throw error;
+    return 'runner';
+  }
+  try {
+    await host.request('GET', '/v1/usage');
+    return 'full';
+  } catch (error) {
+    if (error.status === 0) throw error;
+    return error.status === 403 ? 'browser' : 'full';
+  }
+}
+
+/** Connects the user's Spindle host (`{url, token, client}`; null disconnects) as the
+ * remote runner and, for a browser token, for threads that run there, after any change
+ * asked before it. A host that does not answer leaves the one connected before as it
+ * was. Panels hear of the outcome. */
 function changeHost(host) {
   const change = hostChanges.then(async () => {
     try {
+      const reached = host ? new RemoteClient({ url: host.url, token: host.token, fetch: reach }) : null;
+      const kind = reached ? await tokenKind(reached) : null;
       const runner = host ? remoteRunner({ url: host.url, token: host.token, fetch: reach }) : null;
-      await client.connectRunner('remote', runner);
-      remote = runner;
-      hostState = { url: host?.url ?? null, connected: Boolean(host), error: null };
+      let sandbox = null;
+      try {
+        await client.connectRunner('remote', runner);
+        remote = runner;
+      } catch (error) {
+        // A host without a sandbox for commands still runs the threads moved there.
+        if (kind !== 'browser') throw error;
+        await client.connectRunner('remote', null).catch(() => {});
+        remote = null;
+        sandbox = `its sandbox does not run this browser's commands (${error.message ?? error})`;
+      }
+      if (hostRemote && (hostRemote.base !== reached?.base || hostRemote.token !== reached?.token)) {
+        for (const [id, entry] of followed) {
+          entry.controller.abort();
+          cancelPageTools(id);
+          followed.delete(id);
+        }
+      }
+      hostRemote = reached;
+      hostState = { url: host?.url ?? null, connected: Boolean(host), error: sandbox, kind, client: host?.client ?? null };
     } catch (error) {
       hostState = { ...hostState, error: `${host.url}: ${error.message ?? error}` };
       throw error;
@@ -522,6 +580,8 @@ function changeHost(host) {
     }
   });
   hostChanges = change.catch(() => {});
+  // Threads on the host, and moves waiting for it, go on once it answers.
+  change.then(() => hostedAwake(), () => {});
   return change;
 }
 
@@ -570,6 +630,154 @@ function originOf(url) {
   }
 }
 
+/** The sites scripts may call, each with the names of its secret headers (`secret`). */
+async function sitesKept() {
+  const [sites, secrets] = await Promise.all([read('kv', 'sites'), read('kv', 'site-secrets')]);
+  return withSecrets(sites ?? [], secrets ?? {});
+}
+
+/** `sites` (kv/sites: grants as the package takes them, so a build from before secret
+ * headers still reads them) with each one's secret header names as `secret`
+ * (kv/site-secrets: by site name, `{url, names}`; only for the address they were saved
+ * for, so a name an earlier build gave another address since never carries them). */
+function withSecrets(sites, secrets) {
+  return sites.map((grant) => {
+    const kept = secrets[grant.name];
+    return kept?.url === grant.url && kept.names?.length ? { ...grant, secret: kept.names } : grant;
+  });
+}
+
+/** Sites (with `secret`) as the package takes them: a site's secret headers are named as
+ * ones the app adds. */
+function grantsFor(sites) {
+  return sites.map(({ secret, ...grant }) => (secret?.length
+    ? { ...grant, headers: Object.fromEntries(secret.map((name) => [name, { app: true }])) }
+    : grant));
+}
+
+/** Whether `url` is under the site address `prefix`, as the package matches them: the
+ * same origin, and the path under the prefix on a segment boundary. */
+function underPrefix(prefix, url) {
+  try {
+    const site = new URL(prefix);
+    const asked = new URL(url);
+    const path = site.pathname;
+    return site.origin === asked.origin
+      && (path.endsWith('/') ? asked.pathname.startsWith(path) : asked.pathname === path || asked.pathname.startsWith(`${path}/`));
+  } catch {
+    return false;
+  }
+}
+
+/** The secret headers of the site a script's request goes to (its grant, `grant`), from
+ * the vault: only to the address they were saved for. Throwing refuses the request
+ * (nothing is sent); the client takes every echo of them out of what comes back. */
+async function grantHeaders({ grant, url }) {
+  const site = (await sitesKept()).find((known) => known.name === grant);
+  const where = site ? new URL(site.url).host : grant;
+  if (!site?.secret?.length) throw new Error(`${where} no longer has a secret header in Settings, Sites scripts may call`);
+  const held = await vault.siteSecret(grant);
+  if (!held) throw new Error(`the secret header saved for ${where} is gone (Spindle's keys were reset): add the site again with it in Settings`);
+  if (held.url !== site.url || !underPrefix(site.url, url)) {
+    throw new Error(`the secret header saved for ${where} is for another address: add the site again with it in Settings`);
+  }
+  return held.headers;
+}
+
+/** Header names a site's secret may not take: those Spindle sets, and those Chrome drops
+ * from a script's request without a word. */
+const UNSENDABLE = new Set([
+  'host', 'content-length', 'transfer-encoding', 'connection', 'upgrade', 'te', 'trailer', 'keep-alive', 'expect',
+  'accept-charset', 'accept-encoding', 'access-control-request-headers', 'access-control-request-method',
+  'access-control-request-private-network', 'cookie', 'cookie2', 'date', 'dnt', 'origin', 'referer', 'set-cookie', 'via',
+]);
+/** The fewest characters of a secret Spindle keeps out of what scripts see. */
+const SECRET_MIN = 8;
+
+/** A secret header as Settings gives it (`{name, value}`), checked: a name a request can
+ * carry, and a value of visible ASCII (the bytes sent are its own) whose secret part
+ * (after an auth scheme such as `Bearer`) is long enough to find in what comes back. */
+function secretHeader(header) {
+  const name = String(header?.name ?? '').trim();
+  const value = String(header?.value ?? '').trim();
+  const lower = name.toLowerCase();
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/.test(name)) {
+    throw failure('invalid', 'A header name is letters, digits and dashes, such as Authorization or X-Api-Key.');
+  }
+  if (UNSENDABLE.has(lower) || lower.startsWith('proxy-') || lower.startsWith('sec-')) {
+    throw failure('invalid', `${name} is set by ${BROWSER} or Spindle, not by a site's secret: use the header the site's API asks for, such as Authorization.`);
+  }
+  if (!/^[\t\x20-\x7e]{1,8192}$/.test(value)) {
+    throw failure('invalid', "A secret header's value is the text the site gave you (letters, digits, symbols and spaces), at most 8 KiB.");
+  }
+  const secret = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]+(\S[\s\S]*)$/.exec(value)?.[1] ?? value;
+  if (secret.length < SECRET_MIN) {
+    throw failure('invalid', `That secret is too short to keep out of what scripts see: ${SECRET_MIN} characters at least.`);
+  }
+  return { name, value };
+}
+
+/** Changes to the sites scripts may call, one after another (two panels at once lose
+ * neither's change, nor a secret header). */
+let siteChanges = Promise.resolve();
+
+/** Adds a site scripts may call (an address already listed is updated: its access, and
+ * its secret header when one is given, else the one it has is kept), or removes one
+ * (`name`) with its secret header. */
+async function changeSites(add, name) {
+  const now = await sitesKept();
+  let next = now.filter((grant) => grant.name !== name);
+  const gone = now.find((grant) => grant.name === name);
+  let named = null;
+  let sealed = null;
+  if (add) {
+    const url = new URL(add.url);
+    const header = add.header ? secretHeader(add.header) : null;
+    const same = now.find((grant) => grant.url === url.href);
+    named = same?.name;
+    if (!named) {
+      // A grant's name: its host, told apart when two share one.
+      const host = url.hostname.replace(/[^A-Za-z0-9.-]/g, '-').slice(0, 56) || 'site';
+      named = host;
+      for (let n = 2; now.some((grant) => grant.name === named); n += 1) named = `${host}-${n}`;
+    }
+    const secret = header ? [header.name] : same?.secret;
+    const entry = {
+      name: named, url: url.href, risk: add.write ? 'write' : 'read',
+      methods: add.write ? ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'] : ['GET', 'HEAD'],
+      ...(secret?.length && { secret }),
+    };
+    next = same ? now.map((grant) => (grant === same ? entry : grant)) : [...now, entry];
+    if (header) {
+      // Over plain HTTP anyone on the network could read it: this computer's own
+      // addresses aside, a secret goes only over HTTPS.
+      const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) || url.hostname.endsWith('.localhost');
+      if (url.protocol !== 'https:' && !loopback) {
+        throw failure('invalid', `A secret header goes only to an https:// address (or this computer's own), so no one on the network can read it: use https://${url.host}${url.pathname}`);
+      }
+      // Kept sealed, so not while the keys are locked.
+      if (!(await vault.usableNow())) throw failure('locked', "Spindle's keys are locked: unlock them in Settings, Providers, then add the site's secret header");
+      sealed = { url: url.href, headers: { [header.name]: header.value } };
+    }
+  }
+  // The package checks the grants first (and refuses ones that are not valid) before
+  // they are kept; the list and a secret header go in one transaction.
+  client.setHttpGrants(grantsFor(next));
+  try {
+    const secrets = Object.fromEntries(next.filter((grant) => grant.secret?.length)
+      .map((grant) => [grant.name, { url: grant.url, names: grant.secret }]));
+    const kept = [['kv', 'sites', next.map(({ secret, ...grant }) => grant)], ['kv', 'site-secrets', secrets]];
+    if (sealed) await vault.keepSite(named, sealed, kept);
+    else if (gone) await vault.forgetSite(gone.name, kept);
+    else await writeTogether(kept);
+  } catch (error) {
+    client.setHttpGrants(grantsFor(now));
+    throw error;
+  }
+  send({ type: 'sites', sites: next });
+  if (sealed || gone?.secret) announceVault();
+}
+
 /** fetch, saying what to do when Chrome refuses a provider the extension may not reach. */
 async function reach(url, init) {
   try {
@@ -603,13 +811,20 @@ function opened(name, input, session) {
   return { ...input, url: view.href, new_tab: true };
 }
 
+const pageEpochs = new Map();
+const pageEpoch = (session) => pageEpochs.get(idOf(session?.split('#')[0] ?? '')) ?? 0;
+function pageStopped(session) {
+  const id = idOf(session?.split('#')[0] ?? '');
+  return running.get(id)?.stopped || hostedTurns.get(id)?.stopped;
+}
+
 function pageTool(name, input, session) {
-  if (running.get(idOf(session?.split('#')[0] ?? ''))?.stopped) return Promise.resolve({ error: 'the turn was stopped' });
+  if (pageStopped(session)) return Promise.resolve({ error: 'the turn was stopped' });
   const call = crypto.randomUUID();
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       self.postMessage({ type: 'page_tool_cancel', call });
-      answerTool(call, uncertain(name, 'Chrome did not answer the page tool in time'));
+      answerTool(call, uncertain(name, `${BROWSER} did not answer the page tool in time`));
     }, PAGE_TOOL_WAIT);
     toolCalls.set(call, Object.assign((answer) => {
       clearTimeout(timer);
@@ -619,7 +834,71 @@ function pageTool(name, input, session) {
   });
 }
 
+/** How long a page action the user is asked about waits for their answer. */
+const APPROVAL_WAIT = 10 * 60_000;
+/** Page actions waiting for the user's answer (Settings, Pages, Before acting): id ->
+ * `{id, thread, tool, text, at, answer}`; `answer(refusal)` settles one (null: go ahead). */
+const approvals = new Map();
+
+/** The waiting actions as panels show them. */
+function approvalsShown() {
+  return [...approvals.values()].map(({ answer, ...shown }) => shown);
+}
+
+function announceApprovals() {
+  send({ type: 'approvals', approvals: approvalsShown() });
+}
+
+/** A page tool for a thread: at once under Full (the default); under Auto or Ask once the
+ * user allows it when it is one they asked to be asked about. A refusal is a known
+ * outcome: nothing was done. */
+async function actOnPage(name, input, session) {
+  const epoch = pageEpoch(session);
+  const refusal = await beforeActing(name, input, session);
+  if (epoch !== pageEpoch(session) || pageStopped(session)) return { error: 'the turn ended or was stopped before the page tool started' };
+  return refusal ? { error: refusal } : pageTool(name, input, session);
+}
+
+/** Null when `name` with `input` may go ahead now; else, once the user answers (or does
+ * not, or the turn stops), null to go ahead or why it was not done. */
+async function beforeActing(name, input, session) {
+  const epoch = pageEpoch(session);
+  if (pageStopped(session)) return 'the turn was stopped, so it was not done';
+  if (!ASKING_NAMES.has(name)) return null;
+  // Opening a file of the thread's workspace for the user changes no page.
+  if (name === 'navigate' && typeof input?.url === 'string' && input.url.startsWith(new URL('view.html?', self.location.href).href)) return null;
+  const mode = confirmMode(await read('kv', 'pages').catch(() => null));
+  if (epoch !== pageEpoch(session) || pageStopped(session)) return 'the turn ended or was stopped, so it was not done';
+  if (mode === 'full') return null;
+  let target = null;
+  if (input?.ref && (name === 'click' || name === 'type' || name === 'select')) {
+    const found = await pageTool('target', { ref: input.ref, ...(input.tab != null && { tab: input.tab }) }, session);
+    target = found?.details ?? null;
+  }
+  if (mode === 'auto' && !sends(name, input, target)) return null;
+  const thread = idOf(session?.split('#')[0] ?? '');
+  if (epoch !== pageEpoch(session) || pageStopped(session)) return 'the turn ended or was stopped, so it was not done';
+  return new Promise((resolve) => {
+    const id = crypto.randomUUID();
+    const settle = (refusal) => {
+      if (!approvals.has(id)) return;
+      clearTimeout(timer);
+      approvals.delete(id);
+      announceApprovals();
+      resolve(refusal);
+    };
+    const timer = setTimeout(() => settle(`the user did not answer within ${APPROVAL_WAIT / 60_000} minutes (Settings, Pages, Before acting asks first), so it was not done`), APPROVAL_WAIT);
+    approvals.set(id, { id, thread, tool: name, text: actionText(name, input, target), at: Date.now(), answer: settle });
+    announceApprovals();
+  });
+}
+
 function cancelPageTools(id) {
+  pageEpochs.set(id, (pageEpochs.get(id) ?? 0) + 1);
+  // An action still waiting for the user's answer is not done.
+  for (const approval of [...approvals.values()]) {
+    if (approval.thread === id) approval.answer('the turn ended before the user answered, so it was not done');
+  }
   for (const [call, answer] of toolCalls) {
     if (idOf(answer.session?.split('#')[0] ?? '') !== id) continue;
     self.postMessage({ type: 'page_tool_cancel', call });
@@ -824,10 +1103,12 @@ async function sendQueued(id) {
     if (status.activity === 'blocked') {
       throw failure('blocked', status.wake?.why ?? 'the thread needs you to look at it first');
     }
-    // A turn that did not finish (stopped, say) takes no new message until it is retried,
-    // continued or taken back.
+    // A turn that did not finish (stopped, say) takes no new turn until it is retried,
+    // continued or taken back; one stopped part way takes the text alone, not the files.
     if (status.accepts_prompt === false) {
-      throw failure('busy', `the last turn did not finish${status.stop_text ? ` (${status.stop_text})` : ''}: retry, continue or take it back first`);
+      throw failure('busy', status.accepts_message
+        ? 'the last turn was stopped part way and takes a message without files: send the text alone, or Continue, Retry or Take back first'
+        : `the last turn did not finish${status.stop_text ? ` (${status.stop_text})` : ''}: retry, continue or take it back first`);
     }
     const { files, note } = attachments(waiting.files);
     turn(id, async (check) => {
@@ -846,6 +1127,22 @@ async function sendQueued(id) {
   }
 }
 
+/** Whether the thread's turn was stopped between its steps (a stop recorded the call it
+ * cut off) in a step its first request made: no point before that request to ask again
+ * from (the store's Retry says so), so Retry starts the turn over. */
+async function firstStepStopped(id) {
+  return within(id, async () => {
+    const dir = dirOf(id);
+    const status = await client.status(dir);
+    if (status.accepts_prompt || !status.accepts_message || status.phase === 'model_wait') return false;
+    if ((await client.targets(dir)).some((target) => target.kind === 'settled')) return false;
+    const messages = (await client.history(dir)).messages ?? [];
+    const replies = messages.filter((message) => message.role === 'assistant');
+    const calling = replies.filter((message) => message.content?.some((block) => block.type === 'tool_use'));
+    return replies.length > 0 && calling.at(-1) === replies[0];
+  });
+}
+
 function notRunning(id, doing) {
   if (running.has(id)) throw failure('busy', `stop this thread before ${doing} it`);
 }
@@ -856,6 +1153,11 @@ async function workable(id) {
   if (!thread) throw failure('not_found', 'there is no such thread');
   if (thread.state === 'moved') throw failure('moved', 'this thread moved into a bundle file; import the file to go on with it');
   if (moving.has(id)) throw failure('busy', 'this thread is moving into a file');
+  // Moving to or from the user's host: it takes no work until the move ends (but for
+  // its last step, once it is live here again).
+  if (thread.moving && thread.moving.step !== 'release') {
+    throw failure('busy', `${STEP_TEXT[thread.moving.step] ?? 'It is moving'}; it takes no work until that is done`);
+  }
   return thread;
 }
 
@@ -949,7 +1251,8 @@ async function snapshot() {
     free: pool?.free ?? null,
     linux: linuxState,
     host: hostState,
-    sites: (await read('kv', 'sites')) ?? [],
+    sites: await sitesKept(),
+    approvals: approvalsShown(),
     standing: (await read('kv', 'standing')) ?? '',
     relay: (await read('kv', 'relay')) ?? null,
     vault: await vaultState(),
@@ -959,7 +1262,7 @@ async function snapshot() {
 /** The vault as panels see it; one that cannot be read still lets Settings open. */
 function vaultState() {
   return vault.state().catch((error) => ({
-    mode: 'device', locked: false, kinds: {}, accounts: {}, ended: {}, error: String(error?.message ?? error),
+    mode: 'device', locked: false, kinds: {}, accounts: {}, ended: {}, sites: [], error: String(error?.message ?? error),
   }));
 }
 
@@ -1071,6 +1374,32 @@ async function workspaceOf(id) {
 /** The most a thread's files may come to, to start another thread with. */
 const MAX_CARRIED = 256 * 1024 * 1024;
 
+/** An imported session (`status`, as the import answered) made a thread of this browser:
+ * it gets Chrome's page tools, and whatever a native host's settings need to run in
+ * Chrome. The thread is in either way; what could not change, it says. Resolves with
+ * `{note, said, runner, network, tasks}`. */
+async function fitHere(dir, status) {
+  try {
+    const settings = await client.settings(dir);
+    const told = status.fit ?? await client.fit(dir);
+    const after = told.changes?.runner ?? settings.runner;
+    const fit = fitForChrome(told, after);
+    const tools = [...(settings.tools ?? []).filter((tool) => !PAGE_NAMES.has(tool.name)), ...client.tools.definitions()];
+    const files = (fit.changes.builtin_tools ?? settings.builtin_tools) === 'files';
+    const instructions = guided(settings.instructions, after === 'app' && files, (await read('kv', 'standing')) ?? '');
+    const fitted = await client.settings(dir, { ...fit.changes, tools, instructions });
+    return {
+      note: fit.said.length ? `Changed to run in ${BROWSER}: ${fit.said.join('; ')}.` : null,
+      said: fit.said, runner: fitted.runner ?? 'none', network: Boolean(fitted.network), tasks: Boolean(fitted.tasks),
+    };
+  } catch (error) {
+    return {
+      note: `Its settings could not be changed for ${BROWSER}: ${error.message}`,
+      said: [`none could be made (${error.message}), so it may not run as it should`], runner: 'none', network: false, tasks: false,
+    };
+  }
+}
+
 const ops = {
   hello: () => snapshot(),
 
@@ -1128,6 +1457,14 @@ const ops = {
       announceQueued(id);
       return { queued: true };
     }
+    // A turn stopped part way goes on with the message (the model reads the stopped step,
+    // then it), which takes text only: files are refused here, so the draft stays.
+    if (given?.length) {
+      const status = await within(id, () => client.status(dirOf(id)));
+      if (!status.accepts_prompt && status.accepts_message) {
+        throw failure('busy', 'This turn was stopped part way and takes a message without files: send the text alone (or Continue it), then the files with your next message.');
+      }
+    }
     const { files, note } = attachments(given);
     turn(id, async (check) => {
       await freshen(dirOf(id));
@@ -1155,6 +1492,9 @@ const ops = {
 
   async retry({ id }) {
     await workable(id);
+    // A step stopped in the thread's first request has nothing before it to ask again
+    // from: the turn starts over instead (taken back, its message sent again).
+    if (await firstStepStopped(id)) return ops.restart({ id });
     turn(id, () => client.retry(dirOf(id)));
     return { started: true };
   },
@@ -1434,7 +1774,7 @@ const ops = {
     const known = new Map((await threads()).map((thread) => [thread.id, thread]));
     const usage = new Map();
     const entry = (id) => {
-      if (!usage.has(id)) usage.set(id, { id, bytes: 0, database: 0, log: 0, tasks: 0, aside: 0, other: 0, free: 0, sealed: 0, bundle: 0 });
+      if (!usage.has(id)) usage.set(id, { id, bytes: 0, database: 0, log: 0, tasks: 0, aside: 0, other: 0, free: 0, sealed: 0, bundle: 0, held: 0, move: null, hosted: false });
       return usage.get(id);
     };
     for (const { path, size } of fs.files()) {
@@ -1453,6 +1793,12 @@ const ops = {
     }
     for (const thread of known.values()) {
       if (thread.state === 'moved') entry(thread.id).bundle = await bundleSize(thread.id);
+      if (thread.home) entry(thread.id).hosted = true;
+    }
+    // A move to or from the user's host holds the thread's bytes here until it is done.
+    for (const move of await moves.list()) {
+      if (!known.has(move.id)) continue;
+      Object.assign(entry(move.id), { held: move.size, move: { way: move.way, step: move.step, error: move.error } });
     }
     return { threads: [...usage.values()] };
   },
@@ -1533,31 +1879,7 @@ const ops = {
       await discard(id).catch(() => {});
       throw error;
     }
-    // Here it gets Chrome's page tools, and whatever a native host's settings need to
-    // run in Chrome. The thread is in either way; what could not change, it says.
-    let note = null;
-    let said = [];
-    let runner = 'none';
-    let network = false;
-    let tasks = false;
-    try {
-      const settings = await client.settings(dir);
-      const told = status.fit ?? await client.fit(dir);
-      const after = told.changes?.runner ?? settings.runner;
-      const fit = fitForChrome(told, after);
-      const tools = [...(settings.tools ?? []).filter((tool) => !PAGE_NAMES.has(tool.name)), ...client.tools.definitions()];
-      const files = (fit.changes.builtin_tools ?? settings.builtin_tools) === 'files';
-      const instructions = guided(settings.instructions, after === 'app' && files, (await read('kv', 'standing')) ?? '');
-      const fitted = await client.settings(dir, { ...fit.changes, tools, instructions });
-      runner = fitted.runner ?? 'none';
-      network = Boolean(fitted.network);
-      tasks = Boolean(fitted.tasks);
-      said = fit.said;
-      if (said.length) note = `Changed to run in Chrome: ${said.join('; ')}.`;
-    } catch (error) {
-      note = `Its settings could not be changed for Chrome: ${error.message}`;
-      said = [`none could be made (${error.message}), so it may not run as it should`];
-    }
+    const { note, said, runner, network, tasks } = await fitHere(dir, status);
     rest(id);
     const first = history.messages
       .find((message) => message.role === 'user' && message.content?.some((block) => block.type === 'text' && block.text.trim()))
@@ -1651,26 +1973,22 @@ const ops = {
     return snapshot();
   },
 
-  /** Adds (`{url, write}`) or removes (`{remove: name}`) a site scripts' `http()` may
-   * reach, against the list as kept (other panels may have changed it): the package
-   * checks the grants (and refuses ones that are not valid) before they are kept. */
+  /** The user's answer to a page action waiting for it (`approval`: its id; `allow`: go
+   * ahead). Not `id`, which names a thread to every operation. */
+  approve({ approval: id, allow }) {
+    const approval = approvals.get(String(id));
+    if (!approval) throw failure('not_found', 'that action is no longer waiting (it was answered, or its turn ended)');
+    approval.answer(allow ? null : 'the user said no (Settings, Pages, Before acting asks first), so it was not done');
+    return { approvals: approvalsShown() };
+  },
+
+  /** Adds (`{url, write, header?: {name, value}}`: a listed address is updated) or
+   * removes (`{remove: name}`) a site scripts' `http()` may reach, against the list as
+   * kept (other panels may have changed it); see changeSites. */
   async sites({ add, remove: name }) {
-    const now = (await read('kv', 'sites')) ?? [];
-    let next = now.filter((grant) => grant.name !== name);
-    if (add) {
-      const url = new URL(add.url);
-      // A grant's name: its host, told apart when two share one.
-      const host = url.hostname.replace(/[^A-Za-z0-9.-]/g, '-').slice(0, 56) || 'site';
-      let named = host;
-      for (let n = 2; now.some((grant) => grant.name === named); n += 1) named = `${host}-${n}`;
-      next = [...now, {
-        name: named, url: url.href, risk: add.write ? 'write' : 'read',
-        methods: add.write ? ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'] : ['GET', 'HEAD'],
-      }];
-    }
-    client.setHttpGrants(next);
-    await write('kv', 'sites', next);
-    send({ type: 'sites', sites: next });
+    const change = siteChanges.then(() => changeSites(add, name));
+    siteChanges = change.catch(() => {});
+    await change;
     return snapshot();
   },
 
@@ -1726,8 +2044,9 @@ const ops = {
     return snapshot();
   },
 
-  /** A forgotten passphrase: every saved key and sign-in goes (the host's token too);
-   * threads stay. */
+  /** A forgotten passphrase: every saved key and sign-in goes (the host's token and
+   * sites' secret headers too; such a site's requests are refused until it is added
+   * again with one); threads stay. */
   async resetVault() {
     await vault.reset();
     await connectKeptHost().catch(() => {});
@@ -1807,6 +2126,1044 @@ const ops = {
   },
 };
 
+// ---- Threads on the user's Spindle host -------------------------------------------
+// A thread moved to the host (its record's `home`: {url, session}) runs there: its model
+// on the host's credentials, its commands in the host's sandbox. The panel drives it with
+// the operations it drives a thread here with; they go to the host's /v1 (RemoteClient).
+// Its events come over the session's event stream (the same JSON forms the package's
+// are) while it runs or a panel has it open, and the page tools it calls are answered
+// here, by the code that answers them for a thread here, while the extension runs.
+// Moving it there and back is host-moves.mjs's (durable, resumed at every start).
+
+/** The connected host's client for a thread on the host at `url` (null: whichever is
+ * connected), when it is connected with a browser token; otherwise it says what to do. */
+function hostedClient(url = null) {
+  const away = (why) => Object.assign(new Error(why), { status: 0, kind: 'host' });
+  if (!hostState.connected || !hostRemote) {
+    throw away(url ? `your host at ${url} is not connected (Settings, Your Spindle host)` : 'no Spindle host is connected: connect one in Settings, Your Spindle host');
+  }
+  if (url && hostState.url !== url) throw away(`this thread is on the host at ${url}, but ${hostState.url} is connected: connect that host again in Settings`);
+  if (hostState.kind !== 'browser') throw away('your host is connected with a runner token, which only runs commands: press Connect in Settings, Your Spindle host');
+  return hostRemote;
+}
+
+/** A host's refusal as the panel says it (`kind` its code). */
+function hostFailure(error) {
+  return error?.kind && typeof error.status === 'number' ? failure(error.kind, sentence(error)) : error;
+}
+
+/** Tests stop a move at one of its steps (`kv/cut-move` names it) as if the engine died
+ * there: nothing after it runs until the engine starts again. */
+async function cutHere(step) {
+  if ((await read('kv', 'cut-move').catch(() => null)) !== step) return;
+  await removeDurably('kv', 'cut-move');
+  send({ type: 'cut', at: step });
+  await new Promise(() => {});
+}
+
+const moves = hostMoves({
+  read,
+  keysOf,
+  update,
+  remote: (url) => hostedClient(url),
+  local: {
+    /** The thread's copy for the host: its page tools kept (the host asks this browser
+     * for them while it is open) and the browser Linux's guide left out; the host's own
+     * fit does the rest (its sandbox, every tool). */
+    copy: (id) => within(id, async () => {
+      const dir = dirOf(id);
+      const status = await client.status(dir);
+      if (status.background) throw failure('busy', 'a task of this thread works in the background: wait for it (or stop it), then move the thread');
+      const settings = await client.settings(dir);
+      return client.exportSession(dir, { keep: true, settings: { tools: settings.tools ?? [], instructions: guided(settings.instructions, false) } });
+    }),
+    facts: (bytes) => client.checkBundle(bytes),
+    sealed: async (id) => {
+      const fs = await openPool();
+      const fence = `${dirOf(id)}/store/authority.sqlite.lock`;
+      return fs.existsSync(fence) && String(fs.readFileSync(fence)).startsWith('spindle-moved: ');
+    },
+    seal: (id) => within(id, async () => {
+      await client.exportSession(dirOf(id), { keep: false });
+    }),
+    dropSealed: async (id) => {
+      await client.closeSession(dirOf(id)).catch(() => {});
+      dropSealed(await openPool(), id);
+    },
+    clear: (id) => discard(id),
+    restore: async (id, bytes) => {
+      await headroom();
+      const dir = dirOf(id);
+      let status;
+      try {
+        status = await client.importSession(dir, bytes);
+      } catch (error) {
+        await discard(id).catch(() => {});
+        throw error;
+      }
+      const fitted = await fitHere(dir, status);
+      rest(id);
+      return {
+        fields: { provider: status.provider, model: status.model, effort: effortOf(status), runner: fitted.runner, network: fitted.network, tasks: fitted.tasks, summaries: true },
+        said: fitted.said,
+      };
+    },
+  },
+  changed: (thread) => send({ type: 'thread', thread }),
+  cut: cutHere,
+});
+
+/** A move started here goes on by itself; one that waits for the host is taken up again
+ * soon (and whenever the host connects). */
+function watchMove(done) {
+  done.then(() => hostedTick(), (error) => {
+    if (!(error instanceof Waiting)) console.warn('Spindle: a move to or from your host stopped:', error);
+    hostedTick();
+  });
+}
+
+/** Hosted threads' turns this engine started: id -> {request, kind}. */
+const hostedTurns = new Map();
+const admittingHosted = new Map();
+const hostedCommandKey = (id) => `host-command:${id}`;
+const hostedStopKey = (id) => `host-stop:${id}`;
+const stoppingHosted = new Map();
+
+function sendHostedStop(id) {
+  if (stoppingHosted.has(id)) return stoppingHosted.get(id);
+  const next = (async () => {
+    const stop = await read('kv', hostedStopKey(id));
+    if (!stop) return;
+    const remote = hostedClient(stop.url);
+    const info = await remote.info();
+    if (!(info.features ?? []).includes('targeted_stop')) throw failure('host', 'update your Spindle host to deliver this saved Stop safely');
+    const mine = hostedTurns.get(id);
+    if (mine?.request === stop.target) mine.stopped = true;
+    try {
+      await settledCommand(remote, 'stop', { session: stop.session, target_request: stop.target }, { requestId: stop.request, attempts: 1 });
+    } catch (error) {
+      if (error?.kind !== 'not_running' && error?.status !== 404) throw error;
+    }
+    if ((await read('kv', hostedStopKey(id)))?.request === stop.request) await removeDurably('kv', hostedStopKey(id));
+  })();
+  stoppingHosted.set(id, next);
+  next.finally(() => { if (stoppingHosted.get(id) === next) stoppingHosted.delete(id); }).catch(() => {});
+  return next;
+}
+
+async function forgetHostedCommand(id, request) {
+  if ((await read('kv', hostedCommandKey(id)))?.request === request) {
+    await removeDurably('kv', hostedCommandKey(id));
+  }
+}
+
+function admitHosted(id, command) {
+  if (admittingHosted.has(id)) return admittingHosted.get(id);
+  const next = (async () => {
+    const thread = await read('threads', id);
+    if (!thread?.home) return;
+    const before = hostedTurns.get(id);
+    const stop = await read('kv', hostedStopKey(id));
+    hostedTurns.set(id, Object.assign(before ?? {}, { request: command.request, kind: command.kind, ...(stop?.target === command.request && { stopped: true }) }));
+    const receipt = await hostedClient(thread.home.url).command(command.kind, command.fields, { requestId: command.request, attempts: 1 });
+    await forgetHostedCommand(id, command.request);
+    if (stop) await sendHostedStop(id).catch((error) => { away(id, `a saved Stop waits for your host (${sentence(error)})`).catch(() => {}); hostedTick(1000); });
+    if (receipt.state !== 'running') await endHosted(id, receipt);
+  })();
+  admittingHosted.set(id, next);
+  next.finally(() => { if (admittingHosted.get(id) === next) admittingHosted.delete(id); }).catch(() => {});
+  return next;
+}
+
+/** Hosted threads' event streams followed now: id -> {controller, answered, opened}. */
+const followed = new Map();
+/** When a panel last opened each hosted thread: it is followed for a while after. */
+const lookedAt = new Map();
+const LOOK_MS = 5 * 60_000;
+/** Why each hosted thread cannot be reached now (said on it), as last written. */
+const awayNow = new Map();
+
+/** Says (or, `why` null, stops saying) that a hosted thread's host cannot be reached;
+ * nothing of the thread is lost meanwhile. Its place in the list stays. */
+async function away(id, why) {
+  if ((awayNow.get(id) ?? null) === why) return;
+  awayNow.set(id, why);
+  const next = await update('threads', id, (thread) => ({ ...thread, away: why }));
+  if (next) send({ type: 'thread', thread: next });
+}
+
+/** A host list state as this browser's thread states say it: [state, note]; null for a
+ * thread moving back here (its move says how it stands). */
+function listed(state) {
+  if (state === 'running' || state === 'stopping') return ['running', null];
+  if (state === 'empty' || state === 'done') return ['idle', null];
+  if (state === 'stopped') return ['stopped', 'It stopped part way on your host'];
+  if (state === 'reply_saved') return ['interrupted', 'Its reply was saved on your host: Continue goes on from it'];
+  if (state === 'needs_attention') return ['interrupted', 'It stopped part way on your host'];
+  if (state === 'moved') return null;
+  return ['failed', `your host cannot read this thread (${state})`];
+}
+
+/** The session object as the panel reads a thread's status. */
+function statusOf(object) {
+  const settings = object.settings ?? {};
+  return { ...object, provider: settings.provider, model: settings.model, effort: settings.effort ?? 'default', unresolved: 0, background: null };
+}
+
+/**
+ * Follows hosted thread `id`'s events (the poll lets go of one that no longer runs and
+ * that no panel has open): each goes to the panels as a thread's here does, a turn's
+ * `command_done` ends it, and the page tools it asks for are answered. `quiet`: the
+ * panel already holds what the stream's first snapshot says (a turn started here), so it
+ * is not told to draw the thread again; after a gap it is.
+ */
+function follow(id, quiet = false) {
+  const known = followed.get(id);
+  if (known) return known;
+  const entry = { controller: new AbortController(), answered: new Set(), quiet, seen: false };
+  entry.opened = new Promise((resolve) => {
+    entry.open = resolve;
+    setTimeout(resolve, 5000);
+  });
+  followed.set(id, entry);
+  (async () => {
+    try {
+      const thread = await read('threads', id);
+      if (!thread?.home) return;
+      await hostedClient(thread.home.url).follow(thread.home.session, {
+        signal: entry.controller.signal,
+        onFrame: (frame) => {
+          entry.open();
+          return hostedFrame(id, thread.home, entry, frame);
+        },
+        onState: (state, error) => {
+          if (state === 'waiting') entry.open();
+          away(id, state === 'open' ? null : `your host does not answer (${sentence(error)}); Spindle keeps trying, and nothing is lost`).catch(() => {});
+        },
+      });
+    } catch (error) {
+      if (error?.status === 404) await away(id, 'your host no longer has this thread').catch(() => {});
+      else if (error?.status === 401) await away(id, "your host no longer takes this browser's token: connect it again in Settings").catch(() => {});
+      else if (error?.status === 0) await away(id, sentence(error)).catch(() => {});
+      else console.warn('Spindle: a hosted thread\'s events stopped:', error);
+    } finally {
+      entry.open();
+      if (followed.get(id) === entry) followed.delete(id);
+    }
+  })();
+  return entry;
+}
+
+async function hostedFrame(id, home, entry, { kind, data }) {
+  if (entry.controller.signal.aborted || followed.get(id) !== entry) return false;
+  if (kind === 'deleted') {
+    await away(id, 'your host no longer has this thread');
+    return false;
+  }
+  if (kind === 'snapshot') {
+    // Opened on a thread at work, or again after a gap: the panel draws it again.
+    if (entry.seen || !entry.quiet) send({ type: 'resync', thread: id });
+    entry.seen = true;
+    for (const call of data?.app_tools ?? (data?.app_tool ? [data.app_tool] : [])) answerHosted(id, home, entry, call);
+    if (data?.busy && (await read('threads', id))?.state !== 'running') await touch(id, { state: 'running', note: null });
+    return true;
+  }
+  entry.seen = true;
+  const event = data;
+  if (event?.type === 'app_tool') {
+    answerHosted(id, home, entry, event);
+  } else if (event?.type === 'app_tool_done') {
+    entry.answered.delete(event.call);
+  } else if (event?.type === 'command_done') {
+    // A turn's end (another command's, a rewind's say, is not one).
+    const mine = hostedTurns.get(id);
+    if (mine ? mine.request === event.request_id : (await read('threads', id))?.state === 'running') await endHosted(id, event);
+    return true;
+  } else if (event?.type === 'prompt' && !hostedTurns.has(id) && (await read('threads', id))?.state !== 'running') {
+    // A turn started elsewhere (the host's own screen) runs here too.
+    await touch(id, { state: 'running', note: null });
+  }
+  if (event?.type === 'task') noteTask(id, event);
+  send({ type: 'event', thread: id, event });
+  return true;
+}
+
+/** Answers a hosted thread's call of one of this browser's tools (the page tools) with
+ * the code that answers them for a thread here; another app's tools are its to answer.
+ * Each call is answered once, however often it is announced (a snapshot and an event
+ * can both name it); one the host no longer waits for is let go. */
+const answeringHosted = new Map();
+function answerHosted(id, home, entry, event) {
+  const key = `host-tool:${id}:${home.session}:${event?.call}`;
+  const known = answeringHosted.get(key);
+  if (known) return known.entry === entry ? known.done : known.done.catch(() => {}).then(() => answerHosted(id, home, entry, event));
+  const next = answerHostedCall(id, home, entry, event, key);
+  const active = { entry, done: next };
+  answeringHosted.set(key, active);
+  next.finally(() => { if (answeringHosted.get(key) === active) answeringHosted.delete(key); }).catch(() => {});
+  return next;
+}
+
+async function answerHostedCall(id, home, entry, event, key) {
+  if (!event?.call || entry.controller?.signal.aborted || entry.answered.has(event.call) || !client.tools.byName.has(event.name)) return;
+  entry.answered.add(event.call);
+  const session = dirOf(id);
+  const epoch = pageEpoch(session);
+  const cancelled = () => entry.controller?.signal.aborted || pageEpoch(session) !== epoch || pageStopped(session);
+  try {
+    const remote = hostedClient(home.url);
+    const kept = await read('kv', key);
+    const stopping = await read('kv', hostedStopKey(id));
+    if (cancelled()) return;
+    if (stopping) {
+      await remote.appToolResult(home.session, event.call, { error: 'the user asked to stop this turn; its Stop is being delivered' });
+      return;
+    }
+    if (!kept) {
+      await writeDurably('kv', key, { started: true });
+    }
+    let answer = kept?.answer;
+    if (!answer) {
+      answer = cancelled() ? { error: 'the turn ended or was stopped before the page tool started' }
+        : await client.tools.answer({ ...event, again: Boolean(event.again || kept), session });
+      await writeDurably('kv', key, { started: true, answer });
+    }
+    if (entry.controller?.signal.aborted) return;
+    try {
+      await remote.appToolResult(home.session, event.call, answer);
+    } catch (error) {
+      if (error?.status === 409) return;
+      if (error?.status !== 400) throw error;
+      const refused = refusedAnswer(error);
+      await writeDurably('kv', key, { started: true, answer: refused });
+      await remote.appToolResult(home.session, event.call, refused);
+    }
+  } catch (error) {
+    entry.answered.delete(event.call);
+    if (error?.status !== 409) {
+      console.warn('Spindle: a page tool answer did not reach your host:', error);
+      if (followed.get(id) === entry && !entry.controller.signal.aborted) {
+        setTimeout(() => {
+          if (followed.get(id) === entry && !entry.controller.signal.aborted) answerHosted(id, home, entry, event);
+        }, 1000);
+      }
+    }
+  }
+}
+
+async function clearHostedTools(id) {
+  const changes = (await keysOf('kv')).filter((key) => String(key).startsWith(`host-tool:${id}:`))
+    .map((key) => ['kv', key, undefined]);
+  if (changes.length) await writeTogether(changes, 'strict');
+}
+
+/** A hosted thread's turn ended (`done`: its `command_done`; null when only the host's
+ * state says so): its state as the host has it, and the panels told, as for a turn here. */
+const endingHosted = new Map();
+function endHosted(id, done) {
+  if (endingHosted.has(id)) return endingHosted.get(id);
+  const next = endHostedCall(id, done);
+  endingHosted.set(id, next);
+  next.finally(() => { if (endingHosted.get(id) === next) endingHosted.delete(id); }).catch(() => {});
+  return next;
+}
+
+async function endHostedCall(id, done) {
+  const mine = hostedTurns.get(id);
+  const thread = await read('threads', id);
+  if (!thread?.home) return;
+  let state = 'idle';
+  let note = null;
+  let complete = false;
+  try {
+    const remote = hostedClient(thread.home.url);
+    const receipt = done ?? (mine ? await remote.receipt(mine.request).catch(() => null) : null);
+    const object = await remote.session(thread.home.session);
+    if (object.busy) {
+      // Still at work (another command of the thread's): its own end tells.
+      return;
+    }
+    complete = Boolean(object.complete);
+    if (receipt?.state === 'failed') {
+      // Stopped by the user mid-step, the host records the step as cut off: a stop, as
+      // a thread here says it.
+      state = mine?.stopped ? 'stopped' : 'failed';
+      note = receipt.error ?? 'it failed on your host';
+    } else if (receipt?.state === 'interrupted') {
+      state = 'interrupted';
+      note = 'your host restarted while it ran';
+    } else if (!object.complete && object.head > 0 && !object.accepts_prompt) {
+      state = 'stopped';
+      note = object.stop_text ?? null;
+    }
+  } catch (error) {
+    // The host went away as the turn ended: the poll says how it ended once it answers.
+    await away(id, sentence(error)).catch(() => {});
+    return;
+  }
+  if (hostedTurns.get(id) !== mine) return;
+  hostedTurns.delete(id);
+  if (mine) await forgetHostedCommand(id, mine.request);
+  cancelPageTools(id);
+  if (complete) await clearHostedTools(id);
+  await touch(id, { state, note });
+  let unsent = done?.unsent ?? [];
+  const waiting = queued.get(id);
+  if (waiting && !waiting.held && unsent.length) {
+    waiting.text = [...unsent, waiting.text].join('\n\n');
+    unsent = [];
+  }
+  send({ type: 'turn_end', thread: id, unsent });
+  if (state !== 'running' && waiting && !waiting.held) sendQueuedHosted(id);
+}
+
+/** The message (with files) that waited for a hosted thread's turn to end goes now; one
+ * the thread cannot take is held, saying why, as for a thread here. */
+async function sendQueuedHosted(id) {
+  const waiting = queued.get(id);
+  if (!waiting) return;
+  try {
+    const thread = await workable(id);
+    const object = await hostedClient(thread.home.url).session(thread.home.session);
+    if (queued.get(id) !== waiting) return;
+    if (object.busy || hostedTurns.has(id)) return;
+    if (!object.accepts_prompt) {
+      throw failure('busy', object.accepts_message
+        ? 'the last turn was stopped part way and takes a message without files: send the text alone, or Continue, Retry or Take back first'
+        : 'the last turn did not finish: retry, continue or take it back first');
+    }
+    await onHost.send({ id, text: waiting.text, files: waiting.files }, null, true);
+    queued.delete(id);
+    announceQueued(id);
+  } catch (error) {
+    if (queued.get(id) !== waiting) return;
+    waiting.held = String(error.message ?? error);
+    announceQueued(id);
+  }
+}
+
+/** Starts a turn of hosted thread `id` (`kind` say, continue or retry) on the host: its
+ * event stream is open first, so no event of the turn is missed, and the command goes
+ * with a request ID of its own (sent again, if need be, with the same one). */
+async function startHosted(id, kind, fields = {}) {
+  const epoch = pageEpoch(dirOf(id));
+  await endingHosted.get(id);
+  const thread = await workable(id);
+  if (hostedTurns.has(id) || thread.state === 'running') throw failure('busy', 'this thread is already running');
+  if (await read('kv', hostedStopKey(id))) throw failure('busy', 'a saved Stop is still being delivered: wait before starting another turn');
+  const remote = hostedClient(thread.home.url);
+  const entry = { kind, stopped: false };
+  hostedTurns.set(id, entry);
+  let object;
+  try {
+    object = await remote.session(thread.home.session);
+    if (object.busy) throw failure('busy', 'this thread is already running on your host');
+    await follow(id, true).opened;
+    if (entry.stopped || epoch !== pageEpoch(dirOf(id))) throw failure('stopped', 'the turn was stopped before it started');
+  } catch (error) {
+    if (hostedTurns.get(id) === entry) hostedTurns.delete(id);
+    throw error;
+  }
+  const request = requestId();
+  entry.request = request;
+  const command = { request, kind, fields: { session: thread.home.session, ...fields, expected_head: object.head } };
+  let next;
+  try {
+    entry.saved = update('threads', id, (current) => ({ ...current, state: 'running', note: null, updated: Date.now() }), {
+      changes: [['kv', hostedCommandKey(id), command]], durability: 'strict',
+    });
+    next = await entry.saved;
+    if (!next) throw failure('not_found', 'there is no such thread');
+  } catch (error) {
+    if (hostedTurns.get(id) === entry) hostedTurns.delete(id);
+    throw error;
+  }
+  send({ type: 'thread', thread: next });
+  try {
+    await admitHosted(id, command);
+  } catch (error) {
+    if (worthRepeating(error)) {
+      await away(id, `the host has not confirmed this message; Spindle retries the same request, never a new one (${sentence(error)})`);
+      hostedTick(1000);
+      return { started: true, pending: true };
+    }
+    await forgetHostedCommand(id, request);
+    hostedTurns.delete(id);
+    await touch(id, { state: thread.state, note: thread.note ?? null });
+    send({ type: 'turn_end', thread: id, unsent: [] });
+    throw hostFailure(error);
+  }
+  return { started: true };
+}
+
+/** A command that runs in the host's worker (a rewind), waited for: its receipt. */
+async function settledCommand(remote, kind, fields, options) {
+  let receipt = await remote.command(kind, fields, options);
+  if (receipt.state === 'running') receipt = await remote.settled(receipt.request_id);
+  if (receipt.state !== 'completed') throw failure('failed', receipt.error ?? `the ${kind} did not finish on your host`);
+  return receipt;
+}
+
+/** The rewind target whose history is `shown`'s first `at` messages, among the targets
+ * the host offers (its newest 48 steps), newest first. */
+async function hostedPointBefore(remote, session, shown, at) {
+  const before = JSON.stringify(shown.slice(0, at));
+  for (const target of await remote.targets(session)) {
+    const { messages = [] } = await remote.messages(session, target.revision);
+    if (messages.length === at && JSON.stringify(messages) === before) return target.revision;
+  }
+  return null;
+}
+
+/** The last turnFiles answer of a hosted thread, by thread and revision. */
+let hostedFilesKept = { key: null, value: null };
+
+/** What the browser's fit would change for a hosted thread's settings to run here (the
+ * package's `fit`, said ahead: the import's own decides, and the thread says it). */
+function fitAhead(settings) {
+  const notes = [];
+  let tools = settings.builtin_tools ?? 'all';
+  let runs = settings.runner ?? 'none';
+  if (tools === 'all') {
+    tools = 'files';
+    notes.push({ setting: 'builtin_tools', to: 'files' });
+  }
+  if (tools === 'files' && runs === 'none') {
+    runs = 'app';
+    notes.push({ setting: 'runner', to: 'app' });
+  }
+  if (settings.network && runs !== 'none') notes.push({ setting: 'network', to: true });
+  if (settings.toolchain) notes.push({ setting: 'toolchain', to: false });
+  if (settings.sources?.length) notes.push({ setting: 'sources', to: [] });
+  if (settings.max_usd != null) notes.push({ setting: 'max_usd', to: settings.max_usd });
+  return fitForChrome({ notes, refused: settings.self_edit ? [{ why: 'a self-edit session runs only on its native host' }] : [] }, runs);
+}
+
+/** Refuses what only a thread here can do. */
+const hereOnly = (doing) => () => {
+  throw failure('invalid', `This thread is on your host: bring it back to this browser to ${doing}`);
+};
+
+/** The operations of a hosted thread, by the name of the one they stand in for; each
+ * takes the operation's arguments and the operation for a thread here. */
+const onHost = {
+  async send({ id, text, files: given }, _here, queuedNow = false) {
+    const thread = await workable(id);
+    const remote = hostedClient(thread.home.url);
+    const session = thread.home.session;
+    const epoch = pageEpoch(dirOf(id));
+    if (!queuedNow && (thread.state === 'running' || hostedTurns.has(id))) {
+      if (!given?.length) {
+        try {
+          return { steered: (await remote.steer(session, text)).queued };
+        } catch (error) {
+          // Ended meanwhile: the message starts a turn of its own.
+          if (error?.kind !== 'not_running') throw hostFailure(error);
+        }
+      } else {
+        if (queued.has(id)) throw failure('busy', 'a message already waits for this turn to end: take it back to change it');
+        queued.set(id, { text: String(text), files: given });
+        announceQueued(id);
+        return { queued: true };
+      }
+    }
+    // Attachments go up first (each kept by the host a day), then the message names them.
+    const { note } = attachments(given);
+    const sent = [];
+    for (const file of given ?? []) {
+      try {
+        const { digest } = await remote.upload(session, file.bytes);
+        sent.push({ path: String(file.path), digest });
+      } catch (error) {
+        throw hostFailure(error);
+      }
+    }
+    if (epoch !== pageEpoch(dirOf(id))) throw failure('stopped', 'the turn was stopped before it started');
+    return startHosted(id, 'say', { text: text + note, ...(sent.length && { attachments: sent }) });
+  },
+
+  async stop({ id }) {
+    const thread = await read('threads', id);
+    const mine = hostedTurns.get(id);
+    if (mine) mine.stopped = true;
+    cancelPageTools(id);
+    if (mine && !mine.request) return { stopping: true };
+    try {
+      await mine?.saved;
+      const pending = await read('kv', hostedCommandKey(id));
+      let target = mine?.request ?? pending?.request;
+      if (!target) target = (await hostedClient(thread.home.url).session(thread.home.session)).running_request;
+      if (!target) return { stopping: false };
+      const kept = await read('kv', hostedStopKey(id));
+      if (!kept) await writeDurably('kv', hostedStopKey(id), { request: requestId(), target, url: thread.home.url, session: thread.home.session });
+      if (pending) await admitHosted(id, pending);
+      await sendHostedStop(id);
+    } catch (error) {
+      if (await read('kv', hostedStopKey(id))) {
+        await away(id, `a saved Stop waits for your host (${sentence(error)})`);
+        hostedTick(1000);
+        return { stopping: true, pending: true };
+      }
+      if (error?.kind !== 'not_running') throw hostFailure(error);
+    }
+    return { stopping: true };
+  },
+
+  retry: ({ id }) => startHosted(id, 'retry'),
+  resume: ({ id }) => startHosted(id, 'continue'),
+
+  async open({ id, from }) {
+    const thread = await read('threads', id);
+    if (!thread) throw failure('not_found', 'there is no such thread');
+    lookedAt.set(id, Date.now());
+    if (thread.moving && thread.moving.step !== 'release') return { thread, status: null, history: null, running: false, moving: thread.moving };
+    try {
+      const remote = hostedClient(thread.home.url);
+      const [object, history] = await Promise.all([remote.session(thread.home.session), remote.messages(thread.home.session)]);
+      if (object.busy || thread.state === 'running') follow(id);
+      await away(id, null);
+      const messages = history.messages ?? [];
+      return {
+        thread: (await read('threads', id)) ?? thread, status: statusOf(object), running: Boolean(object.busy), queued: queuedOf(id),
+        history: { messages: from ? messages.slice(from) : messages, total: messages.length, revision: history.revision },
+      };
+    } catch (error) {
+      return { thread, status: null, history: null, running: thread.state === 'running', away: sentence(error) };
+    }
+  },
+
+  async rewindTo({ id, at, revision }) {
+    const thread = await workable(id);
+    if (thread.state === 'running' || hostedTurns.has(id)) throw failure('busy', 'stop this thread before taking it back');
+    const remote = hostedClient(thread.home.url);
+    const session = thread.home.session;
+    try {
+      const object = await remote.session(session);
+      const shown = (await remote.messages(session, revision ?? undefined)).messages ?? [];
+      const message = shown[at];
+      if (message?.role !== 'user') throw failure('invalid', 'that is not one of your messages');
+      const { text, paths } = unattached(message.content.filter((block) => block.type === 'text').map((block) => block.steer ?? block.text).join('\n'));
+      if (at === 0) throw failure('invalid', 'On your host a thread cannot go back to before its first message: bring it back to this browser for that, or start a new thread');
+      const files = [];
+      for (const path of paths) {
+        try {
+          files.push({ path, bytes: await remote.read(session, path, revision ?? undefined) });
+        } catch (error) {
+          if (error?.status !== 404) throw error;
+        }
+      }
+      const target = await hostedPointBefore(remote, session, shown, at);
+      if (target == null) throw failure('not_found', 'Your host no longer offers the point before that message (it keeps its newest 48 steps to go back to): bring the thread back to this browser to go further back');
+      await settledCommand(remote, 'rewind', { session, revision: target, expected_head: object.head });
+      await touch(id, { state: 'idle', note: null });
+      return { text, files };
+    } catch (error) {
+      throw hostFailure(error);
+    }
+  },
+
+  async earlier({ id, revision }) {
+    const thread = await workable(id);
+    const remote = hostedClient(thread.home.url);
+    const session = thread.home.session;
+    const shown = (await remote.messages(session, revision ?? undefined)).messages ?? [];
+    const summary = JSON.stringify(shown[0] ?? null);
+    for (const target of await remote.targets(session)) {
+      if (revision != null && target.revision >= revision) continue;
+      const history = await remote.messages(session, target.revision);
+      if (JSON.stringify(history.messages?.[0] ?? null) !== summary) return { revision: target.revision, history: { ...history, total: (history.messages ?? []).length } };
+    }
+    throw failure('not_found', 'Your host no longer offers the messages before that summary');
+  },
+
+  async settings({ id, changes = {} }) {
+    const thread = await workable(id);
+    const remote = hostedClient(thread.home.url);
+    const session = thread.home.session;
+    // Its commands run in the host's sandbox while it is there: where they run is not
+    // this thread's to choose until it is back.
+    const asked = Object.fromEntries(Object.entries(changes).filter(([key]) => ['provider', 'model', 'network', 'effort', 'compaction', 'max_usd', 'tasks'].includes(key)));
+    try {
+      if (Object.keys(asked).length) await settledCommand(remote, 'settings', { session, ...asked });
+      const settings = (await remote.session(session)).settings ?? {};
+      await touch(id, { provider: settings.provider, model: settings.model, effort: settings.effort ?? 'default', network: Boolean(settings.network), tasks: Boolean(settings.tasks) });
+      return settings;
+    } catch (error) {
+      throw hostFailure(error);
+    }
+  },
+
+  async spend({ id }) {
+    const thread = await read('threads', id);
+    const object = await hostedClient(thread.home.url).session(thread.home.session);
+    const usage = object.usage ?? {};
+    return {
+      max_usd: object.settings?.max_usd ?? null, usd: usage.usd ?? 0, calls: usage.calls ?? 0,
+      subscription: usage.subscription ?? 0, unpriced: usage.unpriced ?? 0, unknown: usage.unknown ?? 0,
+    };
+  },
+
+  /** Takes back (or starts over, `resend`) a turn that stopped before it finished, on
+   * the host: back to the end of the turn before, its message (and files) returned. */
+  async restart({ id, changes = {}, resend = true }) {
+    const thread = await workable(id);
+    if (thread.state === 'running' || hostedTurns.has(id)) throw failure('busy', 'stop this thread before starting it over');
+    const remote = hostedClient(thread.home.url);
+    const session = thread.home.session;
+    try {
+      const object = await remote.session(session);
+      if (object.accepts_prompt) throw failure('invalid', 'this thread has no unfinished turn to start over');
+      const settled = (await remote.targets(session)).find((target) => target.kind === 'settled');
+      if (!settled) throw failure('invalid', 'On your host a first turn cannot be taken back or started over: bring the thread back to this browser for that, or delete it');
+      const kept = ((await remote.messages(session, settled.revision)).messages ?? []).length;
+      const prompt = ((await remote.messages(session)).messages ?? []).slice(kept)
+        .find((message) => message.role === 'user' && message.content?.some((block) => block.type === 'text' && block.text.trim()));
+      if (!prompt) throw failure('invalid', "this turn's message was not found");
+      const { text, paths } = unattached(prompt.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n'));
+      const files = [];
+      for (const path of paths) {
+        try {
+          files.push({ path, bytes: await remote.read(session, path) });
+        } catch (error) {
+          if (error?.status !== 404) throw error;
+        }
+      }
+      await settledCommand(remote, 'rewind', { session, revision: settled.revision, expected_head: object.head });
+      if (Object.keys(changes).length) await onHost.settings({ id, changes });
+      await touch(id, { state: 'idle', note: null });
+      if (!resend) return { text, files };
+      return onHost.send({ id, text, files });
+    } catch (error) {
+      throw hostFailure(error);
+    }
+  },
+
+  async rename({ id, title }) {
+    const thread = await read('threads', id);
+    const name = String(title).trim().slice(0, 80) || 'Untitled';
+    // The host's name follows when it can; this browser's is the one shown.
+    await hostedClient(thread.home.url).command('rename', { session: thread.home.session, name }).catch(() => {});
+    return touch(id, { title: name });
+  },
+
+  /** Deletes the thread where it lives (the host), then what is left of it here. */
+  async remove({ id }, here) {
+    const thread = await read('threads', id);
+    if (thread.state === 'running' || hostedTurns.has(id)) throw failure('busy', 'stop this thread before deleting it');
+    if (thread.moving && thread.moving.step !== 'release') throw failure('busy', 'this thread is moving: wait for it to finish, then delete it');
+    try {
+      await settledCommand(hostedClient(thread.home.url), 'delete', { session: thread.home.session });
+    } catch (error) {
+      if (error?.status !== 404) throw failure('host', `it lives on your host, which did not delete it (${sentence(error)})`);
+    }
+    followed.get(id)?.controller.abort();
+    return here({ id });
+  },
+
+  async files({ id, revision }) {
+    const thread = await read('threads', id);
+    return hostedClient(thread.home.url).files(thread.home.session, revision).catch((error) => { throw hostFailure(error); });
+  },
+
+  async read({ id, path }) {
+    const thread = await read('threads', id);
+    return { bytes: await hostedClient(thread.home.url).read(thread.home.session, path).catch((error) => { throw hostFailure(error); }) };
+  },
+
+  async turnFiles({ id }) {
+    const thread = await read('threads', id);
+    const remote = hostedClient(thread.home.url);
+    const session = thread.home.session;
+    const now = await remote.files(session);
+    const key = `${id}@${now.revision}`;
+    if (hostedFilesKept.key === key) return hostedFilesKept.value;
+    const shown = (await remote.messages(session)).messages ?? [];
+    const at = shown.findLastIndex((message) => message.role === 'user' && (message.content ?? []).some((block) =>
+      block.type === 'text' && typeof block.steer !== 'string' && block.text.trim() && !block.text.startsWith('[Earlier conversation compacted')));
+    let before = null;
+    if (at === 0) {
+      before = [];
+    } else if (at > 0) {
+      const revision = await hostedPointBefore(remote, session, shown, at).catch(() => null);
+      if (revision != null) before = (await remote.files(session, revision)).files.map((file) => [file.path, file.digest]);
+    }
+    const value = { ...now, before };
+    hostedFilesKept = { key, value };
+    return value;
+  },
+
+  // A hosted thread's tasks show as its steps; their cards are this browser's only.
+  tasks: async () => ({ tasks: [], activity: null }),
+  async taskStop({ id, task }) {
+    const thread = await read('threads', id);
+    return hostedClient(thread.home.url).taskStop(thread.home.session, String(task));
+  },
+
+  export: hereOnly('move it to a file'),
+  compact: hereOnly('free space in it'),
+  dropAside: hereOnly('remove its first attempts'),
+  freeSealed: hereOnly('free its sealed copy'),
+  bundle: hereOnly('save it as a file'),
+};
+
+// Every operation on a thread goes to the host for a thread that lives there (and
+// `open` also shows a thread in a move as it stands, touching no copy of it).
+for (const [name, hosted] of Object.entries(onHost)) {
+  const here = ops[name];
+  ops[name] = async (args) => {
+    const thread = args?.id ? await read('threads', args.id) : null;
+    if (thread?.home) return hosted(args, here);
+    if (name === 'open' && thread?.moving && thread.moving.step !== 'release') return hosted(args, here);
+    return here(args);
+  };
+}
+// A new thread starts with the files of a thread here only.
+{
+  const here = ops.create;
+  ops.create = async (args) => {
+    if (args?.from && (await read('threads', args.from))?.home) throw failure('invalid', 'That thread is on your host: bring it back to this browser to start a thread with its files');
+    return here(args);
+  };
+}
+// A thread is deleted with its move's record (one that is only removing the host's
+// sealed copy tries that first).
+{
+  const here = ops.remove;
+  ops.remove = async (args) => {
+    const thread = await read('threads', args.id);
+    if (thread?.moving && thread.moving.step !== 'release') throw failure('busy', 'this thread is moving: wait for it to finish, then delete it');
+    if (thread?.moving?.step === 'release') {
+      notRunning(args.id, 'deleting');
+      const move = await read('kv', MOVE(args.id));
+      if (move?.session) {
+        try {
+          await settledCommand(hostedClient(move.url), 'delete', { session: move.session });
+        } catch (error) {
+          if (error?.status !== 404) throw error;
+        }
+      }
+    }
+    const done = await here(args);
+    await clearHostedTools(args.id);
+    await writeTogether([['kv', hostedCommandKey(args.id), undefined], ['kv', hostedStopKey(args.id), undefined], ['kv', MOVE(args.id), undefined], ['bundles', MOVE(args.id), undefined]], 'strict');
+    return done;
+  };
+}
+
+/** Keeps hosted threads' states as the host says them (GET /v1/sessions): follows one
+ * that runs, ends one this engine missed the end of, says when the host cannot be
+ * reached; lets go of the streams of threads that no longer run and that no panel has
+ * open. True while there are hosted threads. */
+async function pollHosted() {
+  const hosted = (await threads()).filter((thread) => thread.home);
+  for (const [id, entry] of followed) {
+    const thread = hosted.find((one) => one.id === id);
+    if (!thread || (thread.state !== 'running' && !hostedTurns.has(id) && Date.now() - (lookedAt.get(id) ?? 0) > LOOK_MS)) entry.controller.abort();
+  }
+  if (!hosted.length) return false;
+  let rows = null;
+  let why = null;
+  try {
+    rows = await hostedClient().sessions();
+  } catch (error) {
+    why = hostState.connected && hostState.kind === 'browser'
+      ? `your host does not answer (${sentence(error)}); Spindle keeps trying, and nothing is lost`
+      : sentence(error);
+  }
+  for (const thread of hosted) {
+    if (thread.moving) continue;
+    const command = await read('kv', hostedCommandKey(thread.id));
+    if (command) {
+      try {
+        await admitHosted(thread.id, command);
+      } catch (error) {
+        if (worthRepeating(error) || error?.status === 401 || error?.kind === 'host') {
+          await away(thread.id, `a saved request waits for your host (${sentence(error)})`);
+        } else {
+          await forgetHostedCommand(thread.id, command.request);
+          hostedTurns.delete(thread.id);
+          await touch(thread.id, { state: 'failed', note: sentence(error) });
+          send({ type: 'turn_end', thread: thread.id, unsent: command.kind === 'say' ? [command.fields.text] : [] });
+        }
+      }
+      continue;
+    }
+    const stop = await read('kv', hostedStopKey(thread.id));
+    if (stop) {
+      try { await sendHostedStop(thread.id); }
+      catch (error) { await away(thread.id, `a saved Stop waits for your host (${sentence(error)})`); continue; }
+    }
+    if (!rows || thread.home.url !== hostState.url) {
+      await away(thread.id, rows ? `this thread is on the host at ${thread.home.url}, which is not the one connected` : why);
+      continue;
+    }
+    const row = rows.find((one) => one.id === thread.home.session);
+    if (!row) {
+      await away(thread.id, 'your host no longer has this thread');
+      continue;
+    }
+    if (!followed.has(thread.id)) await away(thread.id, null);
+    const [state, note] = listed(row.status?.state) ?? [null, null];
+    if (!state) continue;
+    if (state === 'running') {
+      follow(thread.id);
+      if (thread.state !== 'running') await touch(thread.id, { state: 'running', note: null });
+    } else if (thread.state === 'running') {
+      // It ended while no stream told this engine (a gap, or another screen ran it).
+      const mine = hostedTurns.get(thread.id);
+      const receipt = mine?.request ? await hostRemote.receipt(mine.request).catch((error) => {
+        if (error?.status === 404) return { state: 'interrupted', error: 'the host no longer retains this command receipt' };
+        return null;
+      }) : null;
+      if (!mine || (receipt && receipt.state !== 'running')) await endHosted(thread.id, receipt);
+    } else if (state !== thread.state && !(HALTED_STATES.has(state) && HALTED_STATES.has(thread.state))) {
+      await touch(thread.id, { state, note });
+    }
+  }
+  return true;
+}
+/** States in which a turn stopped part way (each keeps its own note). */
+const HALTED_STATES = new Set(['stopped', 'failed', 'interrupted']);
+
+/** Every quarter minute while there are hosted threads or moves: their states, and the
+ * moves that wait for the host. */
+let ticking = null;
+function hostedTick(ms = 15_000) {
+  if (ticking) return;
+  ticking = setTimeout(async () => {
+    ticking = null;
+    let more = false;
+    try {
+      if (!hostState.connected && hostState.url && await vault.usableNow()) await connectKeptHost().catch(() => {});
+      if ((await moves.list()).length) {
+        more = true;
+        moves.resume().catch(() => {});
+      }
+      if (await pollHosted()) more = true;
+    } catch (error) {
+      more = true;
+      console.warn('Spindle: hosted threads were not brought up to date:', error);
+    }
+    if (more) hostedTick(ms);
+  }, ms);
+  ticking?.unref?.();
+}
+
+/** The host connected: moves waiting for it go on, and hosted threads catch up. */
+function hostedAwake() {
+  if (hostState.kind !== 'browser') return;
+  moves.resume().catch(() => {});
+  pollHosted().catch(() => {});
+  hostedTick();
+}
+
+Object.assign(ops, {
+  /** This browser's name on the user's host (`base`, such as "Edge on Windows", with a
+   * short id of this profile's, kept): connecting again keeps its threads. */
+  async hostName({ base }) {
+    const kept = await read('kv', 'host-name');
+    if (kept) return { name: kept };
+    const id = [...crypto.getRandomValues(new Uint8Array(3))].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    const name = `${String(base ?? 'Spindle for Browser').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 50) || 'Spindle for Browser'} ${id}`;
+    await write('kv', 'host-name', name);
+    return { name };
+  },
+
+  /** One-click connect: trades the code the host's page gave (`code`, with its PKCE
+   * `verifier`) for a browser token named `client`, keeps it sealed where the host's
+   * token lives, and connects the host with it. */
+  async hostConnect({ url, code, verifier, client: name }) {
+    const base = String(url).replace(/\/+$/, '');
+    // A code is good for one trade: none while its token could not be kept.
+    if (!(await vault.usableNow())) throw failure('locked', "Spindle's keys are locked: unlock them, then connect your host");
+    let token;
+    try {
+      ({ token } = await new RemoteClient({ url: base, fetch: reach }).connectToken(String(code), String(verifier)));
+    } catch (error) {
+      throw failure(error.kind ?? 'host', `your host did not give this browser a token (${sentence(error)})`);
+    }
+    try {
+      await changeHost({ url: base, token, client: name });
+    } catch (error) {
+      throw failure('host', `the host did not connect (${error.message ?? error}); ${hostState.connected ? `still connected to ${hostState.url}` : 'none is connected'}`);
+    }
+    await vault.keepHost(token, [['kv', 'host', { url: base, client: name }]]);
+    return snapshot();
+  },
+
+  /** Whether thread `id` can move to the host connected now, and on which model:
+   * `{url, fits, provider, model, providers}` (`providers`: the host's signed-in ones
+   * and their models; `fits`: the thread's own model is among them), or `{why}`. */
+  async hostPreflight({ id }) {
+    const thread = await workable(id);
+    if (thread.home) throw failure('invalid', 'this thread is on your host already');
+    let remote;
+    try {
+      remote = hostedClient();
+    } catch (error) {
+      return { why: error.message };
+    }
+    let info;
+    let models;
+    try {
+      [info, models] = await Promise.all([remote.info(), remote.models()]);
+    } catch (error) {
+      return { why: `your host at ${hostState.url} does not answer (${sentence(error)})` };
+    }
+    if (!(info.features ?? []).includes('threads')) return { why: 'your host is older than this extension: update it to run threads there' };
+    const providers = (models.providers ?? []).filter((provider) => provider.signed_in).map((provider) => ({
+      id: provider.id, name: provider.name ?? provider.id, default_model: provider.default_model,
+      models: (provider.models ?? []).map((model) => ({ id: model.id, label: model.label ?? model.id })),
+    }));
+    const own = providers.find((provider) => provider.id === thread.provider);
+    const fits = Boolean(own?.models.some((model) => model.id === thread.model));
+    return { url: hostState.url, fits, provider: thread.provider, model: thread.model, providers };
+  },
+
+  /** Moves thread `id` to the connected host (`provider` and `model`: the host's to run
+   * it on, when its own is not signed in there). Answers once the move is recorded; the
+   * thread says how it goes. */
+  async toHost({ id, provider, model }) {
+    const thread = await workable(id);
+    notRunning(id, 'moving');
+    if (thread.home) throw failure('invalid', 'this thread is on your host already');
+    if (thread.moving) throw failure('busy', 'the previous move is still finishing: wait for its host cleanup before moving it again');
+    if (queued.has(id)) throw failure('busy', 'a message waits for this thread: send it or take it back first');
+    hostedClient();
+    const route = provider && model ? { provider: String(provider), model: String(model) } : {};
+    const { done } = await moves.toHost(id, { url: hostState.url, name: thread.title || 'Untitled', ...route });
+    watchMove(done);
+    return { moving: true };
+  },
+
+  /** What changes for hosted thread `id` to run here, said before it comes back. */
+  async backPreview({ id }) {
+    const thread = await read('threads', id);
+    if (!thread?.home) throw failure('invalid', 'this thread is not on your host');
+    const object = await hostedClient(thread.home.url).session(thread.home.session).catch((error) => { throw hostFailure(error); });
+    if (object.busy) throw failure('busy', 'it is at work on your host: stop it first');
+    return { said: fitAhead(object.settings ?? {}).said };
+  },
+
+  /** Brings hosted thread `id` back to this browser (see host-moves.mjs). */
+  async backHere({ id }) {
+    const thread = await read('threads', id);
+    if (!thread?.home) throw failure('invalid', 'this thread is not on your host');
+    if (thread.moving) throw failure('busy', 'this thread is moving already');
+    if (thread.state === 'running' || hostedTurns.has(id)) throw failure('busy', 'stop this thread before bringing it back');
+    hostedClient(thread.home.url);
+    if (await read('kv', hostedStopKey(id))) throw failure('busy', 'a saved Stop is still being delivered: wait before moving this thread');
+    await headroom();
+    const known = followed.get(id);
+    known?.controller.abort();
+    followed.delete(id);
+    cancelPageTools(id);
+    const { done } = await moves.back(id);
+    watchMove(done);
+    return { moving: true };
+  },
+});
+
 const starting = (async () => {
   try {
     // Compiled once: a renewal instantiates it again.
@@ -1825,13 +3182,16 @@ const starting = (async () => {
     const files = new Set(await keysOf('bundles'));
     for (const thread of await threads()) {
       known.add(thread.id);
-      if (thread.state === 'running') {
-        await touch(thread.id, { state: 'interrupted', note: 'Chrome stopped while it ran' });
+      // (One on the user's host may run there still: the host says, once it answers.)
+      if (thread.state === 'running' && !thread.home) {
+        await touch(thread.id, { state: 'interrupted', note: `${BROWSER} stopped while it ran` });
       }
       const fence = `/threads/${thread.id}/store/authority.sqlite.lock`;
       const fs = await openPool();
       let moved = thread.state === 'moved';
-      if (!moved && fs.existsSync(fence) && fs.readFileSync(fence).startsWith('spindle-moved: ')) {
+      // A thread on the user's host, or moving there or back, keeps its fence: its move
+      // (below) says where it is.
+      if (!moved && !thread.home && !thread.moving && fs.existsSync(fence) && fs.readFileSync(fence).startsWith('spindle-moved: ')) {
         await touch(thread.id, { state: 'moved', note: null });
         moved = true;
       }
@@ -1844,6 +3204,10 @@ const starting = (async () => {
     for (const name of fs.readdirSync('/threads')) {
       if (!known.has(name)) fs.rmSync(`/threads/${name}`, { recursive: true, force: true });
     }
+    // Moves to or from the user's host go on from where they were recorded (those that
+    // need the host wait for it to connect).
+    moves.resume().catch(() => {});
+    hostedTick(1000);
   } catch (error) {
     broken = `the engine could not start: ${error.message ?? error}`;
   }

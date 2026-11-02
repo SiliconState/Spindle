@@ -47,7 +47,9 @@ fn at(
 }
 /// Where a session's committed head stands: `head`,
 /// `phase` (`empty` before the first turn), `stop`/`stop_text` once stopped,
-/// `complete`, `accepts_prompt`, `prompts`, `files`, and for a waiting model step
+/// `complete`, `accepts_prompt`, `accepts_message` (text alone is taken: it starts a
+/// turn, or goes on with one stopped part way), `prompts`, `files`, and for a waiting
+/// model step
 /// whether its reply is already `recorded` (Continue adopts it without sending) or
 /// the provider's `rejection` of it.
 pub fn head_on(view: &mut ReadView<'_>) -> Result<Value> {
@@ -84,8 +86,8 @@ pub fn head_on(view: &mut ReadView<'_>) -> Result<Value> {
     let Some(state) = state else {
         return Ok(json!({
             "head": head, "phase": "empty", "stop": null, "stop_text": null,
-            "complete": false, "accepts_prompt": true, "prompts": 0, "files": files,
-            "recorded": false, "rejection": null,
+            "complete": false, "accepts_prompt": true, "accepts_message": true, "prompts": 0,
+            "files": files, "recorded": false, "rejection": null,
         }));
     };
     let phase = state.control().phase();
@@ -107,6 +109,13 @@ pub fn head_on(view: &mut ReadView<'_>) -> Result<Value> {
         "stop_text": stop.map(stop_text),
         "complete": stop == Some(Stop::Complete),
         "accepts_prompt": stop == Some(Stop::Complete),
+        // A message also goes on with a turn stopped part way (`Driver::takes_message`).
+        "accepts_message": match phase {
+            Phase::Stopped(stop) => stop == Stop::Complete,
+            Phase::Ready | Phase::AfterTools | Phase::FinalReview => true,
+            Phase::ModelWait => !recorded && state.transcript_ref().is_ok_and(|t| t.messages.len() > 1),
+            _ => false,
+        },
         "prompts": prompts,
         "files": files,
         "recorded": recorded,

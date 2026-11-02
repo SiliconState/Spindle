@@ -72,7 +72,7 @@ let launched = null;
 function launch(phase, dir) {
   const query = new URLSearchParams({ phase, dir, provider: options.provider, ...(options.model && { model: options.model }) });
   const url = `http://localhost:${port}/tests/browser_real/index.html?${query}`;
-  launched = spawn(browser, ['--headless=new', '--no-first-run', '--no-default-browser-check', '--disable-gpu',
+  launched = spawn(browser, ['--headless=new', '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--password-store=basic',
     `--user-data-dir=${windows ? toWindows(profile) : profile}`, url], { stdio: 'ignore', detached: !windows });
 }
 /** Stops this run's browser only: the processes on its profile. */

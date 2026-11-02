@@ -127,7 +127,52 @@ async function crashCut(journal) {
   store.close();
 }
 
+async function lockCreationCuts() {
+  for (const cut of ['created', 'partial', 'synced', 'linked']) {
+    const dir = join(root, `lock-${cut}`);
+    fs.mkdirSync(dir);
+    const database = join(dir, 'authority.sqlite');
+    const lock = `${database}.lock`;
+    const child = spawn(process.execPath, [
+      fileURLToPath(new URL('node_vfs_child.mjs', import.meta.url)), glue, database, 'delete', cut,
+    ], { stdio: ['ignore', 'pipe', 'inherit'] });
+    try {
+      await new Promise((resolve, reject) => {
+        let out = '';
+        const timer = setTimeout(() => reject(new Error(`lock cut ${cut} timed out: ${out}`)), 15_000);
+        child.stdout.on('data', (chunk) => {
+          out += chunk;
+          if (out.includes(`cut ${cut}\n`)) { clearTimeout(timer); resolve(); }
+        });
+        child.once('exit', (status) => { clearTimeout(timer); reject(new Error(`lock cut ${cut} exited: ${status}: ${out}`)); });
+      });
+    } finally {
+      const ended = new Promise((resolve) => child.once('exit', resolve));
+      child.kill('SIGKILL');
+      await ended;
+    }
+    if (cut === 'linked') {
+      assert.equal(fs.readFileSync(lock, 'utf8'), `spindle-embed: pid ${child.pid}`, 'the published lock is always complete');
+      assert.equal(code(() => spindle.ProbeStore.openNode(database, 'delete', true, 'next')), 'locked');
+    } else {
+      assert.ok(!fs.existsSync(lock), `${cut}: an unpublished draft fences no store`);
+      const store = spindle.ProbeStore.openNode(database, 'delete', true, 'next');
+      store.close();
+    }
+  }
+}
+
+function unsafeLockFallbackRefused() {
+  const database = join(root, 'no-links.sqlite');
+  spindle.installNodeFs({ ...watched, linkSync() { throw Object.assign(new Error('no hard links'), { code: 'ENOTSUP' }); } }, process.platform);
+  assert.equal(code(() => spindle.ProbeStore.openNode(database, 'delete', true, 'unsupported')), 'failed');
+  assert.ok(!fs.existsSync(`${database}.lock`), 'a failed atomic publish never falls back to an empty in-place lock');
+  spindle.installNodeFs(watched, process.platform);
+}
+
 try {
+  unsafeLockFallbackRefused();
+  await lockCreationCuts();
   for (const journal of ['delete', 'wal']) {
     lifecycle(journal);
     await crashCut(journal);

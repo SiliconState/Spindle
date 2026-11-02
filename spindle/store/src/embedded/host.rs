@@ -367,6 +367,9 @@ struct RunWait {
     helper: [u8; 32],
     /// A script request of the running command whose children the app is running.
     code: Option<CodeWait>,
+    /// The user's stop asked the app to stop the command (`work_stop`): its answer, with
+    /// what it printed until then, is recorded as stopped.
+    stopping: bool,
 }
 
 /// One script request's children, journaled and handed to the app (`code_call`), and
@@ -468,6 +471,11 @@ pub struct Host {
     runner: Option<[u8; 32]>,
     /// Works this session stopped waiting for before the app answered them.
     cancelled: Vec<(String, u64)>,
+    /// Commands the user's stop asks the app to stop: their answers are still taken.
+    stopping: Vec<(String, u64)>,
+    /// Why the reply being handed to the driver could not be parsed (the parser's
+    /// words), for the failure it reads: taken by `model_sent`.
+    unparsed: Option<String>,
     /// What an app-started task answered (`task_start`), once its turn ended.
     started: Option<Value>,
     /// Tasks running in the background.
@@ -520,6 +528,8 @@ impl Host {
             next_code: first_call(),
             runner: None,
             cancelled: vec![],
+            stopping: vec![],
+            unparsed: None,
             started: None,
             background: Vec::new(),
             works: Vec::new(),
@@ -673,6 +683,13 @@ impl Host {
                 bytes,
             });
         }
+        // A native host's MCP pack session id, where this place kept one (an import).
+        if let Some(bytes) = self.storage.sidecar(bundle::PACK_SESSION) {
+            files.push(BundleFile {
+                path: bundle::PACK_SESSION.into(),
+                bytes,
+            });
+        }
         let mut opened = vec![];
         bundle_tasks(self.storage.as_ref(), "", &mut files, &mut opened)?;
         Ok((files, opened))
@@ -803,10 +820,16 @@ impl Host {
                     "body": prepared["body"], "headers": headers, "auth": auth, "key_slot": KEY_SLOT,
                     "claims": claims_json(&facts.claims)})
             } else if prepared["kind"] == "http" {
-                json!({"index": index, "kind": "http", "method": prepared["method"],
+                // `app_headers`: the grant's headers the app adds, by name.
+                let mut child = json!({"index": index, "kind": "http", "grant": prepared["grant"],
+                    "method": prepared["method"],
                     "url": prepared["url"], "headers": prepared["headers"], "body": prepared["body"],
                     "timeout_seconds": prepared["timeout_seconds"],
-                    "max_response_bytes": prepared["max_response_bytes"]})
+                    "max_response_bytes": prepared["max_response_bytes"]});
+                if let Some(added) = prepared.get("app_headers") {
+                    child["app_headers"] = added.clone();
+                }
+                child
             } else {
                 json!({"index": index, "kind": "app", "name": prepared["name"],
                     "input": prepared["input"], "call": prepared["call"]})
@@ -948,24 +971,35 @@ impl Host {
 
     /// Works this session (or its tasks) stopped waiting for: the app ends them.
     pub fn take_cancelled(&mut self) -> Vec<(String, u64)> {
-        let mut cancelled = std::mem::take(&mut self.cancelled);
+        self.gather(|host| std::mem::take(&mut host.cancelled))
+    }
+
+    /// Commands this session (or its tasks) asks the app to stop: the app stops them
+    /// and still answers, with what they printed until then.
+    pub fn take_stopping(&mut self) -> Vec<(String, u64)> {
+        self.gather(|host| std::mem::take(&mut host.stopping))
+    }
+
+    /// `take` of this host and of each child session it holds.
+    fn gather(&mut self, take: fn(&mut Host) -> Vec<(String, u64)>) -> Vec<(String, u64)> {
+        let mut works = take(self);
         for task in &mut self.background {
-            cancelled.extend(task.child.take_cancelled());
+            works.extend(task.child.gather(take));
         }
         match &mut self.waiting {
             Some((_, Waiting::Tasks(batch))) => {
                 for call in &mut batch.calls {
                     if let Some(child) = &mut call.child {
-                        cancelled.extend(child.take_cancelled());
+                        works.extend(child.gather(take));
                     }
                 }
             }
             Some((_, Waiting::Started(started))) => {
-                cancelled.extend(started.child.take_cancelled());
+                works.extend(started.child.gather(take));
             }
             _ => {}
         }
-        cancelled
+        works
     }
 
     pub(crate) fn store(&mut self) -> &mut Store {
@@ -1072,10 +1106,25 @@ impl Host {
     ) -> Result<Progress> {
         self.begin("prompt")?;
         let outcome = (|| {
-            if let Some(patch) = state {
-                if !patch.is_object() {
-                    return Err("`state` is a JSON merge patch: an object".to_string());
+            if let Some(patch) = &state
+                && !patch.is_object()
+            {
+                return Err("`state` is a JSON merge patch: an object".to_string());
+            }
+            // A turn stopped part way goes on with the message (read after what it has);
+            // a state sent with it is a step of its own just before it.
+            if Driver::takes_message(&mut self.store)? {
+                if !files.is_empty() {
+                    return Err(driver::STOPPED_TEXT_ONLY.into());
                 }
+                if let Some(patch) = &state {
+                    self.driver.set_state(&mut self.store, patch)?;
+                }
+                self.driver.begin_run();
+                let need = self.driver.say(&mut self.store, text.to_string())?;
+                return self.advance(Some(need));
+            }
+            if let Some(patch) = state {
                 self.start_state = Some(StartState::Patch(patch));
             }
             let first = self.store.snapshot().map_err(store_error)?.revision == 0;
@@ -1331,6 +1380,18 @@ impl Host {
         let Some((id, waiting)) = self.waiting.take() else {
             return Ok(Progress::Streaming);
         };
+        // A command is asked to stop, and its answer (what it printed until then) is
+        // recorded as stopped: a known outcome, never run again. Asked again before the
+        // app answers, it is recorded as stopped without that answer.
+        let waiting = match waiting {
+            Waiting::Run(mut run) if !run.stopping => {
+                run.stopping = true;
+                self.stopping.push((self.label.clone(), id));
+                self.waiting = Some((id, Waiting::Run(run)));
+                return Ok(Progress::Waiting(vec![]));
+            }
+            waiting => waiting,
+        };
         self.cancelled.push((self.label.clone(), id));
         match waiting {
             Waiting::Authorize(need) => self.reserve_model(need),
@@ -1347,8 +1408,14 @@ impl Host {
                     // A script call still waiting ends with its command (its children
                     // stay uncertain in the journal).
                     code: _,
+                    stopping: _,
                 } = *run;
-                self.ran(need, request, helper, Err(Error::Cancelled))
+                let unanswered = RunnerResult {
+                    failure: Some("its runner had not answered the stop".into()),
+                    stopped: true,
+                    ..RunnerResult::default()
+                };
+                self.ran(need, request, helper, Ok(unanswered))
             }
             Waiting::Backoff(backoff) => Err(backoff.stopped),
             Waiting::App { need } => self.app_answered(need, AppAnswer::Stopped),
@@ -1729,11 +1796,17 @@ impl Host {
         cut: Option<u64>,
         rejection: Option<attempt::Rejection>,
     ) -> Result<Progress> {
+        let unparsed = self.unparsed.take();
         let sent = ModelSent {
             outcome: outcome.map_err(|error| match error {
                 Error::Model(ModelError::Http(status)) => ModelFailure::Http(status),
                 Error::Model(error @ (ModelError::Transport | ModelError::Deadline)) => {
                     ModelFailure::Dropped(store_error(Error::Model(error)))
+                }
+                // What was wrong with the stream, so the failure says (not only that
+                // it could not be parsed).
+                Error::Model(ModelError::Protocol) => {
+                    ModelFailure::Failed(driver::unreadable(unparsed.as_deref()))
                 }
                 other => ModelFailure::Failed(store_error(other)),
             }),
@@ -1833,6 +1906,7 @@ impl Host {
                 };
                 self.cancelled.push((self.label.clone(), id));
                 let rejection = fetch.attempt.take_rejection();
+                self.unparsed = fetch.attempt.take_failure();
                 let Fetch { need, streamed, .. } = *fetch;
                 self.model_sent(need, Err(attempt_error(error)), streamed, None, rejection)
             }
@@ -1865,6 +1939,15 @@ impl Host {
             );
         }
         if !attempt::event_stream(content_type.as_deref()) {
+            // (A reply with no stated type is read as a stream.)
+            let stated: String = content_type
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(120)
+                .collect();
+            self.unparsed = Some(format!("the reply was {stated}, not an event stream"));
             return self.model_sent(
                 need,
                 Err(Error::Model(ModelError::Protocol)),
@@ -1888,13 +1971,16 @@ impl Host {
             }
             _ => {}
         };
-        let outcome = wire
-            .finish(waiting, &observe)
-            .map_err(attempt_error)
-            .and_then(|recorded| {
+        let outcome = match wire.finish_explained(waiting, &observe) {
+            Ok(recorded) => {
                 self.store
                     .ingest_turn_model(&need.request, &committed, recorded.checkpoint())
-            });
+            }
+            Err((error, why)) => {
+                self.unparsed = why;
+                Err(attempt_error(error))
+            }
+        };
         let streamed = streamed_now.load(Ordering::SeqCst);
         self.model_sent(need, outcome, streamed, None, None)
     }
@@ -2212,6 +2298,7 @@ impl Host {
                         request,
                         helper,
                         code: None,
+                        stopping: false,
                     })),
                     work,
                 )))
@@ -3356,7 +3443,7 @@ impl Host {
             (Waiting::SummaryFetch(wait, _), WorkAnswer::Dropped(dropped)) => {
                 self.summary_failed(*wait, dropped_error(dropped))
             }
-            (Waiting::Run(run), WorkAnswer::Ran(result)) => {
+            (Waiting::Run(run), WorkAnswer::Ran(mut result)) => {
                 let RunWait {
                     need,
                     request,
@@ -3364,7 +3451,10 @@ impl Host {
                     // A script call still waiting ends with its command (its children
                     // stay uncertain in the journal).
                     code: _,
+                    stopping,
                 } = *run;
+                // Asked to stop, it ended so (one that finished first is told as it was).
+                result.stopped = stopping && !(result.success && result.failure.is_none());
                 self.ran(need, request, helper, Ok(result))
             }
             (Waiting::Run(run), WorkAnswer::Dropped(_)) => {
@@ -3375,6 +3465,7 @@ impl Host {
                     // A script call still waiting ends with its command (its children
                     // stay uncertain in the journal).
                     code: _,
+                    stopping: _,
                 } = *run;
                 self.ran(need, request, helper, Err(Error::Cancelled))
             }
@@ -3577,7 +3668,7 @@ fn bundle_tasks(
             path: format!("{at}{}", bundle::STORE),
             bytes: store.image().map_err(store_error)?,
         });
-        for name in [SETTINGS_SIDECAR, TASK_SIDECAR] {
+        for name in [SETTINGS_SIDECAR, TASK_SIDECAR, bundle::PACK_SESSION] {
             if let Some(bytes) = child.sidecar(name) {
                 files.push(BundleFile {
                     path: format!("{at}{name}"),

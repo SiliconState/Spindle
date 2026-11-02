@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy: Spindle for Browser</title>
+<meta name="description" content="What Spindle for Browser handles, where it goes, and what we receive: nothing. No account, no server of ours, no analytics.">
+<meta name="color-scheme" content="light dark">
+<link rel="canonical" href="https://siliconstate.github.io/Spindle/privacy/">
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="wrap">
+    <a class="mark" href="../" aria-label="Spindle home"><span class="glyph" aria-hidden="true">s</span>Spindle <span class="crumb">/ Privacy</span></a>
+    <nav aria-label="Product">
+      <a href="../browser/">Spindle for Browser</a>
+      <a href="https://github.com/SiliconState/Spindle">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Privacy policy · updated 31 October 2026</p>
+      <h1>Your work stays yours.</h1>
+      <p class="lead">Spindle for Browser is open-source software (MIT) for <strong>Google Chrome</strong> and the
+        browsers that install from its Web Store (Microsoft Edge, Brave and others). It has no account and no server
+        of ours. What it handles stays in your browser, or goes where you send it. We receive nothing.</p>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="where-h">
+    <div class="wrap"><div class="prose">
+      <h2 id="where-h">What it handles, and where it goes</h2>
+      <ul>
+        <li><strong>Your threads</strong> (your messages, the model's replies, the files you attach and the files a
+          thread makes) are kept in the extension's own storage on this device. What a thread sends goes to the model
+          provider you chose for it, when you send.</li>
+        <li><strong>Pages</strong>, only once you turn on page reading (Settings, Pages; off when installed): the text,
+          parts and HTML of the tabs a thread reads go to that thread's model provider. With page actions also on, a
+          thread clicks, types and navigates in your tabs as you, and can record a tab's network requests when a task
+          asks for them; what it records goes to the provider too, once a thread reads it. Screenshots are kept in the
+          thread's workspace.</li>
+        <li><strong>Your keys and sign-ins</strong> are encrypted (AES-GCM) in your browser's storage, with an optional
+          passphrase, and sent only to the provider they were saved for (and to OpenAI's sign-in service, if you sign in
+          with ChatGPT). A site's secret header that you save is encrypted the same way and sent only to that site.</li>
+        <li><strong>Commands' network</strong>, only once you turn it on for a thread: its commands reach the websites
+          they ask for, through your browser (without your cookies) or through a relay you set up. With a relay, names
+          are looked up over DNS-over-HTTPS (Cloudflare), only while such a command runs.</li>
+        <li><strong>Sites scripts may call</strong>: requests go only to the sites you list.</li>
+        <li><strong>Your Spindle host</strong>, if you connect one: the commands of threads you run there, with their
+          workspace files, go to that host, which is yours.</li>
+      </ul>
+    </div></div>
+  </section>
+
+  <section class="block" aria-labelledby="us-h">
+    <div class="wrap"><div class="prose">
+      <h2 id="us-h">What we receive</h2>
+      <p>Nothing. Spindle has no analytics, telemetry, advertising or tracking, and sends us no data. We never sell,
+        transfer or use your data for anything else, and no person at SiliconState reads it.</p>
+      <h2>Who else processes it</h2>
+      <p>The model providers you choose (for example OpenAI, Anthropic, DeepSeek, Z.ai, Moonshot, or a model server
+        you run) process what your threads send them under their own privacy policies. Websites your threads visit see
+        those visits, as they would yours.</p>
+      <h2>How long it is kept</h2>
+      <p>On your device, until you delete the thread or remove the extension (which deletes everything it keeps). A key
+        or sign-in stays until you remove it in Settings, and a site's secret header until you remove the site; if you
+        forget your passphrase, <strong>Forgot it</strong> deletes them all. Your threads are protected by your browser
+        profile; only keys and secrets are encrypted inside it.</p>
+      <h2>Limited Use</h2>
+      <p>Spindle's use of the information it handles complies with the Chrome Web Store User Data Policy, including
+        the Limited Use requirements: it is used only to do what you ask a thread to do.</p>
+      <h2>Children</h2>
+      <p>Spindle is not directed at children under 13.</p>
+      <h2>Changes and questions</h2>
+      <p>Changes to this policy are published on this page, with its date. Ask about it, or about anything Spindle
+        does, on <a href="https://github.com/SiliconState/Spindle/issues">GitHub</a>; the
+        <a href="https://github.com/SiliconState/Spindle">source code</a> shows exactly what it does.</p>
+    </div></div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Spindle for Browser · MIT · &copy; SiliconState</span>
+    <nav aria-label="Footer">
+      <a href="../browser/">Spindle for Browser</a>
+      <a href="https://github.com/SiliconState/Spindle/blob/main/SECURITY.md">Security</a>
+      <a href="https://github.com/SiliconState/Spindle">GitHub</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

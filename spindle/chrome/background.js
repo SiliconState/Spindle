@@ -3,7 +3,7 @@
 // document cannot reach tabs). Reading needs page reading on; acting needs page actions
 // on as well (chrome.debugger: clicks, keys and typing reach the page as the user's
 // would, and a tab's network can be watched).
-import { ACTING_NAMES, PAGE_ACCESS, PICTURE_ACCESS, pageSwitches, uncertain } from './page-tools.mjs';
+import { ACTING_NAMES, BROWSER, PAGE_ACCESS, PICTURE_ACCESS, pageSwitches, uncertain } from './page-tools.mjs';
 import { read, write } from './shared.mjs';
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
@@ -58,6 +58,9 @@ async function preview(url) {
 const TOOLS = {
   list_tabs: listTabs, read_page: readPage, page_elements: pageElements, page_html: pageHtml, screenshot,
   navigate, click, type, select, press, scroll, wait_for: waitFor, dialog, close_tab: closeTab, network,
+  // The engine's own, offered to no thread: what an action would land on, for the check
+  // Settings, Pages, Before acting asks for.
+  target,
 };
 
 /** How long one call into a page or Chrome's debugger may take (a tool has 30 s). */
@@ -160,8 +163,8 @@ async function lookedAt() {
 async function pageTab(id) {
   const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt();
   if (!tab) throw new Error(id != null ? `there is no tab ${id}` : 'no tab is open');
-  if (!tab.url) throw new Error(`Chrome gives Spindle no access to tab ${tab.id} (a new tab, a blank page or a browser page)`);
-  if (!/^https?:/.test(tab.url)) throw new Error(`Chrome does not let extensions into ${new URL(tab.url).protocol} pages`);
+  if (!tab.url) throw new Error(`${BROWSER} gives Spindle no access to tab ${tab.id} (a new tab, a blank page or a browser page)`);
+  if (!/^https?:/.test(tab.url)) throw new Error(`${BROWSER} does not let extensions into ${new URL(tab.url).protocol} pages`);
   return tab;
 }
 
@@ -427,6 +430,14 @@ async function aim(tabId, ref, control) {
   return page(tabId, 'point', { ref }, control);
 }
 
+/** What `ref` is (its description, whether a click on it submits a form, its words) and
+ * where (the tab's site): read from the page, nothing done to it. */
+async function target({ ref, tab: id }, control) {
+  const tab = await pageTab(id);
+  const found = await page(tab.id, 'target', { ref }, control);
+  return { content: found.what, details: { ...found, host: new URL(tab.url).host, tab: tab.id } };
+}
+
 /** Something else lies over the target: nothing is clicked or typed there. */
 const coveredError = (at, ref) => ({
   error: `${at.what} [${ref}] is covered by ${at.covered}, so nothing was done (a click would land on that); close or move what covers it, or act on that instead`,
@@ -589,7 +600,7 @@ function refuseWhileDialog(tabId) {
 async function attach(tabId) {
   if (attached.has(tabId)) return;
   if (await vetoed(tabId)) {
-    throw new Error(`the user stopped Spindle acting on tab ${tabId} (they closed Chrome's debugging bar); Spindle will not act on it again until the user turns page actions off and on in Spindle's settings`);
+    throw new Error(`the user stopped Spindle acting on tab ${tabId} (they closed ${BROWSER}'s debugging bar); Spindle will not act on it again until the user turns page actions off and on in Spindle's settings`);
   }
   if (!attaching.has(tabId)) {
     attaching.set(tabId, (async () => {
@@ -597,7 +608,7 @@ async function attach(tabId) {
         await chrome.debugger.attach({ tabId }, '1.3');
       } catch (error) {
         // Spindle's own earlier attach (before this worker last rested) still holds.
-        if (!/already attached/i.test(error.message)) throw new Error(`Chrome would not let Spindle act on tab ${tabId}: ${error.message}`);
+        if (!/already attached/i.test(error.message)) throw new Error(`${BROWSER} would not let Spindle act on tab ${tabId}: ${error.message}`);
       }
       attached.set(tabId, setTimeout(() => detach(tabId), 20_000));
       // Dialogs are said as they open (an action waiting on one would wait forever).
@@ -737,11 +748,11 @@ async function network({ action, tab: id, filter, body }, control) {
     return { content: `Watching tab ${tab.id}'s network from now on (reload it with navigate to see its page load).` };
   }
   const log = watched.get(tab.id);
-  if (!log) return { error: `tab ${tab.id}'s network is not watched (start it; Chrome ends a watch when its debugging bar is closed)` };
+  if (!log) return { error: `tab ${tab.id}'s network is not watched (start it; ${BROWSER} ends a watch when its debugging bar is closed)` };
   if (body) {
     const entry = log.get(body);
     if (!entry) return { error: `there is no request ${body} in tab ${tab.id}'s log` };
-    if (entry.redirected) return { error: 'Chrome does not keep a redirect hop\'s body; read the final request instead' };
+    if (entry.redirected) return { error: `${BROWSER} does not keep a redirect hop's body; read the final request instead` };
     const answer = await cdp(tab.id, 'Network.getResponseBody', { requestId: entry.id }, control).catch((error) => ({ error: error.message }));
     if (answer.error || answer.body == null) return { error: `that response's body is not kept (${answer.error ?? 'none was given'})` };
     if (answer.base64Encoded) return { content: `[a binary body of about ${Math.round((answer.body.length * 3) / 4)} bytes]` };
@@ -1050,6 +1061,16 @@ function inPage(op, args) {
         getSelection().addRange(range);
       }
       return { value: true };
+    }
+    if (op === 'target') {
+      const element = elementOf(args.ref);
+      const kind = (element.getAttribute('type') ?? '').toLowerCase();
+      const submits = (element.localName === 'button' && (kind === 'submit' || (!kind && Boolean(element.form))))
+        || (element.localName === 'input' && (kind === 'submit' || kind === 'image'));
+      // A field's words are its label, never what it holds when that is a password.
+      const value = element.type === 'password' ? '' : element.value;
+      const label = clean(element.innerText || value || element.getAttribute('aria-label') || element.title || '', 120);
+      return { value: { what: describe(element), submits, label } };
     }
     if (op === 'value') {
       const element = elementOf(args.ref);

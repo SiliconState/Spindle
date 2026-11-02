@@ -496,6 +496,23 @@ pub(crate) fn reasoning(route: &Route, effort: Effort) -> Result<Reasoning> {
                 short: format!("think {}K", budget / 1024),
             })
         }
+        // A model the catalog says does not reason (GPT-4.1, GPT-4o) is refused with a
+        // 400 when a request names an effort: it takes only the provider default.
+        (
+            RequestContract::OpenAiChatCompletions
+            | RequestContract::OpenAiResponses
+            | RequestContract::ChatGptResponses,
+            level,
+        ) if level != Effort::Default
+            && !deepseek
+            && !local
+            && !provider::resolve_model_spec(&route.profile, &route.model).reasoning =>
+        {
+            Err(format!(
+                "{} does not reason: it takes only the provider default effort",
+                route.model
+            ))
+        }
         (RequestContract::OpenAiChatCompletions, Effort::Default | Effort::Off) if deepseek => {
             plain(
                 vec![("thinking", off)],
@@ -561,10 +578,12 @@ pub(crate) fn reasoning(route: &Route, effort: Effort) -> Result<Reasoning> {
             plain(vec![], "provider default", "default")
         }
         (RequestContract::OpenAiResponses | RequestContract::ChatGptResponses, level) => {
-            let declared = !provider::resolve_model_spec(&route.profile, &route.model)
-                .effort_levels
-                .is_empty();
-            let sent = if level != Effort::Off && declared {
+            let levels = provider::resolve_model_spec(&route.profile, &route.model).effort_levels;
+            // A model whose catalog entry lists `none` (GPT-6 Sol, GPT-6 Luna) turns
+            // reasoning off with it.
+            let sent = if level == Effort::Off && levels.iter().any(|level| level == "none") {
+                "none".to_string()
+            } else if level != Effort::Off && !levels.is_empty() {
                 chat_effort(route, level)
             } else {
                 provider::chatgpt_reasoning_effort(&route.model, level.provider())
@@ -1154,12 +1173,46 @@ pub(crate) fn request_body_for(
     for (key, value) in reasoning.fields {
         body[key] = value;
     }
+    name_output_cap(route, model, &mut body);
     if route.contract == RequestContract::AnthropicMessages
         && provider::resolve_model_spec(&route.profile, &route.model).prompt_cache
     {
         mark_prompt_cache(&mut body);
     }
     Ok(body)
+}
+
+/// The field a chat completions request caps its output with on `route` for `model`:
+/// OpenAI's own API takes `max_completion_tokens` (its reasoning models refuse
+/// `max_tokens`, which it deprecated for every model), as GPT-6 models do wherever they
+/// are served (Dext's rule); every other chat completions server keeps `max_tokens`.
+pub(crate) fn chat_output_cap(route: &Route, model: &str) -> &'static str {
+    let openai = provider::canonical_provider_id(&route.profile.id) == "openai"
+        || route
+            .profile
+            .base_url
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("https://api.openai.com");
+    if openai || provider::is_gpt_6_model(model) {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    }
+}
+
+/// A chat completions `body` with its output cap under the name `route` takes for `model`.
+fn name_output_cap(route: &Route, model: &str, body: &mut Value) {
+    if route.contract != RequestContract::OpenAiChatCompletions
+        || chat_output_cap(route, model) == "max_tokens"
+    {
+        return;
+    }
+    if let Some(object) = body.as_object_mut()
+        && let Some(cap) = object.remove("max_tokens")
+    {
+        object.insert("max_completion_tokens".into(), cap);
+    }
 }
 
 /// Anthropic prompt caching, as Dext places it: the system prompt, the tool list and a
@@ -1546,7 +1599,12 @@ pub(crate) fn code_model_request(
                 "messages".into(),
                 json!([{"role":"system","content":system},{"role":"user","content":user}]),
             );
-            object.insert("max_tokens".into(), json!(max_tokens + thinking));
+            object.remove("max_tokens");
+            object.remove("max_completion_tokens");
+            object.insert(
+                chat_output_cap(route, &route.model).into(),
+                json!(max_tokens + thinking),
+            );
         }
         RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
             let mut content = vec![json!({"type":"input_text","text":prompt})];

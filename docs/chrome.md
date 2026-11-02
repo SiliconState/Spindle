@@ -7,12 +7,15 @@ The threads run in a worker of an offscreen document, so they keep going while t
 closed. Model requests go from that worker straight to the provider with a key or sign-in kept
 sealed in the extension's IndexedDB. Threads can read and act on browser tabs through page tools,
 run `bash` in a Linux that runs inside the extension (see [browser-linux.md](browser-linux.md)),
-and move to and from a native Spindle host as `.spindle` files. The extension works on its own;
-connecting a native host is optional and only adds a second place where commands can run.
-It is tested on Chrome and Edge (Chromium 116 or later, on desktop); this page uses Chrome's
-names, which Edge shares. The manifest's current version is **0.1.4**
+and move to and from a native Spindle host, as `.spindle` files or straight to a connected host.
+The extension works on its own; connecting a native Spindle host is optional and adds a second
+place where a thread's commands, or the whole thread, can run.
+It is tested on Chrome, Edge and Brave (Chromium 116 or later, on desktop); this page uses Chrome's
+names, which Edge shares. In Edge, Brave or Opera, the panel and the messages it shows say that
+browser's name where they would say Chrome (`BROWSER` in
+[`page-tools.mjs`](../spindle/chrome/page-tools.mjs)). The manifest's current version is **0.1.5**
 ([`manifest.json`](../spindle/chrome/manifest.json)); the release asset is
-`spindle-browser-0.1.4.zip`.
+`spindle-browser-0.1.5.zip`.
 
 ## Contents
 
@@ -22,8 +25,10 @@ names, which Edge shares. The manifest's current version is **0.1.4**
 - [Providers, keys and requests](#providers-keys-and-requests)
 - [Page tools](#page-tools)
 - [Files in and out](#files-in-and-out)
+- [Stopping a turn](#stopping-a-turn)
 - [Settings](#settings)
 - [Moving threads to and from a native host](#moving-threads-to-and-from-a-native-host)
+- [Running a thread on your Spindle host](#running-a-thread-on-your-spindle-host)
 - [Permissions](#permissions)
 - [Install a release](#install-a-release)
 - [Build and load](#build-and-load)
@@ -32,8 +37,9 @@ names, which Edge shares. The manifest's current version is **0.1.4**
 ## Components and Chrome contexts
 
 All sources are in [`spindle/chrome/`](../spindle/chrome/). [`chrome/build.sh`](../spindle/chrome/build.sh)
-also copies in the JS client ([`embedded.mjs`](../spindle/clients/js/embedded.mjs),
-[`opfs.mjs`](../spindle/clients/js/opfs.mjs), [`common.mjs`](../spindle/clients/js/common.mjs)) and the
+also copies in the JS clients ([`embedded.mjs`](../spindle/clients/js/embedded.mjs),
+[`opfs.mjs`](../spindle/clients/js/opfs.mjs), [`common.mjs`](../spindle/clients/js/common.mjs), and
+[`remote.mjs`](../spindle/clients/js/remote.mjs) for a connected host's `/v1`) and the
 native UI's `store/ui/text.js` and `store/ui/theme.js`, so the panel uses the same Markdown parser
 and theme switch as the native UI.
 
@@ -42,7 +48,7 @@ and theme switch as the native UI.
 | [`manifest.json`](../spindle/chrome/manifest.json) | — | MV3 manifest: side panel, module service worker, permissions, the sandboxed `preview.html`, content security policies. Requires Chrome 116 or later. |
 | [`background.js`](../spindle/chrome/background.js) | Service worker | Opens the side panel from the toolbar button. Does the page tools' work (only it can reach tabs). Keeps the page switches consistent with Chrome's site access. |
 | [`engine.html`](../spindle/chrome/engine.html), [`engine.mjs`](../spindle/chrome/engine.mjs) | Offscreen document (one per profile, reason `WORKERS`) | Starts the engine worker and relays its page-tool calls to the service worker (a worker has no `chrome.runtime`). |
-| [`engine-worker.mjs`](../spindle/chrome/engine-worker.mjs) | Dedicated worker of the offscreen document | The engine. Holds an `EmbeddedClient` over the OPFS pool, the thread index, every thread's turns and the command runners; opens the provider's sealed credential for each request. |
+| [`engine-worker.mjs`](../spindle/chrome/engine-worker.mjs) | Dedicated worker of the offscreen document | The engine. Holds an `EmbeddedClient` over the OPFS pool, the thread index, every thread's turns and the command runners; opens the provider's sealed credential for each request. Drives threads that live on a connected host through a `RemoteClient`. |
 | [`linux-runner.mjs`](../spindle/chrome/linux-runner.mjs), [`linux-route.mjs`](../spindle/chrome/linux-route.mjs) | Engine worker | The `app` command runner: picks a Linux for each command and talks to the Linux workers. |
 | [`linux-worker.mjs`](../spindle/chrome/linux-worker.mjs), [`wasm-linux-worker.mjs`](../spindle/chrome/wasm-linux-worker.mjs) | Nested workers started by the engine | The two browser Linuxes. See [browser-linux.md](browser-linux.md). |
 | [`panel.html`](../spindle/chrome/panel.html), [`panel.mjs`](../spindle/chrome/panel.mjs), [`panel.css`](../spindle/chrome/panel.css) | Side panel (also opens in a tab) | The UI. It holds no session: it sends requests to the engine and renders the events the engine broadcasts. |
@@ -51,10 +57,11 @@ and theme switch as the native UI.
 | [`view.html`](../spindle/chrome/view.html), [`view.mjs`](../spindle/chrome/view.mjs) | Extension page in a tab | Shows one workspace file in a tab of its own. |
 | [`preview.html`](../spindle/chrome/preview.html), [`preview.js`](../spindle/chrome/preview.js) | Sandboxed extension page (iframe) | Renders a web page a thread made. It has its own origin and no extension APIs. |
 | [`page.mjs`](../spindle/chrome/page.mjs) | Panel, file tab | Workspace file helpers: file type and display kind, inlining a page's workspace resources for the preview, safe download names, `saveFile`. |
-| [`page-tools.mjs`](../spindle/chrome/page-tools.mjs) | Panel, engine, service worker | Page tool definitions, the host permission patterns they need, and the `pageSwitches` rule. |
+| [`page-tools.mjs`](../spindle/chrome/page-tools.mjs) | Panel, engine, service worker | Page tool definitions, the host permission patterns they need, the `pageSwitches` rule, what Before acting asks about (`confirmMode`, `sends`, `actionText`), and the browser's name (`BROWSER`). |
 | [`shared.mjs`](../spindle/chrome/shared.mjs) | Panel, engine, file tab, service worker | The `BroadcastChannel` name, the extension's IndexedDB helpers, `accessFor`, and `startEngine`. |
-| [`vault.mjs`](../spindle/chrome/vault.mjs) | Engine | Credentials at rest: sealing, opening, the passphrase lock (see [Keys at rest](#keys-at-rest)). |
-| [`signin.mjs`](../spindle/chrome/signin.mjs) | Panel (the tab), engine (the tokens) | Browser sign-in: which providers have one, the PKCE tab flow, the code exchange and refreshes. |
+| [`vault.mjs`](../spindle/chrome/vault.mjs) | Engine | Credentials and sites' secret headers at rest: sealing, opening, the passphrase lock (see [Keys at rest](#keys-at-rest)). |
+| [`signin.mjs`](../spindle/chrome/signin.mjs) | Panel (the tab), engine (the tokens) | Browser sign-in: which providers have one, the PKCE tab flow, the code exchange and refreshes. Also the tab of a host's one-click Connect (`connectInTab`). |
+| [`host-moves.mjs`](../spindle/chrome/host-moves.mjs) | Engine | Moving a thread to the connected host and back as a recorded move that finishes or rolls back by itself after any stop (see [Running a thread on your Spindle host](#running-a-thread-on-your-spindle-host)). |
 | [`zip.mjs`](../spindle/chrome/zip.mjs) | Panel | Writes an uncompressed (stored) `.zip` of a workspace. |
 | [`build.sh`](../spindle/chrome/build.sh) | — | Assembles the loadable extension folder. |
 
@@ -69,6 +76,7 @@ flowchart LR
     subgraph EW["Dedicated worker: engine-worker.mjs"]
       client["EmbeddedClient and spindle-embed wasm"]
       runner["linux-runner.mjs"]
+      rc["RemoteClient: remote.mjs"]
     end
   end
   subgraph LX["Linux workers"]
@@ -97,6 +105,7 @@ flowchart LR
   panel --> idb
   client -->|"fetch with key"| provider
   client -->|"remote runner, optional"| host
+  rc -->|"/v1: threads on the host and moves, optional"| host
   client --> runner
   runner <-->|"postMessage run, files, code"| v86
   runner <-->|"postMessage run, files, code"| wasm
@@ -116,6 +125,9 @@ origin can join it.
 | engine to page | `{to, id, ok, result}` or `{to, id, ok: false, error: {kind, message}}` | The reply to one request. |
 | engine to all | `{type: 'event', thread, event}` | A session event of a thread, as the embedded package emits it. |
 | engine to all | `{type: 'thread', thread}`, `{type: 'removed', id}`, `{type: 'turn_end', thread, unsent}` | Thread index changes and turn ends. |
+| engine to all | `{type: 'queued', thread, queued}` | A message waiting for a turn's end, or held (`held` says why). |
+| engine to all | `{type: 'approvals', approvals}` | The page actions waiting for the user's Allow or Deny (see [Before acting](#before-acting)). |
+| engine to all | `{type: 'resync', thread}` | A thread on the host whose event stream opened again after a gap: panels draw it again. |
 | engine to all | `{type: 'linux', state, detail, wasm}` | Browser Linux states (see [browser-linux.md](browser-linux.md#boot-resume-and-idle)). |
 | engine to all | `{type: 'host' \| 'sites' \| 'relay', ...}` | Settings changes, so every open panel updates. |
 | engine to all | `{type: 'ready', broken}` | The engine finished starting (or could not). |
@@ -128,7 +140,7 @@ The engine's operations (`ops` in [`engine-worker.mjs`](../spindle/chrome/engine
 
 | Operation | Does |
 | --- | --- |
-| `hello` | Returns a snapshot: package info, catalog, thread index, running threads, Linux and host state, sites, standing instructions, relay, and the vault's state (its mode, whether it is locked, each provider's credential kind and signed-in account). |
+| `hello` | Returns a snapshot: package info, catalog, thread index, running threads, Linux and host state, sites, standing instructions, relay, the page actions waiting for an answer, and the vault's state (its mode, whether it is locked, each provider's credential kind and signed-in account). |
 | `create` | Creates a thread (optionally with another thread's workspace, `from`) and starts its first turn. |
 | `send` | Starts a turn or steers a running one with text. The panel queues a message with files for the next turn, with Take back; it stays held when the prior turn needs recovery or did not finish. |
 | `stop`, `retry`, `resume` | Stop a turn; resend a request that was cut off; continue where Spindle knows it stopped. |
@@ -143,9 +155,16 @@ The engine's operations (`ops` in [`engine-worker.mjs`](../spindle/chrome/engine
 | `files`, `turnFiles`, `read` | List the workspace; list it together with the files as the last turn found them; read one file's bytes. |
 | `remove` | Deletes a thread, its OPFS files, its kept bundles and what the Linuxes kept of its workspace. |
 | `host`, `sites`, `relay`, `standing`, `catalog` | Global settings (see [Settings](#settings)). |
+| `approve` | The user's Allow or Deny for a page action waiting for it (see [Before acting](#before-acting)). |
+| `hostName`, `hostConnect` | This browser's name on the host (kept for the profile); trade the code a Connect tab caught for a browser token and connect with it. |
+| `hostPreflight`, `toHost`, `backPreview`, `backHere` | Run on my host and Bring back to this browser (see [Running a thread on your Spindle host](#running-a-thread-on-your-spindle-host)). |
 | `saveKey`, `forget`, `signIn` | Seal a provider's API key; remove its key or sign-in; exchange a sign-in the panel caught for tokens and seal them (see [Providers, keys and requests](#providers-keys-and-requests)). |
 | `unlock`, `lock`, `protect`, `unprotect` | The passphrase lock: unlock, lock now, set or change the passphrase, remove it (see [Keys at rest](#keys-at-rest)). |
 | `warm` | Starts or resumes the browser Linux ahead of a command. |
+
+For a thread that lives on the connected host, the thread operations go to the host's `/v1`
+instead, and those only a thread here can do (`export`, `bundle`, `compact`, `dropAside`,
+`freeSealed`, and `create` with its files) are refused until it is brought back.
 
 Thread ids are 16 hex digits; the engine rejects any other. Short operations on one thread run
 one after another (`operate` keeps a queue per thread), and `stop` skips that queue. Operations
@@ -197,10 +216,10 @@ object stores:
 
 | Store | Key | Holds |
 | --- | --- | --- |
-| `keys` | provider id, or `:host` | A provider credential or the host runner's token sealed by the vault (see [Keys at rest](#keys-at-rest)); the host record is separate from provider entries. |
-| `threads` | thread id | The thread index: title, route, effort, runner, network, tasks, creation/update times, state, note, summaries and last v86 use. |
-| `bundles` | thread id, or `prior:ID:TIME:UUID` | The `.spindle` file a moved thread went into; a temporary whole-checked backup while a first turn is reset, removed once reset or restoration finishes. |
-| `kv` | name | `catalog`, `host`, `sites`, `relay`, `standing`, `pages`, `vault` (the vault key, or its wrapped form), and `reset:ID` markers. |
+| `keys` | provider id, `:host`, or `:site:NAME` | A provider credential, the host's token, or a site's secret headers, sealed by the vault (see [Keys at rest](#keys-at-rest)); the host and site records are separate from provider entries. |
+| `threads` | thread id | The thread index: title, route, effort, runner, network, tasks, creation/update times, state, note, summaries and last v86 use; for a thread on the host, `home` (its address and session), a move under way (`moving`) and why the host cannot be reached now (`away`). |
+| `bundles` | thread id, `prior:ID:TIME:UUID`, or `host-move:ID` | The `.spindle` file a moved thread went into; a temporary whole-checked backup while a first turn is reset, removed once reset or restoration finishes; the bytes a move to or from the host holds until it ends. |
+| `kv` | name | `catalog`, `host`, `host-name`, `sites`, `site-secrets` (each site's secret header names), `relay`, `standing`, `pages`, `vault` (the vault key, or its wrapped form), `reset:ID` markers, and for threads on the host their moves (`host-move:ID`), turn commands and Stops saved until the host confirms them (`host-command:ID`, `host-stop:ID`) and page tool answers (`host-tool:...`). |
 
 A thread's `state` is one of `idle`, `running`, `stopped`, `failed`, `interrupted` or `moved`.
 A moved thread stays moved even if a turn ends after the move.
@@ -215,10 +234,14 @@ loads the site grants and relay, and then repairs what an earlier stop left behi
   imported back, then the marker and backup are removed; finished resets keep no
   backup, and startup removes unused reset backups and stale bundles from moves
   that never sealed;
-- a thread the index still calls `running` becomes `interrupted` ("Chrome stopped while it ran");
+- a thread the index still calls `running` becomes `interrupted` ("Chrome stopped while it ran"),
+  unless it lives on the host, where it may still run (the host says how it stands once it
+  answers);
 - a thread whose store lock file starts with `spindle-moved: ` is marked `moved` (a move sealed
   before the index was updated);
-- directories under `/threads` that no index entry names are removed.
+- directories under `/threads` that no index entry names are removed;
+- moves to or from the host go on from the step they recorded; those that need the host wait
+  for it.
 
 ### Before each turn
 
@@ -313,10 +336,12 @@ API key here; its subscription sign-in is not offered.
 
 ### Keys at rest
 
-Every secret in the `keys` store, including the host token under `:host`, is sealed
+Every secret in the `keys` store, including the host token under `:host` and sites'
+secret headers under `:site:NAME`, is sealed
 with AES-GCM (256-bit, a fresh 96-bit IV per write), with its record id as additional
 authenticated data, so a record cannot be moved to another provider or into the host
-slot. The host's URL remains readable in `kv/host`, but its token does not. The
+slot. The host's URL remains readable in `kv/host`, and a site's address and header names
+in `kv/sites` and `kv/site-secrets`, but their secrets do not. The
 vault key that seals them is one of two kinds:
 
 | Mode | Vault key | Protects against | Unlock |
@@ -332,8 +357,9 @@ the same IndexedDB transaction that replaces the vault key, so an interruption l
 vault or the new one, never a mix, and neither the device key nor an earlier passphrase opens
 what is kept from then on. Locked, a send asks for the passphrase and nothing reaches the
 provider; a wrong passphrase is refused by the key unwrap itself. A forgotten passphrase cannot
-be recovered: **Forgot it** (after a confirmation) deletes every saved key and sign-in and starts
-a new device vault, leaving threads as they are. Opening a record costs one AES-GCM decryption,
+be recovered: **Forgot it** (after a confirmation) deletes every saved key and sign-in, the
+host's token and sites' secret headers, and starts a new device vault, leaving threads as they
+are. Opening a record costs one AES-GCM decryption,
 so requests are no slower; the vault's state for the panel is read without waiting behind a
 token refresh, and every vault change is announced to every open panel.
 
@@ -348,22 +374,62 @@ provider's origin (`accessFor`: the origin of the catalog's `base_url`), and sen
 asks again if access is missing. When Chrome refuses a request, the engine's `reach` wrapper
 names the origin and explains how to allow it.
 
-A native Spindle host connected under Settings, Your Spindle host is used only as a
-remote command runner (`remoteRunner` in
-[`embedded.mjs`](../spindle/clients/js/embedded.mjs)). Mint its token with
-`spindle --dir HOST token new chrome --runner`; it reaches `/v1`, `/v1/runner`,
-`/v1/run` and the starting token's run status and stop, but no session or transcript.
+A native Spindle host connected under Settings, Your Spindle host is the remote command
+runner for threads here (`remoteRunner` in
+[`embedded.mjs`](../spindle/clients/js/embedded.mjs)) and, when connected with a browser
+token, can also take whole threads (see
+[Running a thread on your Spindle host](#running-a-thread-on-your-spindle-host)). **Connect**
+gets that browser token through the host's own page. A token pasted instead comes from
+`spindle --dir HOST token new NAME --browser`, or, for commands only,
+`spindle --dir HOST token new NAME --runner`: a runner token reaches `/v1`, `/v1/runner`,
+`/v1/run` and the starting token's run status and stop, but no session or transcript, and
+cannot move threads or run their model turns.
 The token is sealed, locked, re-sealed and reset with the provider credentials;
 older plaintext host tokens are migrated into the vault at engine start. Model
-requests never go through this host. See [host.md](host.md).
+requests of threads in the browser never go through this host. See [host.md](host.md).
+
+### Secret headers for sites
+
+A site listed under Settings, Sites scripts may call can carry one secret header, such as
+an API token as `Authorization: Bearer ...` or a key header such as `X-Api-Key`. Settings
+takes a header name (`Authorization` when left empty) and its value. The engine
+(`changeSites` in [`engine-worker.mjs`](../spindle/chrome/engine-worker.mjs)) checks it
+before keeping anything:
+
+- the name must be one a request can carry; names the browser or Spindle set themselves
+  (`Host`, `Cookie`, `Origin`, `Referer`, `Proxy-*`, `Sec-*` and the like) are refused;
+- the value is visible ASCII, at most 8 KiB, and its secret part (after an auth scheme such
+  as `Bearer`) has at least 8 characters, so it can be found in what comes back;
+- the address must be `https://`, or one of this computer's own (`localhost`, `127.0.0.1`,
+  `[::1]`, `*.localhost`);
+- the keys must be unlocked: the header is sealed in the vault with the provider keys
+  (`keys/:site:NAME`), and only its name is kept in `kv/site-secrets`.
+
+Adding a listed address again updates it (with a new header, or keeping the one it has);
+removing the site removes its header. The package only learns the header's name: the
+site's grant names it as one the app adds (`{"app": true}`), and the embedded client asks
+the engine for the value (`grantHeaders`) as each request a script makes under that grant
+goes out, only for the address it was saved for. A script may not set that header itself,
+its value is never journaled, and an echo of it in what comes back (headers, body or
+errors; as is, JSON-escaped, percent-encoded or in base64) is replaced with `[redacted]`
+before the script or the thread sees it. While the keys are locked such requests are
+refused; after **Forgot it** the site shows its header as gone and refuses requests until it
+is added again with one.
+
+The header keeps the token from scripts, not its use: any script of a thread can make the
+requests that site's address and access allow with it, and pass on what comes back. List
+the narrowest address, choose **Read it** where reading is enough, and use a token with the
+least scope. Redaction finds the forms a server commonly echoes a token in, not every
+transformation of it.
 
 ## Page tools
 
 Page tools let a thread see and use the user's tabs. The engine registers every tool in
 `PAGE_TOOLS` ([`page-tools.mjs`](../spindle/chrome/page-tools.mjs)) as an app tool with a 30 s
-timeout, and the service worker does the work. Two switches, kept as `kv/pages` = `{reading,
-acting}`, gate them, together with Chrome's host access to `https://*/*` and `http://*/*`
-(`PAGE_ACCESS`):
+timeout (an action [Before acting](#before-acting) may ask about gets ten minutes more, to wait
+for the user's answer), and the service worker does the work. Two switches, kept with the
+Before acting mode as `kv/pages` = `{reading, acting, confirm}`, gate them, together with
+Chrome's host access to `https://*/*` and `http://*/*` (`PAGE_ACCESS`):
 
 - **Page reading** is on only when the user turned it on and Chrome grants site access.
 - **Page actions** is on only when page reading is on as well.
@@ -426,6 +492,27 @@ How the tools run ([`background.js`](../spindle/chrome/background.js)):
   image as a workspace write in `screenshots/`, named by its capture time and tab (the
   panel shows it as "Screenshot" and the time it was taken). The model does not see it directly, but a script in the browser
   Linux can pass it to a vision model with `spindle model --image FILE`.
+
+### Before acting
+
+Settings, Pages, **Before acting** decides whether a thread asks the user before a page action
+(`beforeActing` in [`engine-worker.mjs`](../spindle/chrome/engine-worker.mjs), `sends` in
+[`page-tools.mjs`](../spindle/chrome/page-tools.mjs)):
+
+| Mode | Asks before |
+| --- | --- |
+| **Full** (the default) | Nothing: it acts without asking, the whole task start to end. |
+| **Auto** | An action that sends or submits: `press` of Enter (with or without modifiers), `type` with `submit` (Enter after typing), `dialog` accepting a page's dialog, and a `click` on a submit control or on one whose label holds a word such as Send, Submit, Post, Reply, Share, Buy, Pay, Order, Confirm, Delete, Remove or Transfer (`SENDING_WORDS`; a click whose target cannot be told counts as one that sends). |
+| **Ask** | Every `click`, `type`, `press`, `select`, `navigate` (going back, forward or reloading too), `dialog` (accepting or dismissing) and `close_tab`. |
+
+Reading tools, `scroll`, `wait_for`, `screenshot` and `network` never ask, and neither does
+`navigate` opening a workspace file for the user. While an action waits, the panel shows it
+above that thread's message box as "Spindle asks before it acts: ..." with **Deny** and
+**Allow**, and the thread's row in the list says "Asks you: ...". The action waits up to ten
+minutes. **Allow** lets it go on. **Deny**, no answer within ten minutes, or the turn being
+stopped or ending means the action is not done, and the thread is told so: a known outcome
+(nothing happened), not an unknown one. The mode applies to threads on the connected host too,
+whose page tools this browser answers.
 
 ## Files in and out
 
@@ -494,6 +581,33 @@ device names (`con.txt` becomes `_con.txt`). **Download all** builds a `.zip` wi
 **New thread with these files** starts a thread whose first message carries another thread's
 current workspace (at most 256 MiB) and none of its conversation.
 
+## Stopping a turn
+
+Stop (the button that replaces Send while a turn runs and nothing is written) ends the turn
+where it is, and cancels its page actions still under way or waiting for an answer
+(`stop` in [`engine-worker.mjs`](../spindle/chrome/engine-worker.mjs)). Stopping is a way to
+steer: the thread then says **Stopped part way**, and while it takes a reply its box says
+"Reply to go on…" (otherwise "Reply…", and "Steer the running turn…" while a turn runs).
+
+- **A command stopped while it runs** is recorded as stopped by the user, with what it
+  printed (in the browser Linux, what it changed in the workspace is dropped). It never runs
+  again, not even on Continue.
+- **A reply** goes on with the same turn: the model reads that the user stopped that step, then
+  the reply ("skip that, use the cached copy"). If the stop cut off the model's own reply, the
+  reply asks the model again with the message read first (the cut request may have been
+  billed).
+- **Text only.** A turn stopped part way takes a message without files: one sent with files is
+  refused and stays in the box. A message with files that waited for the turn to end is not
+  sent: it shows as "Not sent (...)", saying why, and Take back puts it in the box again.
+- **Continue** lets the model decide what to do next. **Retry** asks it again from before the
+  stopped step; when that step came from the thread's first request, which has nothing before
+  it, Retry starts the turn over with its message sent again. **Take back** returns the message
+  to the box.
+
+A thread on the connected host stops the same way; see
+[Running a thread on your Spindle host](#running-a-thread-on-your-spindle-host) for what its
+Stop needs.
+
 ## Settings
 
 Global settings are a full page, opened by the gear button, with a sticky heading
@@ -521,22 +635,23 @@ Global settings are stored in IndexedDB and applied by the engine:
 | Providers | key or sign-in per provider | `keys/ID` (sealed) | Used for that provider's requests. Each row shows the provider's name, host and state and, for a sign-in, its account. Saving a key asks Chrome for the provider's origin; signing in asks for its API, token and redirect origins. |
 | Providers | Passphrase: set, unlock, lock now; change and remove under **Change or remove the passphrase** | `kv/vault` | See [Keys at rest](#keys-at-rest). |
 | Providers | Provider list | `kv/catalog` | Import a `providers.json`, or use the built-ins. Refused while threads run. |
-| Pages | Page reading, Page actions | `kv/pages` | See [Page tools](#page-tools). |
-| Pages | Take back Chrome's access to sites | — | Removes `https://*/*`, `http://*/*` and `<all_urls>` and turns both switches off. |
+| Pages | Read pages, Act on pages | `kv/pages` | Page reading and page actions; see [Page tools](#page-tools). |
+| Pages | Before acting: Full, Auto or Ask | `kv/pages` (`confirm`) | See [Before acting](#before-acting). |
+| Pages | Remove Chrome's site access | — | Removes `https://*/*`, `http://*/*` and `<all_urls>` and turns both switches off. |
 | Relay | Address | `kv/relay` | A WISP server address (`wisp://HOST` or `wisps://HOST`, nothing else accepted). Threads with network then reach any address through it. See [browser-linux.md](browser-linux.md#through-a-relay). |
-| Sites scripts may call | Address prefixes | `kv/sites` | Address prefixes that scripts' `spindle http` may reach: **Read it** allows `GET` and `HEAD`, **Read and change it** also `POST`, `PUT`, `PATCH`, `DELETE`. Adding one asks Chrome for that origin. The package checks each grant (`setHttpGrants`). |
-| Your Spindle host | URL and runner token | `kv/host` (URL), `keys/:host` (sealed token) | `spindle --dir HOST token new chrome --runner`. Kept after the host answers; no session or transcript access. |
+| Sites scripts may call | Address prefixes, each with an optional secret header | `kv/sites`, `kv/site-secrets` (header names), `keys/:site:NAME` (sealed values) | Address prefixes that scripts' `spindle http` may reach: **Read it** allows `GET` and `HEAD`, **Read and change it** also `POST`, `PUT`, `PATCH`, `DELETE`. Adding one asks Chrome for that origin. The package checks each grant (`setHttpGrants`). See [Secret headers for sites](#secret-headers-for-sites). |
+| Your Spindle host | Address; **Connect**, or **Or paste a token** | `kv/host` (URL, and this browser's name there after Connect), `keys/:host` (sealed token) | Connect opens the host's own page to approve this browser (see [Running a thread on your Spindle host](#running-a-thread-on-your-spindle-host)). A pasted token comes from `spindle --dir HOST token new NAME --browser` (threads and commands) or `--runner` (commands only). Kept after the host answers. |
 | Storage | Thread sizes, Free, Free all, Remove first attempts, Linux snapshot | OPFS and `bundles` | See [Storage controls](#storage-controls). |
 | Your instructions | standing instructions | `kv/standing` | Up to 8000 characters, added to new threads at once and to other threads before their next turn. |
-| Appearance | Paper, neutral Light, Dark or System (Light or Dark as the system is); Textured or Plain | `localStorage` (`theme.js`) | The panel's look. |
-| About | Open in a tab, Restart engine | — | Opens `panel.html` in a tab (useful when Chrome cannot show a permission prompt in the side panel); closes and restarts the offscreen engine. |
+| Appearance | Paper, neutral Light, Dim or System (Light or Dim as the system is); Textured or Plain | `localStorage` (`theme.js`) | The panel's look. Dim is the dark theme, a soft charcoal; a panel that chose the old Dark shows Dim. |
+| About | The extension's version, Open in a tab, Restart engine | — | Opens `panel.html` in a tab (useful when Chrome cannot show a permission prompt in the side panel); closes and restarts the offscreen engine. |
 
 Settings for one thread are in its model page (the model button in the composer):
 
 | Setting | Values | Notes |
 | --- | --- | --- |
 | Provider, Model, Effort | from the catalog | The efforts listed are those the model accepts (`efforts`). |
-| Commands run in | This browser (`runner: 'app'`), Your host (`'remote'`), Nowhere (`'none'`) | `app` threads get the browser Linux guide in their instructions. |
+| Commands run in | Browser (`runner: 'app'`), Host (`'remote'`), None (`'none'`) | `app` threads get the browser Linux guide in their instructions. A thread that lives on the host runs its commands in the host's sandbox until it is brought back. |
 | Network for commands | on or off | Off by default. For commands in this browser with no relay set, turning it on asks Chrome for site access; if Chrome declines, the network stays off. |
 | Tasks | on or off | Child sessions, including background work and queued reports. |
 | Budget | US dollars, or unlimited | `max_usd` is enforced in the package; spend and the cap are also reachable from the header. |
@@ -571,7 +686,9 @@ already running Linux. These are separate actions, not part of Free all. Source:
 
 A thread moves as a `.spindle` session bundle (`exportSession` and `importSession` of the
 embedded client). Native Spindle takes such a file with `spindle --dir DIR import-session FILE`
-and produces one with `export-session FILE` (see [cli.md](cli.md)).
+and produces one with `export-session FILE` (see [cli.md](cli.md)). To have a connected host
+run a thread while this panel still drives it, without a file in between, see
+[Running a thread on your Spindle host](#running-a-thread-on-your-spindle-host).
 
 **To a file** (thread menu):
 
@@ -614,6 +731,82 @@ The embedded package checks the same settings and refuses anything it still cann
 can also stay in Chrome and run its commands on a connected host (`runner: 'remote'`). Its turn
 then waits for the host connection to settle before it starts.
 
+## Running a thread on your Spindle host
+
+A thread can live on the user's Spindle host (`spindle serve`, see [host.md](host.md)) while
+this panel still shows and drives it: the host's model credentials, programs and sandbox run
+it. The engine talks to the host's `/v1` with a `RemoteClient`
+([`remote.mjs`](../spindle/clients/js/remote.mjs), see [clients.md](clients.md#remoteclient)
+and [API.md](API.md#http-api)), and moves threads there and back with
+[`host-moves.mjs`](../spindle/chrome/host-moves.mjs). This is not synchronization: a thread
+is live in one place at a time.
+
+**Connect.** In Settings, Your Spindle host, type the host's address and press **Connect**.
+Chrome asks for access to the host's origin, and the host's `/connect` page opens in a tab,
+naming this browser (for example "Chrome on Windows" with a short id kept for this profile, so
+connecting again keeps its threads). If that tab is not paired with the host yet, the page asks
+for the host's pairing key first. **Allow** there sends the tab to the host's `/connect/done`
+with a one-time code; the panel catches that address, checks it answers this request (`state`),
+and closes the tab. The engine then trades the code, with its PKCE verifier, for a browser
+token (`POST /v1/connect/token`) and seals it like a key. No token passes through a URL. Deny,
+a closed tab, or ten minutes without an answer end the attempt, and Connect is refused while
+the keys are locked. A browser token runs commands in the host's sandbox, brings this
+browser's threads there and back, and reads the host's providers and models; it sees none of
+the host's other threads. The host's own Settings, Screens can revoke it. With a runner token
+pasted instead (`token new NAME --runner`), the host only runs the commands of threads here
+that choose Host, and Run on my host is not offered.
+
+**Run on my host** (the thread's menu, when the host is connected with a browser token and
+the thread is not running). The host must list `threads` among its features (`GET /v1`);
+an older one is asked to be updated. If the thread's model is signed in on the host, the
+thread runs on it; otherwise the user chooses one of the host's signed-in models. A task
+still working in the background, or a message waiting for the thread, must end or be taken
+back first. The move then goes as recorded steps, each committed before the next, which the
+thread shows as it goes ("Moving to your host: sending it", then sealing and tidying the copy
+here):
+
+1. The thread's copy (its history and workspace as a bundle, its page tools kept, the browser
+   Linux guide left out) is held here and sent with an `Idempotency-Key`. Sent again after a
+   lost answer, the same key and bytes bring the same session, never a second one. A refusal
+   that no repeat can change rolls the move back, and the thread stays here; a host that does
+   not answer is waited for.
+2. Once the host holds it, the copy here is sealed; then its store and the held bytes go, and
+   the thread's record says where it lives (`home`).
+
+A move cut short by a crash, Chrome closing or an engine restart goes on from its last
+recorded step when the engine starts again, or when the host answers. Until the host holds
+the thread, this browser keeps its copy.
+
+**On the host.** The panel drives the thread with the same controls: messages, steering,
+Stop, Continue, Retry and going back to an earlier message (among the host's newest 48 rewind
+targets, and not to before the first message). Its events come over the host's event stream
+while it runs and for five minutes after a panel opens it, and its state is checked every
+15 seconds. Closing the
+panel, the engine or Chrome does not stop a turn there: a restarted engine finds it running
+and follows it to its end. The page tools it calls are answered by this browser while Chrome
+is open, by the same code as for a thread here (Before acting included). Each answer is saved
+before it is sent, so a lost answer is sent again rather than the action repeated, and an
+action cut off before its answer was saved answers that its outcome is unknown. A turn's
+command (a message, Continue or Retry) or a Stop is saved before it is sent and goes again
+under the same request ID until the host confirms it. When the host cannot be reached, the thread says so ("Your host is out of
+reach: ...") and loses nothing. Move to a file, Export a copy, New thread with these files and
+Storage's Free are for threads here only.
+
+**Stop** on a hosted turn names the exact command it stops (`target_request`), so it can never
+stop a later turn, even when it is delivered after the browser was offline or restarted. It
+needs a host that lists `targeted_stop` among its features: an older host is asked to be
+updated, and the Stop stays pending, with no less exact fallback. Until a pending Stop is
+delivered, a new turn or a move back is refused.
+
+**Bring back to this browser** (the thread's menu, when it is not running) first says what
+changes for the thread to run here, as an import does (see the table in
+[Moving threads to and from a native host](#moving-threads-to-and-from-a-native-host)), and
+asks to go on. The host is asked for the thread (`POST /v1/sessions/ID/export`), which seals
+its copy and answers every later export with the same bytes; the bytes are held here and
+imported in place of the fenced copy; then the host's sealed copy is deleted. The thread works
+here as soon as it is imported, even while that deletion waits for the host; moving it to the
+host again is refused until the deletion is done.
+
 ## Permissions
 
 | Permission | Used for |
@@ -626,8 +819,7 @@ then waits for the host connection to settle before it starts.
 | `unlimitedStorage` | OPFS sessions and the saved Linux state. |
 | `storage` | Chrome's session storage, for tabs whose debugging bar the user closed. |
 | `favicon` | Site icons on browser steps (`_favicon/`). |
-| `activeTab` | Declared in the manifest. |
-| optional `https://*/*`, `http://*/*` | Provider origins and your Spindle host's (asked one origin at a time), a browser sign-in's token endpoint and loopback redirect, page reading, a thread's network through Chrome, sites scripts may call. |
+| optional `https://*/*`, `http://*/*` | Provider origins and your Spindle host's (asked one origin at a time; the host's also lets the panel see its Connect tab come back), a browser sign-in's token endpoint and loopback redirect, page reading, a thread's network through Chrome, sites scripts may call. |
 | optional `<all_urls>` | Picturing the visible tab (`captureVisibleTab`), asked by the camera button. |
 
 Extension pages run under `script-src 'self' 'wasm-unsafe-eval'`, which is what loading the
@@ -648,9 +840,9 @@ provenance, and attaches it with its SHA-256. The zip also holds the `LICENSE` a
 [`THIRD-PARTY.md`](../spindle/chrome/THIRD-PARTY.md), which lists the other software it carries,
 with licenses and sources.
 
-1. Unzip it into a folder you will keep. To check version 0.1.4 first, run
-   `sha256sum -c spindle-browser-0.1.4.zip.sha256`, or
-   `gh attestation verify spindle-browser-0.1.4.zip -R SiliconState/Spindle`.
+1. Unzip it into a folder you will keep. To check version 0.1.5 first, run
+   `sha256sum -c spindle-browser-0.1.5.zip.sha256`, or
+   `gh attestation verify spindle-browser-0.1.5.zip -R SiliconState/Spindle`.
 2. Load the folder as below (**Load unpacked**).
 3. To update, unzip the next version over the same folder and click **Reload** on the
    extension's card. The browser derives an unpacked extension's id from its folder, and its
@@ -661,7 +853,9 @@ with licenses and sources.
 Build from the `spindle/` directory. The browser Linux must be built first
 ([browser-linux.md](browser-linux.md#building-the-images)). [`chrome/build.sh`](../spindle/chrome/build.sh)
 refuses to run without it, and refuses a wasm-bindgen CLI whose version differs from the one
-pinned in `embed/Cargo.toml`. It also needs the `wasm32-unknown-unknown` Rust target and clang,
+pinned in `embed/Cargo.toml`. Before building anything it also checks the manifest against the
+Chrome Web Store's limits, and stops when `name` is over 75 characters, `short_name` over 12
+or `description` over 132. It also needs the `wasm32-unknown-unknown` Rust target and clang,
 which compiles SQLite for it (`sqlite-wasm-rs`). Build paths are remapped (`/src`, `/cargo`), so
 the wasm names no directory of the building machine.
 
@@ -697,19 +891,20 @@ folder, so rebuilding does not touch them.
 The tests are in [`spindle/chrome/tests/`](../spindle/chrome/tests/). The ones that drive Chrome
 use [`cdp.mjs`](../spindle/chrome/tests/cdp.mjs): Chrome over the DevTools protocol on a pipe, with
 the extension loaded through `Extensions.loadUnpacked` and clicks and typing sent as real input
-events. Tests of the Linuxes themselves are listed in
+events. Its throwaway profiles use `--password-store=basic`, so Chrome never asks the desktop
+keyring. Tests of the Linuxes themselves are listed in
 [browser-linux.md](browser-linux.md#tests). See [testing.md](testing.md) for the project as a
 whole.
 
 | Test | Needs | Checks |
 | --- | --- | --- |
-| [`extension_real.mjs`](../spindle/chrome/tests/extension_real.mjs) | a build, `SPINDLE_BROWSER`; a key and `--provider`, or `--scripted`; optional `SPINDLE_BIN` | End to end through the panel in a fresh profile: page reading off and on, steering, a turn finishing with no panel open, Stop, Continue and Retry, Chrome killed mid-turn, moving to native Spindle and back (with `SPINDLE_BIN`), copies and deletes, no key in any bundle, bash in the browser Linux with Spindle calls, a granted site, TypeScript, attachments and downloads, browsing tools, a host sandbox (with `SPINDLE_BIN`), and (scripted) long threads, rewinds, compaction and the wasm Linux. |
-| [`signin_vault.mjs`](../spindle/chrome/tests/signin_vault.mjs) | a build, `SPINDLE_BROWSER` | Against scripted OAuth and ChatGPT-style services (no account): Sign in through a tab whose loopback redirect is caught and closed, the PKCE exchange, the row naming the signed-in account, Settings fitting a side panel's width, a refresh before the first turn, the token and its account header on the request; keys and sign-ins sealed in IndexedDB and absent as text from the profile's files; a legacy text key sealed at engine start; a passphrase that locks, refuses a wrong passphrase, unlocks, relocks on engine restart, changes and comes off; a token endpoint that is down while the token is good, a refused refresh ending the sign-in, and **Forgot it** deleting the saved keys while threads stay. |
-| [`review_browser.mjs`](../spindle/chrome/tests/review_browser.mjs) | a build, `SPINDLE_BROWSER`; Node `node:sqlite` for the storage case | Permission/send ordering, camera permission, covered targets and unknown actions, reset rollback and backup cleanup, one copy per move, Storage > Free, static and contained previews (templates, reparsing, WebRTC, resource hints and DNS netlog), version-scoped script/web choices, background task cards and stopped reports, and messages with files queued for the next turn. |
-| [`review_regressions.mjs`](../spindle/chrome/tests/review_regressions.mjs) | Node only | Engine operation ordering, reset rollback, early Stop, page-step cancellation, gateway redirect and buffer bounds, IPv6 address checks, dotted CDP request ids. |
+| [`extension_real.mjs`](../spindle/chrome/tests/extension_real.mjs) | a build, `SPINDLE_BROWSER`; a key and `--provider`, or `--scripted`; optional `SPINDLE_BIN` | End to end through the panel in a fresh profile: page reading off and on, steering, a turn finishing with no panel open, Stop, Continue and Retry, Chrome killed mid-turn, moving to native Spindle and back (with `SPINDLE_BIN`), copies and deletes, no key in any bundle, bash in the browser Linux with Spindle calls, a granted site, a site's secret header (added to a script's request, redacted from what comes back, refused when the script sets it, never kept as text or in the thread, removed with the site), TypeScript, attachments and downloads, browsing tools, a host sandbox (with `SPINDLE_BIN`), and (scripted) Before acting (Ask asks and Deny does nothing; Auto asks only before Enter), a command stopped while it runs (kept as stopped with what it printed) and a reply going on after it, long threads, rewinds, compaction and the wasm Linux. Scripted with `SPINDLE_BIN`, it also runs a thread on a Spindle host: Connect through the host's page, Run on my host, turns there (steering, Stop, Retry, a page tool this browser answers), the engine restarted mid-turn, the host out of reach and back, Bring back, and a crash or reload at every step of both moves, leaving one live copy each time. `SPINDLE_ONLY=hosted` runs only that part; `SPINDLE_ONLY=browser` skips it. |
+| [`signin_vault.mjs`](../spindle/chrome/tests/signin_vault.mjs) | a build, `SPINDLE_BROWSER` | Against scripted OAuth and ChatGPT-style services (no account): Sign in through a tab whose loopback redirect is caught and closed, the PKCE exchange, the row naming the signed-in account, Settings fitting a side panel's width, a refresh before the first turn, the token and its account header on the request; keys, sign-ins and a site's secret header sealed in IndexedDB and absent as text from the profile's files; a legacy text key sealed at engine start; a passphrase that locks, refuses a wrong passphrase and a secret header while locked, unlocks, relocks on engine restart, changes and comes off; a token endpoint that is down while the token is good, a refused refresh ending the sign-in, and **Forgot it** deleting the saved keys and secret headers while threads stay. |
+| [`review_browser.mjs`](../spindle/chrome/tests/review_browser.mjs) | a build, `SPINDLE_BROWSER`; Node `node:sqlite` for the storage case | Permission/send ordering, camera permission, covered targets and unknown actions, reset rollback and backup cleanup, one copy per move, move and index updates sharing one strict IndexedDB transaction, Storage > Free, static and contained previews (templates, reparsing, WebRTC, resource hints and DNS netlog), version-scoped script/web choices, background task cards and stopped reports, and messages with files queued for the next turn. |
+| [`review_regressions.mjs`](../spindle/chrome/tests/review_regressions.mjs) | Node only | Engine operation ordering, reset rollback, early Stop, a turn stopped part way taking a reply (text alone) and Retry after a stopped step, page-step cancellation, Before acting (Full, Auto, Ask; allowed, denied, ended), site secret headers (names, values, HTTPS only, named to the package without their values), the Dim theme (an old Dark shows Dim), the host `/v1` client (event stream parsing and resuming, commands sent again under their request ID, bundles in and out), Connect's PKCE and state, hosted turns and Stops surviving a lost answer or an engine restart, moves to the host and back cut at every step (one live copy each time), gateway redirect and buffer bounds, IPv6 address checks, dotted CDP request ids. |
 | [`panel_long_run.mjs`](../spindle/chrome/tests/panel_long_run.mjs) | a build, `SPINDLE_BROWSER` | One long scripted turn in each theme: step groups, labels, Stop, Latest, the workspace page, label contrast. |
 | [`panel_steps.mjs`](../spindle/chrome/tests/panel_steps.mjs) | Node only | `steps.mjs` labels, tenses, retried failures, durations, a group's time on the clock (steps run at once counted once), scratch files. |
-| [`panel_tree.mjs`](../spindle/chrome/tests/panel_tree.mjs) | a build, `SPINDLE_BROWSER` | Large workspace trees: closed folders draw no descendants, single-child folder chains, counts and change marks, open state across redraws, filtering and next/previous navigation; draw timing and Light/Dark screenshots. |
+| [`panel_tree.mjs`](../spindle/chrome/tests/panel_tree.mjs) | a build, `SPINDLE_BROWSER` | Large workspace trees: closed folders draw no descendants, single-child folder chains, counts and change marks, open state across redraws, filtering and next/previous navigation; draw timing and Light/Dim screenshots. |
 | [`engine_renew.mjs`](../spindle/chrome/tests/engine_renew.mjs) | build's `web/`, Node `--expose-gc` | Fresh wasm instance from one compiled module; old glue drops references, resident memory falls, fresh sessions work. |
 | [`linux_warm.mjs`](../spindle/chrome/tests/linux_warm.mjs) | Node only | Stand-in workers: wasm-only warming leaves v86 unstarted, commands start the Linux they need, and `onRan` identifies it. |
 | [`vault_host.mjs`](../spindle/chrome/tests/vault_host.mjs) | Node only | Host token sealed apart from provider keys, passphrase lock/unlock and re-sealing, reset removes it. |

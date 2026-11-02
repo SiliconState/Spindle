@@ -552,6 +552,44 @@ fn a_native_owner_holds_the_fence_the_package_respects_and_clears_its_own_stale_
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn native_fence_creation_crash_states_never_leave_an_empty_fence() {
+    let temp = Temp::new();
+    let root = temp.0.with_extension("fence-crashes");
+    let _ = std::fs::remove_dir_all(&root);
+    drop(Store::open(&root).unwrap());
+    let fence = root.join(spindle_store::FENCE);
+    let draft = root.join(format!("{}.native-999-draft", spindle_store::FENCE));
+    let package_draft = root.join(format!("{}.embed-123-draft", spindle_store::FENCE));
+    std::fs::write(&package_draft, b"spindle-embed: making a lock").unwrap();
+    for (bytes, linked) in [
+        (b"".as_slice(), false),
+        (b"spindle-n".as_slice(), false),
+        (b"spindle-native pid 999\n".as_slice(), false),
+        (b"spindle-native pid 999\n".as_slice(), true),
+    ] {
+        std::fs::write(&draft, bytes).unwrap();
+        if linked {
+            std::fs::hard_link(&draft, &fence).unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert!(
+            std::fs::read(&fence)
+                .unwrap()
+                .starts_with(spindle_store::NATIVE_FENCE.as_bytes())
+        );
+        assert!(!draft.exists(), "native drafts are swept under the flock");
+        assert!(
+            package_draft.exists(),
+            "another writer's draft is not swept"
+        );
+        drop(store);
+        assert!(!fence.exists());
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_previous_schema_store_opened_from_a_connection_or_an_image_is_packed_in_place() {
     // A store the previous build left (schema 19): every object kept as it is.

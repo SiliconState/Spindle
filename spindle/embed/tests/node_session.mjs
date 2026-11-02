@@ -111,6 +111,57 @@ async function anAppRunner() {
   await c.close();
 }
 
+// The user stops a command the app's runner runs: the runner is told (its signal) and
+// its answer, what the command printed, is recorded as stopped. After a reopen a reply
+// goes on with the turn, the model reading the stopped result and then the reply, and
+// nothing runs the command again. A runner that does not answer is recorded as stopped
+// at a second stop.
+async function aStoppedCommand() {
+  const dir = join(root, 'stopped-command');
+  const runs = [];
+  let c;
+  const runner = {
+    run({ command, signal }) {
+      runs.push(command);
+      setTimeout(() => c.stop(dir), 20);
+      return new Promise((done) => signal.addEventListener('abort', () => done({
+        output: 'started\n', success: false, failure: 'the command was stopped',
+      })));
+    },
+  };
+  const fetch = scriptedFetch([call('bash', { command: 'echo started; sleep 100' }), text('skipped it')]);
+  c = client(fetch, { runner });
+  await c.create(dir, 'fake', { runner: 'app' });
+  await assert.rejects(c.prompt(dir, 'run it'), (error) => error.kind === 'stopped');
+  const status = await c.status(dir);
+  assert.equal(status.phase, 'after_tools');
+  assert.equal(status.accepts_message, true);
+  assert.equal(status.accepts_prompt, false);
+  await c.close();
+  // Reopened, as an app that restarted: a reply goes on with the stopped turn.
+  c = client(fetch, { runner });
+  const result = await c.prompt(dir, 'skip it and say so');
+  assert.equal(result.stopped.complete, true);
+  assert.equal(runs.length, 1, 'the stopped command never runs again');
+  const next = fetch.seen[1].body;
+  const stopped = next.indexOf('started\\n\\n[the user stopped this command');
+  assert.ok(stopped >= 0 && stopped < next.indexOf('skip it and say so'), next);
+  await c.close();
+
+  const silent = join(root, 'stopped-silent');
+  const quiet = { run() { return new Promise(() => {}); } };
+  const s = client(scriptedFetch([call('bash', { command: 'sleep 100' }), text('ok')]), { runner: quiet });
+  await s.create(silent, 'fake', { runner: 'app' });
+  const turn = s.prompt(silent, 'run it');
+  setTimeout(() => s.stop(silent), 50);
+  setTimeout(() => s.stop(silent), 150);
+  await assert.rejects(turn, (error) => error.kind === 'stopped');
+  const history = await s.history(silent);
+  assert.match(JSON.stringify(history), /the user stopped this command/);
+  assert.equal((await s.status(silent)).accepts_message, true);
+  await s.close();
+}
+
 // Both runners at once: each run goes to the runner its session names, and an app
 // runner that declares a sandbox runs a session that requires isolation, unannounced.
 async function twoRunners() {
@@ -182,7 +233,7 @@ async function aScriptsCalls() {
     },
   };
   c = client(web, { runner });
-  assert.throws(() => c.setHttpGrants([{ name: 'x', url: 'https://x.example/', risk: 'read', headers: { a: 'b' } }]), /no headers/);
+  assert.throws(() => c.setHttpGrants([{ name: 'x', url: 'https://x.example/', risk: 'read', headers: { a: 'b' } }]), /the app supplies/);
   c.setHttpGrants([{ name: 'notes', url: 'https://notes.example/api/', risk: 'read' }]);
   let looked = 0;
   c.tool({ name: 'lookup', description: 'Looks a word up', inputSchema: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'], additionalProperties: false },
@@ -208,6 +259,97 @@ async function aScriptsCalls() {
   assert.equal(nested.headers.authorization, `Bearer ${KEY}`, 'the nested request carried the key');
   assert.ok(!nested.body.includes('"tools"'), 'and no tools');
   await c.close();
+}
+
+// A grant that adds a secret header: the app gives its value as each request goes, and
+// the script, the journal and the reply never hold it (an echo of it is taken out, in
+// the forms servers send it back in, before any cut); without a usable value nothing
+// is sent.
+async function aGrantsSecretHeader() {
+  const dir = join(root, 'keyed');
+  const fetch = scriptedFetch([call('bash', { command: 'python3 keyed.py' }), text('done')]);
+  const token = `sk/site+${'0123456789abcdef'.repeat(3)}`;
+  const value = `Bearer ${token}`;
+  const pct = encodeURIComponent(token);
+  const b64 = Buffer.from(`x${token}`).toString('base64');
+  const seen = [];
+  const web = async (url, init) => {
+    if (!String(url).startsWith('https://keyed.example/')) return fetch(url, init);
+    seen.push({ path: new URL(url).pathname, authorization: init.headers.authorization });
+    const path = new URL(url).pathname;
+    if (path === '/api/echo') {
+      const body = `{"auth":${JSON.stringify(value)},"slashed":"${token.replaceAll('/', '\\/')}","pct":"${pct}","b64":"${b64}","url64":"${b64.replaceAll('+', '-').replaceAll('/', '_')}"}`;
+      return new Response(body, { headers: { 'content-type': 'application/json', 'x-echo': value } });
+    }
+    const streamed = (...parts) => new Response(new ReadableStream({
+      start(controller) {
+        for (const part of parts) controller.enqueue(new TextEncoder().encode(part));
+        controller.close();
+      },
+    }));
+    // A secret across the response limit, its first part in a chunk that ends past it:
+    // read on and taken out whole before the cut.
+    if (path === '/api/edge') return streamed(`${'x'.repeat(4096 - 20)}${token.slice(0, 25)}`, `${token.slice(25)}${'y'.repeat(200)}`);
+    // Read only so far past the limit, a body can stop partway into a secret, and the
+    // room the whole ones before it give back brings that part under the limit.
+    if (path === '/api/many') return streamed(`${`${token} `.repeat(100)}${token.slice(0, 30)}`, `${token.slice(30)} rest`);
+    return new Response('{}', { headers: { 'content-type': 'application/json' } });
+  };
+  const asked = [];
+  const grantHeaders = async (facts) => {
+    asked.push(facts);
+    if (facts.url.endsWith('/locked')) throw new Error("Spindle's keys are locked: unlock them");
+    if (facts.url.endsWith('/bad')) return { Authorization: 'Bearer a\nb' };
+    if (facts.url.endsWith('/short')) return { Authorization: 'Bearer abc' };
+    return { authorization: value };
+  };
+  const replies = [];
+  let c;
+  const runner = {
+    async run({ session }) {
+      for (const [id, path, headers] of [[0, 'echo'], [1, 'edge'], [2, 'many'], [3, 'echo', { Authorization: 'Bearer guessed' }], [4, 'locked'], [5, 'bad'], [6, 'short']]) {
+        replies.push(await c.code(session, { method: 'http', id, input: { url: `https://keyed.example/api/${path}`, ...(headers && { headers }) } }));
+      }
+      return { output: 'ran\n', success: true };
+    },
+  };
+  c = client(web, { runner, grantHeaders });
+  c.setHttpGrants([{ name: 'keyed', url: 'https://keyed.example/api/', risk: 'read', max_response_bytes: 4096, headers: { Authorization: { app: true } } }]);
+  await c.create(dir, 'fake', { runner: 'app' });
+  await c.prompt(dir, 'run the script');
+  await c.close();
+  const [echo, edge, many, own, locked, bad, short] = replies;
+  assert.equal(seen[0].authorization, value, 'the request carried the header');
+  assert.deepEqual(asked[0], { grant: 'keyed', url: 'https://keyed.example/api/echo', method: 'GET', names: ['Authorization'] });
+  assert.equal(echo.ok, true, JSON.stringify(echo));
+  const forms = [token, token.slice(8), token.replaceAll('/', '\\/'), pct, b64.slice(4), b64.slice(4).replaceAll('+', '-').replaceAll('/', '_')];
+  for (const reply of [echo, edge, many]) {
+    const said = JSON.stringify(reply);
+    for (const form of forms) assert.ok(!said.includes(form), `${form} in ${said.slice(0, 600)}`);
+  }
+  assert.equal(echo.data.headers['x-echo'], '[redacted]', JSON.stringify(echo.data.headers));
+  assert.equal(echo.data.json.auth, '[redacted]');
+  assert.match(echo.data.json.pct, /\[redacted\]/);
+  assert.equal(edge.data.truncated, true);
+  assert.ok(!edge.data.body.includes(token.slice(0, 6)), `cut through a secret: ${edge.data.body.slice(-40)}`);
+  assert.ok(edge.data.body.endsWith('x[redacted]yyyyyyyyyy'), edge.data.body.slice(-40));
+  assert.equal(many.data.truncated, true);
+  assert.ok(!many.data.body.includes(token.slice(0, 6)), `a part of a secret at a cut: ${many.data.body.slice(-60)}`);
+  assert.ok(many.data.body.startsWith('[redacted] [redacted] '), many.data.body.slice(0, 60));
+  assert.match(own.error, /supplied by grant keyed/, JSON.stringify(own));
+  assert.equal(locked.ok, false);
+  assert.equal(locked.may_have_run, false, JSON.stringify(locked));
+  assert.match(locked.error, /locked[\s\S]*nothing was sent/, JSON.stringify(locked));
+  assert.equal(bad.may_have_run, false, JSON.stringify(bad));
+  assert.match(bad.error, /no value it can send for header Authorization/, JSON.stringify(bad));
+  assert.equal(short.may_have_run, false, JSON.stringify(short));
+  assert.match(short.error, /too short to keep out of what comes back/, 'what cannot be found is not sent');
+  assert.deepEqual(seen.map((visit) => visit.path), ['/api/echo', '/api/edge', '/api/many'], 'nothing else was sent');
+  // Nothing the session keeps holds the secret, in any form.
+  for (const file of filesUnder(dir)) {
+    const bytes = fs.readFileSync(file);
+    for (const form of forms) assert.ok(!bytes.includes(form), `${form} in ${file}`);
+  }
 }
 
 async function aKilledOwner() {
@@ -236,6 +378,36 @@ async function aKilledOwner() {
   assert.equal(retried.stopped.complete, true);
   assert.equal(fetch.seen.length, 1, 'retry sends it once');
   assert.ok(fs.existsSync(join(dir, 'store.abandoned-1', 'authority.sqlite')), 'the old store is kept aside');
+  await c.close();
+}
+
+// An owner killed between the user's stop and the stopped command's record (its
+// runner never answered): reopened, the call is reconciled as not completed (the
+// existing path), never run again, and a message then goes on with the turn.
+async function aKilledStopping() {
+  const dir = join(root, 'crash-stopping');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('node_session_child.mjs', import.meta.url)), glue, dir, 'stop'], { stdio: ['ignore', 'pipe', 'inherit'] });
+  await new Promise((resolve, reject) => {
+    let out = '';
+    child.stdout.on('data', (chunk) => { out += chunk; if (out.includes('stopping')) resolve(); });
+    child.on('exit', (code) => reject(new Error(`the owner exited (${code}) before the stop`)));
+  });
+  const ended = new Promise((resolve) => child.once('exit', resolve));
+  child.kill('SIGKILL');
+  await ended;
+  const runs = [];
+  const runner = { async run({ command }) { runs.push(command); return { output: 'ran again', success: true }; } };
+  const fetch = scriptedFetch([text('it did not complete'), text('went on')]);
+  const c = client(fetch, { runner });
+  fs.unlinkSync(join(dir, 'store', 'authority.sqlite.lock')); // the operator's decision
+  const before = await c.status(dir);
+  assert.equal(before.phase, 'tools_wait');
+  assert.equal(before.accepts_message, false, 'an unrecorded call is settled first');
+  assert.equal((await c.resume(dir)).stopped.complete, true);
+  assert.equal(runs.length, 0, 'the command is never run again');
+  assert.match(fetch.seen[0].body, /did not complete/);
+  assert.equal((await c.prompt(dir, 'go on without it')).stopped.complete, true);
+  assert.equal(runs.length, 0);
   await c.close();
 }
 
@@ -383,7 +555,7 @@ async function aRemoteRunner() {
     await assert.rejects(c.read(dir, 'in.txt'), (error) => error.kind === 'not_found', 'the run removed it');
     await c.close();
 
-    // Stop ends the wait and the host's command with it.
+    // Stop ends the host's command, and the wait with its answer: what it printed.
     const named = [];
     const watched = remoteRunner({
       url: `http://127.0.0.1:${port}`, token,
@@ -394,14 +566,17 @@ async function aRemoteRunner() {
     });
     const stop = new AbortController();
     const started = Date.now();
-    const waiting = watched.run({ command: 'sleep 30', timeoutS: 60, network: false, files: [], links: [], directories: [], read: () => new Uint8Array(), signal: stop.signal });
+    const waiting = watched.run({ command: 'echo started-remote; sleep 30', timeoutS: 60, network: false, files: [], links: [], directories: [], read: () => new Uint8Array(), signal: stop.signal });
     const state = async () => (await (await fetch(`http://127.0.0.1:${port}/v1/run/${named[0]}`, { headers: { authorization: `Bearer ${token}` } })).json()).state;
     while (!named.length || (await state()) !== 'running') {
       assert.ok(Date.now() - started < 20_000, 'the run started');
       await new Promise((done) => setTimeout(done, 50));
     }
     stop.abort();
-    await assert.rejects(waiting, (error) => error.name === 'AbortError');
+    const answer = await waiting;
+    assert.equal(answer.success, false);
+    assert.match(String(answer.failure), /stopped/, JSON.stringify(answer));
+    assert.match(answer.output, /started-remote/, 'what it printed before the stop comes back');
     let ended;
     while ((ended = await state()) !== 'stopped' && Date.now() - started < 20_000) await new Promise((done) => setTimeout(done, 50));
     assert.equal(ended, 'stopped', 'the host stopped the command');
@@ -411,13 +586,86 @@ async function aRemoteRunner() {
   }
 }
 
+async function responsesReasoningSnapshots() {
+  const profiles = catalog();
+  profiles.providers[0].request_contract = 'openai-responses';
+  profiles.providers[0].model_specs['fake-model'].context_window = 10_000_000;
+  const reasoning = (id, content) => ({ type: 'reasoning', id, encrypted_content: content, summary: [] });
+  const first = reasoning('rs_first', 'y'.repeat(3_000_000));
+  const second = reasoning('rs_second', 'z'.repeat(1_000_000));
+  const terminal = (output) => ({ type: 'response.completed', response: { status: 'completed', output, usage: { input_tokens: 17, output_tokens: 9 } } });
+  const answer = (content) => [{ type: 'response.output_text.delta', delta: content }, terminal([])];
+  const seen = [];
+  const replies = [
+    [{ type: 'response.output_item.done', item: reasoning('rs_old', 'old') }, ...answer('old answer')],
+    [
+      { type: 'response.output_item.done', item: reasoning('rs_first', 'x'.repeat(1_000_000)) },
+      { type: 'response.output_item.done', item: reasoning('rs_second', 'x'.repeat(3_000_000)) },
+      { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_write', call_id: 'call_write', name: 'write_file', arguments: '' } },
+      terminal([first, second, { type: 'function_call', id: 'fc_write', call_id: 'call_write', name: 'write_file', arguments: JSON.stringify({ path: 'reasoning.txt', content: 'kept' }) }]),
+    ],
+    answer('current answer'),
+    answer('new answer'),
+  ];
+  const fetch = async (_url, init) => {
+    seen.push(JSON.parse(new TextDecoder().decode(init.body)));
+    const records = replies.shift();
+    assert.ok(records, 'no unexpected automatic provider request');
+    const bytes = new TextEncoder().encode(records.map((record) => `data: ${JSON.stringify(record)}\n\n`).join(''));
+    let at = 0;
+    return new Response(new ReadableStream({ pull(controller) {
+      if (at === bytes.length) return controller.close();
+      controller.enqueue(bytes.subarray(at, at += Math.min(4093, bytes.length - at)));
+    } }), { headers: { 'content-type': 'text/event-stream' } });
+  };
+  const c = nodeClient({ glue, catalog: profiles, credentials, fetch });
+  const dir = join(root, 'responses-reasoning');
+  try {
+    await c.create(dir, 'fake');
+    await c.prompt(dir, 'old task');
+    const result = await c.prompt(dir, 'current task');
+    assert.equal(result.stopped.complete, true);
+    assert.equal(new TextDecoder().decode(await c.read(dir, 'reasoning.txt')), 'kept');
+    assert.deepEqual(seen[2].input.filter((item) => item.type === 'reasoning'), [first, second], 'terminal copies, not streamed or previous-turn copies, reach the next request');
+    const history = await c.history(dir);
+    const kept = history.messages.flatMap((message) => message.content).filter((block) => block.type === 'reasoning');
+    assert.equal(kept.length, 3, 'history includes the old and current reasoning placeholders');
+    assert.ok(kept.every((block) => !('item' in block) && !('encrypted_content' in block)), 'the public history projection does not expose opaque reasoning');
+    await c.prompt(dir, 'next task');
+    assert.equal(seen[3].input.some((item) => item.type === 'reasoning'), false, 'a new turn does not replay old encrypted reasoning');
+  } finally {
+    await c.close();
+  }
+  for (const placeholderFirst of [true, false]) {
+    let calls = 0;
+    const item = reasoning('rs_duplicate', 'valid');
+    const placeholder = { type: 'reasoning', id: 'rs_duplicate', summary: [] };
+    const d = nodeClient({ glue, catalog: profiles, credentials, fetch: async () => {
+      calls += 1;
+      return new Response(`data: ${JSON.stringify(terminal(placeholderFirst ? [placeholder, item] : [item, placeholder]))}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    const dir = join(root, `responses-duplicate-${placeholderFirst}`);
+    try {
+      await d.create(dir, 'fake');
+      await assert.rejects(d.prompt(dir, 'reject a duplicate final reasoning id'));
+      assert.equal(calls, 1, 'a duplicate snapshot is a protocol failure, never implicitly resent');
+    } finally {
+      await d.close();
+    }
+  }
+}
+
 try {
+  await responsesReasoningSnapshots();
   const dir = await aTurnWithFileTools();
   await reopenAndAppTool(dir);
   await anAppRunner();
+  await aStoppedCommand();
   await twoRunners();
   await aScriptsCalls();
+  await aGrantsSecretHeader();
   await aKilledOwner();
+  await aKilledStopping();
   await readItNowAndStop();
   await aModelWrittenSummary();
   await aBudget();
@@ -428,8 +676,9 @@ try {
 }
 console.log(
   'node-session passed: wasm package via EmbeddedClient against a scripted model (file tools, ' +
-    'credentials kept out of the store, app tool with files/state, app runner, app and remote runners at once (a declared sandbox isolates), Spindle calls from a script journaled and replayed (http() only where a grant allows), reopen, second ' +
-    'owner refused, killed owner: unknown kept and sent once by retry, read-it-now cut, stop, ' +
+    'Responses reasoning snapshots budgeted as a batch, final copies replayed only within their turn, duplicate placeholders rejected without resend, ' +
+    'credentials kept out of the store, app tool with files/state, app runner, a command the user stops (recorded with its output, a reply going on after a reopen, never run again), app and remote runners at once (a declared sandbox isolates), Spindle calls from a script journaled and replayed (http() only where a grant allows; a secret header a grant adds, never kept or shown), reopen, second ' +
+    'owner refused, killed owner: unknown kept and sent once by retry, killed between a stop and its record: not completed, never run again, read-it-now cut, stop, ' +
     'compaction by a model-written summary, a budget (refused unsent, raised, sent once, costed, usage), a background task (queued, driven after its answer, reported next turn), ' +
     'remote runner on spindle serve with a runner token, and Stop stopping its command, when SPINDLE_BIN is set)',
 );

@@ -92,7 +92,9 @@ The driver may read the store, commit steps, and call three host traits:
 | `deliver(store, answer)` | Takes the host's answer to a need. The host calls it only after emitting the need's preview events and retaining its receipt. Returns the next need. |
 | `resume(store)` | Continues the committed head. A turn stopped at the legacy step limit gets a fresh step count (`Extend`); a turn already stopped, with no task report or pack follow-up waiting, emits `NothingToContinue`. |
 | `resume_until_unknown(store)` | As `resume`, but stops with an error at the first unknown outcome instead of acting on it (see [Unknown outcomes](#unknown-outcomes)). |
-| `retry(store)` | Re-runs an unresolved model request. Returns `Retry::InPlace(need)`, or `Retry::FreshStore { prompt }` when it was the session's first request and the host must replace the store. |
+| `retry(store)` | Re-runs an unresolved model request, or the last step of a turn the user stopped between its steps (back to the point before the request whose reply made it). Returns `Retry::InPlace(need)`, or `Retry::FreshStore { prompt }` when it was the session's first request and the host must replace the store. |
+| `say(store, text)` | A message for a turn stopped part way: it is committed as the turn's next user message and the turn goes on. A turn that rests between steps reads it after the stopped result; one stopped in a model request whose reply was not saved goes back to the point before that request and makes it again with the message read first. |
+| `takes_message(store)` | Whether the head's turn takes `say`: it rests between steps, or waits on a model request with no saved reply that is not the session's first. |
 | `report_stop(store)` | Emits `Stopped` for the committed stop, after the host has applied its between-turn settings. |
 | `begin_run()` | Resets the retry policy for a new host-driven run. |
 | `set_state(store, patch)` | Commits an app-state merge patch as a step of its own, at a safe boundary. |
@@ -412,7 +414,7 @@ When a send does not produce a reply, `deliver` classifies it:
 | HTTP 400 or 422 that states a lower output-token limit | Output limit (recorded) | The limit is remembered per provider and model in the `output_limits` metadata and the request is sent again at once asking for less. |
 | Any other HTTP status | Refusal (recorded) | The turn stops; `spindle retry` sends it again. |
 | Connection lost or deadline passed (`ModelFailure::Dropped`) | Unknown outcome | Only with `resend_unknown`, and not in until-unknown mode: sent again after 1, 2 and 4 seconds, up to 3 automatic retries. Otherwise the turn stops. |
-| Anything else (`ModelFailure::Failed`: an unparsable stream, an oversized response, a store error) | Not recorded | The turn stops and points at `spindle retry`; a request that was reserved is an unknown outcome on `continue`. |
+| Anything else (`ModelFailure::Failed`: an unparsable stream, an oversized response, a store error) | Not recorded | The turn stops and points at `spindle retry`; a request that was reserved is an unknown outcome on `continue`. An unparsable stream's message says why in parentheses (the parser's words); an error the provider streamed after its reply began reads `the provider ended its reply with an error (...)`. |
 
 No automatic retry applies to the session's first request. Each automatic retry emits
 `ProviderRetry { status, seconds, attempt, compacting }` (status `0` for a drop); the
@@ -472,12 +474,17 @@ the turn at its next safe point:
 | Before reservation | Reservation refuses (`Cancelled`); nothing is reserved, so `continue` sends it later. |
 | Model reply streaming | The send ends. The reserved request has no receipt, so it is an unknown outcome on `continue`. |
 | Backoff wait | The wait ends with the backoff's stop message; the refused or dropped request keeps its outcome for `continue`. |
-| Tool call running | The command is ended; its candidate workspace is discarded. When the session is opened again, `continue` records the call as not completed; it never runs again. |
+| Tool call running | The command is ended and recorded at once as a failed result with status `interrupted`: what it printed until then, then a line saying the user stopped it. Its workspace changes are kept only as its runner reports them (none from the sandbox, which discards an unfinished run). Calls of the same reply that had not started are recorded as not run. The turn rests between its steps (`after_tools`). A host that dies before that record leaves the call reserved; `continue` then records it as not completed. Either way it never runs again. |
 | App call | The app receives the flag; an `AppAnswer::Stopped` records nothing and the call is asked again on `continue`. |
 | Waiting for tasks | Native stops the tasks. Embedded ends a finished turn's wait as complete and leaves tasks running; reports wait for the next turn. |
 
 A stop commits no `cancelled` step: the head stays where the work was, and `continue`
-resolves it as described in [Crash and restart](#crash-and-restart).
+resolves it as described in [Crash and restart](#crash-and-restart). After a stop, `say`
+goes on with the turn (text alone; files wait for the next turn), `continue` lets the
+model read what was stopped and decide, and `retry` asks again from before the stopped
+step (a step of the session's first request has no such point, and `retry` says so). The
+stopped request of a model reply stays an unknown outcome: it may have been billed, and
+it counts so.
 
 ## Budgets and cost accounting
 

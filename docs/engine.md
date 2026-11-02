@@ -430,6 +430,12 @@ without NUL. On Windows each component must also survive the filesystem as writt
 | Chat Completions | One text and one reasoning buffer, tool calls by index | A `finish_reason` or `[DONE]`; nothing after `[DONE]` | Thinking (when reasoning capture is on), text, tool calls |
 | OpenAI Responses, ChatGPT | Output items, text, reasoning summaries, function calls by item id, from `response.*` events | A terminal `response.completed`, `response.done` or `response.incomplete` event, or `[DONE]`; function calls require the terminal event and must reconcile with its output | Reasoning items (OpenAI Responses only), thinking from reasoning summaries, text, tool calls |
 
+OpenAI Responses reasoning items that carry `encrypted_content` are kept by item id, to
+be sent back with the next request. The terminal event's copy of an item replaces the
+streamed one (OpenAI encrypts it afresh each time, so the two need not match). The
+terminal snapshot is budgeted as a whole against the 4 MiB reasoning cap, so one item
+may grow while another shrinks; an item id that appears twice in it fails the stream.
+
 Tool call arguments must parse as a JSON object. When the output-token limit cut a call
 off mid-JSON (`max_tokens` or `length`), the call is counted in `unfinished_tool_calls`
 instead of failing the stream; an Anthropic tool block that was never explicitly stopped
@@ -453,6 +459,10 @@ the native transport record the same bytes for the same stream.
   with the status the same refusal would have had before the stream (529 overloaded, 429
   rate limit, 400 invalid request or context length, 504 timeout, otherwise 500).
   `take_rejection` returns the status, `Retry-After` and up to 4096 bytes of body.
+- A stream that cannot be parsed is `AttemptError::Protocol`. `take_failure` returns why,
+  once: the parser's words (which event, what was wrong, or the error the provider
+  streamed after output began), on one line, at most 600 characters. `finish_explained`
+  is `finish` with that reason.
 - `endpoint_allowed` accepts HTTPS, or HTTP to a literal loopback address, with no user
   info or fragment. `event_stream` accepts a missing `Content-Type` (the ChatGPT backend
   sends none) and refuses any declared type other than `text/event-stream`.
@@ -468,6 +478,9 @@ sends one attempt with reqwest.
   automatic retries. `Deadlines` default to 10 s connect, 60 s to first byte, 60 s idle
   between chunks and 300 s total; each must be between zero and 600 s and none above the
   total.
+- `ModelTransport::take_failure` gives the same reason for its last `Protocol` error,
+  and for a successful reply that was not an event stream, its stated content type
+  (at most 120 characters).
 - `send_once` requires a `Waiting` request whose identity equals the route's, checks the
   endpoint as above, posts the body with `content-type: application/json`,
   `accept: text/event-stream` and `content-encoding: gzip` for gzip bodies, and polls an
@@ -537,8 +550,9 @@ runs. Each run gets:
   the run needs.
 - Sets resource limits on Unix (each lowered to the inherited limit if that is smaller):
   no core files; file size 1 GiB (4 GiB with a toolchain); CPU time equal to the timeout
-  on every core plus 10 s; address space 256 GiB and private data 4 GiB (16 GiB with a
-  toolchain), both required on Linux; and on Linux, without a pids-capped cgroup, a
+  on every core plus 10 s; address space 256 GiB and private data three quarters of
+  physical memory (on Linux; never below 4 GiB, 16 GiB with a toolchain, which are the
+  caps elsewhere), both required on Linux; and on Linux, without a pids-capped cgroup, a
   process limit of the user's current thread count plus 1024 (4096 with a toolchain).
 - Joins its own cgroup when the host declares a delegated cgroup (see
   [process trees and cgroups](#process-trees-and-cgroups)). When the `pids` and `memory`
@@ -708,6 +722,12 @@ provider is `glm`):
 
 Built-in profiles also carry curated models, context windows, effort levels and pricing
 (`hydrate_builtin_model_specs`, `builtin_model_pricing`, `openai_responses_model_specs`).
+The `chatgpt` profile lists only the models its backend serves a ChatGPT account
+(`gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`,
+`gpt-5.6-luna`); it refuses older ones there with HTTP 400. A model whose spec says it
+does not reason (`capabilities.reasoning` false, as for GPT-4.1 and GPT-4o) takes only
+the default effort in Spindle, which then sends no reasoning field; a Responses model
+whose `effort_levels` list `none` is sent `none` for effort `off`.
 
 **Ids and aliases** (`canonical_provider_id`): `zai`, `bigmodel`, `bigmodel-cn` → `glm`;
 `openai-codex`, `codex-openai`, `codex`, `chatgpt-plus`, `chatgpt-pro` → `chatgpt`;

@@ -1109,13 +1109,36 @@ mod session {
         {
             return text_stream("Summary: earlier turns wrote notes and counted them.");
         }
-        let Some(prompt) = messages
-            .iter()
-            .rposition(|m| m["role"] == "user" && m.to_string().contains("TURN-"))
-        else {
+        let Some(prompt) = messages.iter().rposition(|m| {
+            m["role"] == "user"
+                && (m.to_string().contains("TURN-") || m.to_string().contains("STOP-"))
+        }) else {
             return text_stream("no turn found");
         };
         let text = messages[prompt].to_string();
+        // A `STOP-n` prompt runs a long command (the user stops it) and, in the same
+        // reply, a second one that must therefore never run; then it answers.
+        if text.contains("STOP-") {
+            return match messages[prompt..].iter().any(|m| m["role"] == "tool") {
+                false => {
+                    let call = |index: usize, id: &str, command: String| {
+                        json!({"index": index, "id": id, "type": "function", "function":
+                            {"name": "bash", "arguments": json!({"command": command}).to_string()}})
+                    };
+                    chunk(
+                        json!({"role": "assistant", "tool_calls": [
+                            call(0, "call-stop", format!("echo run >> {}; echo started; sleep 30",
+                                stop_count().display())),
+                            call(1, "call-after", format!("echo after >> {}.after",
+                                stop_count().display())),
+                        ]}),
+                        Value::Null,
+                    ) + &chunk(json!({}), json!("tool_calls"))
+                        + "data: [DONE]\n\n"
+                }
+                true => text_stream("went on without the stopped command"),
+            };
+        }
         let turn: u64 = text
             .rsplit("TURN-")
             .next()
@@ -1148,6 +1171,48 @@ mod session {
         fn event(&self, _: Event<'_>) {}
     }
 
+    /// Where the `STOP-n` command counts its runs (outside every session and image).
+    fn stop_count() -> PathBuf {
+        std::env::temp_dir().join(format!("spindle-power-stop-{}", std::process::id()))
+    }
+
+    fn stop_runs() -> usize {
+        std::fs::read_to_string(stop_count())
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    /// Runs of the call that came in the same reply as the stopped one: never any.
+    fn after_runs() -> usize {
+        std::fs::read_to_string(stop_count().with_extension("after"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    /// The user: stops the long command as soon as it says it started.
+    #[derive(Default)]
+    struct StopOnStart(std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>);
+    impl Observer for StopOnStart {
+        fn event(&self, event: Event<'_>) {
+            if let Event::Output { bytes, .. } = event
+                && bytes.windows(7).any(|w| w == b"started")
+                && let Some(stop) = &*self.0.lock().unwrap()
+            {
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+    impl StopOnStart {
+        /// Opens the session at `dir` with this observer, armed to stop it.
+        fn open(self: &Arc<Self>, dir: &Path) -> Result<Session, String> {
+            let session = Session::open(dir, self.clone())?;
+            *self.0.lock().unwrap() = Some(session.interrupt_handle());
+            Ok(session)
+        }
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum Step {
         Create,
@@ -1158,6 +1223,10 @@ mod session {
         Rewind,
         Doctor,
         Close,
+        /// A `STOP-n` turn whose long command the user stops while it runs.
+        StopRun(u64),
+        /// A message after that stop: it goes on with the stopped turn.
+        Say,
     }
 
     struct Run {
@@ -1222,6 +1291,25 @@ mod session {
                     }
                 }
                 Step::Close => self.session = None,
+                Step::StopRun(turn) => {
+                    self.session = None;
+                    let user = Arc::new(StopOnStart::default());
+                    let mut session = user.open(&self.dir)?;
+                    match session.prompt(&format!("STOP-{turn}: run the long command")) {
+                        Err(error) if error.contains("stopped by the user") => {}
+                        Err(error) => return Err(error),
+                        Ok(()) => return Err("the command was not stopped".into()),
+                    }
+                    // The stop ends with its operation, as the API's hosts clear it.
+                    *user.0.lock().unwrap() = None;
+                    session
+                        .interrupt_handle()
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    self.session = Some(session);
+                }
+                Step::Say => {
+                    self.session()?.prompt("SKIP: skip that and go on")?;
+                }
             }
             Ok(())
         }
@@ -1324,7 +1412,126 @@ mod session {
                 summaries(dir)
             ));
         }
+        if steps.iter().any(|step| matches!(step, Step::StopRun(_))) {
+            return recover_stopped(dir);
+        }
         continue_and_prompt(dir, "TURN-99: after the crash")
+    }
+
+    /// Whether the image's long command was dispatched (its result is in the history, or
+    /// its pending call holds an attempt: reserved, maybe run, maybe recorded), and
+    /// whether its user's stop is recorded (its result carries the stopped status).
+    fn long_command_dispatched(dir: &Path) -> Result<(bool, bool), String> {
+        let mut store = Store::open(&dir.join("store")).map_err(|e| e.to_string())?;
+        let snapshot = store.snapshot().map_err(|e| e.to_string())?;
+        if snapshot.revision == 0 {
+            return Ok((false, false));
+        }
+        let stopped = |block: &dext_transcript::Block| {
+            matches!(block, dext_transcript::Block::ToolResult { metadata, .. }
+                if metadata.status.as_deref() == Some("interrupted"))
+        };
+        let state = dext_transcript::turn::TurnContinuation::restore(&snapshot.continuation)
+            .map_err(|e| e.to_string())?;
+        let long = |input: &Value| input.to_string().contains("sleep 30");
+        let transcript = state.transcript().map_err(|e| e.to_string())?;
+        let called = transcript
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|block| match block {
+                dext_transcript::Block::ToolUse { id, input, .. } if long(input) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            });
+        let Some(called) = called else {
+            return Ok((false, false));
+        };
+        let answered = transcript.messages.iter().flat_map(|m| &m.content).find(|block| {
+            matches!(block, dext_transcript::Block::ToolResult { tool_use_id, .. } if *tool_use_id == called)
+        });
+        if let Some(answer) = answered {
+            return Ok((true, stopped(answer)));
+        }
+        for effect in state.pending_effects().map_err(|e| e.to_string())? {
+            if let dext_transcript::turn::Effect::Tool { id, call } = effect
+                && long(&call.input)
+            {
+                let Some(attempt) = store.attempt_for(&id).map_err(|e| e.to_string())? else {
+                    return Ok((false, false));
+                };
+                let recorded = store.receipt(&attempt.id).map_err(|e| e.to_string())?;
+                let stop = recorded
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                    .is_some_and(|block| stopped(&block));
+                return Ok((true, stop));
+            }
+        }
+        Ok((false, false))
+    }
+
+    /// What a user does after power came back during the stop workload: a message (a
+    /// stopped turn takes one), `continue` or `retry` otherwise, then a new prompt. The
+    /// long command never runs again once it was dispatched (a first run of it, when the
+    /// power went before that, is stopped again); once the stop is recorded, the call of
+    /// the same reply after it never runs (cut before that record, the store never heard
+    /// of the stop: `continue` seals the command as interrupted and goes on with the
+    /// reply, as after any crash); and nothing is left unresolved.
+    fn recover_stopped(dir: &Path) -> Result<(), String> {
+        let (dispatched, stop_recorded) = long_command_dispatched(dir)?;
+        let before = stop_runs();
+        let after_before = after_runs();
+        let user = Arc::new(StopOnStart::default());
+        let mut said = vec![];
+        for _ in 0..4 {
+            let mut session = user.open(dir)?;
+            if session.accepts_prompt() {
+                break;
+            }
+            let outcome = if session.accepts_message() {
+                said.push("message");
+                session.prompt("SKIP: skip that and go on")
+            } else {
+                said.push("continue");
+                session.resume()
+            };
+            match outcome {
+                Ok(()) => {}
+                // A first run of the command (the power went before it ran): stopped.
+                Err(error) if error.contains("stopped by the user") => {}
+                Err(error) if error.contains("retry") => {
+                    drop(session);
+                    said.push("retry");
+                    Session::open(dir, user.clone())?.retry()?;
+                }
+                Err(error) => return Err(format!("{said:?}: {error}")),
+            }
+        }
+        let ran = stop_runs() - before;
+        if (dispatched && ran != 0) || ran > 1 {
+            return Err(format!(
+                "the long command ran {ran} more time(s) after {said:?} (dispatched before: {dispatched})"
+            ));
+        }
+        let after = after_runs() - after_before;
+        if (stop_recorded && after != 0) || after > 1 {
+            return Err(format!(
+                "the call after the stopped one ran {after} time(s) after {said:?} (stop recorded: {stop_recorded}): the rest of a stopped reply never runs"
+            ));
+        }
+        let mut session = Session::open(dir, Arc::new(Quiet))?;
+        session
+            .prompt("TURN-99: after the crash")
+            .map_err(|error| format!("{said:?}, then a new prompt: {error}"))?;
+        let status = session.status()?;
+        if status.unresolved != 0 {
+            return Err(format!(
+                "{} unresolved steps after new work",
+                status.unresolved
+            ));
+        }
+        Ok(())
     }
 
     /// What a user does after an interruption: `continue`, or `retry` when continuing
@@ -1366,9 +1573,18 @@ mod session {
         };
         let mut heads = vec![];
         let mut sums = vec![];
+        // The events up to each step's end, and the window cuts are taken from: the stop
+        // and the message after it, when the workload has them, or all of it.
+        let mut window = 0..u64::MAX;
         for step in steps {
+            let began = reference.events();
             run.step(*step)
                 .unwrap_or_else(|error| panic!("reference run, {step:?}: {error}"));
+            match step {
+                Step::StopRun(_) => window.start = began,
+                Step::Say => window.end = reference.events() + 1,
+                _ => {}
+            }
             heads.push(revisions(&run.dir).map_or(0, |rows| rows.len()));
             sums.push(summaries(&run.dir));
         }
@@ -1378,7 +1594,8 @@ mod session {
         let trace = reference.traced();
         drop(reference);
         assert!(
-            sums.last().is_some_and(|calls| *calls > 0),
+            sums.last().is_some_and(|calls| *calls > 0)
+                || !steps.iter().any(|step| matches!(step, Step::Rewind)),
             "the workload compacts with a model summary"
         );
         let reference = Reference {
@@ -1393,6 +1610,7 @@ mod session {
         // A whole session is too long to cut at every event (hours): a seeded sample,
         // larger when exhaustive.
         let mut points = crash_points(&trace, sample);
+        points.retain(|point| window.contains(point));
         let mut rng = Rng::new(seed() ^ 0x5e55);
         while points.len() > sample {
             points.remove(rng.below(points.len() as u64) as usize);
@@ -1783,6 +2001,25 @@ mod session {
         eprintln!("{}", outcomes.join("\n"));
         let _ = std::fs::remove_dir_all(&root);
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A command the user stops, and the message after it: cut at sampled points, every
+    /// image holds the stop as recorded (or the call reserved and never recorded, which
+    /// `continue` seals as not completed), never runs the command again, and takes the
+    /// message, or `continue`, then new work.
+    #[test]
+    fn a_stopped_command_and_the_message_after_it_survive_power_loss() {
+        // Every flush and truncation of the stop and the message after it (about 45).
+        let sample = if exhaustive() { 240 } else { 64 };
+        let steps = [
+            Step::Create,
+            Step::Prompt(1),
+            Step::StopRun(2),
+            Step::Say,
+            Step::Prompt(3),
+            Step::Close,
+        ];
+        assert_clean(sweep_session("session-stop", &steps, sample));
     }
 
     #[test]

@@ -69,12 +69,13 @@ export async function entriesOf(store) {
 }
 
 /** Puts and deletes records of several stores in one transaction: all of them, or none.
- * `changes` are `[store, key, value]`; an undefined value deletes the record. */
-export async function writeTogether(changes) {
+ * `changes` are `[store, key, value]`; an undefined value deletes the record.
+ * `durability` 'strict': on disk once it resolves (as `writeDurably`). */
+export async function writeTogether(changes, durability = null) {
   const db = await database();
   const stores = [...new Set(changes.map(([store]) => store))];
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(stores, 'readwrite');
+    const tx = durability ? db.transaction(stores, 'readwrite', { durability }) : db.transaction(stores, 'readwrite');
     tx.oncomplete = () => resolve();
     tx.onerror = tx.onabort = () => reject(tx.error);
     try {
@@ -92,11 +93,12 @@ export async function writeTogether(changes) {
 
 /** Changes the record at `key` in one transaction (`change` gets it, returns the new
  * one): two changes never undo each other. Resolves with the new record, or undefined
- * when there was none. */
-export async function update(store, key, change) {
+ * when there was none. `changes` commit beside it, only if this record exists. */
+export async function update(store, key, change, { changes = [], durability = null } = {}) {
   const db = await database();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
+    const stores = [...new Set([store, ...changes.map(([name]) => name)])];
+    const tx = durability ? db.transaction(stores, 'readwrite', { durability }) : db.transaction(stores, 'readwrite');
     const records = tx.objectStore(store);
     let next;
     const got = records.get(key);
@@ -105,6 +107,10 @@ export async function update(store, key, change) {
       try {
         next = change(got.result);
         records.put(next, key);
+        for (const [name, otherKey, value] of changes) {
+          if (value === undefined) tx.objectStore(name).delete(otherKey);
+          else tx.objectStore(name).put(value, otherKey);
+        }
       } catch (error) {
         tx.abort();
         reject(error);

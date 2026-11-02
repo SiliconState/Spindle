@@ -231,3 +231,27 @@ fn portable_sources_have_no_ambient_native_dependencies() {
         }
     }
 }
+
+#[test]
+fn openai_api_models_are_asked_no_more_than_they_answer_and_retired_ones_are_gone() {
+    let profiles = built_in_provider_profiles();
+    let openai = profiles
+        .iter()
+        .find(|profile| profile.id == "openai")
+        .unwrap();
+    // OpenAI answers model_not_found for these (deprecated).
+    for retired in ["o3-mini", "o4-mini"] {
+        assert!(
+            !openai.models.iter().any(|model| model == retired),
+            "{retired}"
+        );
+    }
+    // GPT-4o refuses an output ask above 16,384 tokens.
+    for model in ["gpt-4o", "gpt-4o-mini"] {
+        assert_eq!(
+            openai.model_specs[model].max_output_tokens,
+            Some(16_384),
+            "{model}"
+        );
+    }
+}
