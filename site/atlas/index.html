@@ -6,6 +6,19 @@
 <title>Spindle Atlas: the architecture on three plates</title>
 <meta name="description" content="An illustrated map of Spindle: every surface and the host boundary, the turn route from transport to committed head, the schema-20 store and the Dext engine, and Spindle for Browser's local-first engine.">
 <meta name="color-scheme" content="light dark">
+<script>
+// Before anything paints: the kept theme, or the system's (followed as it changes).
+(() => {
+  const root = document.documentElement;
+  const valid = new Set(["light", "dark", "dim"]);
+  let kept = null;
+  try { kept = localStorage.getItem("spindle-atlas-theme"); } catch {}
+  const query = window.matchMedia("(prefers-color-scheme: dark)");
+  const follow = () => { if (!valid.has(root.dataset.chosen)) root.dataset.theme = query.matches ? "dark" : "light"; };
+  if (valid.has(kept)) { root.dataset.theme = kept; root.dataset.chosen = kept; } else follow();
+  query.addEventListener("change", follow);
+})();
+</script>
 <meta property="og:title" content="Spindle Atlas: the architecture on three plates">
 <meta property="og:description" content="Spindle's hosts, store, engine and browser extension, mapped from the code.">
 <meta property="og:type" content="website">
@@ -307,6 +320,8 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
 .site-foot{display:flex;flex-wrap:wrap;gap:6px 18px;justify-content:space-between;align-items:baseline}
 .site-foot nav{display:flex;flex-wrap:wrap;gap:6px 16px}
 .site-foot a{color:var(--muted)}
+.panel{scroll-margin-top:72px}
+.pending-note{margin:16px 0 0;padding:9px 12px;border:1px dashed var(--line-strong);color:var(--muted);font-size:11px;line-height:1.6}
 .node p code,.engine-card p code,.face p code,.route-card p code{display:inline;margin:0;color:inherit;font-size:inherit;font-weight:600;overflow-wrap:anywhere}
 </style>
 </head>
@@ -325,13 +340,14 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
     <div class="kicker">Spindle / Dext engine / architecture atlas</div>
     <h1>Spindle <span class="slash">/</span><br>Dext Engine</h1>
     <p class="dek">The whole system on three plates: every surface and the host it reaches, the route a turn takes to a committed head, the store and engine underneath, and Spindle for Browser, which runs the same engine inside your browser.</p>
-    <div class="revision">Schema 20 · API v1 · Spindle for Browser 0.1.6 · drawn from the code, November 2026</div>
+    <div class="revision">Schema 20 · API v1 · drawn from the source after Spindle for Browser 0.1.6, November 2026</div>
   </div>
   <div class="hero-side">
     <div class="theme" role="group" aria-label="Theme">
       <button type="button" data-set-theme="light">PAPER</button>
       <button type="button" data-set-theme="dark">DARK</button>
       <button type="button" data-set-theme="dim">DIM</button>
+      <button type="button" data-set-theme="system">SYSTEM</button>
     </div>
     <div class="stamp">Schema 20<br>API v1<br>Browser 0.1.6</div>
   </div>
@@ -346,14 +362,14 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
   <div class="fact"><b>v1</b><span>shared API contract</span></div>
 </div>
 
-<div class="tabbar" role="tablist" aria-label="Atlas sections">
-  <button type="button" role="tab" id="tab-host" aria-controls="panel-host" data-tab="host" aria-selected="true">01 / Host map</button>
-  <button type="button" role="tab" id="tab-browser" aria-controls="panel-browser" data-tab="browser" aria-selected="false" tabindex="-1">02 / Spindle for Browser</button>
-  <button type="button" role="tab" id="tab-details" aria-controls="panel-details" data-tab="details" aria-selected="false" tabindex="-1">03 / Store + Engine</button>
+<div class="tabbar" aria-label="Atlas sections">
+  <button type="button" id="tab-host" data-tab="host">01 / Host map</button>
+  <button type="button" id="tab-browser" data-tab="browser">02 / Spindle for Browser</button>
+  <button type="button" id="tab-details" data-tab="details">03 / Store + Engine</button>
 </div>
 
 <main>
-  <section class="panel" id="panel-host" data-panel="host" role="tabpanel" aria-labelledby="tab-host">
+  <section class="panel" id="host" data-panel="host">
     <div class="section-head">
       <div class="section-num">01</div>
       <div>
@@ -832,7 +848,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
 
   </section>
 
-  <section class="panel" id="panel-browser" data-panel="browser" role="tabpanel" aria-labelledby="tab-browser">
+  <section class="panel" id="browser" data-panel="browser">
     <div class="section-head">
       <div class="section-num">02</div>
       <div>
@@ -931,7 +947,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
         <text x="480" y="246" class="tiny">only engine.html may ask tools</text>
         <rect x="480" y="262" width="270" height="44" fill="var(--panel)" stroke="var(--line)"/>
         <text x="492" y="280" class="code-blue">page-tools.mjs · shared.mjs</text>
-        <text x="492" y="296" class="tiny">20 s per page call · unknown, never repeated</text>
+        <text x="492" y="296" class="tiny">28 s per tool · unknown, never repeated</text>
         <path d="M438 190V635" class="line-red" stroke-dasharray="4 4" opacity=".55"/>
 
         <!-- Offscreen engine -->
@@ -1015,7 +1031,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
       </div>
       <div class="note-box">
         <h3>Trust boundaries</h3>
-        <p>Reading and acting on pages are separate switches, both off until you turn them on. Page tools are accepted only from <code>engine.html</code>; actions use <code>chrome.debugger</code>. Under Before acting (Auto or Ask), an action you allow is done only while the tab still shows the page, part or dialog the question showed you. Provider keys, host tokens, and site secrets are sealed by AES-GCM in the vault.</p>
+        <p>Reading and acting on pages are separate switches, both off until you turn them on. Page tools are accepted only from <code>engine.html</code>; actions use <code>chrome.debugger</code>. Under Before acting (Auto or Ask), an action you allow is done only while the tab still shows the page, part or dialog the question showed you (new since 0.1.6: the next browser release). Provider keys, host tokens, and site secrets are sealed by AES-GCM in the vault.</p>
       </div>
       <div class="note-box">
         <h3>Preview containment</h3>
@@ -1247,14 +1263,14 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
 
   </section>
 
-  <section class="panel" id="panel-details" data-panel="details" role="tabpanel" aria-labelledby="tab-details">
+  <section class="panel" id="details" data-panel="details">
     <div class="section-head">
       <div class="section-num">03</div>
       <div>
         <h2>Store + engine evidence</h2>
         <p>The hard numbers behind the maps, plus the boundaries that keep the browser, host, embedded package, and engine from being confused.</p>
       </div>
-      <div class="section-meta">As of 0.1.6</div>
+      <div class="section-meta">Source after 0.1.6</div>
     </div>
 
     <div class="detail-grid">
@@ -1292,22 +1308,23 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
       </article>
     </div>
 
-    <div class="detail-grid" style="margin-top:14px">
+    <p class="pending-note">The four below describe the source after Spindle for Browser 0.1.6. What is new in them since 0.1.6 (approvals held to the page, slot names a crash cannot split, imports checked from disk, a thread too large to bring back left on the host, background tasks spared by a parent's Stop) ships in the next browser release.</p>
+    <div class="detail-grid" style="margin-top:10px">
       <article class="detail-card">
         <h3>Approvals held to the page</h3>
-        <p>Before acting is Full (the default), Auto (asks before what sends or submits) or Ask (before every action). An action you allow carries what the question showed: the tab, the page's document, the part's description, or the dialog. The service worker checks it just before acting; if the page reloaded or moved on, nothing is done and the thread is told.</p>
+        <p>Before acting is Full (the default), Auto (asks before what sends or submits) or Ask (before every action). An action you allow carries what the question showed: the tab, the page's document (where Chrome says which it is; else its address), the part's description, or the dialog. The service worker checks it just before acting; if the page reloaded or moved on, nothing is done and the thread is told.</p>
       </article>
       <article class="detail-card">
-        <h3>Storage a crash cannot tear</h3>
-        <p>Every OPFS slot header carries a CRC-32 beside its path, in its first sector, and every rename writes a record of itself first. A crash at any byte of any header write reopens with each file whole under one of its two names, and a directory never split; tests cut every byte and every set of sectors.</p>
+        <h3>Names a crash cannot split</h3>
+        <p>Each slot header this version writes carries a CRC-32 right after its path (in the first 512-byte sector, for paths under about 470 bytes), and every rename writes a record of itself first. A crash at any byte or sector of a header write reopens with each file whole under one of its two names and a directory never split: tested by cutting every byte and every set of sectors in a model of the storage, not a physical power-loss proof.</p>
       </article>
       <article class="detail-card">
         <h3>One live copy</h3>
-        <p>A thread moves between browser and host by bundle and lives in one place: sealed where it left, staged where it arrives. A host unpacks an import into a private staging directory and checks every store there, one import at a time, never holding the bundle in memory; browser tokens see only their own threads.</p>
+        <p>A thread moves between browser and host by bundle and lives in one place: sealed where it left, staged where it arrives. A host unpacks an import into a private staging directory and checks every store there, one import at a time, holding no store in memory; it says a thread's size first, and the browser leaves one over 1 GB on the host. Browser tokens see only their own threads.</p>
       </article>
       <article class="detail-card">
         <h3>Unknown stays unknown</h3>
-        <p>A step cut off is recorded as stopped or unknown, never sent again on its own: Retry sends it once, Take back returns its message. A page action interrupted mid-way is reported unknown; in the browser, a parent's Stop leaves its background tasks running, their page actions too.</p>
+        <p>A step cut off is recorded as stopped or unknown, never sent again on its own (unless the session opted in, <code>resend_unknown</code>): Retry sends it once, Take back returns its message. A page action interrupted mid-way is reported unknown. In a thread run in the browser, a parent's Stop leaves its background tasks running, their page actions too.</p>
       </article>
     </div>
 
@@ -1320,7 +1337,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
         <article class="engine-card"><h3>dext-native</h3><code>native/src/*.rs</code><p>SSE, streaming, model transport, strict/host runners, jobs, cgroups, process tree, image policy.</p></article>
         <article class="engine-card app"><h3>dext CLI app</h3><code>src/main.rs + modules</code><p>Full app; not linked by <code>spindle-store</code>.</p></article>
       </div>
-      <div class="engine-foot">Engine limits (<code>native/src/limits.rs</code>): 64 MiB files, 2 GiB trees, 1,800 s runs, 16 jobs. Toolchain memory and process limits are separate from the Spindle admission model.</div>
+      <div class="engine-foot">Engine limits (<code>native/src/limits.rs</code>, <code>strict.rs</code>): 64 MiB files, 2 GiB trees, 1,800 s runs, 16 jobs per process. Toolchain memory and process limits are separate from the Spindle admission model.</div>
     </div>
 
     <div class="oracle" style="margin-top:14px">
@@ -1331,7 +1348,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
 </main>
 
 <footer class="footer site-foot">
-  <p>Spindle · MIT · &copy; SiliconState · drawn from the code as of Spindle for Browser 0.1.6; the docs say more.</p>
+  <p>Spindle · MIT · &copy; SiliconState · drawn from the source after Spindle for Browser 0.1.6; the docs say more.</p>
   <nav aria-label="Footer">
     <a href="../">Spindle</a>
     <a href="../browser/">Spindle for Browser</a>
@@ -1349,27 +1366,45 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
   root.classList.remove("no-js");
   const KEY = "spindle-atlas-theme";
   const themeButtons = Array.from(document.querySelectorAll("[data-set-theme]"));
-  const validThemes = new Set(["light", "dark", "dim"]);
-  let kept = null;
-  try { kept = localStorage.getItem(KEY); } catch {}
-  const system = () => (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-  const markTheme = (theme) => {
-    themeButtons.forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.setTheme === theme)));
+  const query = window.matchMedia("(prefers-color-scheme: dark)");
+  const markTheme = () => {
+    const chosen = root.dataset.chosen || "system";
+    themeButtons.forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.setTheme === chosen)));
   };
-  root.dataset.theme = validThemes.has(kept) ? kept : system();
-  markTheme(root.dataset.theme);
+  markTheme();
   themeButtons.forEach((button) => {
     button.addEventListener("click", () => {
-      root.dataset.theme = button.dataset.setTheme;
-      markTheme(button.dataset.setTheme);
-      try { localStorage.setItem(KEY, button.dataset.setTheme); } catch {}
+      const theme = button.dataset.setTheme;
+      if (theme === "system") {
+        delete root.dataset.chosen;
+        root.dataset.theme = query.matches ? "dark" : "light";
+        try { localStorage.removeItem(KEY); } catch {}
+      } else {
+        root.dataset.chosen = theme;
+        root.dataset.theme = theme;
+        try { localStorage.setItem(KEY, theme); } catch {}
+      }
+      markTheme();
     });
   });
 
+  // Tabs (the pattern's roles are added here: without the script, the sections show one
+  // after another and the tab bar is hidden).
+  const bar = document.querySelector(".tabbar");
   const tabs = Array.from(document.querySelectorAll("[data-tab]"));
   const panels = Array.from(document.querySelectorAll("[data-panel]"));
   const ids = tabs.map((tab) => tab.dataset.tab);
-  const show = (id, { hash = true, focus = false } = {}) => {
+  bar.setAttribute("role", "tablist");
+  tabs.forEach((tab) => {
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-controls", tab.dataset.tab);
+  });
+  panels.forEach((panel) => {
+    panel.setAttribute("role", "tabpanel");
+    panel.setAttribute("aria-labelledby", `tab-${panel.dataset.panel}`);
+    panel.tabIndex = 0;
+  });
+  const show = (id, { history: how = null, focus = false } = {}) => {
     tabs.forEach((tab) => {
       const on = tab.dataset.tab === id;
       tab.setAttribute("aria-selected", String(on));
@@ -1377,21 +1412,34 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
       if (on && focus) tab.focus();
     });
     panels.forEach((panel) => { panel.hidden = panel.dataset.panel !== id; });
-    if (hash && location.hash.slice(1) !== id) history.pushState(null, "", `#${id}`);
+    if (how && location.hash.slice(1) !== id) history[how](null, "", `#${id}`);
   };
   tabs.forEach((tab, at) => {
-    tab.addEventListener("click", () => { show(tab.dataset.tab); window.scrollTo({ top: 0, behavior: "auto" }); });
+    tab.addEventListener("click", () => { show(tab.dataset.tab, { history: "pushState" }); window.scrollTo({ top: 0, behavior: "auto" }); });
     tab.addEventListener("keydown", (event) => {
       const step = { ArrowRight: 1, ArrowLeft: -1, Home: -at, End: tabs.length - 1 - at }[event.key];
       if (step === undefined) return;
       event.preventDefault();
-      show(ids[(at + step + tabs.length) % tabs.length], { focus: true });
+      show(ids[(at + step + tabs.length) % tabs.length], { history: "replaceState", focus: true });
     });
   });
-  const fromHash = () => show(ids.includes(location.hash.slice(1)) ? location.hash.slice(1) : ids[0], { hash: false });
+  const fromHash = () => show(ids.includes(location.hash.slice(1)) ? location.hash.slice(1) : ids[0]);
   window.addEventListener("hashchange", fromHash);
   window.addEventListener("popstate", fromHash);
   fromHash();
+  // A hash that names a panel opens it with the page at its top (the browser would
+  // scroll to the section, which without the script is how one is reached).
+  if (ids.includes(location.hash.slice(1))) {
+    if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+    const top = () => {
+      window.scrollTo(0, 0);
+      // The browser focuses a focusable target it scrolled to: not wanted here.
+      if (document.activeElement?.matches?.("[data-panel]")) document.activeElement.blur();
+    };
+    top();
+    requestAnimationFrame(top);
+    window.addEventListener("load", () => requestAnimationFrame(top), { once: true });
+  }
 })();
 </script>
 </body>

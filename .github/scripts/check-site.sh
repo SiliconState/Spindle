@@ -42,6 +42,15 @@ else
     grep -qiE 'optional|empty|no limit|blank' <<<"$cost" || fail "the cost answer does not say the limit is optional"
 fi
 
+# The atlas says which browser release it was drawn after: the one the site offers, so a
+# new release flags the atlas for a look (what it says may have changed).
+atlas=site/atlas/index.html
+if [ -s "$atlas" ] && [ -n "$versions" ]; then
+    drawn=$(grep -oE 'Spindle for Browser [0-9]+\.[0-9]+\.[0-9]+' "$atlas" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -u || true)
+    if [ "$drawn" != "$versions" ]; then
+        fail "$atlas names Spindle for Browser $(tr '\n' ' ' <<<"$drawn"), the download $(tr '\n' ' ' <<<"$versions"): look the atlas over for the release and update it"
+    fi
+fi
 # The Chrome Web Store needs a privacy policy at a working address.
 [ -s site/privacy/index.html ] || fail "site/privacy/index.html (the privacy policy the store links to) is missing"
 grep -q 'Limited Use' site/privacy/index.html || fail "the privacy policy has no Limited Use statement"
