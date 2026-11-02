@@ -220,7 +220,9 @@ fn killed_host_retains_shared_core_retry_budget() {
             .spawn()
             .unwrap(),
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Only a hung child reaches this; a cold process start on a busy CI runner (Windows
+    // scanning a fresh test binary) once took longer than 10 s to commit three steps.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while !realm.0.join("checkpoint-ready").is_file() {
         assert!(
             child.0.try_wait().unwrap().is_none(),
