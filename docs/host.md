@@ -321,7 +321,7 @@ registered, with its owner and the request's idempotency key, in one `host.sqlit
 transaction, and anything half-made is removed when the host opens. Before a move
 back, the client can read the thread's `bundle_bytes` (an estimate from its files'
 sizes, over rather than under) and leave a thread too large for it here, unsealed;
-Spindle for Browser does for a thread over 1 GB (after 0.1.6). A thread that moved
+Spindle for Browser does for a thread over 1 GB (since 0.1.7). A thread that moved
 back keeps its checked bundle (`moved.spindle`) and refuses new work (every command
 but rename, delete and stop) until its app deletes it. A browser token sees only the threads it brought;
 the phone UI sees every thread. See [API.md](API.md#bringing-threads-to-the-host).

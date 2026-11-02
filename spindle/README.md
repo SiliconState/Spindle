@@ -24,7 +24,7 @@ and schema 19 migrates in place. Native and embedded hosts share the
 [`spend` ledger](store/src/spend.rs), dollar budgets and queued task reports.
 The embedded client also offers checked store compaction and bundle validation;
 see [the package reference](../docs/embedded.md). The browser extension is version
-0.1.6 ([manifest](chrome/manifest.json)); its UI, preview choices and storage controls
+0.1.7 ([manifest](chrome/manifest.json)); its UI, preview choices and storage controls
 are documented in [Spindle for Browser](../docs/chrome.md).
 
 Documentation lives in [`../docs`](../docs/README.md): start with

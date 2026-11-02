@@ -161,7 +161,7 @@ and navigation through large trees; `linux_warm.mjs` checks lazy v86 starts;
 template/reparse sanitizing, WebRTC and DNS leakage checks with a positive netlog
 control, background task cards/reports, queued file messages, reset backup cleanup,
 one copy per moved thread, move and index updates sharing one strict transaction, and
-Storage > Free. Its document previews (after 0.1.6) use
+Storage > Free. Its document previews (since 0.1.7) use
 [`office_fixtures.mjs`](../spindle/chrome/tests/office_fixtures.mjs): a Word, an Excel
 and a PowerPoint file written as those programs write them (stored and deflated parts),
 a PDF, an SVG without its namespace, one whose markup is not XML, a short WAV, and
@@ -173,7 +173,7 @@ the reason. Then each file opens in a tab of its own: the PDF's tab becomes Chro
 viewer of it, served by the service worker; each document shows its text in the preview
 frame under a `script-src 'none'` policy; the SVGs draw (the loose one as a page) and
 the WAV is ready to play. The workspace page shows the same previews and offers each in
-a tab. `review_regressions.mjs` also checks what came after 0.1.6: the service worker's
+a tab. `review_regressions.mjs` also checks what 0.1.7 added: the service worker's
 PDF address (a thread's PDF answered as `application/pdf` with `nosniff`, read from the
 engine over a channel closed after each read; a page, an SVG, a bad thread id, an empty,
 `..` or encoded-slash path and a bad escape refused before anything is read; a site's

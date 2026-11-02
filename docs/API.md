@@ -1630,7 +1630,7 @@ session, if the commit happened, or a fresh import, if it did not.
 - Before asking, a client that takes bundles only up to some size can read the thread's
   `bundle_bytes` ([session object](#session-object)) and leave a thread too large for it
   here: nothing is sealed until an export without `keep` is asked for. Spindle for
-  Browser does so (after 0.1.6): it takes a bundle of up to 1 GB, as it takes a thread
+  Browser does so (since 0.1.7): it takes a bundle of up to 1 GB, as it takes a thread
   file it imports, and a larger thread stays on the host, its note saying why. A host
   that does not report `bundle_bytes` (an older one) is asked for the bundle as before.
 - `200`, `application/octet-stream`: the bundle, with `Content-Length` its size,

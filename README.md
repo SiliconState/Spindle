@@ -144,7 +144,7 @@ Interrupted? `spindle --dir ../demo continue`. The web UI:
 [docs/host.md](docs/host.md#remote-access-through-a-reverse-proxy)). Full walkthrough:
 [docs/getting-started.md](docs/getting-started.md).
 
-**Spindle for Browser 0.1.6.** Download `spindle-browser-0.1.6.zip` from the
+**Spindle for Browser 0.1.7.** Download `spindle-browser-0.1.7.zip` from the
 [latest release](https://github.com/SiliconState/Spindle/releases/latest), unzip it, and load
 the folder with **Load unpacked** in `chrome://extensions`, `edge://extensions` or `brave://extensions`
 ([docs/chrome.md](docs/chrome.md#install-a-release)). Its single-box composer,
@@ -155,9 +155,9 @@ return free database pages without deleting history. A thread can move to your S
 host (**Run on my host**, after a one-click Connect) and back; Before acting sets
 whether page actions ask first; a site you list can carry a sealed secret header that
 scripts never see; and a Stop is a way to steer: the stopped step is kept, and your
-reply goes on with the turn. Built from source (after 0.1.6), previews also open a PDF
-in a tab in the browser's own viewer, draw Word, Excel and PowerPoint files as static
-pages, and play audio and video. The native phone UI follows
+reply goes on with the turn. Since 0.1.7, previews also open a PDF in a tab in the
+browser's own viewer, draw Word, Excel and PowerPoint files as static pages, and play
+audio and video. The native phone UI follows
 the same layout, adapted to the smaller screen. Sources:
 [`panel.mjs`](spindle/chrome/panel.mjs), [`page.mjs`](spindle/chrome/page.mjs) and
 [`app.js`](spindle/store/ui/app.js).

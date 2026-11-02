@@ -522,7 +522,7 @@ runs over that pool.
   (after a rollback) and cut short there. `lost` counts those slots, `lostBytes` is the
   data they hold, and `reclaim()` empties them and returns the bytes freed; it is the
   app's to call. Spindle for Browser offers it under Settings, Storage, Unreadable
-  (after 0.1.6).
+  (since 0.1.7).
 - `lockSession(dir)` takes the exclusive Web Lock `spindle:<dir>` if it is available
   and returns `null` when another worker or tab holds it.
 

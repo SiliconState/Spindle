@@ -143,7 +143,7 @@ See [docs/tools.md](docs/tools.md) for the full execution model.
   two names are too long for a record, thousands of bytes, renames without one; a
   header of it cut short is kept apart instead.) A rename that fails after its record
   stops the pool until it is opened again. A header damaged in another way keeps its
-  bytes out of use until the app frees them (in Spindle for Browser after 0.1.6,
+  bytes out of use until the app frees them (in Spindle for Browser 0.1.7 and later,
   Settings > Storage > Unreadable). This relies on OPFS honoring flushes; it is tested by
   replaying crash points in Node, not proven against power loss.
 
@@ -249,7 +249,7 @@ See [docs/host.md](docs/host.md).
   action on that tab, including choosing, scrolling, moving and closing it, until page actions
   are turned off and on (reading it is not an action); a click or typing whose target is
   covered by something else is refused rather than landing on it; actions on one tab run one
-  at a time. Under Before acting, an action the user allows (after 0.1.6) carries what
+  at a time. Under Before acting, an action the user allows (since 0.1.7) carries what
   the question showed: the tab, its site and Chrome's id for the page it shows (its
   address where Chrome gives none), the part of the page, or the dialog, which the
   question quotes. The service worker checks these just before acting and refuses,
@@ -267,7 +267,7 @@ See [docs/host.md](docs/host.md).
   DNS prefetch is off, and markup that cannot be safely reparsed is shown as text.
   **Load from the web** allows scripts and HTTPS connections under a separate
   allowlist. Allowed uncontained scripts can disclose page data despite CSP.
-  Word, Excel and PowerPoint files (after 0.1.6; macro-enabled kinds too, whose macros
+  Word, Excel and PowerPoint files (since 0.1.7; macro-enabled kinds too, whose macros
   never run) are read from their parts in the extension's page, within size bounds;
   they, and an SVG whose markup is not XML, are drawn as static pages in the same frame
   under the policy of a page without scripts: no script, frame, form submission, link
@@ -275,7 +275,7 @@ See [docs/host.md](docs/host.md).
   Sources: [`page.mjs`](spindle/chrome/page.mjs),
   [`documents.mjs`](spindle/chrome/documents.mjs),
   [`preview.js`](spindle/chrome/preview.js), [`background.js`](spindle/chrome/background.js).
-- PDFs (after 0.1.6; Chrome 123 and later) are not contained like previews. A thread's
+- PDFs (since 0.1.7; Chrome 123 and later) are not contained like previews. A thread's
   PDF opens in a tab of its own as Chrome's own PDF viewer, served by the service worker
   at an address of the extension's that only its own pages reach: PDFs only, as
   `application/pdf` with `nosniff`, from workspace paths only, read from the engine over

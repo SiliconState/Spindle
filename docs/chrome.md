@@ -13,10 +13,9 @@ place where a thread's commands, or the whole thread, can run.
 It is tested on Chrome, Edge and Brave (Chromium 116 or later, on desktop); this page uses Chrome's
 names, which Edge shares. In Edge, Brave or Opera, the panel and the messages it shows say that
 browser's name where they would say Chrome (`BROWSER` in
-[`page-tools.mjs`](../spindle/chrome/page-tools.mjs)). The manifest's current version is **0.1.6**
+[`page-tools.mjs`](../spindle/chrome/page-tools.mjs)). The manifest's current version is **0.1.7**
 ([`manifest.json`](../spindle/chrome/manifest.json)); the release asset is
-`spindle-browser-0.1.6.zip`. This page describes the source: what is newer than the latest
-release, 0.1.6, is marked "(after 0.1.6)".
+`spindle-browser-0.1.7.zip`. What 0.1.7 added is marked "(since 0.1.7)".
 
 ## Contents
 
@@ -47,7 +46,7 @@ and theme switch as the native UI.
 | File | Runs in | Role |
 | --- | --- | --- |
 | [`manifest.json`](../spindle/chrome/manifest.json) | — | MV3 manifest: side panel, module service worker, permissions, the sandboxed `preview.html`, content security policies. Requires Chrome 116 or later. |
-| [`background.js`](../spindle/chrome/background.js) | Service worker | Opens the side panel from the toolbar button. Serves `preview.html` with its `Connection-Allowlist`, and a thread's PDFs for Chrome's PDF viewer (`/file/THREAD/PATH`, after 0.1.6). Does the page tools' work (only it can reach tabs). Keeps the page switches consistent with Chrome's site access. |
+| [`background.js`](../spindle/chrome/background.js) | Service worker | Opens the side panel from the toolbar button. Serves `preview.html` with its `Connection-Allowlist`, and a thread's PDFs for Chrome's PDF viewer (`/file/THREAD/PATH`, since 0.1.7). Does the page tools' work (only it can reach tabs). Keeps the page switches consistent with Chrome's site access. |
 | [`engine.html`](../spindle/chrome/engine.html), [`engine.mjs`](../spindle/chrome/engine.mjs) | Offscreen document (one per profile, reason `WORKERS`) | Starts the engine worker and relays its page-tool calls to the service worker (a worker has no `chrome.runtime`). |
 | [`engine-worker.mjs`](../spindle/chrome/engine-worker.mjs) | Dedicated worker of the offscreen document | The engine. Holds an `EmbeddedClient` over the OPFS pool, the thread index, every thread's turns and the command runners; opens the provider's sealed credential for each request. Drives threads that live on a connected host through a `RemoteClient`. |
 | [`linux-runner.mjs`](../spindle/chrome/linux-runner.mjs), [`linux-route.mjs`](../spindle/chrome/linux-route.mjs) | Engine worker | The `app` command runner: picks a Linux for each command and talks to the Linux workers. |
@@ -57,8 +56,8 @@ and theme switch as the native UI.
 | [`markdown.mjs`](../spindle/chrome/markdown.mjs) | Panel, file tab | Renders `text.js` Markdown blocks as DOM nodes. |
 | [`view.html`](../spindle/chrome/view.html), [`view.mjs`](../spindle/chrome/view.mjs) | Extension page in a tab | Shows one workspace file in a tab of its own. |
 | [`preview.html`](../spindle/chrome/preview.html), [`preview.js`](../spindle/chrome/preview.js) | Sandboxed extension page (iframe) | Renders a web page a thread made. It has its own origin and no extension APIs. |
-| [`page.mjs`](../spindle/chrome/page.mjs) | Panel, file tab | Workspace file helpers: file type and display kind, inlining a page's workspace resources for the preview, an SVG made fit to show as a picture (after 0.1.6), safe download names, `saveFile`. |
-| [`documents.mjs`](../spindle/chrome/documents.mjs) | Panel, file tab | Reads a Word, Excel or PowerPoint file from its zip parts and draws it as a static page for the preview (after 0.1.6). |
+| [`page.mjs`](../spindle/chrome/page.mjs) | Panel, file tab | Workspace file helpers: file type and display kind, inlining a page's workspace resources for the preview, an SVG made fit to show as a picture (since 0.1.7), safe download names, `saveFile`. |
+| [`documents.mjs`](../spindle/chrome/documents.mjs) | Panel, file tab | Reads a Word, Excel or PowerPoint file from its zip parts and draws it as a static page for the preview (since 0.1.7). |
 | [`page-tools.mjs`](../spindle/chrome/page-tools.mjs) | Panel, engine, service worker | Page tool definitions, the host permission patterns they need, the `pageSwitches` rule, what Before acting asks about (`confirmMode`, `sends`, `actionText`), and the browser's name (`BROWSER`). |
 | [`shared.mjs`](../spindle/chrome/shared.mjs) | Panel, engine, file tab, service worker | The `BroadcastChannel` name, the extension's IndexedDB helpers, the preview choices (`previewChoice`, `keepPreviewChoice`), `accessFor`, and `startEngine`. |
 | [`vault.mjs`](../spindle/chrome/vault.mjs) | Engine | Credentials, the host's token and sites' secret headers at rest: sealing, opening, the passphrase lock (see [Keys at rest](#keys-at-rest)). |
@@ -149,15 +148,15 @@ The engine's operations (`ops` in [`engine-worker.mjs`](../spindle/chrome/engine
 | `unqueue` | Takes back the message waiting for a turn's end (Take back) and removes its saved copy. |
 | `stop`, `retry`, `resume` | Stop a turn; resend a request that was cut off; continue where Spindle knows it stopped. |
 | `tasks`, `taskStop` | List child tasks and stop one, including while the parent only waits for reports. |
-| `storage`, `compact`, `dropAside`, `freeSealed`, `reclaimLost` | Per-thread disk use (and, after 0.1.6, the bytes no file name leads to), return free database pages, remove set-aside first attempts, remove a moved thread's sealed copy after checking its bundle, or (after 0.1.6) free those unreadable bytes. |
+| `storage`, `compact`, `dropAside`, `freeSealed`, `reclaimLost` | Per-thread disk use (and, since 0.1.7, the bytes no file name leads to), return free database pages, remove set-aside first attempts, remove a moved thread's sealed copy after checking its bundle, or (since 0.1.7) free those unreadable bytes. |
 | `open` | A thread's status and history (optionally from a message index). For a thread whose commands run in the browser it also warms the wasm Linux (when the build carries it), and v86 only if the thread ran a command there in the last 24 hours. |
 | `rewindTo` | Takes the thread back to just before one of the user's messages, searching the last 8192 rewind targets, and returns that message and its attachments. |
 | `earlier` | The history before a compaction summary. |
 | `restart` | Starts an unfinished turn over, optionally with other settings, or hands its message back. |
 | `settings`, `efforts`, `rename` | Change a thread's settings; list a model's efforts; rename. |
-| `export`, `bundle`, `import` | Move or copy a thread to a `.spindle` file; fetch a moved thread's file again; import one (after 0.1.6, refused over 1 GiB). |
+| `export`, `bundle`, `import` | Move or copy a thread to a `.spindle` file; fetch a moved thread's file again; import one (since 0.1.7, refused over 1 GiB). |
 | `files`, `turnFiles`, `read` | List the workspace; list it together with the files as the last turn found them; read one file's bytes. |
-| `remove` | Deletes a thread, its OPFS files, its kept bundles, its preview choices, its waiting messages, a message that came back for it (after 0.1.6) and what the Linuxes kept of its workspace, and ends its tasks' page actions and the questions they wait on. |
+| `remove` | Deletes a thread, its OPFS files, its kept bundles, its preview choices, its waiting messages, a message that came back for it (since 0.1.7) and what the Linuxes kept of its workspace, and ends its tasks' page actions and the questions they wait on. |
 | `host`, `sites`, `relay`, `standing`, `catalog` | Global settings (see [Settings](#settings)). |
 | `approve` | The user's Allow or Deny for a page action waiting for it (see [Before acting](#before-acting)). |
 | `hostName`, `hostConnect` | This browser's name on the host (kept for the profile); trade the code a Connect tab caught for a browser token and connect with it. |
@@ -186,10 +185,10 @@ A page tool call goes from the engine worker to the offscreen document with `pos
 (`page_tool`), then to the service worker with `chrome.runtime.sendMessage`. The service worker
 accepts tool calls only from `engine.html` of its own extension and from no tab. Answers come
 back the same way (`page_tool_answer`). A turn that ends or is stopped sends `page_tool_cancel`
-for its outstanding calls; after 0.1.6, only for its own: a task's call is cancelled when the
+for its outstanding calls; since 0.1.7, only for its own: a task's call is cancelled when the
 package settles it without an answer (`call.signal`), and every call of a thread when the
 thread is deleted, brought back from the host or its host changes (see
-[Stopping a turn](#stopping-a-turn)). After 0.1.6, an action the user allowed under
+[Stopping a turn](#stopping-a-turn)). Since 0.1.7, an action the user allowed under
 [Before acting](#before-acting) also carries what the question showed (`allowed`), which the
 service worker checks before acting. The panel sends `{type: 'pages'}` to the service worker
 when the page switches change, and the service worker then detaches the debugger from every
@@ -209,7 +208,7 @@ The engine creates its client with `storage: 'opfs'` and a pool opened by `openO
 ([`opfs.mjs`](../spindle/clients/js/opfs.mjs)): a set of OPFS files opened up front with
 synchronous access handles, because SQLite needs synchronous file calls. A pool belongs to one
 worker at a time, and each session takes the Web Lock `spindle:<dir>` before it touches its
-files. Thread `ID` lives in the session directory `/threads/ID`. After 0.1.6, each file slot's
+files. Thread `ID` lives in the session directory `/threads/ID`. Since 0.1.7, each file slot's
 header carries a check beside its name, and every rename writes a record first, so a header
 cut short by a crash is never read as a wrong name; a slot whose header is found damaged
 otherwise is kept apart (`lost`), never read or reused, until Settings, Storage frees it (see
@@ -237,7 +236,7 @@ object stores:
 | `keys` | provider id, `:host`, or `:site:NAME` | A provider credential, the host's token, or a site's secret headers, sealed by the vault (see [Keys at rest](#keys-at-rest)); the host and site records are separate from provider entries. |
 | `threads` | thread id | The thread index: title, provider, model, effort, runner, network, tasks, creation/update times, state, note, summaries and last v86 use; for a thread on the host, `home` (its address and session), a move under way (`moving`) and why the host cannot be reached now (`away`). |
 | `bundles` | thread id, `prior:ID:TIME:UUID`, or `host-move:ID` | The `.spindle` file a moved thread went into; a temporary whole-checked backup while a first turn is reset, removed once reset or restoration finishes; the bytes a move to or from the host holds until it ends. |
-| `kv` | name | `catalog`, `host`, `host-name`, `sites`, `site-secrets` (each site's secret header names), `relay`, `standing`, `pages`, `vault` (the vault key, or its wrapped form), `reset:ID` markers, `preview:ID:PATH` (what the user let one version of a page do in its preview: run its scripts, reach the web), `queued:ID:NONCE` (a message waiting for a turn's end, or held: its text and files, kept until a turn has taken it or the user takes it back), `came-back:ID` (after 0.1.6: a message that came back for a thread that was not open, its text and files, until that thread is opened; `came-back:start` for the start page), moves to or from the host (`host-move:ID`), and for threads on the host their turn commands and Stops saved until the host confirms them (`host-command:ID`, `host-stop:ID`) and page tool answers (`host-tool:...`). |
+| `kv` | name | `catalog`, `host`, `host-name`, `sites`, `site-secrets` (each site's secret header names), `relay`, `standing`, `pages`, `vault` (the vault key, or its wrapped form), `reset:ID` markers, `preview:ID:PATH` (what the user let one version of a page do in its preview: run its scripts, reach the web), `queued:ID:NONCE` (a message waiting for a turn's end, or held: its text and files, kept until a turn has taken it or the user takes it back), `came-back:ID` (since 0.1.7: a message that came back for a thread that was not open, its text and files, until that thread is opened; `came-back:start` for the start page), moves to or from the host (`host-move:ID`), and for threads on the host their turn commands and Stops saved until the host confirms them (`host-command:ID`, `host-stop:ID`) and page tool answers (`host-tool:...`). |
 
 A thread's `state` is one of `idle`, `running`, `stopped`, `failed`, `interrupted` or `moved`.
 A moved thread stays moved even if a turn ends after the move.
@@ -263,8 +262,8 @@ what an earlier stop left behind:
 - a message that waited for a turn's end, or was held, comes back held ("Not sent (...)")
   with Take back, unless the turn that took it had already committed it (then it is not
   offered again); one whose thread is gone is removed;
-- a message that came back for a thread that is gone (`came-back:ID`) is removed (after
-  0.1.6);
+- a message that came back for a thread that is gone (`came-back:ID`) is removed (since
+  0.1.7);
 - moves to or from the host go on from the step they recorded; those that need the host wait
   for it.
 
@@ -511,7 +510,7 @@ How the tools run ([`background.js`](../spindle/chrome/background.js)):
   acting tools until `dialog` answers it, and actions report a dialog when one opens.
 - **Deadlines.** Each call into a page or the debugger has 20 s, a whole tool 28 s in the
   service worker, and the engine waits 35 s before it cancels the call. Stopping the turn (or,
-  after 0.1.6, the task) that made a call, a deadline passing, or page actions being turned
+  since 0.1.7, the task) that made a call, a deadline passing, or page actions being turned
   off cancel the remaining steps of a call. A
   request already handed to Chrome cannot be undone.
 - **Cut-off actions.** A tool that fails once it has begun acting (its input reached the page,
@@ -552,7 +551,7 @@ its site; a `type` question shows up to 300 characters of the text. For `press`,
 first looks up the tab (`tab_of` in [`background.js`](../spindle/chrome/background.js): the
 tab named, or the one the user is looking at then) and names it, as in "Press Enter in tab 4
 (“Inbox”, mail.example)". The action is then pinned to that tab, whatever the user looks at
-by the time they answer. After 0.1.6:
+by the time they answer. Since 0.1.7:
 
 - when no tab was named and Chrome cannot say which tab such an action would land on, the
   question is not asked and nothing is done;
@@ -562,7 +561,7 @@ by the time they answer. After 0.1.6:
   [`page-tools.mjs`](../spindle/chrome/page-tools.mjs));
 - a task's question begins "A task asks:".
 
-**What Allow covers** (after 0.1.6). An allowed action carries what its question showed,
+**What Allow covers** (since 0.1.7). An allowed action carries what its question showed,
 and the service worker checks that just before acting, after any wait for the tab
 (`asAllowed` in [`background.js`](../spindle/chrome/background.js)):
 
@@ -580,9 +579,9 @@ Otherwise nothing is done, and the thread is told why and that it can ask again.
 While an action waits, the panel shows it above that thread's message box as "Spindle asks
 before it acts: ..." with **Deny** and **Allow**, and the thread's row in the list says "Asks
 you: ...". The question area is a polite live region, and both buttons are described by the
-question. The action waits up to ten minutes. **Allow** lets it go on (after 0.1.6, only on
+question. The action waits up to ten minutes. **Allow** lets it go on (since 0.1.7, only on
 what the question showed; see above). **Deny**, no answer within ten minutes, or the turn
-being stopped or ending (after 0.1.6, for a task's question, the task being stopped) means the
+being stopped or ending (since 0.1.7, for a task's question, the task being stopped) means the
 action is not done, and the thread is told so: a known outcome (nothing happened), not an
 unknown one. A script's action that waits for an answer is withdrawn when the command that asked ends: nothing is done (that
 command was already told the outcome is unknown). The mode applies to threads on the
@@ -599,7 +598,7 @@ turn ends"). The engine saves it first, so if Chrome or the engine stops before 
 it comes back held, with Take back. Going back to a message (`rewindTo`) or starting its turn
 over (`restart`) reads those files back from the workspace so they can be sent again.
 
-**A message that comes back** (after 0.1.6): one taken back (Take back, of an unfinished
+**A message that comes back** (since 0.1.7): one taken back (Take back, of an unfinished
 turn or of a message waiting for a turn), returned by going back to before it, or whose
 send failed goes into the box only
 while its own thread is open (the box is every thread's), before what the box already holds.
@@ -617,11 +616,11 @@ the last turn's final answer (at the end when the turn ended without one), marki
 or edited (`turnFiles` compares digests
 with the workspace before the turn), whether a file tool or a command made them. Scratch files (`isScratch`:
 `.txt`, `.py`, `.pyc`, `.log`, `.tmp`, and anything under `test/`, `tests/`, `__pycache__/` or
-`.cache/`) are hidden until shown. Cards of pages, pictures, Markdown files and (after
-0.1.6) documents sit below their run of steps; a page's or document's card has a button that
+`.cache/`) are hidden until shown. Cards of pages, pictures, Markdown files and (since
+0.1.7) documents sit below their run of steps; a page's or document's card has a button that
 shows more of its preview. A PDF's card has a button that opens it in a tab in place of a
-preview (after 0.1.6). The workspace also has a page of its own in the panel, which offers to
-open a page or picture and (after 0.1.6) a PDF, document, audio or video in a tab of its own,
+preview (since 0.1.7). The workspace also has a page of its own in the panel, which offers to
+open a page or picture and (since 0.1.7) a PDF, document, audio or video in a tab of its own,
 and `view.html` shows one file in a tab. Folders start shut and draw their children only
 when opened; a folder containing only a folder shares its row. Counts and change
 marks reach enclosing folders; search lists matching files with their paths. Open
@@ -634,10 +633,10 @@ How a file is shown depends on `kindOf` in [`page.mjs`](../spindle/chrome/page.m
 | Kind | Shown as |
 | --- | --- |
 | page (`.html`, `.htm`) | A sandboxed `preview.html` iframe. `pageOf` inlines relative styles, scripts when permitted, pictures and media (each at most 16 MiB). Scripts receive only named small data files (each at most 1 MiB, 8 MiB in all), checked against workspace digests, for in-memory `fetch`. |
-| picture (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`; after 0.1.6 also `.avif`, `.bmp`, `.ico`, `.apng`) | An `<img>`. After 0.1.6, an SVG written without the SVG namespace on its root (which a picture needs to draw anything) gets it, and xlink's where it uses xlink (`pictureBlob`); one whose markup is not XML (an HTML entity, a stray `&`) is drawn as a static page instead (`svgPage`). |
-| PDF (`.pdf`, after 0.1.6) | Never in the panel: it opens in a tab of its own as Chrome's own PDF viewer (see [PDFs](#pdfs)). |
-| document (`.docx`, `.xlsx`, `.pptx` and the macro-enabled `.docm`, `.xlsm`, `.pptm`, after 0.1.6) | A static page in the sandboxed preview frame (see [Documents](#documents)). |
-| audio and video (`.mp4`, `.m4v`, `.webm`, `.ogv`, `.mov`, `.mp3`, `.m4a`, `.aac`, `.wav`, `.ogg`, `.oga`, `.opus`, `.flac`, after 0.1.6) | An `<audio>` or `<video>` player with controls; a file the browser cannot play says so and leaves the download. The panel pauses a player when its card is folded or the conversation goes out of sight, and lets go of its file once its card or preview is gone. |
+| picture (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`; since 0.1.7 also `.avif`, `.bmp`, `.ico`, `.apng`) | An `<img>`. Since 0.1.7, an SVG written without the SVG namespace on its root (which a picture needs to draw anything) gets it, and xlink's where it uses xlink (`pictureBlob`); one whose markup is not XML (an HTML entity, a stray `&`) is drawn as a static page instead (`svgPage`). |
+| PDF (`.pdf`, since 0.1.7) | Never in the panel: it opens in a tab of its own as Chrome's own PDF viewer (see [PDFs](#pdfs)). |
+| document (`.docx`, `.xlsx`, `.pptx` and the macro-enabled `.docm`, `.xlsm`, `.pptm`, since 0.1.7) | A static page in the sandboxed preview frame (see [Documents](#documents)). |
+| audio and video (`.mp4`, `.m4v`, `.webm`, `.ogv`, `.mov`, `.mp3`, `.m4a`, `.aac`, `.wav`, `.ogg`, `.oga`, `.opus`, `.flac`, since 0.1.7) | An `<audio>` or `<video>` player with controls; a file the browser cannot play says so and leaves the download. The panel pauses a player when its card is folded or the conversation goes out of sight, and lets go of its file once its card or preview is gone. |
 | Markdown | Rendered with the native UI's parser. |
 | text and code | Plain text. The panel shows the first 60,000 characters and the file tab the first 2 MiB (Markdown too); download for the rest. |
 | anything else | Offered for download (the workspace page shows it as text if it holds no NUL byte). Older Office files (`.doc`, `.xls`, `.ppt`) and OpenDocument files are among them. |
@@ -684,7 +683,7 @@ and tasks settings, but none of its conversation.
 
 ### PDFs
 
-After 0.1.6, a PDF opens in a tab of its own: `view.html` replaces itself with the
+Since 0.1.7, a PDF opens in a tab of its own: `view.html` replaces itself with the
 extension's address `/file/THREAD/PATH` (`pdfAddress` in [`page.mjs`](../spindle/chrome/page.mjs)),
 which the service worker answers through a static route with the file, read from the engine
 (`pdf` in [`background.js`](../spindle/chrome/background.js); the worker joins the engine's
@@ -704,7 +703,7 @@ download.
 
 ### Documents
 
-After 0.1.6, `documentPage` in [`documents.mjs`](../spindle/chrome/documents.mjs) reads a
+Since 0.1.7, `documentPage` in [`documents.mjs`](../spindle/chrome/documents.mjs) reads a
 Word, Excel or PowerPoint file from its zip parts in the extension's page (nothing is sent
 anywhere, and a macro-enabled file's macros never run) and writes static HTML, which shows in
 the sandboxed preview frame as a static page: no script, frame, link out or web load
@@ -765,9 +764,9 @@ a turn runs).
 - **Continue** lets the model decide what to do next. **Retry** asks it again from before the
   stopped step; when that step came from the thread's first request, which has nothing before
   it, Retry starts the turn over with its message sent again. **Take back** returns the message
-  to the box (after 0.1.6, only while its thread is open: see
+  to the box (since 0.1.7, only while its thread is open: see
   [Files in and out](#files-in-and-out)).
-- **Tasks' page actions** (after 0.1.6). Stop ends the turn's own page actions and those of
+- **Tasks' page actions** (since 0.1.7). Stop ends the turn's own page actions and those of
   the tasks it waits for, which the package stops with the turn (ending their calls'
   `call.signal`). A task running in the background goes on, its page actions and their
   questions too, until its own Stop, or until the thread is deleted, brought back from the
@@ -814,7 +813,7 @@ Global settings are stored in IndexedDB and applied by the engine:
 | Your Spindle host | Address; **Connect**, or **Or paste a token** | `kv/host` (URL, and this browser's name there after Connect), `keys/:host` (sealed token) | Connect opens the host's own page to approve this browser (see [Running a thread on your Spindle host](#running-a-thread-on-your-spindle-host)). A pasted token comes from `spindle --dir HOST token new NAME --browser` (threads and commands) or `--runner` (commands only). Kept after the host answers. |
 | Your instructions | standing instructions | `kv/standing` | Up to 8000 characters, added to new threads at once and to other threads before their next turn. |
 | Appearance | Paper, neutral Light, Dim or System (Light or Dim as the system is); Textured or Plain | `localStorage` (`spindle-theme`, `spindle-texture`; `theme.js`) | The panel's look; Paper and Textured are the defaults. Dim is the dark theme, a soft charcoal. |
-| Storage | Thread sizes, Free, Free all, Remove first attempts, Linux snapshot, Unreadable (after 0.1.6) | OPFS and `bundles` | See [Storage controls](#storage-controls). |
+| Storage | Thread sizes, Free, Free all, Remove first attempts, Linux snapshot, Unreadable (since 0.1.7) | OPFS and `bundles` | See [Storage controls](#storage-controls). |
 | About | The extension's version, the engine, build and Linux images, storage used; Open in a tab, Restart engine | — | **Open in a tab** opens `panel.html` in a tab (useful when Chrome cannot show a permission prompt in the side panel). **Restart engine** closes and restarts the offscreen engine, asking first while browser threads run. |
 
 Settings for one thread, and the defaults for new threads, are in the model page (the model
@@ -848,7 +847,7 @@ For an older moved thread with a sealed OPFS copy, Free calls `freeSealed`:
 `checkBundle` checks the saved file before the redundant store is removed.
 
 **Free all** performs those two operations where useful, one thread at a time
-(after 0.1.6, after first freeing any Unreadable bytes);
+(since 0.1.7, after first freeing any Unreadable bytes);
 it does not delete history, set-aside first attempts or the Linux snapshot.
 **Remove first attempts** calls `dropAside`, deleting `store.abandoned-*` trees
 left when a first request was retried fresh; their retained spend stays counted.
@@ -857,7 +856,7 @@ so a future v86 start boots afresh instead of resuming them; it does not stop an
 already running Linux. These are separate actions, not part of Free all. Source:
 [`panel.mjs`](../spindle/chrome/panel.mjs).
 
-**Unreadable** (after 0.1.6) is a row shown only when the OPFS pool found file slots whose
+**Unreadable** (since 0.1.7) is a row shown only when the OPFS pool found file slots whose
 header is damaged (`lost` in [`opfs.mjs`](../spindle/clients/js/opfs.mjs)). A crash leaves
 one only rarely (an older version's file with a very long name, deleted as the crash came),
 since every rename is recorded first and finished or undone whole. For one file
@@ -898,7 +897,7 @@ new thread, which gets the current page tools and the guide if its commands run 
 The package's `fit` report supplies the changes Chrome needs; the engine applies
 them and records them in the thread's note. When anything changed, the panel lists it
 before anything runs and asks **Keep this thread here?**; declining removes that local
-import, not the original file. After 0.1.6, a file over 1 GiB (`BUNDLE_MOST` in
+import, not the original file. Since 0.1.7, a file over 1 GiB (`BUNDLE_MOST` in
 [`host-moves.mjs`](../spindle/chrome/host-moves.mjs)) is refused before it is read, by the
 panel and again by the engine: bringing one in holds it about three times over in the engine's
 memory, so a larger one would end the engine rather than fail (a native Spindle takes it).
@@ -999,7 +998,7 @@ for a newer turn replaces an older saved one.
 **Bring back to this browser** (the thread's menu, when it is not running) first says what
 changes for the thread to run here, as an import does (see the table in
 [Moving threads to and from a native host](#moving-threads-to-and-from-a-native-host)), and
-asks to go on. After 0.1.6, the engine first reads the thread's size from the host
+asks to go on. Since 0.1.7, the engine first reads the thread's size from the host
 (`bundle_bytes` in `GET /v1/sessions/ID`, an estimate that errs high), before the host
 seals anything: a thread over 1 GiB (`BUNDLE_MOST`, as for a file) stays on the host as it
 was, and its note says why ("It stays on your host: it would come back as about N GB, more
@@ -1051,9 +1050,9 @@ zip. The zip also holds the `LICENSE` and
 with licenses and sources.
 
 1. Download `spindle-browser-VERSION.zip` (and `spindle-browser-VERSION.zip.sha256` to check
-   it) and unzip it into a folder you will keep. To check version 0.1.6 first, run
-   `sha256sum -c spindle-browser-0.1.6.zip.sha256`, or
-   `gh attestation verify spindle-browser-0.1.6.zip -R SiliconState/Spindle`.
+   it) and unzip it into a folder you will keep. To check version 0.1.7 first, run
+   `sha256sum -c spindle-browser-0.1.7.zip.sha256`, or
+   `gh attestation verify spindle-browser-0.1.7.zip -R SiliconState/Spindle`.
 2. Load the folder as below (**Load unpacked**).
 3. To update, unzip the next version over the same folder and click **Reload** on the
    extension's card. The browser derives an unpacked extension's id from its folder, and its
@@ -1116,10 +1115,10 @@ whole.
 
 | Test | Needs | Checks |
 | --- | --- | --- |
-| [`extension_real.mjs`](../spindle/chrome/tests/extension_real.mjs) | a build, `SPINDLE_BROWSER`; a key and `--provider`, or `--scripted`; optional `SPINDLE_BIN` | End to end through the panel in a fresh profile: page reading off and on, steering, a turn finishing with no panel open, Stop, Continue and Retry, Chrome killed mid-turn, moving to native Spindle and back (with `SPINDLE_BIN`), copies and deletes, no key in any bundle, bash in the browser Linux with Spindle calls, a granted site, a site's secret header (added to a script's request, redacted from what comes back, refused when the script sets it, never kept as text or in the thread, removed with the site), TypeScript, attachments and downloads, browsing tools, a host sandbox (with `SPINDLE_BIN`), and (scripted) Before acting (Ask asks and Deny does nothing; Auto asks only before Enter; after 0.1.6, Allow does nothing on a page reloaded since the question), a command stopped while it runs (kept as stopped with what it printed) and a reply going on after it, long threads, rewinds, compaction and, in a build with the wasm Linux, a plain `sh` command there. Scripted with `SPINDLE_BIN` (and a host whose sandbox works), it also runs a thread on a Spindle host: Connect through the host's page, Run on my host, turns there (steering, Stop, Retry, a page tool this browser answers), the engine restarted mid-turn, the host out of reach and back, a Stop made offline that survives restarts and cannot stop a later turn, Bring back, and a crash or reload at every step of both moves, leaving one live copy each time. `SPINDLE_ONLY=hosted` runs only that part; `SPINDLE_ONLY=browser` skips it. |
+| [`extension_real.mjs`](../spindle/chrome/tests/extension_real.mjs) | a build, `SPINDLE_BROWSER`; a key and `--provider`, or `--scripted`; optional `SPINDLE_BIN` | End to end through the panel in a fresh profile: page reading off and on, steering, a turn finishing with no panel open, Stop, Continue and Retry, Chrome killed mid-turn, moving to native Spindle and back (with `SPINDLE_BIN`), copies and deletes, no key in any bundle, bash in the browser Linux with Spindle calls, a granted site, a site's secret header (added to a script's request, redacted from what comes back, refused when the script sets it, never kept as text or in the thread, removed with the site), TypeScript, attachments and downloads, browsing tools, a host sandbox (with `SPINDLE_BIN`), and (scripted) Before acting (Ask asks and Deny does nothing; Auto asks only before Enter; since 0.1.7, Allow does nothing on a page reloaded since the question), a command stopped while it runs (kept as stopped with what it printed) and a reply going on after it, long threads, rewinds, compaction and, in a build with the wasm Linux, a plain `sh` command there. Scripted with `SPINDLE_BIN` (and a host whose sandbox works), it also runs a thread on a Spindle host: Connect through the host's page, Run on my host, turns there (steering, Stop, Retry, a page tool this browser answers), the engine restarted mid-turn, the host out of reach and back, a Stop made offline that survives restarts and cannot stop a later turn, Bring back, and a crash or reload at every step of both moves, leaving one live copy each time. `SPINDLE_ONLY=hosted` runs only that part; `SPINDLE_ONLY=browser` skips it. |
 | [`signin_vault.mjs`](../spindle/chrome/tests/signin_vault.mjs) | a build, `SPINDLE_BROWSER` | Against scripted OAuth and ChatGPT-style services (no account): Sign in through a tab whose loopback redirect is caught and closed, the PKCE exchange, the row naming the signed-in account, Settings fitting a side panel's width, a refresh before the first turn, the token and its account header on the request; keys, sign-ins and a site's secret header sealed in IndexedDB and absent as text from the profile's files; a legacy text key sealed at engine start; a passphrase that locks, refuses a wrong passphrase and a secret header while locked, unlocks, relocks on engine restart, changes and comes off; a token endpoint that is down while the token is good, a refused refresh ending the sign-in, and **Forgot it** deleting the saved keys and secret headers while threads stay. |
-| [`review_browser.mjs`](../spindle/chrome/tests/review_browser.mjs) | a build, `SPINDLE_BROWSER`; Node `node:sqlite` for the storage case | Permission/send ordering, camera permission, covered targets and unknown actions, reset rollback and backup cleanup, one copy per move, move and index updates sharing one strict IndexedDB transaction, Storage's Free, static and contained previews (templates, reparsing, WebRTC, resource hints and DNS netlog), version-scoped script/web choices, background task cards and stopped reports, and messages with files queued for the next turn; after 0.1.6, Word, Excel and PowerPoint files drawn as pages with nothing hidden shown (a damaged or renamed file refused, saying why), and in a tab and on the workspace page a PDF's tab becoming Chrome's viewer of it from the service worker, documents, an SVG without its namespace, an SVG that is not XML drawn as a page, and audio. |
-| [`review_regressions.mjs`](../spindle/chrome/tests/review_regressions.mjs) | Node only | Engine operation ordering, reset rollback, early Stop, a turn stopped part way taking a reply (text alone) and Retry after a stopped step, page-step cancellation, Before acting (Full, Auto, Ask; allowed, denied, ended), site secret headers (names, values, HTTPS only, named to the package without their values), the Dim theme (an old Dark shows Dim), the host `/v1` client (event stream parsing and resuming, commands sent again under their request ID, bundles in and out), Connect's PKCE and state, hosted turns and Stops surviving a lost answer or an engine restart, moves to the host and back cut at every step (one live copy each time), gateway redirect and buffer bounds, IPv6 address checks, dotted CDP request ids, the debugging-bar veto (for tabs vetoed at once, and for actions without the debugger), Before acting kept when site access is taken back, Return asked about as Enter, one action at a time per tab, cut-off actions answering unknown, a message with files waiting for the turn's end (kept on disk until its turn has taken it, restored at start, held, unless taken), a message stopped before its turn began coming back held, a message to a thread that takes none refused at once, the tab a question is about named and pinned, an unreadable Before acting asking, a script's question withdrawn when its command ends, icon buttons named Send asked about, moves rolled back after a lost first request and a refusal only a new key gets (never after a lost answer), a move back waiting on its own export, and a snapshot holding threads as they are when it answers; after 0.1.6, an allowed action held to the page, part or dialog its question showed, a task's page action going on after its parent's Stop, a message coming back only into its own thread's box, and the service worker's PDF address (only a thread's PDFs, its channel closed after each read). |
+| [`review_browser.mjs`](../spindle/chrome/tests/review_browser.mjs) | a build, `SPINDLE_BROWSER`; Node `node:sqlite` for the storage case | Permission/send ordering, camera permission, covered targets and unknown actions, reset rollback and backup cleanup, one copy per move, move and index updates sharing one strict IndexedDB transaction, Storage's Free, static and contained previews (templates, reparsing, WebRTC, resource hints and DNS netlog), version-scoped script/web choices, background task cards and stopped reports, and messages with files queued for the next turn; since 0.1.7, Word, Excel and PowerPoint files drawn as pages with nothing hidden shown (a damaged or renamed file refused, saying why), and in a tab and on the workspace page a PDF's tab becoming Chrome's viewer of it from the service worker, documents, an SVG without its namespace, an SVG that is not XML drawn as a page, and audio. |
+| [`review_regressions.mjs`](../spindle/chrome/tests/review_regressions.mjs) | Node only | Engine operation ordering, reset rollback, early Stop, a turn stopped part way taking a reply (text alone) and Retry after a stopped step, page-step cancellation, Before acting (Full, Auto, Ask; allowed, denied, ended), site secret headers (names, values, HTTPS only, named to the package without their values), the Dim theme (an old Dark shows Dim), the host `/v1` client (event stream parsing and resuming, commands sent again under their request ID, bundles in and out), Connect's PKCE and state, hosted turns and Stops surviving a lost answer or an engine restart, moves to the host and back cut at every step (one live copy each time), gateway redirect and buffer bounds, IPv6 address checks, dotted CDP request ids, the debugging-bar veto (for tabs vetoed at once, and for actions without the debugger), Before acting kept when site access is taken back, Return asked about as Enter, one action at a time per tab, cut-off actions answering unknown, a message with files waiting for the turn's end (kept on disk until its turn has taken it, restored at start, held, unless taken), a message stopped before its turn began coming back held, a message to a thread that takes none refused at once, the tab a question is about named and pinned, an unreadable Before acting asking, a script's question withdrawn when its command ends, icon buttons named Send asked about, moves rolled back after a lost first request and a refusal only a new key gets (never after a lost answer), a move back waiting on its own export, and a snapshot holding threads as they are when it answers; since 0.1.7, an allowed action held to the page, part or dialog its question showed, a task's page action going on after its parent's Stop, a message coming back only into its own thread's box, and the service worker's PDF address (only a thread's PDFs, its channel closed after each read). |
 | [`panel_long_run.mjs`](../spindle/chrome/tests/panel_long_run.mjs) | a build, `SPINDLE_BROWSER` | One long scripted turn in each theme: step groups, labels, Stop, Latest, the workspace page, label contrast. |
 | [`panel_steps.mjs`](../spindle/chrome/tests/panel_steps.mjs) | Node only | `steps.mjs` labels, tenses, retried failures, durations, a group's time on the clock (steps run at once counted once), scratch files. |
 | [`panel_tree.mjs`](../spindle/chrome/tests/panel_tree.mjs) | a build, `SPINDLE_BROWSER` | Large workspace trees: closed folders draw no descendants, single-child folder chains, counts and change marks, open state across redraws, filtering and next/previous navigation; draw timing and Light/Dim screenshots. |
