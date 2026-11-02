@@ -54,11 +54,11 @@ returns (`linuxRunner`). The engine connects it to its `EmbeddedClient` as the r
 The wasm Linux runs at the machine's own speed with no emulator in between, which is why
 routing sends it every command it can run. [`linux_bench.mjs`](../spindle/chrome/tests/linux_bench.mjs)
 runs the same commands on both Linuxes through `linuxRunner` with a forced route, in headless
-Chrome 153, and keeps the median of five runs:
+Chrome 153, and keeps the median of five runs (the first command is timed once):
 
 | Workload | v86 Linux | wasm Linux | Faster by |
 | --- | ---: | ---: | ---: |
-| Shell: `true`, a file write and read, a directory listing piped to `wc`, a sort pipeline, 30 program starts, 200 files, an `awk` loop | | | 2.2x to 8.6x |
+| Shell: `true`, a file write and read, a directory listing piped to `wc`, a sort pipeline, 30 program starts, 200 files, an `awk` loop | varies by command | varies by command | 2.2x to 8.6x |
 | `python3 -c pass` | 418 ms | 102 ms | 4.1x |
 | Python importing `json`, `re`, `collections`, `datetime`, `pathlib`, `subprocess` | 1,299 ms | 171 ms | 7.6x |
 | Python summing 3 million squares | 8,353 ms | 326 ms | 25.6x |
@@ -113,7 +113,7 @@ sends the command to v86 if any of the following holds:
   `$( )`, backticks and unquoted heredoc bodies;
 - a command name is built at run time (from an expansion), or the command uses `eval`;
 - a wrapped command is unknown. `env`, `nice`, `nohup`, `time`, `exec`, `stdbuf`, `timeout`,
-  `xargs`, `find -exec`/`-execdir`/`-ok`, `busybox APPLET`, `command`, and `sh -c SCRIPT`
+  `xargs`, `find -exec`/`-execdir`/`-ok`/`-okdir`, `busybox APPLET`, `command`, and `sh -c SCRIPT`
   (also `ash`, `hush`, `dash`) are looked through to the command they run.
 
 ### When a wasm result is run again on v86
@@ -190,7 +190,7 @@ Each agent takes commands as frames, which are lines of the form `STX KIND ID BA
 | Direction | Frame | Payload |
 | --- | --- | --- |
 | browser to agent | `RUN id` | JSON `{command, timeout_s, dir}`; on v86 also `network` (`'chrome'`, `'relay'` or null) and `now` (the browser's clock) |
-| browser to agent | `STOP id`, `PING n` | — |
+| browser to agent | `STOP id`, `PING n` | none |
 | browser to agent | `REPLY id` | JSON `{seq, reply}`: the answer to a script's Spindle call |
 | agent to browser | `READY n` | `READY 0` when the agent starts; `READY n` answers `PING n` |
 | agent to browser | `OUT id` | Output bytes (stdout and stderr together) |
@@ -248,8 +248,9 @@ CPUs, so a runaway holds only its own command's CPUs.
 Both Linuxes keep a thread's workspace on their 9p share between commands
 ([`linux-workspace.mjs`](../spindle/chrome/linux-workspace.mjs), class `Workspaces`):
 
-1. **Plan.** For the next command, files of the thread's kept copy whose digest, size, mode,
-   owner and link count still match the package's file list are reused: by the same path first,
+1. **Plan.** For the next command, files of the thread's kept copy whose digest, size and
+   executable flag match the package's file list, and whose mode, owner and link count are
+   still those of a fresh copy, are reused: by the same path first,
    then any kept file with the same content (a move or copy). The guest has not written to these
    files since they were kept. All other objects are asked for (`need`).
 2. **Build.** A fresh directory `/runs/N` (root's `/runs` is mode 0700) is made for the command
@@ -322,7 +323,8 @@ flowchart LR
 3. **The proxy** ([`proxy.py`](../spindle/chrome/linux/guest/proxy.py), root, restarted by init if
    it stops) passes plain-HTTP requests to the gateway at `192.168.86.1:3128` as they came. For
    `CONNECT host:port`, it answers `200`, ends TLS itself with a certificate for that host signed
-   by the Linux's CA (made on demand, valid 397 days, cached in `/run/spindle-certs`), sends
+   by the Linux's CA (made on demand, valid 397 days, written to `/run/spindle-certs` and reused while the
+   proxy runs), sends
    `SPINDLE-ORIGIN https://host:port`, and then forwards the decrypted HTTP/1.1 requests. If the
    gateway refuses the connection, because no command with network is running, the proxy answers
    `403` and says the thread has no network.
@@ -332,27 +334,31 @@ flowchart LR
    `Expect: 100-continue`), drops hop-by-hop headers, and calls `fetch` with `credentials:
    'omit'`, `cache: 'no-store'`, `redirect: 'manual'` and `referrerPolicy: 'no-referrer'`. It
    streams the response back, pausing while more than 1 MiB waits for the guest.
-5. **Refused addresses.** `local(hostname)` refuses, with `403`, names without a dot; names ending
-   in `localhost`, `local`, `internal`, `lan`, `localdomain` or `home.arpa`; IPv4 `0/8`, `10/8`,
+5. **Refused addresses.** `local(hostname)` refuses, with `403`, names without a dot; names that are, or end in a dot and,
+   `localhost`, `local`, `internal`, `lan`, `localdomain` or `home.arpa`; IPv4 `0/8`, `10/8`,
    `127/8`, `169.254/16`, `172.16/12`, `192.168/16`, `100.64/10` and `224/4` and above; and IPv6
    `::`-prefixed, `fc00::/7`, `fe80::/10` and `ff00::/8` addresses. Chrome resolves names, so a
-   public name that resolves into a private network is not caught.
+   public name that resolves into a private network is not caught. A request to the browser's
+   own extension store (Chrome's or Edge's) also gets a `403`, which says the browser never
+   lets an extension reach it.
 6. **Redirects** are never followed by the gateway. If Chrome hides a redirect's target
    (`opaqueredirect`), the gateway answers `502` and asks for the final address. If the target
    is visible (a non-browser `fetch`), it is passed to the client only when it is a public http(s)
    address.
 
 The gateway works only for clients that use a proxy from the environment, or that speak plain
-HTTP to port 80. Other ports and protocols are not reachable through Chrome. Requests carry no
+HTTP to port 80. Without the proxy, other ports and protocols (ssh, `git://`, databases)
+are not reachable through Chrome. Requests carry no
 cookies.
 
 ### Through a relay
 
-When the user sets a relay (`wisp://HOST` or `wisps://HOST`, Settings, Commands), the v86 card is
+When the user sets a relay (`wisp://HOST` or `wisps://HOST`, Settings, Relay), the v86 card is
 wired to that WISP server instead of the gateway. Every TCP connection of a command with network
-goes to the relay as it is, with the guest's own TLS, so any protocol works. Connections to the
+goes to the relay as it is, with the guest's own TLS, so any protocol over TCP works (ssh,
+git over SSH, databases). Connections to the
 guest's own subnet (`192.168.86.*`) are refused, and a connection whose unread data exceeds 64 MiB
-is cut. Name lookups use DNS-over-HTTPS while a command with network runs; at other times they
+is cut. Name lookups use DNS-over-HTTPS (cloudflare-dns.com) while a command with network runs; at other times they
 get answers that lead nowhere. The agent sets no proxy variables for such a command. Changing
 the relay restarts the v86 machine once no command is running.
 
@@ -404,8 +410,9 @@ sequenceDiagram
   its error ends with `[may_have_run]`. When the command ends, its abort signal stops further
   calls, and children that never ran stay uncertain in the journal.
 - **Limits per command** (`LIMITS` in [`store/src/embedded/code.rs`](../spindle/store/src/embedded/code.rs)):
-  128 calls, 32 of them model calls, and up to 4 children of a `batch` at once. `spindle limits`
-  prints them.
+  128 calls, 32 of them model calls, and up to 4 children of a `batch` at once (one at a time
+  when it includes a tool call), within a nested-model allowance of 1,048,576 (input bytes plus
+  requested output tokens). `spindle limits` prints them.
 - **Agent bounds.** At most 64 connections per command. A request line may be up to 64 MiB on
   v86 and 16 MiB on the wasm Linux. A script that leaves too many replies unread is disconnected.
 
@@ -414,8 +421,8 @@ The interfaces:
 | From | Calls |
 | --- | --- |
 | bash and any program: `spindle` ([`main.rs`](../spindle/chrome/linux/command/src/main.rs), a static Rust binary) | `spindle model [--provider P] [--model M] [--system S] [--max-tokens N] [--effort E] [--image FILE]... PROMPT` (prints the text; `-` reads the prompt from stdin); `spindle tool NAME [JSON]`; `spindle search [QUERY]`; `spindle describe NAME`; `spindle limits`; `spindle http [-X METHOD] [-H 'NAME: VALUE']... [-d BODY \| --json JSON] URL` (prints the body, fails on HTTP 400 and up); `spindle call METHOD [JSON]` (the raw reply) |
-| Python: `import spindle` ([`spindle.py`](../spindle/chrome/linux/guest/spindle.py), both Linuxes) | `model(prompt, **options)`, `models(prompts)`, `tool(name, args)`, `tools.search`/`describe`/`call`, `batch(calls)`, `limits()`, `http(url, **options)`, `image(path)`; failures raise `SpindleError` with `may_have_run` |
-| Node: `require('spindle')` or `import ... from 'spindle'` ([`spindle.js`](../spindle/chrome/linux/guest/spindle.js), v86 only) | The same functions, synchronous, each running `spindle call METHOD -`; installed at `/node_modules/spindle` so ES module imports and `node file.ts` find it |
+| Python: `import spindle` ([`spindle.py`](../spindle/chrome/linux/guest/spindle.py), both Linuxes) | `model(prompt, **options)`, `models(prompts, **options)`, `tool(name, args)`, `tools.search`/`describe`/`call`, `batch(calls)`, `limits()`, `http(url, **options)`, `image(path)`; failures raise `SpindleError` with `may_have_run` |
+| Node: `require('spindle')` or `import ... from 'spindle'` ([`spindle.js`](../spindle/chrome/linux/guest/spindle.js), v86 only) | The same functions, synchronous, each call running `spindle call METHOD -` (`image` reads the file itself); failures throw an `Error` whose message ends with `[may_have_run]` when it may have run; installed at `/node_modules/spindle` so ES module imports and `node file.ts` find it |
 
 Being a static binary, `spindle` makes a call cost only the round trip, with no interpreter
 start. The Python module talks to the socket directly.
@@ -426,8 +433,8 @@ The engine warms the optional wasm Linux when a browser-runner thread is opened 
 created. It warms v86 then only if that thread used v86 in the last day; a chat-only
 thread leaves v86 and its 512 MiB unstarted. A command that needs v86 starts it then.
 Choosing This browser as a thread's runner explicitly warms both (`warm()`;
-`warm({v86: false})` skips v86). `onRan` records which Linux ran each
-command. A Linux worker that has run nothing for 10 minutes is terminated
+`warm({v86: false})` skips v86). The engine's `onRan` callback notes on the thread when it
+last ran a command on v86. A Linux worker that has run nothing for 10 minutes is terminated
 (`IDLE_MS`), giving its memory back. Sources:
 [`engine-worker.mjs`](../spindle/chrome/engine-worker.mjs) and
 [`linux-runner.mjs`](../spindle/chrome/linux-runner.mjs).
@@ -469,12 +476,12 @@ The panel shows each Linux's state (Settings, Commands):
 | --- | --- | --- |
 | `not started` | not started yet | not started yet (only when the extension carries it) |
 | `booting` | first start | starting |
-| `saving`, `resuming` | saving its first start; resuming the saved state | — |
+| `saving`, `resuming` | saving its first start; resuming the saved state | not used |
 | `ready` | running | running |
 | `stopped` | resting after 10 idle minutes | resting |
-| `ended` | — | a machine ended; the next command starts another |
+| `ended` | not used | a machine ended; the next command starts another |
 | `failed` | failed to start | failed to start; the next command tries again |
-| `unavailable` | — | not usable in this browser, or disabled after repeated failures; commands go to v86 |
+| `unavailable` | not used | not usable in this browser, or disabled after repeated failures; commands go to v86 |
 
 ## Runner identity
 
@@ -484,13 +491,16 @@ embedded client binds it with `setAppRunner`, so the package records runs as san
 - The v86 identity (`linux/identity`) is the SHA-256 of `fs.json` (which names every file by
   digest), `libv86.mjs`, `v86.wasm` and both BIOS images.
 - The wasm identity (`wasm-linux/identity`) is the SHA-256 of `fs.json`, `vmlinux.wasm`, and the
-  runtime that boots it (the `wasm-linux/*.mjs` files and the vendored v86 files).
+  runtime that boots it (the `wasm-linux/*.mjs` files and everything under `v86/`: the vendored
+  files and Spindle's stand-ins).
 - When both are carried, the runner's identity is the SHA-256 of
-  `spindle-browser-linux-v1\0V86\0WASM`. Otherwise it is the v86 identity.
+  `spindle-browser-linux-v1\0V86\0WASM`, where V86 and WASM are the two images' identities
+  (hex). Otherwise it is the v86 identity.
 
 ## Building the images
 
-Neither build needs root. Downloads are pinned by version, commit or checksum, except Alpine's
+Neither build runs as root (on Ubuntu 23.10 and later an administrator may first have to allow
+unprivileged user namespaces; see [v86 Linux](#v86-linux)). Downloads are pinned by version, commit or checksum, except Alpine's
 packages, which come from the branch's current index and are checked against its signing keys.
 Run the builds from the `spindle/` directory, then build the extension with them (see
 [chrome.md](chrome.md#build-and-load)):
@@ -552,13 +562,18 @@ chrome/wasm-linux/build-image.sh    $W/kernel/vmlinux.wasm $W/userland $W/rust $
 | [`build-python.sh`](../spindle/chrome/wasm-linux/build-python.sh) | CPython 3.13 | Cross-compiled with zlib, bzip2 and SQLite (release tarballs pinned by SHA-256), all C modules linked into one program (there is no `dlopen`), `subprocess` patched to use `posix_spawn` ([`python/subprocess-spawn.patch`](../spindle/chrome/wasm-linux/python/subprocess-spawn.patch)), pymalloc, no `ctypes`, `ssl`, `readline` or `curses`. |
 | [`build-image.sh`](../spindle/chrome/wasm-linux/build-image.sh) | `dist/`: `vmlinux.wasm`, `fs.json`, `flat/`, `identity` | Builds [`guest/`](../spindle/chrome/wasm-linux/guest/) (`spindle-agent`, allowed up to 1 GiB of memory, and `spindle` from `chrome/linux/command`) with `cargo-wasm-linux`, adds `init`, `passwd`, `group`, `spindle.py` (precompiled), sets owners, modes and a fixed time, and converts the tree with v86's tools (same pinned commit as the v86 build). |
 
-`chrome/build.sh` copies the runtime (`console`, `devicetree`, `entropy`, `imports`, `machine`,
-`ninep`, `runner`, `task`, `user`, `virtio` `.mjs`), the vendored `v86/` directory, and the
+`chrome/build.sh` copies the runtime (`console.mjs`, `devicetree.mjs`, `entropy.mjs`,
+`imports.mjs`, `machine.mjs`, `ninep.mjs`, `runner.mjs`, `task.mjs`, `user.mjs` and
+`virtio.mjs`), the vendored `v86/` directory, and the
 image into the extension's `wasm-linux/` folder.
 
 **Licenses.** Per the build scripts' headers: the kernel and busybox are GPL-2.0, and the source
-offer for each binary is the pinned commit in its build script. The LLVM toolchain is Apache-2.0
-with LLVM exceptions, musl is MIT, and Python is under the PSF license.
+offer for each binary is the pinned commit in its build script, plus, for the kernel, Spindle's
+patches in [`kernel/`](../spindle/chrome/wasm-linux/kernel/). The LLVM toolchain is Apache-2.0
+with LLVM exceptions, musl is MIT, and Python is under the PSF license. zlib, bzip2 and SQLite
+(in Python) are under the Zlib license, a BSD-style license and public domain; Rust's standard
+library is MIT or Apache-2.0. [`chrome/THIRD-PARTY.md`](../spindle/chrome/THIRD-PARTY.md) lists
+everything a build carries.
 [`wasm-linux/v86/`](../spindle/chrome/wasm-linux/v86/) vendors four of v86's files unchanged
 (`lib/9p.js`, `lib/filesystem.js`, `lib/marshall.js`, `src/browser/filestorage.js`) under v86's
 BSD 2-Clause license ([`LICENSE`](../spindle/chrome/wasm-linux/v86/LICENSE)); its
@@ -566,26 +581,29 @@ BSD 2-Clause license ([`LICENSE`](../spindle/chrome/wasm-linux/v86/LICENSE)); it
 `v86/src/` are Spindle's own stand-ins for the emulator modules those four import.
 [`ninep.mjs`](../spindle/chrome/wasm-linux/ninep.mjs) drives v86's 9p server over the wasm machine's
 virtio transport ([`virtio.mjs`](../spindle/chrome/wasm-linux/virtio.mjs), split rings), mounted with
-`cache=loose,msize=262144,ignoreqv`. Because of that, both Linuxes share `linux-workspace.mjs`.
+`cache=loose,msize=262144,ignoreqv`. Because the wasm Linux's shares are v86 filesystems served
+by v86's own 9p code, both Linuxes share `linux-workspace.mjs`.
 
 ## Tests
 
-The tests are in [`spindle/chrome/tests/`](../spindle/chrome/tests/). Each prints its usage, and
-most print timings. The Node tests need no browser and no provider, and all but `linux_route.mjs`
-need a built image or its parts. See also
+The tests are in [`spindle/chrome/tests/`](../spindle/chrome/tests/). Each names its usage in its
+header (those that need arguments print it when one is missing), and most print timings. All
+but `linux_bench.mjs` run in Node alone; none needs a provider; all but `linux_route.mjs` and
+`linux_warm.mjs` need a built image or its parts. See also
 [chrome.md](chrome.md#tests) and [testing.md](testing.md).
 
 | Test | Usage | Checks |
 | --- | --- | --- |
-| [`linux_node.mjs`](../spindle/chrome/tests/linux_node.mjs) | `node chrome/tests/linux_node.mjs LINUX_DIST` | The v86 Linux in Node: commands with bash, Python and Node over a 9p workspace, writes coming back, timeouts, commands side by side in their own namespaces, the workspace kept between commands, the code bridge from all three interfaces, resuming with the browser's clock, and the network: none without it; HTTP and HTTPS through the gateway from curl, Python, Node, pip and git; never a local address; a test WISP relay. The network checks need the internet. |
-| [`linux_route.mjs`](../spindle/chrome/tests/linux_route.mjs) | `node chrome/tests/linux_route.mjs` | `wasmCanRun` and `wantsV86`, including a saved program refused on the wasm Linux. |
-| [`wasm_linux_runner.mjs`](../spindle/chrome/tests/wasm_linux_runner.mjs) | `VMLINUX_WASM USERLAND_ROOT GUEST_BIN [CPUS]` | `WasmLinux` as a runner: workspaces, exit statuses, threads side by side, Spindle calls, timeouts, Stop, isolation (no program a command saved in its workspace, `/tmp` or home runs, `/run` takes nothing, a script run through `sh` does), and a runaway loop that only a restart ends. |
-| [`wasm_linux_python.mjs`](../spindle/chrome/tests/wasm_linux_python.mjs) | `[DIST]` | Python from the built image: C modules, threads, files, `subprocess` via `posix_spawn`, asyncio, Unix sockets, the `spindle` module. |
-| [`wasm_linux_rust.mjs`](../spindle/chrome/tests/wasm_linux_rust.mjs) | `VMLINUX_WASM STD_CHECK LAYOUT_C LAYOUT_RUST [CPUS]` | Rust `std` on the target, and C and Rust struct layouts agreeing ([`wasm-linux/tests/`](../spindle/chrome/wasm-linux/tests/)). |
-| [`wasm_linux_shares.mjs`](../spindle/chrome/tests/wasm_linux_shares.mjs) | `VMLINUX_WASM USERLAND_ROOT [CPUS]` | A 9p root and a second share at `/workspace`; the entropy device. |
-| [`wasm_linux_busybox.mjs`](../spindle/chrome/tests/wasm_linux_busybox.mjs) | `VMLINUX_WASM USERLAND_ROOT [CPUS]` | busybox `sh` from an initramfs on the console. |
-| [`wasm_linux_userland.mjs`](../spindle/chrome/tests/wasm_linux_userland.mjs) | `VMLINUX_WASM HELLO_WASM [CPUS]` | A C program as `/init`: `posix_spawn` of itself, a thread. |
-| [`wasm_linux_node.mjs`](../spindle/chrome/tests/wasm_linux_node.mjs) | `VMLINUX_WASM [CPUS]` | The kernel boots on Spindle's runtime and ends as a kernel without init ends. |
+| [`linux_node.mjs`](../spindle/chrome/tests/linux_node.mjs) | `node chrome/tests/linux_node.mjs [LINUX_DIST]` | The v86 Linux in Node: commands with bash, Python and Node over a 9p workspace, writes coming back, timeouts, commands side by side in their own namespaces, the workspace kept between commands, the code bridge from all three interfaces, resuming with the browser's clock, and the network: none without it; HTTP and HTTPS through the gateway from curl, Python, Node, pip and git; never a local address; a test WISP relay. The network checks need the internet. |
+| [`linux_route.mjs`](../spindle/chrome/tests/linux_route.mjs) | `node chrome/tests/linux_route.mjs` | `wasmCanRun` and `wantsV86`, including the results a saved program refused on the wasm Linux gives. |
+| [`linux_warm.mjs`](../spindle/chrome/tests/linux_warm.mjs) | `node chrome/tests/linux_warm.mjs` | Which Linux starts ahead of a command, with stand-in workers: `warm()` starts both, `warm({ v86: false })` the wasm Linux alone, nothing without a wasm Linux; v86 starts with the first command that needs it; `onRan` says which Linux ran each command. |
+| [`wasm_linux_runner.mjs`](../spindle/chrome/tests/wasm_linux_runner.mjs) | `node chrome/tests/wasm_linux_runner.mjs VMLINUX_WASM USERLAND_ROOT GUEST_BIN [CPUS]` | `WasmLinux` as a runner: workspaces, exit statuses, threads side by side, Spindle calls, timeouts, Stop, isolation (no program a command saved in its workspace, `/tmp` or home runs, `/run` takes nothing, a script run through `sh` does), and a runaway loop that only a restart ends. |
+| [`wasm_linux_python.mjs`](../spindle/chrome/tests/wasm_linux_python.mjs) | `node chrome/tests/wasm_linux_python.mjs [DIST]` | Python from the built image: C modules, threads, files, `subprocess` via `posix_spawn`, asyncio, Unix sockets, the `spindle` module. |
+| [`wasm_linux_rust.mjs`](../spindle/chrome/tests/wasm_linux_rust.mjs) | `node chrome/tests/wasm_linux_rust.mjs VMLINUX_WASM STD_CHECK LAYOUT_C LAYOUT_RUST [CPUS]` | Rust `std` on the target, and C and Rust struct layouts agreeing ([`wasm-linux/tests/`](../spindle/chrome/wasm-linux/tests/)). |
+| [`wasm_linux_shares.mjs`](../spindle/chrome/tests/wasm_linux_shares.mjs) | `node chrome/tests/wasm_linux_shares.mjs VMLINUX_WASM USERLAND_ROOT [CPUS]` | A 9p root and a second share at `/workspace`; the entropy device. |
+| [`wasm_linux_busybox.mjs`](../spindle/chrome/tests/wasm_linux_busybox.mjs) | `node chrome/tests/wasm_linux_busybox.mjs VMLINUX_WASM USERLAND_ROOT [CPUS]` | busybox `sh` from an initramfs on the console. |
+| [`wasm_linux_userland.mjs`](../spindle/chrome/tests/wasm_linux_userland.mjs) | `node chrome/tests/wasm_linux_userland.mjs VMLINUX_WASM HELLO_WASM [CPUS]` | A C program as `/init`: `posix_spawn` of itself, a thread. |
+| [`wasm_linux_node.mjs`](../spindle/chrome/tests/wasm_linux_node.mjs) | `node chrome/tests/wasm_linux_node.mjs VMLINUX_WASM [CPUS]` | The kernel boots on Spindle's runtime and ends as a kernel without init ends. |
 | [`linux_bench.mjs`](../spindle/chrome/tests/linux_bench.mjs) | `SPINDLE_BROWSER=... node chrome/tests/linux_bench.mjs DIST [RUNS]` | Times the same commands on both Linuxes in real Chrome through `linuxRunner` with a forced route. It writes a page into `DIST`, so use a test build made with `SPINDLE_WASM_LINUX`. |
 
 `extension_real.mjs` ([chrome.md](chrome.md#tests)) also runs bash, Spindle calls and a granted

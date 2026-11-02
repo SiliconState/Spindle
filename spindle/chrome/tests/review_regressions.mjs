@@ -59,7 +59,7 @@ const context = vm.createContext({
     return next;
   },
 });
-vm.runInContext(`${engineSource}\nglobalThis.test = { operate, ops, running, renew, replaceFirst, creationSettings, pageTool, cancelPageTools, secretHeader, changeSites, grantsFor, underPrefix, withSecrets, beforeActing, actOnPage, hostedFrame, answerHosted, endHosted, startHosted, admitHosted, sendHostedStop, hostedTurns, followed, pollHosted, setHost: (value) => { hostState = { connected: true, kind: 'browser', url: 'http://host' }; hostRemote = value; }, setClient: (value) => { client = value; poolOpening = Promise.resolve({ free: 100, rmSync() {} }); } };`, context);
+vm.runInContext(`${engineSource}\nglobalThis.test = { operate, ops, running, snapshot, restoreQueued, queued, renew, replaceFirst, creationSettings, pageTool, cancelPageTools, secretHeader, changeSites, grantsFor, underPrefix, withSecrets, beforeActing, actOnPage, hostedFrame, answerHosted, endHosted, startHosted, admitHosted, sendHostedStop, hostedTurns, followed, pollHosted, setHost: (value) => { hostState = { connected: true, kind: 'browser', url: 'http://host' }; hostRemote = value; }, setClient: (value) => { client = value; poolOpening = Promise.resolve({ free: 100, rmSync() {} }); } };`, context);
 const engine = context.test;
 const id = '0123456789abcdef';
 let entered = 0;
@@ -118,7 +118,7 @@ assert.equal(records.has(`kv:reset:${id}`), false);
 
 const host = deferred();
 vm.runInContext('hostChanges = globalThis.hostWait;', Object.assign(context, { hostWait: host.promise }));
-records.set(`threads:${id}`, { id, runner: 'remote', state: 'idle' });
+records.set(`threads:${id}`, { id, runner: 'remote', state: 'interrupted', note: 'Chrome stopped while it ran' });
 let retried = 0;
 engine.setClient({
   async retry() { retried += 1; },
@@ -132,7 +132,8 @@ await engine.operate('stop', { id });
 host.resolve();
 await tick();
 assert.equal(retried, 0, 'Stop during host connection must not send the pending turn later');
-assert.equal(records.get(`threads:${id}`).state, 'stopped');
+// Stopped before it began, the turn leaves the thread as it was (Retry still applies).
+assert.deepEqual([records.get(`threads:${id}`).state, records.get(`threads:${id}`).note], ['interrupted', 'Chrome stopped while it ran']);
 
 engine.setClient({
   async files() { return { revision: 5, files: [{ path: 'kept.txt' }] }; },
@@ -234,17 +235,22 @@ assert.equal(local('[2606:4700:4700::1111]'), false);
 const background = readFileSync(new URL('../background.js', import.meta.url), 'utf8').replace(/^import .*;\n/gm, '');
 const sent = [];
 const event = { addListener() {} };
+// What the service worker writes, and its listener for Chrome's site access taken back.
+const bgWrites = [];
+let accessRemoved = null;
+const closedTabs = [];
 const pageContext = vm.createContext({
   // The service worker's own: where it was loaded from, and its events (previews, unused here).
   location: new URL('chrome-extension://spindle/background.js'), self: { addEventListener() {} },
   console, setTimeout, clearTimeout, URL, crypto: globalThis.crypto, read: async () => ({ reading: true, acting: true }), PAGE_ACCESS: [], ACTING_NAMES, uncertain, BROWSER: 'Chrome',
+  write: async (store, key, value) => { bgWrites.push([store, key, value]); },
   pageSwitches: () => ({ reading: true, acting: true }),
   chrome: {
     sidePanel: { setPanelBehavior: async () => {} },
     runtime: { onInstalled: event, onMessage: event },
-    permissions: { contains: async () => true, onRemoved: event },
+    permissions: { contains: async () => true, onRemoved: { addListener(listener) { accessRemoved = listener; } } },
     debugger: { onDetach: event, onEvent: event, sendCommand: async (_, method, params) => { sent.push({ method, params }); return { body: 'pong' }; } },
-    tabs: { get: async (tab) => ({ id: tab, url: 'https://public.example/' }), onRemoved: event },
+    tabs: { get: async (tab) => ({ id: tab, url: 'https://public.example/' }), onRemoved: event, remove: async (tab) => { closedTabs.push(tab); } },
     // Chrome's session storage, in memory.
     storage: { session: (() => {
       const kept = {};
@@ -258,6 +264,14 @@ const pageContext = vm.createContext({
 });
 vm.runInContext(`${background}\nglobalThis.test = { watched, attached, network, recordNetwork, cdp, calls, inPage, attach, veto, unveto, vetoed, onTab, run };`, pageContext);
 const bg = pageContext.test;
+// Chrome's site access taken back turns both switches off and keeps Before acting.
+pageContext.read = async () => ({ reading: true, acting: true, confirm: 'ask' });
+pageContext.PAGE_ACCESS = ['https://*/*'];
+pageContext.chrome.debugger.getTargets = async () => [];
+await accessRemoved({ origins: ['https://*/*'] });
+assert.equal(JSON.stringify(bgWrites.at(-1)), JSON.stringify(['kv', 'pages', { reading: false, acting: false, confirm: 'ask' }]), 'Before acting outlives site access');
+pageContext.read = async () => ({ reading: true, acting: true });
+pageContext.PAGE_ACCESS = [];
 bg.attached.set(7, null);
 bg.watched.set(7, new Map([['1234.56', { id: '1234.56' }]]));
 assert.equal((await bg.network({ tab: 7, body: '1234.56' })).content, 'pong');
@@ -285,6 +299,12 @@ for (let n = 0; n < 2; n++) await assert.rejects(bg.attach(9), /closed Chrome's 
 // Closing the bar detaches every tab at once: vetoes written side by side all hold.
 await Promise.all([bg.veto(11), bg.veto(12), bg.veto(13)]);
 for (const tab of [9, 11, 12, 13]) assert.equal(await bg.vetoed(tab), true, `tab ${tab} stays vetoed`);
+// And not only what goes through the debugger: choosing, scrolling, moving and closing a
+// vetoed tab are refused too, before anything is done (a plain failure, not unknown).
+for (const [name, input] of [['close_tab', { tab: 9 }], ['navigate', { tab: 9, action: 'reload' }], ['scroll', { tab: 9 }], ['select', { tab: 9, ref: 'a1', values: ['x'] }]]) {
+  await assert.rejects(bg.run(name, input), /closed Chrome's debugging bar/, `${name} on a vetoed tab is refused`);
+}
+assert.deepEqual(closedTabs, [], 'a vetoed tab is not closed');
 await bg.unveto(12);
 assert.equal(await bg.vetoed(12), false, 'a closed tab drops its own veto');
 assert.equal(await bg.vetoed(13), true, 'and only its own');
@@ -392,6 +412,9 @@ delete globalThis.chrome;
   assert.equal(announced().text, 'look at this');
   assert.equal(announced().names[0], 'shot.png');
   assert.equal(announced().held, null);
+  const kept = () => [...records.keys()].filter((key) => key.startsWith(`kv:queued:${thread}:`));
+  assert.equal(kept().length, 1, 'a waiting message is on disk before the panel is told it waits');
+  assert.equal(records.get(kept()[0]).text, 'look at this');
   await assert.rejects(engine.operate('send', { id: thread, text: 'more', files: [shot] }), /already waits/);
   turns[0].resolve({ stopped: { complete: true }, unsent: ['unread steer'] });
   await settle();
@@ -401,11 +424,14 @@ delete globalThis.chrome;
   assert.equal(announced(), null);
   const ended = messages.filter((message) => message.type === 'turn_end' && message.thread === thread).at(-1);
   assert.equal(ended.unsent.length, 0, 'what the turn did not read went with it, not back to the box');
+  assert.equal(kept().length, 1, 'kept on disk while the turn that took it runs');
   // The thread needs the user when the turn ends: nothing is sent, and it is taken back.
   assert.equal((await engine.operate('send', { id: thread, text: 'again', files: [shot] })).queued, true);
   activity = 'blocked';
   turns[1].resolve({ stopped: { complete: true }, unsent: ['also unread'] });
   await settle();
+  assert.equal(kept().length, 1, 'once that turn ended, only the message held now is on disk');
+  assert.equal(records.get(kept()[0]).text, 'also unread\n\nagain');
   assert.equal(prompts.length, 2, 'nothing sent to a thread that needs the user first');
   assert.equal(announced().held, 'an unknown outcome');
   const back = await engine.operate('unqueue', { id: thread });
@@ -413,16 +439,21 @@ delete globalThis.chrome;
   assert.equal(back.files[0].path, 'shot.png');
   assert.equal(announced(), null);
   assert.equal(await engine.operate('unqueue', { id: thread }), null);
+  assert.equal(kept().length, 0, 'taken back, it is gone from the disk too');
   // Nor to one whose last turn did not finish (stopped by the user, say).
   activity = 'idle';
-  accepts = false;
   await engine.operate('send', { id: thread, text: 'third' });
   await settle();
   assert.equal((await engine.operate('send', { id: thread, text: 'after the stop', files: [shot] })).queued, true);
+  accepts = false;
   turns[2].resolve({ stopped: { complete: false, reason: 'stopped' } });
   await settle();
   assert.equal(prompts.length, 3, 'nothing sent after a turn that did not finish');
   assert.match(announced().held, /^the last turn did not finish \(stopped\): retry, continue or take it back first$/);
+  // A message sent to it then is refused at once (the panel keeps the draft), rather than
+  // a turn that fails with it.
+  await assert.rejects(engine.operate('send', { id: thread, text: 'keep going' }), /did not finish \(stopped\)/);
+  assert.equal(prompts.length, 3);
   // A turn stopped part way (the stop recorded the step it cut off) takes a reply that
   // goes on with it: text alone. Files sent then are refused at once, the draft kept; a
   // message with files that waited for such a turn is held, saying so.
@@ -439,6 +470,65 @@ delete globalThis.chrome;
   await settle();
   assert.equal(prompts.length, 4);
   assert.match(announced().held, /stopped part way and takes a message without files/);
+}
+
+// Stopped before it began (the message not yet handed over): the thread is as it was,
+// and the message comes back, held, on disk, to take back into the box.
+{
+  const thread = 'abababababababab';
+  records.set(`threads:${thread}`, { id: thread, runner: 'none', state: 'idle', note: null, summaries: true });
+  const gate = deferred();
+  const prompts = [];
+  engine.setClient({
+    async prompt(dir, text) { prompts.push(text); return { stopped: { complete: true } }; },
+    async status() { return { accepts_prompt: true, accepts_message: true }; },
+    async settings() { await gate.promise; return {}; },
+    async stop() {},
+    tools: { definitions: () => [] },
+    async closeSession() {},
+  });
+  await engine.operate('send', { id: thread, text: 'hello there' });
+  await tick();
+  await engine.operate('stop', { id: thread });
+  gate.resolve();
+  for (let i = 0; i < 20; i++) await tick();
+  assert.equal(prompts.length, 0, 'nothing was sent');
+  assert.deepEqual([records.get(`threads:${thread}`).state, records.get(`threads:${thread}`).note], ['idle', null], 'the thread is as it was');
+  const back = messages.filter((message) => message.type === 'queued' && message.thread === thread).at(-1)?.queued;
+  assert.equal(back.text, 'hello there');
+  assert.match(back.held, /stopped its turn before it began/);
+  const onDisk = () => [...records.keys()].filter((key) => key.startsWith(`kv:queued:${thread}:`));
+  assert.equal(onDisk().length, 1);
+  assert.equal((await engine.operate('unqueue', { id: thread })).text, 'hello there');
+  assert.equal(onDisk().length, 0);
+}
+
+// At start, waiting messages a stopped engine left on disk: one its turn had already
+// taken goes; another comes back held; one of a thread that is gone goes.
+{
+  const taken = 'cdcdcdcdcdcdcdcd';
+  const waiting = 'efefefefefefefef';
+  records.set(`threads:${taken}`, { id: taken, runner: 'none', state: 'interrupted' });
+  records.set(`threads:${waiting}`, { id: waiting, runner: 'none', state: 'interrupted' });
+  const shot = { path: 'a.png', bytes: new Uint8Array([1, 2, 3]) };
+  records.set(`kv:queued:${taken}:1`, { thread: taken, text: 'went', files: [shot], held: null, at: 1 });
+  records.set(`kv:queued:${waiting}:2`, { thread: waiting, text: 'stayed', files: [shot], held: null, at: 2 });
+  records.set('kv:queued:0000000000000000:3', { thread: '0000000000000000', text: 'orphan', files: [], held: null, at: 3 });
+  engine.setClient({
+    async history(dir) {
+      const said = dir.endsWith(taken) ? 'went\n\n[Attached, in the workspace: a.png (3 bytes)]' : 'something else';
+      return { messages: [{ role: 'user', content: [{ type: 'text', text: said }] }, { role: 'assistant', content: [] }] };
+    },
+    async closeSession() {},
+  });
+  await engine.restoreQueued();
+  assert.equal(records.has(`kv:queued:${taken}:1`), false, 'a message its turn had taken is not offered again');
+  assert.equal(records.has('kv:queued:0000000000000000:3'), false, 'one of a thread that is gone goes');
+  assert.equal(records.get(`kv:queued:${waiting}:2`).text, 'stayed');
+  assert.match(records.get(`kv:queued:${waiting}:2`).held, /stopped before the turn it waited for ended/);
+  assert.equal(engine.queued.get(waiting).files[0].path, 'a.png');
+  assert.equal(engine.queued.has(taken), false);
+  await engine.operate('unqueue', { id: waiting });
 }
 
 // Retry after a step the user stopped: asked again from before that step's request,
@@ -535,6 +625,8 @@ delete globalThis.chrome;
   assert.equal(confirmMode({ confirm: 'nonsense' }), 'full');
   assert.equal(sends('press', { key: 'Enter' }), true);
   assert.equal(sends('press', { key: 'Control+Enter' }), true);
+  assert.equal(sends('press', { key: 'Return' }), true, 'Return is pressed as Enter');
+  assert.equal(sends('press', { key: 'control+return' }), true);
   assert.equal(sends('press', { key: 'a' }), false);
   assert.equal(sends('type', { text: 'hi', submit: true }), true);
   assert.equal(sends('type', { text: 'hi' }), false);
@@ -543,6 +635,7 @@ delete globalThis.chrome;
   assert.equal(sends('click', { ref: 'a1' }, { submits: true, label: 'Go' }), true);
   assert.equal(sends('click', { ref: 'a1' }, { submits: false, label: 'Send message' }), true);
   assert.equal(sends('click', { ref: 'a1' }, { submits: false, label: 'Next page' }), false);
+  assert.equal(sends('click', { ref: 'a1' }, { submits: false, label: '➤', what: 'button "Send"' }), true, 'an icon button named Send');
   assert.equal(sends('click', { ref: 'a1' }, null), true, 'what cannot be told is asked about');
   assert.equal(sends('navigate', { url: 'https://x.example/' }), false);
   assert.equal(actionText('click', { ref: 'b7' }, { what: 'button "Send"', host: 'mail.example' }), 'Click button "Send" on mail.example');
@@ -551,31 +644,66 @@ delete globalThis.chrome;
   assert.ok(!ASKING_NAMES.has('screenshot') && !ASKING_NAMES.has('scroll') && !ASKING_NAMES.has('network') && !ASKING_NAMES.has('wait_for'));
 
   const waiting = () => messages.filter((message) => message.type === 'approvals').at(-1)?.approvals ?? [];
+  // What an action without a part lands on is looked up before asking (the tab the user
+  // looks at then), named in the question and pinned to the action: the user answers
+  // about that tab, whatever they look at by the time they answer.
+  const looked = [];
+  const posting = context.self.postMessage;
+  context.self.postMessage = (message) => {
+    if (message.type === 'page_tool' && message.name === 'tab_of') {
+      looked.push(message.input);
+      queueMicrotask(() => context.self.onmessage({ data: { type: 'page_tool_answer', call: message.call, answer: { content: 'tab 4', details: { tab: 4, host: 'mail.example', title: 'Inbox' } } } }));
+      return;
+    }
+    posting(message);
+  };
+  const settleAsk = async () => { for (let i = 0; i < 8; i++) await tick(); };
   records.set('kv:pages', { reading: true, acting: true });
   assert.equal(await engine.beforeActing('navigate', { url: 'https://x.example/' }, 's'), null, 'Full asks nothing');
   records.set('kv:pages', { reading: true, acting: true, confirm: 'auto' });
   assert.equal(await engine.beforeActing('press', { key: 'a' }, 's'), null, 'Auto lets a plain key go');
   assert.equal(await engine.beforeActing('navigate', { url: 'https://x.example/' }, 's'), null);
-  const asked = engine.beforeActing('press', { key: 'Enter' }, 's');
-  await tick();
+  const enter = { key: 'Enter' };
+  const asked = engine.beforeActing('press', enter, 's');
+  await settleAsk();
   assert.equal(waiting().length, 1);
-  assert.equal(waiting()[0].text, 'Press Enter');
+  assert.equal(waiting()[0].text, 'Press Enter in tab 4 (“Inbox”, mail.example)');
   await engine.operate('approve', { approval: waiting()[0].id, allow: true });
   assert.equal(await asked, null, 'allowed: it goes ahead');
+  assert.equal(enter.tab, 4, 'on the tab it asked about');
   assert.equal(waiting().length, 0);
   records.set('kv:pages', { reading: true, acting: true, confirm: 'ask' });
   const denied = engine.beforeActing('navigate', { url: 'https://y.example/' }, 's');
-  await tick();
+  await settleAsk();
+  assert.equal(waiting()[0].text, 'Go to https://y.example/ in tab 4 (“Inbox”, mail.example)');
   await engine.operate('approve', { approval: waiting()[0].id, allow: false });
   assert.match(await denied, /said no[\s\S]*not done/);
   assert.equal(await engine.beforeActing('navigate', { url: 'chrome-extension://id/view.html?thread=t&path=a.html' }, 's'), null,
     'opening a workspace file for the user asks nothing');
   const ended = engine.beforeActing('dialog', { accept: true }, 's');
-  await tick();
+  await settleAsk();
   assert.equal(waiting().length, 1);
   engine.cancelPageTools(waiting()[0].thread);
   assert.match(await ended, /turn ended[\s\S]*not done/, 'a stopped turn refuses what waits');
   assert.equal(waiting().length, 0);
+  // A script's call whose command ends while it waits: the question goes, nothing is done.
+  const command = new AbortController();
+  const scripted = engine.beforeActing('press', { key: 'Enter' }, 's', command.signal);
+  await settleAsk();
+  assert.equal(waiting().length, 1);
+  command.abort();
+  assert.match(await scripted, /command that asked for it ended[\s\S]*not done/);
+  assert.equal(waiting().length, 0, 'its question is withdrawn');
+  // A choice that cannot be read asks (never acts unasked on what it could not see).
+  const reading = context.read;
+  context.read = async (store, key) => { if (store === 'kv' && key === 'pages') throw new Error('storage failed'); return reading(store, key); };
+  const unread = engine.beforeActing('press', { key: 'a' }, 's');
+  await settleAsk();
+  assert.equal(waiting().length, 1, 'an unreadable Before acting asks');
+  await engine.operate('approve', { approval: waiting()[0].id, allow: false });
+  assert.match(await unread, /said no/);
+  context.read = reading;
+  context.self.postMessage = posting;
   records.delete('kv:pages');
 }
 
@@ -1171,11 +1299,20 @@ function moveWorld() {
     return {
       async importThread(bytes, { key }) {
         if (!host.up) throw fail(0, 'unreachable', 'no answer');
-        if (host.refuse) throw host.refuse;
+        if (host.dropRequest) {
+          // Lost on the way: the host never saw it.
+          host.dropRequest = false;
+          throw fail(0, 'unreachable', 'no answer');
+        }
+        // As the host: refusals of the request itself come before its key is looked up;
+        // a bundle it cannot read or a model it cannot send to, only for a new key.
+        const late = ['bad_bundle', 'no_credentials'].includes(host.refuse?.kind);
+        if (host.refuse && !late) throw host.refuse;
         const digest = bytes.join(',');
         const known = host.keys.get(key);
         let id = known?.session;
         if (known && known.digest !== digest) throw fail(409, 'conflict', 'another bundle');
+        if (!known && late) throw host.refuse;
         if (!known) {
           host.imports += 1;
           id = `s${host.imports}`;
@@ -1191,7 +1328,18 @@ function moveWorld() {
       async exportThread(id) {
         const session = host.sessions.get(id);
         if (!session) throw fail(404, 'not_found', 'session not found');
+        // As the host: a sealed thread's bundle goes whatever else holds it.
+        if (session.sealed && !host.failExport && !host.loseReply) {
+          host.exports += 1;
+          return { bytes: session.bytes, head: 3, identity: 'thread-identity' };
+        }
         if (host.busy) throw fail(409, 'busy', 'a command is running');
+        if (host.loseReply === 'export-running') {
+          // The export goes on there (writing its bundle) while its answer is lost.
+          host.loseReply = null;
+          host.busy = true;
+          throw fail(0, 'unreachable', 'the reply was lost');
+        }
         host.exports += 1;
         session.sealed = true;
         if (host.failExport) {
@@ -1355,6 +1503,68 @@ for (const cut of ['cutAt', 'failAt']) {
   assert.equal(records.get('bundles:host-move:t1'), held, 'a stale scan never deletes a concurrent move\'s bundle');
 }
 
+// A lost answer, then a refusal only a new key can get: the host had imported it under
+// that key, so it answers with the session (as the host does), never a rollback.
+{
+  const w = moveWorld();
+  w.host.loseReply = 'import';
+  await assert.rejects((await w.moves().toHost('t1', { url: 'http://host' })).done, (error) => error instanceof Waiting);
+  w.host.refuse = Object.assign(new Error('no_credentials: this host cannot send to x y'), { status: 409, kind: 'no_credentials' });
+  await w.moves().resume();
+  assert.equal(w.liveCopies(), 1);
+  assert.equal(w.local.live, false, 'it lives on the host');
+  assert.equal(w.host.sessions.size, 1);
+}
+// The first request lost on the way (the host never saw it), then a refusal only a new
+// key can get: proof that nothing was imported under the key, so the move rolls back.
+{
+  const w = moveWorld();
+  w.host.dropRequest = true;
+  await assert.rejects((await w.moves().toHost('t1', { url: 'http://host' })).done, (error) => error instanceof Waiting);
+  assert.equal(w.records.get('kv:host-move:t1').attempted, true);
+  w.host.refuse = Object.assign(new Error('no_credentials: this host cannot send to x y'), { status: 409, kind: 'no_credentials' });
+  await w.moves().resume();
+  assert.equal(w.local.live, true, 'rolled back, not waiting for good');
+  assert.equal(w.host.sessions.size, 0);
+  assert.match(w.thread().note, /stayed in this browser: your host refused it/);
+}
+// No host to send to (not connected): nothing is attempted, so the first real send's
+// refusal still rolls back; a refusal after an attempt that may have reached the host
+// (a too large body: no key looked up) waits instead.
+{
+  const w = moveWorld();
+  w.host.up = false;
+  await assert.rejects((await w.moves().toHost('t1', { url: 'http://host' })).done, (error) => error instanceof Waiting);
+  assert.equal(w.records.get('kv:host-move:t1').attempted, undefined, 'nothing was sent, so nothing was attempted');
+  w.host.up = true;
+  w.host.refuse = Object.assign(new Error('too_large: over 2 GiB'), { status: 413, kind: 'too_large' });
+  await w.moves().resume();
+  assert.equal(w.local.live, true);
+  assert.match(w.thread().note, /stayed in this browser/);
+  const later = moveWorld();
+  later.host.loseReply = 'import';
+  await assert.rejects((await later.moves().toHost('t1', { url: 'http://host' })).done, (error) => error instanceof Waiting);
+  later.host.refuse = Object.assign(new Error('too_large: over 2 GiB'), { status: 413, kind: 'too_large' });
+  await later.moves().resume();
+  assert.equal(await later.moves().holding('t1'), true, 'after an attempt that may have imported it, a 413 is no proof');
+}
+// Back: an export whose answer was lost goes on there; asked again meanwhile, the host is
+// busy with that very export, which is no "it stays on your host": the move waits, and
+// gets the sealed bundle once the export is done.
+{
+  const w = await hosted();
+  w.host.loseReply = 'export-running';
+  await assert.rejects((await w.moves().back('t1')).done, (error) => error instanceof Waiting);
+  await assert.rejects(w.moves().resume().then(() => { throw new Waiting('still'); }), (error) => error instanceof Waiting);
+  assert.equal(w.records.get('kv:host-move:t1')?.step, 'export', 'still moving back, not ended');
+  assert.equal(w.thread().moving?.way, 'back');
+  w.host.busy = false;
+  await w.moves().resume();
+  assert.equal(w.liveCopies(), 1);
+  assert.equal(w.local.live, true);
+  assert.deepEqual(w.leftOver(), []);
+}
+
 // A refusal the same request cannot change rolls the move back: the thread stays here.
 {
   const w = moveWorld();
@@ -1474,6 +1684,26 @@ for (const step of ['back:recorded', 'back:held', 'back:imported', 'back:release
   assert.deepEqual(w.leftOver(), []);
 }
 assert.match(moveKey('ab:cd/ef', 12), /^abcdef-12-[0-9a-f]{12}$/);
+
+// A panel replaces its whole thread list with a snapshot's, after the broadcasts sent
+// before it: a thread that changed while the snapshot's other reads waited (a move that
+// finished as a restarted engine was asked for its state) must be in it as it is now,
+// or the panel would show the move under way for good.
+{
+  const moved = '00000000000000ab';
+  records.set(`threads:${moved}`, { id: moved, updated: 1, moving: { way: 'to', step: 'upload' }, home: null });
+  const vaultRead = deferred();
+  context.vault = { state: () => vaultRead.promise };
+  engine.setClient({ info: async () => ({}) });
+  const taking = engine.snapshot();
+  await tick();
+  records.set(`threads:${moved}`, { id: moved, updated: 2, moving: null, home: { url: 'http://host', session: 's1' } });
+  vaultRead.resolve({ mode: 'device', locked: false, kinds: {}, accounts: {}, ended: {}, sites: [] });
+  const taken = (await taking).threads.find((thread) => thread.id === moved);
+  assert.deepEqual([taken.moving, taken.home?.session], [null, 's1'], 'the snapshot holds the thread as it was when the snapshot answered');
+  records.delete(`threads:${moved}`);
+  delete context.vault;
+}
 assert.equal(sentence(Object.assign(new Error('busy: a command is running'), { kind: 'busy' })), 'a command is running');
 
-console.log('review-regressions passed: the host /v1 client (event stream parsing and resuming, commands sent again with their request ID, bundles in and out), connect PKCE and its state, moves to the host and back cut at every step (one live copy each time), operation races, Before acting (Full, Auto, Ask; allowed, refused, ended), the Dim theme (the old Dark shows Dim), site secret headers checked (names, values, HTTPS only) and named to the package without their values, reset safety, early Stop, a message with files waiting for the turn to end, a turn stopped part way taking a reply (text alone) and Retry after a stopped step, gateway bounds/redirects (the extension store told as closed), IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too), one action per tab, uncertain actions unknown (engine, its document and the background)');
+console.log('review-regressions passed: waiting messages kept on disk (until their turn has taken them; restored at start, held, unless taken), a message stopped before its turn began coming back held, a message to a thread that takes none refused at once, the tab a question is about named and pinned, an unreadable Before acting asking, a script\'s question withdrawn when its command ends, icon buttons named Send asked about, moves rolled back after a lost first request and a refusal only a new key gets (never after a lost answer), a move back waiting on its own export, a snapshot holding threads as they are when it answers, the host /v1 client (event stream parsing and resuming, commands sent again with their request ID, bundles in and out), connect PKCE and its state, moves to the host and back cut at every step (one live copy each time), operation races, Before acting (Full, Auto, Ask; allowed, refused, ended), the Dim theme (the old Dark shows Dim), site secret headers checked (names, values, HTTPS only) and named to the package without their values, reset safety, early Stop, a message with files waiting for the turn to end, a turn stopped part way taking a reply (text alone) and Retry after a stopped step, gateway bounds/redirects (the extension store told as closed), IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too, and for actions without the debugger), Before acting kept when site access is taken back, Return asked about as Enter, one action per tab, uncertain actions unknown (engine, its document and the background)');

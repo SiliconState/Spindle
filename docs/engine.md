@@ -566,7 +566,9 @@ runs. Each run gets:
   followed; target at most 4095 bytes) and empty directories are kept. A file whose inode,
   size, times and mode equal the input can be `Unchanged`. On Linux an inotify
   watcher also records input files opened for writing: shared-mapping writes can
-  leave timestamps unchanged on tmpfs. Those files are read back; if watching fails
+  leave timestamps unchanged on tmpfs. Such a file whose stamp is unchanged is compared
+  with its input's bytes (the host supplies them again) and is `Unchanged` only if they
+  match, so an opening that wrote nothing is not reported as a write. If watching fails
   or its event queue overflows, every input file is treated as possibly changed.
   Other platforms rely on stamps alone. Sockets, pipes and devices are left out
   and named in stderr. Non-UTF-8 names,

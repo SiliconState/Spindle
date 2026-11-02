@@ -708,6 +708,12 @@ fn exports_refuse_busy_threads_and_never_send_a_stale_file() {
     );
     assert_eq!(spindle_store::bundle::read(&bytes).unwrap().head, newer);
     assert_ne!(bytes, copy);
+    // Moved: every later export sends those same bytes, even while the thread is held
+    // busy (a client asks again while its first export, whose answer it lost, runs on).
+    host.live(&id).unwrap().lock().busy = true;
+    let (status, _, again) = take(&host, &token, &id, false);
+    assert_eq!((status, again == bytes), (200, true));
+    host.live(&id).unwrap().lock().busy = false;
     // Unknown fields, and keep that is not a boolean.
     let (status, _) = post(
         &host,

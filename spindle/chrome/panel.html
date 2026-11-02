@@ -88,7 +88,7 @@
       <span class="grow"></span>
       <button id="model-chip" type="button" aria-haspopup="dialog"><span id="model-words"></span></button>
     </div>
-    <div id="asking" hidden></div>
+    <div id="asking" role="status" aria-live="polite" hidden></div>
     <div id="carry" class="box-line" hidden><span id="carry-text"></span><button id="carry-drop" type="button" class="line-icon" aria-label="Start without those files" title="Start without those files"></button></div>
     <div id="queued" class="box-line" hidden><span id="queued-text"></span><button id="queued-back" type="button" class="link-like" title="Put it back in the box, to change or send it">Take back</button></div>
     <div id="attached" hidden></div>
@@ -233,8 +233,8 @@
         <form id="site-form" autocomplete="off">
           <label>Address<input id="site-url" placeholder="https://api.example.com/v1/" spellcheck="false"></label>
           <div class="field"><span class="field-label" id="site-access-heading">Scripts may</span>
-            <div id="site-access-kind" class="seg seg-2" role="radiogroup" aria-labelledby="site-access-heading"><button type="button" role="radio" data-value="read" aria-checked="true" title="GET">Read it</button><button type="button" role="radio" data-value="write" aria-checked="false" title="GET, POST, PUT, PATCH, DELETE">Read and change it</button></div>
-            <p class="field-note" id="site-access-note">GET requests only.</p></div>
+            <div id="site-access-kind" class="seg seg-2" role="radiogroup" aria-labelledby="site-access-heading"><button type="button" role="radio" data-value="read" aria-checked="true" title="GET, HEAD">Read it</button><button type="button" role="radio" data-value="write" aria-checked="false" title="GET, HEAD, POST, PUT, PATCH, DELETE">Read and change it</button></div>
+            <p class="field-note" id="site-access-note">GET and HEAD requests only.</p></div>
           <div class="field site-secret-field"><span class="field-label">Secret header (optional)</span>
             <div class="pair">
               <label>Header<input id="site-header" placeholder="Authorization" spellcheck="false" autocomplete="off"></label>

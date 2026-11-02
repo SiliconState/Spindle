@@ -511,7 +511,11 @@ function renderAsking() {
     allow.onclick = answer(true);
     deny.type = 'button';
     deny.onclick = answer(false);
-    item.append(icon('warning', 14), el('span', 'ask-text', `Spindle asks before it acts: ${approval.text}`), deny, allow);
+    const said = el('span', 'ask-text', `Spindle asks before it acts: ${approval.text}`);
+    said.id = `ask-${approval.id}`;
+    allow.setAttribute('aria-describedby', said.id);
+    deny.setAttribute('aria-describedby', said.id);
+    item.append(icon('warning', 14), said, deny, allow);
     box.append(item);
   }
 }
@@ -3401,11 +3405,11 @@ function renderVault() {
     ]));
     const forgot = action('Forgot it', 'link-like', async () => {
       const sure = await confirmed('Forget every saved key?',
-        'Without the passphrase they cannot be opened. Every saved key, sign-in and site secret header is deleted (threads stay), and you add them again.',
+        'Without the passphrase they cannot be opened. Every saved key, sign-in and site secret header is deleted, and so is your Spindle host\'s token, so the host disconnects (threads stay). You add them again, and connect the host again.',
         'Delete keys');
       if (!sure) return;
       apply(await ask('resetVault'));
-      toast('Saved keys, sign-ins and secret headers deleted. Add them again to send.');
+      toast('Saved keys, sign-ins, secret headers and the host\'s token deleted. Add them again to send, and connect your host again.');
     });
     const line = el('p', 'note');
     line.append(forgot, ': delete every saved key and add them again');
@@ -3609,7 +3613,7 @@ $('site-form').onsubmit = (event) => {
 for (const button of $('site-access-kind').querySelectorAll('button')) {
   button.onclick = () => {
     for (const other of $('site-access-kind').querySelectorAll('button')) other.setAttribute('aria-checked', String(other === button));
-    $('site-access-note').textContent = button.dataset.value === 'write' ? 'GET, POST, PUT, PATCH and DELETE requests.' : 'GET requests only.';
+    $('site-access-note').textContent = button.dataset.value === 'write' ? 'GET, HEAD, POST, PUT, PATCH and DELETE requests.' : 'GET and HEAD requests only.';
   };
 }
 
@@ -3637,6 +3641,13 @@ function platformName() {
  * keeps its threads); the engine trades and keeps it. */
 $('host-form').onsubmit = (event) => {
   event.preventDefault();
+  // The engine seals the token it trades for: with the keys locked it would refuse it
+  // after the user approved on the host, so the host is not asked at all until then.
+  if (engine?.vault?.locked) {
+    toast('Unlock Spindle\'s keys first (Settings, Providers, Passphrase), then connect.');
+    document.querySelector('[data-fold="vault"]').open = true;
+    return;
+  }
   const url = $('host-url').value.trim().replace(/\/+$/, '');
   let origin;
   try {
@@ -3730,9 +3741,12 @@ async function renderPages() {
   const access = await chrome.permissions.contains({ origins: PAGE_ACCESS });
   const kept = await read('kv', 'pages').catch(() => null);
   const now = pageSwitches(kept, access);
-  // The switches change together; what Before acting says is kept with them.
+  // The switches change together; what Before acting says is kept with them. Written
+  // over the record as it is now (the service worker, or another panel, may have changed
+  // it since this was drawn), never over what this drawing read.
   const set = async (next) => {
-    await write('kv', 'pages', { ...kept, ...next });
+    const fresh = await read('kv', 'pages').catch(() => null);
+    await write('kv', 'pages', { ...(fresh ?? {}), ...next });
     // The service worker lets go of tabs when actions go off.
     chrome.runtime.sendMessage({ type: 'pages' }).catch(() => {});
     renderPages();
@@ -3748,11 +3762,11 @@ async function renderPages() {
       return;
     }
     const asked = access ? Promise.resolve(true) : mayReach(PAGE_ACCESS, 'websites');
-    asked.then((given) => (given ? set({ reading: true, acting: now.acting }) : toast(`${BROWSER} did not give Spindle access to sites.`)));
+    asked.then((given) => (given ? set({ reading: true, acting: false }) : toast(`${BROWSER} did not give Spindle access to sites.`)));
   };
   acting.onclick = () => {
     if (now.acting) {
-      set({ reading: true, acting: false });
+      set({ acting: false });
       return;
     }
     const asked = access ? Promise.resolve(true) : mayReach(PAGE_ACCESS, 'websites');
@@ -3780,11 +3794,18 @@ async function renderPages() {
   $('site-access-remove').onclick = async () => {
     await chrome.permissions.remove({ origins: [...PAGE_ACCESS, ...PICTURE_ACCESS] }).catch(() => false);
     // Giving the access again later (for a thread's network) turns no switch back on.
-    await write('kv', 'pages', { ...kept, reading: false, acting: false });
+    const fresh = await read('kv', 'pages').catch(() => null);
+    await write('kv', 'pages', { ...(fresh ?? {}), reading: false, acting: false });
     chrome.runtime.sendMessage({ type: 'pages' }).catch(() => {});
     toast(`${BROWSER}'s access to sites is taken back: no page is read or acted on, and commands reach no website through ${BROWSER}.`);
     renderPages();
   };
+}
+
+// Chrome's access to sites given or taken back elsewhere (its own settings, a thread's
+// network): an open Settings shows the switches as they now are.
+for (const change of [chrome.permissions.onAdded, chrome.permissions.onRemoved]) {
+  change?.addListener(() => { if ($('settings-dialog').open) renderPages().catch(() => {}); });
 }
 
 function renderTheme() {

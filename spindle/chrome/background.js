@@ -6,7 +6,8 @@
 import { ACTING_NAMES, BROWSER, PAGE_ACCESS, PICTURE_ACCESS, pageSwitches, uncertain } from './page-tools.mjs';
 import { read, write } from './shared.mjs';
 
-chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+// (A browser without the side panel API still runs the rest.)
+chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
 // The switches are kept from the first start: off on a new install. Builds before the
 // switches were Spindle's took page reading to be Chrome's access to sites, so a user
@@ -60,7 +61,7 @@ const TOOLS = {
   navigate, click, type, select, press, scroll, wait_for: waitFor, dialog, close_tab: closeTab, network,
   // The engine's own, offered to no thread: what an action would land on, for the check
   // Settings, Pages, Before acting asks for.
-  target,
+  target, tab_of: tabOf,
 };
 
 /** How long one call into a page or Chrome's debugger may take (a tool has 30 s). */
@@ -177,6 +178,7 @@ const webTab = (tab) => /^https?:/.test(tab?.url ?? '') || tab?.url === 'about:b
 async function page(tabId, op, args = {}, control) {
   if (!(await reading())) throw new Error(OFF);
   if (['point', 'caret', 'select', 'scroll'].includes(op) && !(await acting())) throw new Error(NO_ACTIONS);
+  if (['caret', 'select', 'scroll'].includes(op)) await refuseVetoed(tabId);
   check(control);
   refuseWhileDialog(tabId);
   // `point` only measures; these change the page, unless it refuses first (then this
@@ -391,6 +393,7 @@ async function navigate({ url, action = 'go', tab: id, new_tab: fresh }, control
     if (!webTab(tab)) return { error: `tab ${tab.id} does not show a web page Spindle may move (a new tab, a browser or extension page): open the address with new_tab` };
     return onTab(tab.id, async () => {
       refuseWhileDialog(tab.id);
+      await refuseVetoed(tab.id);
       check(control);
       control.acted = true;
       try {
@@ -436,6 +439,19 @@ async function target({ ref, tab: id }, control) {
   const tab = await pageTab(id);
   const found = await page(tab.id, 'target', { ref }, control);
   return { content: found.what, details: { ...found, host: new URL(tab.url).host, tab: tab.id } };
+}
+
+/** Which tab an action without a `tab` would land on now (the one the user is looking
+ * at), and its site and title, so a question asked before it acts names that tab and the
+ * action stays there whatever the user looks at by the time they answer. */
+async function tabOf({ tab: id }) {
+  const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt();
+  if (!tab) return { error: id != null ? `there is no tab ${id}` : 'no tab is open' };
+  let host = '';
+  try {
+    host = tab.url ? new URL(tab.url).host : '';
+  } catch {}
+  return { content: `tab ${tab.id}`, details: { tab: tab.id, host, title: tab.title ?? '' } };
 }
 
 /** Something else lies over the target: nothing is clicked or typed there. */
@@ -543,6 +559,7 @@ async function closeTab({ tab: id }, control) {
   const tab = await chrome.tabs.get(id).catch(() => null);
   if (!tab) return { error: `there is no tab ${id}` };
   if (!webTab(tab)) return { error: `tab ${id} does not show a web page: Spindle closes only those` };
+  await refuseVetoed(id);
   check(control);
   control.acted = true;
   await chrome.tabs.remove(id);
@@ -569,6 +586,14 @@ async function vetoed(tabId) {
 }
 async function veto(tabId) {
   await chrome.storage.session.set({ [`${VETOED}${tabId}`]: true });
+}
+/** Refuses any action on a tab the user took back by closing the debugging bar there:
+ * its input (through the debugger) and what needs no debugger (choosing, scrolling,
+ * moving or closing the tab) alike. */
+async function refuseVetoed(tabId) {
+  if (await vetoed(tabId)) {
+    throw new Error(`the user stopped Spindle acting on tab ${tabId} (they closed ${BROWSER}'s debugging bar); Spindle will not act on it again until the user turns page actions off and on in Spindle's settings`);
+  }
 }
 async function unveto(tabId) {
   if (tabId !== undefined) return chrome.storage.session.remove(`${VETOED}${tabId}`);
@@ -599,9 +624,7 @@ function refuseWhileDialog(tabId) {
 
 async function attach(tabId) {
   if (attached.has(tabId)) return;
-  if (await vetoed(tabId)) {
-    throw new Error(`the user stopped Spindle acting on tab ${tabId} (they closed ${BROWSER}'s debugging bar); Spindle will not act on it again until the user turns page actions off and on in Spindle's settings`);
-  }
+  await refuseVetoed(tabId);
   if (!attaching.has(tabId)) {
     attaching.set(tabId, (async () => {
       try {
@@ -610,7 +633,7 @@ async function attach(tabId) {
         // Spindle's own earlier attach (before this worker last rested) still holds.
         if (!/already attached/i.test(error.message)) throw new Error(`${BROWSER} would not let Spindle act on tab ${tabId}: ${error.message}`);
       }
-      attached.set(tabId, setTimeout(() => detach(tabId), 20_000));
+      attached.set(tabId, setTimeout(() => idleDetach(tabId), 20_000));
       // Dialogs are said as they open (an action waiting on one would wait forever).
       await chrome.debugger.sendCommand({ tabId }, 'Page.enable').catch(() => {});
     })().finally(() => attaching.delete(tabId)));
@@ -627,7 +650,7 @@ async function cdp(tabId, method, params = {}, control) {
   // Input and a dialog's answer act on the page; a picture or the network only look.
   if (control && /^Input\.|^Page\.handleJavaScriptDialog$/.test(method)) control.acted = true;
   clearTimeout(attached.get(tabId));
-  attached.set(tabId, watched.has(tabId) ? null : setTimeout(() => detach(tabId), 20_000));
+  attached.set(tabId, watched.has(tabId) ? null : setTimeout(() => idleDetach(tabId), 20_000));
   // A dialog the command opened ends the wait for it (it answers once the dialog is).
   let opened;
   const dialogOpened = new Promise((resolve) => {
@@ -655,6 +678,21 @@ function detach(tabId) {
   chrome.debugger.detach({ tabId }).catch(() => {});
 }
 
+/** How long an open dialog keeps the debugger on its tab: past the wait for the user's
+ * answer to a question about answering it (10 minutes). */
+const DIALOG_KEEP_MS = 11 * 60_000;
+/** Lets go of an unused tab's debugger, but not while a dialog it saw there is open (its
+ * record goes with the debugger: an answer to it, asked about meanwhile, would find none,
+ * and reads would no longer be held back by it), for at most DIALOG_KEEP_MS. */
+function idleDetach(tabId) {
+  const open = dialogs.get(tabId);
+  if (open && Date.now() - (open.at ?? 0) < DIALOG_KEEP_MS && attached.has(tabId)) {
+    attached.set(tabId, setTimeout(() => idleDetach(tabId), 20_000));
+    return;
+  }
+  detach(tabId);
+}
+
 // A closed tab's veto goes with it.
 chrome.tabs.onRemoved.addListener((tabId) => { unveto(tabId).catch(() => {}); });
 chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
@@ -663,7 +701,7 @@ chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
 });
 chrome.debugger.onEvent.addListener(({ tabId }, method, params) => {
   if (method === 'Page.javascriptDialogOpening') {
-    dialogs.set(tabId, { type: params.type, message: String(params.message ?? '').slice(0, 500) });
+    dialogs.set(tabId, { type: params.type, message: String(params.message ?? '').slice(0, 500), at: Date.now() });
     for (const resolve of dialogWaiters.get(tabId) ?? []) resolve();
     dialogWaiters.delete(tabId);
   } else if (method === 'Page.javascriptDialogClosed') {
@@ -691,7 +729,9 @@ async function letGo() {
 // switches off: giving it again later, for a thread's network, turns nothing back on.
 chrome.permissions.onRemoved.addListener(async ({ origins = [] }) => {
   if (origins.some((origin) => PAGE_ACCESS.includes(origin))) {
-    await write('kv', 'pages', { reading: false, acting: false }).catch(() => {});
+    // Before acting (`confirm`) is the user's choice for when actions come back: kept.
+    const kept = await read('kv', 'pages').catch(() => null);
+    await write('kv', 'pages', { ...(kept ?? {}), reading: false, acting: false }).catch(() => {});
   }
   await letGo().catch(() => {});
 });

@@ -284,9 +284,11 @@ export function confirmMode(kept) {
  * which counts as sending). */
 export function sends(name, input, target) {
   if (name === 'type') return input?.submit === true;
-  if (name === 'press') return /(^|\+)\s*(numpad)?enter$/i.test(String(input?.key ?? '').trim());
+  // "Return" is pressed as Enter (background.js ALIASES).
+  if (name === 'press') return /(^|\+)\s*((numpad)?enter|return)$/i.test(String(input?.key ?? '').trim());
   if (name === 'dialog') return input?.accept === true;
-  if (name === 'click') return !target || target.submits === true || SENDING_WORDS.test(target.label ?? '');
+  // Its words, and its accessible name (an icon button labelled "Send").
+  if (name === 'click') return !target || target.submits === true || SENDING_WORDS.test(target.label ?? '') || SENDING_WORDS.test(target.what ?? '');
   return false;
 }
 
@@ -298,20 +300,22 @@ export function actionText(name, input, target) {
   };
   const what = target?.what ?? (input?.ref ? `part ${input.ref}` : 'the page');
   const where = target?.host ? ` on ${target.host}` : '';
+  // The tab an action without a part lands on, named (its title, then its site).
+  const inTab = target?.tab != null ? ` in tab ${target.tab}${target.title ? ` (${quote(target.title, 60)}${target.host ? `, ${target.host}` : ''})` : target.host ? ` (${target.host})` : ''}` : '';
   switch (name) {
     case 'click': return `${input?.double ? 'Double-click' : input?.button === 'right' ? 'Right-click' : 'Click'} ${what}${where}`;
-    case 'type': return `Type ${quote(input?.text)} into ${what}${where}${input?.submit ? ', then press Enter' : ''}`;
+    case 'type': return `Type ${quote(input?.text, 300)} into ${what}${where}${input?.submit ? ', then press Enter' : ''}`;
     case 'select': return `Choose ${(input?.values ?? []).map((value) => quote(value, 40)).join(', ')} in ${what}${where}`;
-    case 'press': return `Press ${String(input?.key ?? '')}${where}`;
+    case 'press': return `Press ${String(input?.key ?? '')}${inTab || where}`;
     case 'navigate': {
       const action = input?.action ?? 'go';
-      if (action === 'back') return 'Go back a page';
-      if (action === 'forward') return 'Go forward a page';
-      if (action === 'reload') return 'Reload the page';
-      return `${input?.new_tab ? 'Open in a new tab' : 'Go to'} ${String(input?.url ?? '')}`;
+      if (action === 'back') return `Go back a page${inTab}`;
+      if (action === 'forward') return `Go forward a page${inTab}`;
+      if (action === 'reload') return `Reload the page${inTab}`;
+      return input?.new_tab ? `Open in a new tab ${String(input?.url ?? '')}` : `Go to ${String(input?.url ?? '')}${inTab}`;
     }
-    case 'dialog': return `${input?.accept ? 'Accept' : 'Dismiss'} the page's dialog${input?.text ? ` with ${quote(input.text)}` : ''}`;
-    case 'close_tab': return `Close tab ${input?.tab}`;
+    case 'dialog': return `${input?.accept ? 'Accept' : 'Dismiss'} the page's dialog${input?.text ? ` with ${quote(input.text)}` : ''}${inTab}`;
+    case 'close_tab': return `Close tab ${input?.tab}${target?.title ? ` (${quote(target.title, 60)}${target.host ? `, ${target.host}` : ''})` : target?.host ? ` (${target.host})` : ''}`;
     default: return name;
   }
 }

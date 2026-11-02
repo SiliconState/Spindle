@@ -101,8 +101,13 @@ const running = new Map();
 const using = new Map();
 /** Thread id -> the message (with files) sent while its turn ran: a running turn takes
  * text only, so it goes as the next turn once this one ends (`sendQueued`); `held` says
- * why it did not when it could not. */
+ * why it did not when it could not. Each is kept on disk too (`kv`, its `key`), from
+ * before any panel is told it waits until a turn has taken it, so Chrome stopping first
+ * loses none of it, files and all (`restoreQueued`). */
 const queued = new Map();
+/** Thread id -> the waiting message its running turn (here) took: its record stays on
+ * disk until that turn has ended and the thread holds it (`afterTurn`). */
+const carrying = new Map();
 /** Page tool call -> the function that answers it. */
 const toolCalls = new Map();
 /** Short operations serialize per thread; a turn itself stays in the background. */
@@ -133,7 +138,8 @@ async function operate(op, args) {
   // and other settings are not held up behind it.
   // An answer to a waiting page action waits behind nothing slow either.
   // So does a connect to the user's host (it waits on the host).
-  if (!keys.length && !stopping) keys.push(op === 'signIn' ? 'signin' : op === 'approve' ? 'approve' : op === 'hostConnect' ? 'connect' : 'settings');
+  // A panel's `hello` (and `ping`) waits behind nothing slow (a host connect, an unlock).
+  if (!keys.length && !stopping) keys.push(op === 'signIn' ? 'signin' : op === 'approve' ? 'approve' : op === 'hostConnect' ? 'connect' : op === 'hello' || op === 'ping' ? 'hello' : 'settings');
   const work = Promise.all(keys.map((key) => lanes.get(key))).then(() => ops[op](args));
   const settled = work.catch(() => {});
   for (const key of keys) lanes.set(key, settled);
@@ -339,6 +345,12 @@ function fitForChrome(fit, runner) {
 
 /** Files the user attached ({path, bytes}), as a prompt takes them, and the line that
  * tells the thread they are there. */
+/** The line `attachments` ends a message with, naming its files. */
+function attachedNote(files) {
+  if (!files?.length) return '';
+  return `\n\n[Attached, in the workspace: ${files.map((file) => `${file.path} (${file.bytes.length} bytes)`).join(', ')}]`;
+}
+
 function attachments(files) {
   if (!files?.length) return { files: null, note: '' };
   const encode = (bytes) => {
@@ -348,7 +360,7 @@ function attachments(files) {
   };
   return {
     files: files.map((file) => ({ path: String(file.path), base64: encode(file.bytes) })),
-    note: `\n\n[Attached, in the workspace: ${files.map((file) => `${file.path} (${file.bytes.length} bytes)`).join(', ')}]`,
+    note: attachedNote(files),
   };
 }
 
@@ -393,10 +405,12 @@ function makeClient(saved) {
     wasm, storage: 'opfs', pool: openPool, catalog: saved, credentials, grantHeaders, fetch: reach, runner: { app: linux },
   });
   for (const tool of PAGE_TOOLS) {
-    // An action the user is asked about first may wait for them (APPROVAL_WAIT) before
-    // its own 30 s; the engine's own wait (PAGE_TOOL_WAIT) still bounds Chrome's silence.
-    const timeoutS = ASKING_NAMES.has(tool.name) ? 30 + APPROVAL_WAIT / 1000 : 30;
-    made.tool({ ...tool, timeoutS, run: (input, call) => actOnPage(tool.name, opened(tool.name, input, call?.session), call?.session) });
+    // An action the user is asked about first may wait for them (APPROVAL_WAIT), after
+    // looking up what it lands on and before acting (each bounded by PAGE_TOOL_WAIT):
+    // the package waits longer than all of that, so the engine always answers first (no
+    // action the package gave up on, said unknown, happens after).
+    const timeoutS = ASKING_NAMES.has(tool.name) ? 100 + APPROVAL_WAIT / 1000 : 30;
+    made.tool({ ...tool, timeoutS, run: (input, call) => actOnPage(tool.name, opened(tool.name, input, call?.session), call?.session, call?.signal) });
   }
   made.on('event', (event, dir) => {
     const id = idOf(dir);
@@ -491,14 +505,19 @@ async function start() {
  * A token an earlier build kept as text beside the URL is sealed in the vault now, or
  * once the vault is unlocked; while a passphrase vault is locked no host is connected
  * (as locking lets it go), so the host waits (disconnected, saying so) until then. */
+/** Counts the user's host changes (connect, paste, disconnect): a reconnect of the kept
+ * host that began before one steps aside (it read what that change replaced). */
+let hostGeneration = 0;
+
 async function connectKeptHost() {
+  const generation = hostGeneration;
   const host = await read('kv', 'host');
   if (!host) return;
   const locked = () => disconnectHost(host.url, "Spindle's keys are locked: unlock them to connect it");
   let token = host.token;
   if (token != null) {
     if (!(await vault.usableNow())) return locked();
-    await vault.keepHost(token, [['kv', 'host', { url: host.url }]]);
+    await vault.keepHost(token, [['kv', 'host', { url: host.url, ...(host.client && { client: host.client }) }]]);
   } else {
     try {
       token = await vault.hostToken();
@@ -511,6 +530,7 @@ async function connectKeptHost() {
     await disconnectHost(host.url, 'its token is gone (the keys were reset): connect it again');
     return;
   }
+  if (generation !== hostGeneration) return;
   hostState = { url: host.url, connected: false, error: null, kind: null, client: host.client ?? null };
   await changeHost({ url: host.url, token, client: host.client ?? null });
 }
@@ -527,18 +547,21 @@ function disconnectHost(url, why) {
  * host's models and the threads it brings there) or 'full' (an API token's whole v1).
  * A host that does not answer is refused, as before. */
 async function tokenKind(host) {
+  // Only a 403 says what a token may not reach; any other failure (a host error, a
+  // proxy's 502, a rate limit) says nothing about it, so the connect fails and is tried
+  // again rather than keep a wrong kind.
   try {
     await host.models();
   } catch (error) {
-    if (error.status === 0) throw error;
+    if (error.status !== 403) throw error;
     return 'runner';
   }
   try {
     await host.request('GET', '/v1/usage');
     return 'full';
   } catch (error) {
-    if (error.status === 0) throw error;
-    return error.status === 403 ? 'browser' : 'full';
+    if (error.status !== 403) throw error;
+    return 'browser';
   }
 }
 
@@ -606,8 +629,9 @@ async function credentials(facts) {
   if (held?.origin && held.origin !== api) throw moved(held, held.origin, api);
   // Saved before credentials named their origin: bound to the one in use now.
   if (held && !held.origin && api) {
-    await vault.keep(facts.provider, {
-      ...held, origin: api, ...(held.kind === 'signin' && { tokenOrigin: originOf(flowOf(profile)?.token_url) }),
+    // Only onto the record it was read from: a sign-out meanwhile is not undone.
+    await vault.rebind(facts.provider, held, {
+      origin: api, ...(held.kind === 'signin' && { tokenOrigin: originOf(flowOf(profile)?.token_url) }),
     });
   }
   if (held?.kind === 'key') return { key: held.key };
@@ -852,30 +876,41 @@ function announceApprovals() {
 /** A page tool for a thread: at once under Full (the default); under Auto or Ask once the
  * user allows it when it is one they asked to be asked about. A refusal is a known
  * outcome: nothing was done. */
-async function actOnPage(name, input, session) {
+async function actOnPage(name, input, session, signal) {
   const epoch = pageEpoch(session);
-  const refusal = await beforeActing(name, input, session);
+  const refusal = await beforeActing(name, input, session, signal);
   if (epoch !== pageEpoch(session) || pageStopped(session)) return { error: 'the turn ended or was stopped before the page tool started' };
+  // A script's call whose command ended meanwhile: no one awaits it (it was said unknown).
+  if (signal?.aborted) return { error: 'the command that asked for it ended first, so it was not done' };
   return refusal ? { error: refusal } : pageTool(name, input, session);
 }
 
 /** Null when `name` with `input` may go ahead now; else, once the user answers (or does
  * not, or the turn stops), null to go ahead or why it was not done. */
-async function beforeActing(name, input, session) {
+async function beforeActing(name, input, session, signal) {
   const epoch = pageEpoch(session);
+  if (signal?.aborted) return 'the command that asked for it ended first, so it was not done';
   if (pageStopped(session)) return 'the turn was stopped, so it was not done';
   if (!ASKING_NAMES.has(name)) return null;
   // Opening a file of the thread's workspace for the user changes no page.
   if (name === 'navigate' && typeof input?.url === 'string' && input.url.startsWith(new URL('view.html?', self.location.href).href)) return null;
-  const mode = confirmMode(await read('kv', 'pages').catch(() => null));
+  // The user's choice, read from storage: one that cannot be read asks (never acts
+  // unasked on a choice it could not see).
+  const kept = await read('kv', 'pages').then((value) => ({ value }), () => null);
+  const mode = kept ? confirmMode(kept.value) : 'ask';
   if (epoch !== pageEpoch(session) || pageStopped(session)) return 'the turn ended or was stopped, so it was not done';
   if (mode === 'full') return null;
   let target = null;
   if (input?.ref && (name === 'click' || name === 'type' || name === 'select')) {
     const found = await pageTool('target', { ref: input.ref, ...(input.tab != null && { tab: input.tab }) }, session);
     target = found?.details ?? null;
+  } else if (name === 'press' || name === 'dialog' || name === 'close_tab' || (name === 'navigate' && !input?.new_tab)) {
+    const found = await pageTool('tab_of', { ...(input?.tab != null && { tab: input.tab }) }, session).catch(() => null);
+    target = found?.details ?? null;
   }
   if (mode === 'auto' && !sends(name, input, target)) return null;
+  // Asked about one tab, it acts on that tab, whatever the user looks at when they answer.
+  if (target?.tab != null && input && typeof input === 'object') input.tab = target.tab;
   const thread = idOf(session?.split('#')[0] ?? '');
   if (epoch !== pageEpoch(session) || pageStopped(session)) return 'the turn ended or was stopped, so it was not done';
   return new Promise((resolve) => {
@@ -889,6 +924,8 @@ async function beforeActing(name, input, session) {
     };
     const timer = setTimeout(() => settle(`the user did not answer within ${APPROVAL_WAIT / 60_000} minutes (Settings, Pages, Before acting asks first), so it was not done`), APPROVAL_WAIT);
     approvals.set(id, { id, thread, tool: name, text: actionText(name, input, target), at: Date.now(), answer: settle });
+    // A script's call whose command ends first: the question goes, unanswered.
+    signal?.addEventListener('abort', () => settle('the command that asked for it ended before the user answered, so it was not done'), { once: true });
     announceApprovals();
   });
 }
@@ -1042,17 +1079,22 @@ async function renewEngine() {
 function turn(id, work) {
   if (running.has(id)) throw failure('busy', 'this thread is already running');
   if (moving.has(id)) throw failure('busy', 'this thread is moving into a file');
-  const entry = { stopped: false };
+  // `sending`: the work got past its last check and handed the message to the package.
+  const entry = { stopped: false, sending: false };
   running.set(id, entry);
   entry.done = (async () => {
     let unsent = [];
+    let failed = false;
+    const before = await read('threads', id).catch(() => null);
     try {
       const thread = await touch(id, { state: 'running', note: null });
       // Its commands run on the user's host: once that host has connected (or failed to).
       if (thread?.runner === 'remote') await hostChanges;
-      if (entry.stopped) throw failure('stopped', 'the turn was stopped before it started');
+      const notYet = () => Object.assign(failure('stopped', 'the turn was stopped before it started'), { beforeStart: true });
+      if (entry.stopped) throw notYet();
       const result = await work(() => {
-        if (entry.stopped) throw failure('stopped', 'the turn was stopped before it started');
+        if (entry.stopped) throw notYet();
+        entry.sending = true;
       });
       const cut = result.stopped && !result.stopped.complete;
       unsent = result.unsent ?? [];
@@ -1061,21 +1103,58 @@ function turn(id, work) {
         : unsent.length ? `${unsent.length} message(s) came after the turn's last step and were not read` : null;
       await touch(id, { state: cut ? 'stopped' : 'idle', note });
     } catch (error) {
-      await touch(id, { state: error.kind === 'stopped' ? 'stopped' : 'failed', note: String(error.message ?? error) });
+      if (error.beforeStart) {
+        // Stopped before the message went: the thread is as it was (the message comes
+        // back, `afterTurn`).
+        const was = before && before.state !== 'running' ? before : { state: 'idle', note: null };
+        await touch(id, { state: was.state, note: was.note ?? null });
+      } else {
+        failed = error.kind !== 'stopped';
+        await touch(id, { state: error.kind === 'stopped' ? 'stopped' : 'failed', note: String(error.message ?? error) });
+      }
     } finally {
       running.delete(id);
       cancelPageTools(id);
-      // Messages the turn did not read go with a message waiting for its end, before it.
-      const waiting = queued.get(id);
-      if (waiting && !waiting.held && unsent.length) {
-        waiting.text = [...unsent, waiting.text].join('\n\n');
-        unsent = [];
-      }
-      send({ type: 'turn_end', thread: id, unsent });
-      if (waiting && !waiting.held) sendQueued(id);
-      else rest(id);
+      const took = carrying.get(id);
+      carrying.delete(id);
+      await afterTurn(id, unsent, took, { sending: entry.sending, failed }).catch((error) => console.warn('Spindle: after a turn:', error));
     }
   })();
+}
+
+/** What follows a turn of a thread here. The waiting message it took (`took`) leaves the
+ * disk once the thread holds it; a turn that ended without taking it (stopped before it
+ * started, say) puts it back, held, saying why. Messages the turn did not read go with a
+ * message waiting for its end, before it; then that message goes. */
+async function afterTurn(id, unsent, took, { sending, failed }) {
+  if (took) {
+    // Not handed over: not taken. Handed over to a turn that went on: taken (the package
+    // commits the message first). Handed over to one that failed: its history tells.
+    const taken = sending && (!failed || (await tookMessage(id, took).catch(() => false)));
+    if (taken) await dropQueued(took).catch(() => {});
+    else await requeue(id, took, sending ? 'its turn failed before taking it' : 'you stopped its turn before it began');
+  }
+  await holdUnsent(id, unsent);
+  send({ type: 'turn_end', thread: id, unsent: [] });
+  const waiting = queued.get(id);
+  if (waiting && !waiting.held) sendQueued(id);
+  else rest(id);
+}
+
+/** Messages a turn ended before reading: with a message waiting for that end, they go
+ * with it, before it; otherwise they wait, held, to be sent or taken back (on disk, so
+ * neither a closed panel nor a stopped engine loses them). */
+async function holdUnsent(id, unsent) {
+  if (!unsent?.length) return;
+  const waiting = queued.get(id);
+  if (waiting && !waiting.held) {
+    waiting.text = [...unsent, waiting.text].join('\n\n');
+    await keepQueued(waiting).catch(() => {});
+    announceQueued(id);
+    return;
+  }
+  await requeue(id, waitingMessage(id, unsent.join('\n\n'), []), 'the turn ended before reading it')
+    .catch((error) => console.warn('Spindle: an unread message could not be kept:', error));
 }
 
 /** What panels show of a thread's waiting message (null: none). */
@@ -1086,6 +1165,87 @@ function queuedOf(id) {
 
 function announceQueued(id) {
   send({ type: 'queued', thread: id, queued: queuedOf(id) });
+}
+
+const QUEUED = 'queued:';
+/** A message to wait for thread `id`'s turn to end (its disk record's own key). */
+function waitingMessage(id, text, files) {
+  return { key: `${QUEUED}${id}:${crypto.randomUUID()}`, thread: id, text: String(text), files: files ?? [], held: null, at: Date.now() };
+}
+/** Writes a waiting message's record as it is now. */
+function keepQueued(waiting) {
+  return writeDurably('kv', waiting.key, { thread: waiting.thread, text: waiting.text, files: waiting.files, held: waiting.held ?? null, at: waiting.at });
+}
+/** Removes a waiting message's record. */
+function dropQueued(waiting) {
+  return removeDurably('kv', waiting.key);
+}
+/** Queues `waiting` for its thread: on disk before any panel is told it waits (a write
+ * that fails leaves nothing queued, and the panel keeps the draft). */
+async function enqueue(waiting) {
+  const id = waiting.thread;
+  if (queued.has(id)) throw failure('busy', 'a message already waits for this turn to end: take it back to change it');
+  queued.set(id, waiting);
+  try {
+    await keepQueued(waiting);
+  } catch (error) {
+    if (queued.get(id) === waiting) queued.delete(id);
+    throw error;
+  }
+  announceQueued(id);
+}
+/** Puts `took` (a waiting message no turn took) back for thread `id`, held for `why`: in
+ * front of one that waits now, if one does. */
+async function requeue(id, took, why) {
+  const there = queued.get(id);
+  if (there) {
+    there.text = `${took.text}\n\n${there.text}`;
+    there.files = [...took.files, ...there.files];
+    await keepQueued(there);
+    await dropQueued(took).catch(() => {});
+  } else {
+    took.held = why;
+    queued.set(id, took);
+    await keepQueued(took);
+  }
+  announceQueued(id);
+}
+/** Whether thread `id` (here) holds `waiting` as one of its latest user messages: the
+ * turn that took it committed it. */
+function tookMessage(id, waiting) {
+  const said = waiting.text + attachedNote(waiting.files);
+  return within(id, async () => {
+    const messages = (await client.history(dirOf(id))).messages ?? [];
+    return messages.slice(-64).some((message) => message.role === 'user'
+      && (message.content ?? []).some((block) => block.type === 'text' && block.text === said));
+  });
+}
+/** Waiting messages a stopped engine left on disk (at start). One its turn had already
+ * taken goes; any other waits again, held, for the user to send or take back. */
+async function restoreQueued() {
+  const records = [];
+  for (const key of await keysOf('kv')) {
+    if (!String(key).startsWith(QUEUED)) continue;
+    const record = await read('kv', key).catch(() => null);
+    if (record) records.push({ ...record, key: String(key) });
+  }
+  records.sort((one, other) => (one.at ?? 0) - (other.at ?? 0));
+  for (const record of records) {
+    const id = record.thread;
+    const thread = typeof id === 'string' ? await read('threads', id).catch(() => null) : null;
+    if (!thread) {
+      await removeDurably('kv', record.key).catch(() => {});
+      continue;
+    }
+    const waiting = { key: record.key, thread: id, text: String(record.text ?? ''), files: record.files ?? [], held: null, at: record.at ?? 0 };
+    if (!thread.home && await tookMessage(id, waiting).catch(() => false)) {
+      await removeDurably('kv', record.key).catch(() => {});
+      continue;
+    }
+    await requeue(id, waiting, record.held ?? `${BROWSER} stopped before the turn it waited for ended`).catch((error) => {
+      console.warn('Spindle: a waiting message could not be restored:', error);
+    });
+  }
 }
 
 /** Sends the message that waited for a thread's turn to end, as its next turn. One the
@@ -1116,12 +1276,15 @@ async function sendQueued(id) {
       check();
       return client.prompt(dirOf(id), waiting.text + note, files ? { files } : {});
     });
-    // Out of the queue once its turn has started (until then a failure holds it).
+    // Out of the queue once its turn has started (until then a failure holds it); its
+    // record stays until that turn has ended (`afterTurn`).
+    carrying.set(id, waiting);
     queued.delete(id);
     announceQueued(id);
   } catch (error) {
     if (queued.get(id) !== waiting) return;
     waiting.held = String(error.message ?? error);
+    await keepQueued(waiting).catch(() => {});
     announceQueued(id);
     rest(id);
   }
@@ -1241,21 +1404,32 @@ function slug(title) {
 }
 
 async function snapshot() {
+  const info = await client.info();
+  const catalogSaved = Boolean(await read('kv', 'catalog'));
+  const sites = await sitesKept();
+  const standing = (await read('kv', 'standing')) ?? '';
+  const relay = (await read('kv', 'relay')) ?? null;
+  const vault = await vaultState();
+  // The thread list is read last, and nothing is awaited after it: a panel replaces its
+  // whole list with this one, so a thread that changed (and was announced) while the
+  // reads above waited must be in it. A change committed after this read is announced
+  // after this answer goes, and the panel applies it on top.
+  const list = await threads();
   return {
-    info: await client.info(),
+    info,
     catalog,
-    catalogSaved: Boolean(await read('kv', 'catalog')),
+    catalogSaved,
     catalogNote,
-    threads: await threads(),
+    threads: list,
     running: [...running.keys()],
     free: pool?.free ?? null,
     linux: linuxState,
     host: hostState,
-    sites: await sitesKept(),
+    sites,
     approvals: approvalsShown(),
-    standing: (await read('kv', 'standing')) ?? '',
-    relay: (await read('kv', 'relay')) ?? null,
-    vault: await vaultState(),
+    standing,
+    relay,
+    vault,
   };
 }
 
@@ -1452,16 +1626,18 @@ const ops = {
     // with files waits for its own turn: a running one takes text only).
     if (running.has(id)) {
       if (!given?.length) return { steered: (await client.steer(dirOf(id), text)).queued };
-      if (queued.has(id)) throw failure('busy', 'a message already waits for this turn to end: take it back to change it');
-      queued.set(id, { text: String(text), files: given });
-      announceQueued(id);
+      await enqueue(waitingMessage(id, text, given));
       return { queued: true };
     }
     // A turn stopped part way goes on with the message (the model reads the stopped step,
-    // then it), which takes text only: files are refused here, so the draft stays.
-    if (given?.length) {
-      const status = await within(id, () => client.status(dirOf(id)));
-      if (!status.accepts_prompt && status.accepts_message) {
+    // then it), which takes text only; a turn that takes no message now (it did not
+    // finish, or needs the user first) refuses it. Refused here, the draft stays.
+    const status = await within(id, () => client.status(dirOf(id)));
+    if (!status.accepts_prompt) {
+      if (!status.accepts_message) {
+        throw failure('busy', `The last turn did not finish${status.stop_text ? ` (${status.stop_text})` : ''}: retry, continue or take it back first.`);
+      }
+      if (given?.length) {
         throw failure('busy', 'This turn was stopped part way and takes a message without files: send the text alone (or Continue it), then the files with your next message.');
       }
     }
@@ -1471,14 +1647,19 @@ const ops = {
       check();
       return client.prompt(dirOf(id), text + note, files ? { files } : {});
     });
+    // Should the turn end without it (stopped before it began), the message comes back.
+    carrying.set(id, waitingMessage(id, text, given));
     return { started: true };
   },
 
   /** Takes a thread's waiting message back (`{text, files}`; null when none waits). */
-  unqueue({ id }) {
+  async unqueue({ id }) {
     const waiting = queued.get(id);
     if (!waiting) return null;
     queued.delete(id);
+    // Back in the box: a record left by a failed removal comes back held after a restart
+    // (the user sees it twice rather than lose it).
+    await dropQueued(waiting).catch(() => {});
     announceQueued(id);
     return { text: waiting.text, files: waiting.files };
   },
@@ -1702,15 +1883,20 @@ const ops = {
 
   async remove({ id }) {
     notRunning(id, 'deleting');
+    // Its background tasks' page actions (and their questions) end with it.
+    cancelPageTools(id);
     if (using.has(id)) throw failure('busy', 'this thread is busy; try again in a moment');
     // Closing it here (if it is open) gives its store and Web Lock back first.
     await discard(id);
     await remove('bundles', id);
     bundleSizes.delete(id);
     await dropPriors(id);
-    for (const key of await keysOf('kv')) if (key.startsWith(`preview:${id}:`)) await remove('kv', key);
+    for (const key of await keysOf('kv')) {
+      if (key.startsWith(`preview:${id}:`) || key.startsWith(`${QUEUED}${id}:`)) await remove('kv', key);
+    }
     await remove('threads', id);
     queued.delete(id);
+    carrying.delete(id);
     linux.forget(dirOf(id));
     send({ type: 'removed', id });
     return { removed: true };
@@ -1959,6 +2145,7 @@ const ops = {
   /** Connects the user's Spindle host (`{url, token}`; null disconnects) for threads whose
    * commands run there. */
   async host({ host }) {
+    hostGeneration += 1;
     const next = host ? { url: String(host.url).replace(/\/+$/, ''), token: String(host.token) } : null;
     // Its token is kept sealed, so not while the keys are locked.
     if (next && !(await vault.usableNow())) throw failure('locked', "Spindle's keys are locked: unlock them, then connect the host");
@@ -2143,7 +2330,11 @@ function hostedClient(url = null) {
     throw away(url ? `your host at ${url} is not connected (Settings, Your Spindle host)` : 'no Spindle host is connected: connect one in Settings, Your Spindle host');
   }
   if (url && hostState.url !== url) throw away(`this thread is on the host at ${url}, but ${hostState.url} is connected: connect that host again in Settings`);
-  if (hostState.kind !== 'browser') throw away('your host is connected with a runner token, which only runs commands: press Connect in Settings, Your Spindle host');
+  if (hostState.kind !== 'browser') {
+    throw away(hostState.kind === 'runner'
+      ? 'your host is connected with a runner token, which only runs commands: press Connect in Settings, Your Spindle host'
+      : 'your host is connected with a full API token, not this browser\'s own: press Connect in Settings, Your Spindle host');
+  }
   return hostRemote;
 }
 
@@ -2286,10 +2477,16 @@ const awayNow = new Map();
 /** Says (or, `why` null, stops saying) that a hosted thread's host cannot be reached;
  * nothing of the thread is lost meanwhile. Its place in the list stays. */
 async function away(id, why) {
-  if ((awayNow.get(id) ?? null) === why) return;
+  if (awayNow.has(id) && awayNow.get(id) === why) return;
   awayNow.set(id, why);
-  const next = await update('threads', id, (thread) => ({ ...thread, away: why }));
-  if (next) send({ type: 'thread', thread: next });
+  // Compared with the record too: one kept from before the engine started (Chrome closed
+  // while the host was out of reach) is cleared once the host answers.
+  let changed = false;
+  const next = await update('threads', id, (thread) => {
+    changed = (thread.away ?? null) !== why;
+    return changed ? { ...thread, away: why } : thread;
+  });
+  if (next && changed) send({ type: 'thread', thread: next });
 }
 
 /** A host list state as this browser's thread states say it: [state, note]; null for a
@@ -2413,7 +2610,13 @@ async function answerHostedCall(id, home, entry, event, key) {
   try {
     const remote = hostedClient(home.url);
     const kept = await read('kv', key);
-    const stopping = await read('kv', hostedStopKey(id));
+    let stopping = await read('kv', hostedStopKey(id));
+    // A saved Stop holds back only the turn it stops (a later turn, started on the host's
+    // own screen say, is not refused its page tools by an older Stop).
+    if (stopping?.target) {
+      const runs = hostedTurns.get(id)?.request ?? (await remote.session(home.session).catch(() => null))?.running_request ?? null;
+      if (runs && runs !== stopping.target) stopping = null;
+    }
     if (cancelled()) return;
     if (stopping) {
       await remote.appToolResult(home.session, event.call, { error: 'the user asked to stop this turn; its Stop is being delivered' });
@@ -2491,7 +2694,7 @@ async function endHostedCall(id, done) {
       note = receipt.error ?? 'it failed on your host';
     } else if (receipt?.state === 'interrupted') {
       state = 'interrupted';
-      note = 'your host restarted while it ran';
+      note = receipt.error ?? 'your host restarted while it ran';
     } else if (!object.complete && object.head > 0 && !object.accepts_prompt) {
       state = 'stopped';
       note = object.stop_text ?? null;
@@ -2507,13 +2710,9 @@ async function endHostedCall(id, done) {
   cancelPageTools(id);
   if (complete) await clearHostedTools(id);
   await touch(id, { state, note });
-  let unsent = done?.unsent ?? [];
+  await holdUnsent(id, done?.unsent ?? []);
+  send({ type: 'turn_end', thread: id, unsent: [] });
   const waiting = queued.get(id);
-  if (waiting && !waiting.held && unsent.length) {
-    waiting.text = [...unsent, waiting.text].join('\n\n');
-    unsent = [];
-  }
-  send({ type: 'turn_end', thread: id, unsent });
   if (state !== 'running' && waiting && !waiting.held) sendQueuedHosted(id);
 }
 
@@ -2532,12 +2731,16 @@ async function sendQueuedHosted(id) {
         ? 'the last turn was stopped part way and takes a message without files: send the text alone, or Continue, Retry or Take back first'
         : 'the last turn did not finish: retry, continue or take it back first');
     }
+    // Its turn's command is saved (and sent again until the host confirms it) before
+    // this answers, so the waiting copy may go.
     await onHost.send({ id, text: waiting.text, files: waiting.files }, null, true);
     queued.delete(id);
+    await dropQueued(waiting).catch(() => {});
     announceQueued(id);
   } catch (error) {
     if (queued.get(id) !== waiting) return;
     waiting.held = String(error.message ?? error);
+    await keepQueued(waiting).catch(() => {});
     announceQueued(id);
   }
 }
@@ -2661,9 +2864,7 @@ const onHost = {
           if (error?.kind !== 'not_running') throw hostFailure(error);
         }
       } else {
-        if (queued.has(id)) throw failure('busy', 'a message already waits for this turn to end: take it back to change it');
-        queued.set(id, { text: String(text), files: given });
-        announceQueued(id);
+        await enqueue(waitingMessage(id, text, given));
         return { queued: true };
       }
     }
@@ -2695,7 +2896,9 @@ const onHost = {
       if (!target) target = (await hostedClient(thread.home.url).session(thread.home.session)).running_request;
       if (!target) return { stopping: false };
       const kept = await read('kv', hostedStopKey(id));
-      if (!kept) await writeDurably('kv', hostedStopKey(id), { request: requestId(), target, url: thread.home.url, session: thread.home.session });
+      // One Stop is kept per thread, for the turn that runs: one kept for an earlier turn
+      // (which ended, as a later one runs) gives way to this one.
+      if (!kept || kept.target !== target) await writeDurably('kv', hostedStopKey(id), { request: requestId(), target, url: thread.home.url, session: thread.home.session });
       if (pending) await admitHosted(id, pending);
       await sendHostedStop(id);
     } catch (error) {
@@ -2942,6 +3145,10 @@ for (const [name, hosted] of Object.entries(onHost)) {
           if (error?.status !== 404) throw error;
         }
       }
+      // The move ends before the thread goes, in one transaction: a stop between leaves
+      // a plain thread here to delete again, never a move whose thread is gone.
+      const now = await read('threads', args.id);
+      if (now) await writeTogether([['threads', args.id, { ...now, moving: null }], ['kv', MOVE(args.id), undefined], ['bundles', MOVE(args.id), undefined]], 'strict');
     }
     const done = await here(args);
     await clearHostedTools(args.id);
@@ -2970,8 +3177,11 @@ async function pollHosted() {
       ? `your host does not answer (${sentence(error)}); Spindle keeps trying, and nothing is lost`
       : sentence(error);
   }
-  for (const thread of hosted) {
-    if (thread.moving) continue;
+  for (const seen of hosted) {
+    // As it is now (the awaits for threads before it can take a while): one that began
+    // moving back, or came back, meanwhile is its move's to tell.
+    const thread = await read('threads', seen.id).catch(() => null);
+    if (!thread?.home || thread.moving) continue;
     const command = await read('kv', hostedCommandKey(thread.id));
     if (command) {
       try {
@@ -2983,7 +3193,10 @@ async function pollHosted() {
           await forgetHostedCommand(thread.id, command.request);
           hostedTurns.delete(thread.id);
           await touch(thread.id, { state: 'failed', note: sentence(error) });
-          send({ type: 'turn_end', thread: thread.id, unsent: command.kind === 'say' ? [command.fields.text] : [] });
+          // The refused message waits, held, for the user (whether or not a panel shows
+          // this thread now).
+          await holdUnsent(thread.id, command.kind === 'say' ? [command.fields.text] : []);
+          send({ type: 'turn_end', thread: thread.id, unsent: [] });
         }
       }
       continue;
@@ -3011,7 +3224,7 @@ async function pollHosted() {
     } else if (thread.state === 'running') {
       // It ended while no stream told this engine (a gap, or another screen ran it).
       const mine = hostedTurns.get(thread.id);
-      const receipt = mine?.request ? await hostRemote.receipt(mine.request).catch((error) => {
+      const receipt = mine?.request && hostRemote ? await hostRemote.receipt(mine.request).catch((error) => {
         if (error?.status === 404) return { state: 'interrupted', error: 'the host no longer retains this command receipt' };
         return null;
       }) : null;
@@ -3028,10 +3241,23 @@ const HALTED_STATES = new Set(['stopped', 'failed', 'interrupted']);
 /** Every quarter minute while there are hosted threads or moves: their states, and the
  * moves that wait for the host. */
 let ticking = null;
+/** When the scheduled tick is due, and whether one runs now (one at a time). */
+let tickDue = 0;
+let tickRunning = false;
+/** Brings hosted threads and moves up to date in `ms` (sooner than a tick already set
+ * for later), then every 15 seconds while any are left. */
 function hostedTick(ms = 15_000) {
-  if (ticking) return;
+  const due = Date.now() + ms;
+  if (ticking && tickDue <= due) return;
+  clearTimeout(ticking);
+  tickDue = due;
   ticking = setTimeout(async () => {
     ticking = null;
+    if (tickRunning) {
+      hostedTick(1000);
+      return;
+    }
+    tickRunning = true;
     let more = false;
     try {
       if (!hostState.connected && hostState.url && await vault.usableNow()) await connectKeptHost().catch(() => {});
@@ -3043,8 +3269,10 @@ function hostedTick(ms = 15_000) {
     } catch (error) {
       more = true;
       console.warn('Spindle: hosted threads were not brought up to date:', error);
+    } finally {
+      tickRunning = false;
     }
-    if (more) hostedTick(ms);
+    if (more) hostedTick();
   }, ms);
   ticking?.unref?.();
 }
@@ -3073,6 +3301,7 @@ Object.assign(ops, {
    * `verifier`) for a browser token named `client`, keeps it sealed where the host's
    * token lives, and connects the host with it. */
   async hostConnect({ url, code, verifier, client: name }) {
+    hostGeneration += 1;
     const base = String(url).replace(/\/+$/, '');
     // A code is good for one trade: none while its token could not be kept.
     if (!(await vault.usableNow())) throw failure('locked', "Spindle's keys are locked: unlock them, then connect your host");
@@ -3082,12 +3311,23 @@ Object.assign(ops, {
     } catch (error) {
       throw failure(error.kind ?? 'host', `your host did not give this browser a token (${sentence(error)})`);
     }
+    // Kept at once: the trade replaced any earlier token of this browser on that host, so
+    // the new one is the only one that works there now.
+    await vault.keepHost(token, [['kv', 'host', { url: base, client: name }]]);
     try {
       await changeHost({ url: base, token, client: name });
     } catch (error) {
-      throw failure('host', `the host did not connect (${error.message ?? error}); ${hostState.connected ? `still connected to ${hostState.url}` : 'none is connected'}`);
+      const why = error.message ?? error;
+      if (!hostState.connected || hostState.url === base) {
+        // Its earlier connection (if any) used the replaced token: tried again with the
+        // new one shortly.
+        hostState = { url: base, connected: false, error: `not connected yet (${why})`, kind: null, client: name };
+        send({ type: 'host', host: hostState });
+        hostedTick(1000);
+        throw failure('host', `your host gave this browser a token (kept here) but did not connect yet (${why}); Spindle tries again shortly`);
+      }
+      throw failure('host', `your host gave this browser a token (kept here) but did not connect (${why}); still connected to ${hostState.url} until Spindle starts again`);
     }
-    await vault.keepHost(token, [['kv', 'host', { url: base, client: name }]]);
     return snapshot();
   },
 
@@ -3204,6 +3444,8 @@ const starting = (async () => {
     for (const name of fs.readdirSync('/threads')) {
       if (!known.has(name)) fs.rmSync(`/threads/${name}`, { recursive: true, force: true });
     }
+    // Messages that waited for a turn's end when the engine stopped.
+    await restoreQueued().catch((error) => console.warn('Spindle: waiting messages:', error));
     // Moves to or from the user's host go on from where they were recorded (those that
     // need the host wait for it to connect).
     moves.resume().catch(() => {});

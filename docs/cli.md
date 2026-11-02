@@ -4,7 +4,7 @@
 session in a directory, sends prompts to a model, runs the model's tool calls in a
 sandbox over a versioned workspace, and records every step as a committed revision, so a
 run that is killed resumes with `spindle continue` and earlier points can be restored
-with `spindle rewind`. The same binary also serves the browser host (`spindle serve`),
+with `spindle rewind`. The same binary also serves the web UI host (`spindle serve`),
 speaks JSON-RPC over stdio (`spindle api`), signs in to model providers through Dext's
 credential store, and replaces itself safely (`spindle upgrade` / `spindle rollback`).
 The ground truth for everything below is the parser in
@@ -22,7 +22,7 @@ The ground truth for everything below is the parser in
 - [Moving work out](#moving-work-out): `export`, `export-session`, `import-session`
 - [Checking and repairing](#checking-and-repairing): `doctor`
 - [Providers and sign-in](#providers-and-sign-in): `providers`, `login`, `logout`, `auth`
-- [Browser host and HTTP tokens](#browser-host-and-http-tokens): `serve`, `token`
+- [Web UI host and HTTP tokens](#web-ui-host-and-http-tokens): `serve`, `token`
 - [JSON-RPC over stdio](#json-rpc-over-stdio): `api`
 - [Code-mode inspection](#code-mode-inspection): `code-packs`, `code-receipts`
 - [The binary itself](#the-binary-itself): `version`, `upgrade`, `rollback`
@@ -47,7 +47,7 @@ See [getting-started.md](getting-started.md) for a first session.
 | Command group | What `DIR` is |
 | --- | --- |
 | Session commands (`new`, `say`, `status`, `rewind`, `doctor`, ...) | One session directory. It holds the session's SQLite store under `DIR/store/` and its settings beside it; see [store.md](store.md). |
-| `serve`, `token` | The browser host's directory, which holds many sessions; see [host.md](host.md#host-directory-layout). |
+| `serve`, `token` | The web UI host's directory, which holds many sessions; see [host.md](host.md#host-directory-layout). |
 | `upgrade` | The default session to verify a candidate against, when no `--session` is given. |
 | `import-session` | The destination; it must be absent or an empty directory. |
 
@@ -111,7 +111,7 @@ packs go to standard error ([What a run prints](#what-a-run-prints)).
 | `doctor` | Check a session and safely repair what can be repaired. |
 | `providers` | Providers in Dext's catalog and whether each can send. |
 | `login`, `logout`, `auth` | Dext's sign-in commands. |
-| `serve` | The browser host on loopback. |
+| `serve` | The web UI host on loopback. |
 | `token` | Named bearer tokens for the host's `/v1` HTTP API. |
 | `api` | JSON-RPC 2.0 over stdin/stdout. |
 | `code-packs` | Offline pack discovery for code mode. |
@@ -286,7 +286,7 @@ session.
 | `auth models [PROVIDER\|INDEX\|all] [--json]` | Known models of a provider. |
 | `auth help` | Dext's auth help text. |
 
-## Browser host and HTTP tokens
+## Web UI host and HTTP tokens
 
 ### `serve`
 

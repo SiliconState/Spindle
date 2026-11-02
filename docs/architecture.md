@@ -10,7 +10,7 @@ any point leaves a state the next process can resume without sending work twice 
 guessing what happened.
 
 The same store and driver run in three kinds of host: the native `spindle` binary (CLI,
-stdio API and browser host), the embedded package (WebAssembly inside a JavaScript app),
+stdio API and web UI host), the embedded package (WebAssembly inside a JavaScript app),
 and Spindle for Browser (the embedded package inside a browser extension).
 
 - [System context](#system-context)
@@ -278,7 +278,7 @@ flowchart TB
     subgraph A["1 · Local CLI"]
         A1["Terminal"] --> A2["spindle --dir S new ..."] --> A3[("S/store")]
     end
-    subgraph B["2 · Browser host"]
+    subgraph B["2 · Web UI host"]
         B1["Phone"] -->|"HTTPS"| B2["Authenticating reverse proxy"] -->|"loopback"| B3["spindle serve"] --> B4[("host dir:<br/>sessions, host.sqlite")]
     end
     subgraph C["3 · App over stdio or HTTP"]
@@ -297,7 +297,7 @@ flowchart TB
 | Shape | Who sends model requests | Where commands run | Storage |
 | --- | --- | --- | --- |
 | Local CLI | `spindle` | bubblewrap sandbox (or host, per isolation mode) | session directory |
-| Browser host | `spindle serve` | bubblewrap sandbox | host directory of sessions |
+| Web UI host | `spindle serve` | bubblewrap sandbox | host directory of sessions |
 | App over stdio/HTTP | `spindle` | bubblewrap sandbox (HTTP always; stdio sessions follow their isolation mode) | session directories |
 | App with wasm package | the app | the app's runner, a remote `spindle serve`, or none | Node files, OPFS, or memory |
 | Browser extension | the extension | browser Linux, or a remote host | OPFS |
@@ -370,7 +370,7 @@ effects a rewind cannot undo. See [SECURITY.md](../SECURITY.md).
 | [`spindle/store/src/code_mode.rs`](../spindle/store/src/code_mode.rs) | Code mode child-effect journal |
 | [`spindle/store/src/embedded/`](../spindle/store/src/embedded) | Embedded host and its storage |
 | [`spindle/store/src/api.rs`](../spindle/store/src/api.rs), [`protocol.rs`](../spindle/store/src/protocol.rs), [`api/stdio.rs`](../spindle/store/src/api/stdio.rs) | Public API forms, JSON-RPC protocol, stdio transport |
-| [`spindle/store/src/serve/`](../spindle/store/src/serve) | Browser host: HTTP, pairing, Access, previews, self-edit |
+| [`spindle/store/src/serve/`](../spindle/store/src/serve) | Web UI host: HTTP, pairing, one-click connect, threads a browser brings, Access, previews, self-edit |
 | [`spindle/store/ui/`](../spindle/store/ui) | Web UI assets embedded in the binary |
 | [`spindle/embed/`](../spindle/embed) | wasm package with Node and browser storage |
 | [`spindle/clients/`](../spindle/clients) | Node.js and Python clients |

@@ -32,6 +32,10 @@ for limit in name:75 short_name:12 description:132; do
     field=${limit%%:*}
     most=${limit#*:}
     value=$(sed -n "s/^  \"$field\": \"\(.*\)\",*$/\1/p" chrome/manifest.json | head -1)
+    if [ -z "$value" ]; then
+        echo "chrome/manifest.json: no $field found (one line, two-space indent: \"$field\": \"...\")" >&2
+        exit 1
+    fi
     if [ "${#value}" -gt "$most" ]; then
         echo "chrome/manifest.json: its $field is ${#value} characters; the Chrome Web Store takes at most $most" >&2
         exit 1

@@ -281,11 +281,11 @@ fn failure(
 
 /// Identity of a file as sealed: an unchanged stamp means unchanged bytes, except after
 /// a write through a shared mapping, which some filesystems (tmpfs) leave unstamped;
-/// on Linux `Writes` reports every file a run opened for writing, which seals it as
-/// changed whatever its stamp. The run cannot set a change time (Unix ctime, Windows
-/// ChangeTime) through the tools it uses, and a replaced file has a new identity
-/// (device and inode, or volume and file id), so restoring a modification time does not
-/// hide a write.
+/// on Linux `Writes` reports every file a run opened for writing, which is then sealed
+/// as changed, whatever its stamp, unless its bytes are still the input's
+/// (`same_bytes`). The run cannot set a change time (Unix ctime, Windows ChangeTime)
+/// through the tools it uses, and a replaced file has a new identity (device and inode,
+/// or volume and file id), so restoring a modification time does not hide a write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Stamp {
     device: u64,
@@ -1484,11 +1484,13 @@ impl StrictExecutor {
         #[cfg(not(target_os = "linux"))]
         let written = Some(std::collections::BTreeSet::new());
         let mut skipped = vec![];
+        let mut same = |name: &str, file: &Path| same_bytes(&mut *host, name, file);
         let sealed = seal(
             &workspace,
             tree,
             &baseline,
             written.as_ref(),
+            &mut same,
             &self.limits,
             &mut skipped,
         );
@@ -2080,6 +2082,52 @@ fn write_tree(
     Ok(stamps)
 }
 
+/// Whether `file` holds exactly input `name`'s bytes, as `host` supplies them again
+/// (compared as they come, a bounded piece at a time; the run is over, so nothing else
+/// writes to it). Anything that cannot be told counts as changed.
+fn same_bytes(host: &mut dyn RunHost, name: &str, file: &Path) -> bool {
+    struct Compare {
+        file: std::fs::File,
+        piece: Vec<u8>,
+        same: bool,
+    }
+    impl Write for Compare {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut rest = bytes;
+            while self.same && !rest.is_empty() {
+                let take = rest.len().min(self.piece.len());
+                self.same = self.file.read_exact(&mut self.piece[..take]).is_ok()
+                    && self.piece[..take] == rest[..take];
+                rest = &rest[take..];
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(opened) = options.open(file) else {
+        return false;
+    };
+    let mut compare = Compare {
+        file: opened,
+        piece: vec![0; 64 * 1024],
+        same: true,
+    };
+    if host.load(name, &mut compare).is_err() || !compare.same {
+        return false;
+    }
+    // And nothing beyond the input's bytes.
+    matches!(compare.file.read(&mut [0u8; 1]), Ok(0))
+}
+
 /// Waits until the filesystem clock has moved past every materialized file's change
 /// time. Kernels without fine-grained timestamps stamp files from a coarse clock (a
 /// few milliseconds per tick), so a run that rewrote a file within the tick it was
@@ -2290,16 +2338,21 @@ fn drain_writes(
 /// Seals the candidate: regular files (hard links are sealed as plain files), symbolic
 /// links (never followed) and empty directories. A file whose stamp still equals its
 /// materialized input's and that the run never opened for writing (`written`; None:
-/// any file may have been) is reported unchanged and not read. Anything else (special
-/// files, non-UTF-8 or overlong names, too many entries or bytes) is the reason the
-/// run's changes cannot be kept. Where the platform has no executable bit (Windows), a
-/// file keeps the bit it came in with.
+/// any file may have been) is reported unchanged and not read. One that was opened for
+/// writing with its stamp unchanged is unchanged only if `same(path, file)` finds the
+/// input's bytes in it: a write through a shared mapping changes no stamp, while an
+/// opening that wrote nothing (or a descriptor another thread's child inherited while
+/// the input was written, closed only as that child started its program) changes no
+/// bytes. Anything else (special files, non-UTF-8 or overlong names, too many entries
+/// or bytes) is the reason the run's changes cannot be kept. Where the platform has no
+/// executable bit (Windows), a file keeps the bit it came in with.
 #[allow(clippy::type_complexity)]
 fn seal(
     root: &Path,
     input: &BTreeMap<String, Input>,
     baseline: &BTreeMap<String, Stamp>,
     written: Option<&std::collections::BTreeSet<String>>,
+    same: &mut dyn FnMut(&str, &Path) -> bool,
     limits: &TreeLimits,
     skipped: &mut Vec<String>,
 ) -> Result<(BTreeMap<String, SealedEntry>, BTreeMap<String, Stamp>), String> {
@@ -2409,20 +2462,20 @@ fn seal(
                         size_text(limits.tree)
                     ));
                 }
-                let stamp = Stamp::of_path(&entry.path(), &metadata).map_err(|error| {
+                let file = entry.path();
+                let stamp = Stamp::of_path(&file, &metadata).map_err(|error| {
                     format!("`{}` could not be read: {error}", path_text(&path))
                 })?;
                 let came_in = match input.get(&path) {
                     Some(Input::File { executable, .. }) => Some(*executable),
                     _ => None,
                 };
+                let unchanged = came_in.is_some()
+                    && baseline.get(&path) == Some(&stamp)
+                    && written
+                        .is_some_and(|written| !written.contains(&path) || same(&path, &file));
                 let entry = match came_in {
-                    Some(executable)
-                        if baseline.get(&path) == Some(&stamp)
-                            && written.is_some_and(|written| !written.contains(&path)) =>
-                    {
-                        SealedEntry::Unchanged { executable }
-                    }
+                    Some(executable) if unchanged => SealedEntry::Unchanged { executable },
                     _ => {
                         #[cfg(unix)]
                         let executable = {

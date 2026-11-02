@@ -45,6 +45,7 @@ jobs:
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
           echo "ASSET=spindle-browser-$version.zip" >> "$GITHUB_ENV"
+          echo "MINIMUM=$(node -p "require('./spindle/chrome/manifest.json').minimum_chrome_version")" >> "$GITHUB_ENV"
       - name: Tools
         run: |
           rustup target add wasm32-unknown-unknown i686-unknown-linux-musl
@@ -97,17 +98,17 @@ jobs:
           cat > "$RUNNER_TEMP/notes.md" <<EOF
           Spindle for Browser $VERSION, for Chrome, Edge and Brave, built from this tag by the browser release workflow.
 
-          **Install** (Chrome, Edge or Brave, Chromium 116 or later, on desktop):
+          **Verify** it before you unzip it: \`sha256sum -c $ASSET.sha256\` (on macOS, \`shasum -a 256 -c $ASSET.sha256\`; on Windows, compare \`Get-FileHash $ASSET\` with the \`.sha256\` file), or \`gh attestation verify $ASSET -R $GITHUB_REPOSITORY\`.
 
-          1. Download \`$ASSET\` and unzip it into a folder you will keep.
+          **Install** (Chrome, Edge or Brave, Chromium $MINIMUM or later, on desktop):
+
+          1. Download \`$ASSET\` and unzip it into a folder you will keep, one without the version in its name.
           2. Open \`chrome://extensions\` (in Edge, \`edge://extensions\`; in Brave, \`brave://extensions\`), turn on **Developer mode**, click **Load unpacked** and choose that folder.
           3. Pin Spindle, open its panel, and in **Settings** add a key or **Sign in**.
 
-          **Update:** unzip the new version over the same folder and click **Reload** on Spindle's card in the extensions page. The browser names an unpacked extension by its folder, so a different folder is a separate install with its own threads.
+          **Update:** unzip the new version over the same folder, replacing its files (Windows' Extract All suggests a new folder named after the zip: change it to the one you loaded; on macOS or Linux, \`unzip -o $ASSET -d FOLDER\`), then click **Reload** on Spindle's card in the extensions page. Reload stops the turns running in the browser; they show as interrupted, and Continue goes on. The browser derives an unpacked extension's id from its folder's path, so another folder, or this one moved or renamed, is a separate install with its own threads and keys.
 
-          This build runs commands in the browser Linux on v86. The faster wasm Linux is in builds made from source with \`SPINDLE_WASM_LINUX\` (docs/browser-linux.md).
-
-          **Verify:** \`sha256sum -c $ASSET.sha256\`, or \`gh attestation verify $ASSET -R $GITHUB_REPOSITORY\`.
+          This build runs commands in the browser Linux on v86. The faster wasm Linux is in builds made from source with \`SPINDLE_WASM_LINUX\` ([how](https://github.com/$GITHUB_REPOSITORY/blob/main/docs/browser-linux.md#building-the-images)).
 
           The zip's THIRD-PARTY.md lists the other software it carries, with licenses and sources.
           EOF

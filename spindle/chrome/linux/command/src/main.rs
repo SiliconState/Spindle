@@ -26,7 +26,8 @@ const USAGE: &str = "spindle: Spindle's calls from bash (and any program), journ
   spindle describe NAME         one tool and its input
   spindle limits                this command's call limits
   spindle http [-X METHOD] [-H 'NAME: VALUE']... [-d BODY | --json JSON] URL
-                                a request to a site the user granted (Settings, Commands);
+                                a request to a site the user granted (Settings,
+                                Sites scripts may call);
                                 prints the body, and fails on HTTP 400 and up
   spindle call METHOD [JSON]    any call, as its reply in JSON (JSON - reads standard input)";
 

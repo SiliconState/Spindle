@@ -86,6 +86,7 @@ parent crash tests invoke, not disabled coverage.
 | `SPINDLE_BIN=target/release/spindle node clients/js/smoke_test.mjs` | The Node client against a real `spindle api` |
 | `SPINDLE_BIN=target/release/spindle python3 clients/python/smoke_test.py` | The Python client |
 | `embed/tests/package.sh WASM_BINDGEN` | Builds the wasm package and runs Node and optional OPFS browser tests. Includes `node_compact.mjs`: shrink session/task stores, preserve history/files/head, remove interrupted copies and refuse busy sessions (needs `node:sqlite`, Node 22.5+) |
+| `SPINDLE_KEY=... SPINDLE_REAL_BROWSER=/path/to/chrome SPINDLE_BIN=target/release/spindle node embed/tests/browser_real.mjs KIT_DIR --provider ID [--model M] [--catalog FILE]` | The package in a real browser against a real provider (`KIT_DIR` from `embed/kit.sh`): stop and resume, steering, a killed browser's unknown request, `retry`, and a bundle out to a native host and back. Real, billed requests |
 | `store/tests/wasi_probe.sh WASI_LIBC_ROOT` | The store compiled for WASI (against an extracted wasi-libc package), run under Node |
 
 The embedded [`browser_opfs.mjs`](../spindle/embed/tests/browser_opfs.mjs) checks

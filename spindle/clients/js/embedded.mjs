@@ -136,7 +136,8 @@ const refusal = (body) => (typeof body?.error === 'string' ? body.error : null);
 
 /** A command runner whose commands a Spindle host runs (`spindle serve`, `/v1/run`):
  * each over a copy of the call's workspace, in that host's sandbox, its changed
- * files returned so a rewind still covers them. `token` is a host API token. */
+ * files returned so a rewind still covers them. `token` is any token that reaches the
+ * runner routes: a runner token, or the browser token one-click connect gives. */
 export function remoteRunner({ url, token, fetch = globalThis.fetch }) {
   const base = url.replace(/\/+$/, '');
   const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
@@ -214,7 +215,7 @@ function claimOf(key, path, provider) {
  *                touched (a call is refused with kind 'locked' while another worker
  *                or tab holds it) and given back once its stores close.
  *   storageOptions  node: { journal: 'wal'|'delete', note } (`note` names this owner
- *                in lock files; default `pid@host` when given by the caller).
+ *                in lock files; default `spindle-embed`).
  *   catalog      providers in Dext's catalog format (default: Dext's built-ins).
  *   credentials  async ({ provider, model, endpoint, contract, headers, auth }) =>
  *                the key (a string or `{ key }`: the client fills the provider's
@@ -670,7 +671,9 @@ export class EmbeddedClient extends Emitter {
   async #codeTool(child, signal, session) {
     // Ended already: the tool never starts (the child stays as it was reserved).
     if (signal?.aborted) return { unknown: true, content: 'the command ended before the tool started' };
-    const answer = this.tools.answer({ type: 'app_tool', call: child.call, name: child.name, input: child.input, again: false, rerun: 'safe', session });
+    // The handler gets the command's signal too: once the command ends, its answer is no
+    // longer awaited (said unknown below), so what it would still do must not happen.
+    const answer = this.tools.answer({ type: 'app_tool', call: child.call, name: child.name, input: child.input, again: false, rerun: 'safe', session, signal });
     if (!signal) return answer;
     let stop;
     const stopped = new Promise((resolve) => {

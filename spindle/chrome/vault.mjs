@@ -190,6 +190,22 @@ export function keep(provider, secret) {
   return exclusive(async () => writeTogether([['keys', provider, await seal(await usable(), provider, secret)]]));
 }
 
+/** Adds `extra` to `provider`'s secret, only if it is still `held` (the same kind and
+ * key or refresh token): a record removed or replaced meanwhile (signed out, saved again)
+ * stays as it is now. */
+export function rebind(provider, held, extra) {
+  return exclusive(async () => {
+    const record = await read('keys', provider);
+    if (record === undefined) return false;
+    const key = await usable();
+    const now = await open(key, provider, record).catch(() => null);
+    const same = now?.kind === held?.kind && (now?.kind === 'signin' ? now.refresh === held.refresh : now?.key === held?.key);
+    if (!same) return false;
+    await writeTogether([['keys', provider, await seal(key, provider, { ...now, ...extra })]]);
+    return true;
+  });
+}
+
 export function forget(provider) {
   return exclusive(() => writeTogether([['keys', provider, undefined]]));
 }

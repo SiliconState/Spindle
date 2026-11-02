@@ -1,4 +1,4 @@
-# The browser host: `spindle serve`
+# The web UI host: `spindle serve`
 
 `spindle serve` runs many Spindle sessions ("threads") from one private host directory
 and serves a phone-friendly browser UI and an HTTP API for them. It listens on
@@ -132,7 +132,9 @@ Every request passes these checks in order (`route` in [`mod.rs`](../spindle/sto
    port). Anything else gets `403 unrecognized host`. The expected origin is
    `--origin` for public requests and `http://` plus the `Host` header for local ones.
 2. **Cross-site fetches.** A request with `Sec-Fetch-Site: cross-site` is refused,
-   except on preview paths, whose sandboxed documents browsers report as cross-site.
+   except on preview paths, whose sandboxed documents browsers report as cross-site, and
+   on top-level navigations (a tab, never a frame) to `/connect` and `/connect/done`,
+   which an app opens.
 3. **Cloudflare Access.** For a public request, when `--access-team` is set, the Access
    token is verified ([below](#cloudflare-access-verification)). Local requests are not
    checked against Access.
@@ -147,10 +149,13 @@ Every request passes these checks in order (`route` in [`mod.rs`](../spindle/sto
    `403 forbidden`, including `/api` with that token as a cookie. `token list`
    marks it `(runner)`. A browser token (`token new NAME --browser`, or one-click
    connect below) reaches the runner's routes, the host's models and providers, and
-   the threads it brought; `token list` marks it `(browser)`. See [API.md](API.md).
+   the threads it brought; `token list` marks it `(browser)`. `POST /v1/connect/token`
+   needs no credential: its one-time code stands in for one. See [API.md](API.md).
 6. **Same-origin commands.** Every other `POST` must carry `Origin` equal to the expected
    origin and the custom header `X-Spindle: 1`.
-7. **Embedded UI files** are served without pairing.
+7. **Embedded UI files** and the one-click connect pages (`GET /connect`,
+   `/connect/done`) are served without pairing; the connect page asks a screen that is
+   not paired to pair first.
 8. **Pairing.** Apart from previews, `POST /api/pair` is the only `/api` route that
    needs no device.
 9. **Device.** Every other route needs a valid device cookie, or gets
@@ -253,7 +258,7 @@ the UI shows a banner offering to sign in again.
 The registry in `host.sqlite` names each thread; its session directory is
 `HOST/sessions/ID`, an ordinary Spindle session ([store.md](store.md)). Threads the host
 creates always use isolation `required`: their commands never run outside the sandbox.
-Thread ids are 1–80 letters, digits, `-` or `_`.
+Thread ids are 1 to 80 letters, digits, `-` or `_`.
 
 Work enters as commands (`POST /api/commands`, or `/v1/commands` per [API.md](API.md)).
 Each carries a client-chosen `request_id`. The host stores the command, its payload
@@ -268,7 +273,7 @@ checks its receipt before accepting more work.
 | --- | --- |
 | Threads per host | 64 |
 | Threads running at once | 4; a fifth run is refused with `four sessions are already running` |
-| Prompt and steering message size | 1–16384 bytes |
+| Prompt and steering message size | 1 to 16384 bytes |
 | Messages waiting for a running turn | 32 |
 | Attachment upload | 8 MiB each, 32 per message, at most 64 MiB of a thread's uploads from the last day waiting to be attached (`HOST/sessions/ID/uploads`, removed after a day) |
 | Receipts | kept a week (a deleted thread's for an hour), at most 8192 |
@@ -301,7 +306,7 @@ running it waits up to 30 minutes for room. Every other thread waits for a perso
 as a session bundle (`POST /v1/threads`) and drives it with the same commands as any
 thread; an export (`POST /v1/sessions/ID/export`) hands it back. The host imports it
 as one of its own threads and always fits its settings: every command in the sandbox,
-the full tool set, no runner, no host source directories, no self-edit; it runs on the
+file tools become the full tool set, no runner, no host source directories, no self-edit; it runs on the
 host's own credentials, on another model only when the request names one. The upload
 goes to `HOST/incoming/` and is checked whole before anything is written; the thread is
 registered, with its owner and the request's idempotency key, in one `host.sqlite`
@@ -327,9 +332,10 @@ reports it and `POST /v1/run/ID/stop` stops it, scoped to the starting token;
 [API.md](API.md#routes) gives the retention, bounds and early-stop behavior.
 Native stdio `capabilities` reports what this host can run; embedded `fit` describes
 settings changes for a moved session, without applying them. Neither is a new
-HTTP route. Session JSON includes stable `activity` codes (`model`, `tools`,
-`waiting_app`, `stopping`, `running`, `blocked`, `resumable`, `idle`) rather than
-requiring clients to parse a status sentence; see [API.md](API.md#status-object).
+HTTP route. Stdio and embedded status objects carry a stable `activity` code (`model`,
+`tools`, `waiting_app`, `stopping`, `running`, `blocked`, `resumable`, `idle`) rather
+than requiring clients to parse a status sentence; the HTTP session object does not
+(read `busy`, `stopping` and `phase`). See [API.md](API.md#status-object).
 
 ## The browser UI
 
@@ -347,6 +353,7 @@ served wrapped in a CSS `base` layer so a [skin](#host-skin) layer can sit over 
 | [`text.js`](../spindle/store/ui/text.js) | Search, line diff, Markdown export and labels. |
 | [`theme.js`](../spindle/store/ui/theme.js) | Paper, Light, Dim or System theme (System is Light or Dim as the device is) and textured or plain background, remembered per screen. Dim is the dark theme, a soft charcoal; a screen that chose the old Dark gets Dim. |
 | [`sw.js`](../spindle/store/ui/sw.js) | Service worker that only shows run notifications; no fetch handler, nothing cached, no push server. |
+| [`connect.html`](../spindle/store/ui/connect.html), [`connect-done.html`](../spindle/store/ui/connect-done.html), [`connect.js`](../spindle/store/ui/connect.js) | The one-click connect page (pairing first when needed, then Allow or Deny) and the page its tab lands on. |
 | [`manifest.webmanifest`](../spindle/store/ui/manifest.webmanifest), [`icon.svg`](../spindle/store/ui/icon.svg) | Home-screen installation. |
 
 Screens and features:
@@ -484,7 +491,7 @@ toast keep the built-in look. `/?safe` serves the page without any skin.
 
 ## Shelf and operator attention
 
-**Shelf.** `HOST/shelf` holds up to 64 operator notes of at most 256 KiB, named with 1–64
+**Shelf.** `HOST/shelf` holds up to 64 operator notes of at most 256 KiB, named with 1 to 64
 letters, digits, spaces, dots, dashes or underscores (not starting with a dot). Notes are
 written in Settings > Shelf, or copied from a thread's head workspace with the viewer's
 Shelf button. When the shelf is not empty, it is mounted read-only at `/shelf` in the
@@ -620,9 +627,9 @@ failures go to standard error.
 | `pairing.key` | The pairing key, 64 hex characters, mode 0600. |
 | `serve.lock` | Locked by the running `serve`; one host per directory. |
 | `host.sqlite` (with `-wal`, `-shm`) | Mode 0600. Tables `sessions` (thread id, name, legacy self-edit flag), `commands` (request id, thread, payload digest, state, error), `submissions` (payloads), `command_times`, `devices` (device and API-token hashes, labels, times), `owners` (which browser token brought a thread) and `threads` (each brought thread's idempotency key, bundle digest, state and fit). |
-| `sessions/ID/` | One session directory per thread: `store/` and settings ([store.md](store.md)), plus `uploads/`, `install-request.json`, `host-sync/` and, for a thread that moved back to its browser, `moved.spindle` when used. |
+| `sessions/ID/` | One session directory per thread: `store/` and settings ([store.md](store.md)), plus `uploads/`, `install-request.json`, `host-sync/` and `moved.spindle`, the kept bundle of a thread that moved back to its client. |
 | `trash/ID/` | A deleted thread's directory until it is removed. |
-| `incoming/` | Thread bundles being uploaded and imports being staged; emptied when the host opens. |
+| `incoming/` | Thread bundles being uploaded, imports being staged and copies being exported; emptied when the host opens. |
 | `skin/` | `active.css`, `staged.css` and `versions/`. |
 | `shelf/` | Operator notes. |
 | `access-keys.json` | Cached Cloudflare Access signing keys. |
@@ -634,7 +641,7 @@ failures go to standard error.
 ## Browser routes
 
 The UI's own routes; all `POST`s need the same-origin header, and all but the UI files,
-`/api/pair` and previews need a paired device. The `/v1` API is documented in
+`/connect`, `/connect/done`, `/api/pair` and previews need a paired device. The `/v1` API is documented in
 [API.md](API.md).
 
 | Method | Path | Purpose |
@@ -677,6 +684,8 @@ The UI's own routes; all `POST`s need the same-origin header, and all but the UI
 | [`serve/auth.rs`](../spindle/store/src/serve/auth.rs) | Pairing, device tokens, cookies, revocation. |
 | [`serve/access.rs`](../spindle/store/src/serve/access.rs) | Cloudflare Access JWT verification and key cache. |
 | [`serve/v1.rs`](../spindle/store/src/serve/v1.rs) | The `/v1` HTTP API and `spindle token`. |
+| [`serve/connect.rs`](../spindle/store/src/serve/connect.rs) | One-click connect: the connect pages, codes and browser tokens. |
+| [`serve/threads.rs`](../spindle/store/src/serve/threads.rs) | Threads a client brings to the host (`POST /v1/threads`) and takes back (export). |
 | [`serve/preview.rs`](../spindle/store/src/serve/preview.rs) | Preview grants, policy and page bundling. |
 | [`serve/selfedit.rs`](../spindle/store/src/serve/selfedit.rs) | Checkout, install requests and the self-edit part of snapshots. |
 | [`serve/sync.rs`](../spindle/store/src/serve/sync.rs) | Sync records and three-way merges with the host source. |

@@ -393,8 +393,12 @@ try {
     const requestCount = requests;
     await page.type('#prompt', `make report ${n}`);
     await page.click('#send');
-    for (let until = Date.now() + 10_000; requests === requestCount && Date.now() < until;) await new Promise((done) => setTimeout(done, 20));
-    assert.ok(requests > requestCount, `report ${n} reached the provider`);
+    // (A loaded machine can take a while: the send reads the thread's status first.)
+    for (let until = Date.now() + 30_000; requests === requestCount && Date.now() < until;) await new Promise((done) => setTimeout(done, 20));
+    if (requests === requestCount) {
+      const said = await page.eval(`({ toast: document.querySelector('#toast')?.textContent ?? '', state: spindlePanel.threads.get('${id}')?.state, note: spindlePanel.threads.get('${id}')?.note, box: document.querySelector('#prompt').value, queued: document.querySelector('#queued')?.hidden === false ? document.querySelector('#queued-text')?.textContent : null })`).catch((error) => ({ error: error.message }));
+      assert.fail(`report ${n} did not reach the provider: ${JSON.stringify(said)}`);
+    }
     await page.until(`spindlePanel.threads.get('${id}')?.state === 'idle'`, { timeout: 240_000 });
     await page.activate();
     await page.until(`document.querySelector('#history .workspace-card .ws-tree')`, { what: 'report workspace', timeout: 5000 }).catch(async (error) => {

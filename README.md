@@ -74,6 +74,7 @@ flowchart TB
     Embedded --> Core
     Ext -.-|".spindle file, either way"| Native
     Ext -.->|"optional remote runner"| Native
+    Ext -.->|"Run on my host: a thread moves there and back"| Native
 ```
 
 **What every use of the core shares**
@@ -112,7 +113,8 @@ flowchart TB
   through anything of Spindle's.
 - Spindle for Browser does not need the native binary, and the native binary does not need
   the browser. Their sessions never share storage: they meet only through a `.spindle` file
-  you move, or when you connect a `spindle serve` host to the extension as a place to run commands.
+  you move, or through a `spindle serve` host you connect to the extension, which can run
+  its commands or take a whole thread and hand it back.
 - Copies do not sync. Moving a session seals the copy it left; copying it (`--keep`) leaves
   two, of which you continue one.
 
@@ -142,7 +144,7 @@ Interrupted? `spindle --dir ../demo continue`. The web UI:
 [docs/host.md](docs/host.md#remote-access-through-a-reverse-proxy)). Full walkthrough:
 [docs/getting-started.md](docs/getting-started.md).
 
-**Spindle for Browser 0.1.5.** Download `spindle-browser-0.1.5.zip` from the
+**Spindle for Browser 0.1.6.** Download `spindle-browser-0.1.6.zip` from the
 [latest release](https://github.com/SiliconState/Spindle/releases/latest), unzip it, and load
 the folder with **Load unpacked** in `chrome://extensions`, `edge://extensions` or `brave://extensions`
 ([docs/chrome.md](docs/chrome.md#install-a-release)). Its single-box composer,

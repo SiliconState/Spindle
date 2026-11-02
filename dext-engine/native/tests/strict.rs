@@ -1076,6 +1076,54 @@ fn background_job_exit_codes_and_lifetimes_are_reported() {
     assert!(matches!(state, JobState::Ended(reason) if reason.contains("lifetime")));
 }
 
+/// Opening an input for writing tells only that it may have changed: one opened and
+/// closed with nothing written (as a descriptor another thread's child inherited while
+/// the input was written, closed only once that child starts its program) keeps its
+/// bytes, so it is sealed unchanged, not sent back as a write. One rewritten beside it
+/// is still a write (a write through a shared mapping, which changes no stamp, is
+/// checked below).
+#[test]
+fn an_input_opened_for_writing_but_left_as_it_was_is_unchanged() {
+    let mut files = BTreeMap::new();
+    for (path, bytes) in [("keep.txt", b"kept".as_slice()), ("a.txt", b"alpha")] {
+        files.insert(
+            path.to_string(),
+            FileValue {
+                bytes: bytes.to_vec(),
+                executable: false,
+            },
+        );
+    }
+    let output = executor()
+        .execute(
+            &files,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                ": >> keep.txt; printf ALPHA > a.txt".into(),
+            ],
+            Duration::from_secs(30),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(
+        output.success(),
+        "{}",
+        String::from_utf8_lossy(output.stderr())
+    );
+    assert!(
+        matches!(output.entries()["keep.txt"], SealedEntry::Unchanged { .. }),
+        "{:?}",
+        output.entries()["keep.txt"]
+    );
+    assert_eq!(output.files()["keep.txt"].bytes, b"kept");
+    assert!(matches!(
+        output.entries()["a.txt"],
+        SealedEntry::File { .. }
+    ));
+    assert_eq!(output.files()["a.txt"].bytes, b"ALPHA");
+}
+
 /// A write through a shared mapping can leave every stamp field of a file as it was
 /// (tmpfs), so stamps alone would seal it unchanged and lose it; the run's opening of the
 /// file for writing tells. Thousands of other writes in the same directory (more than

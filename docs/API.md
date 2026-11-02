@@ -1010,7 +1010,7 @@ session's own report merged with its [head state](#head-state).
 | `rejected` | integer or null | Requests the provider refused before generating anything; null while a turn runs. |
 | `isolation`, `effort` | string | From the settings. |
 | `phase`, `stop`, `stop_text`, `complete`, `accepts_prompt`, `accepts_message`, `recorded`, `rejection`, `wake` | | See [head state](#head-state). While a turn runs, `wake` is `{work: "running", why: null}`. |
-| `activity` | string | `stopping`, `waiting_app`, `model`, `tools` or `running` during a turn; `blocked`, `resumable` or `idle` between turns. `wake.why` explains a block. Both hosts report these codes. |
+| `activity` | string | `stopping`, `waiting_app`, `model`, `tools` or `running` during a turn; `blocked`, `resumable` or `idle` between turns. `wake.why` explains a block. Stdio and the embedded package report these codes; the HTTP [session object](#session-object) has no `activity` (read `busy`, `stopping` and `phase` there). |
 | `background` | integer | Embedded only: how many background tasks run. Its activity is `waiting_tasks` while a finished turn waits for their reports, or `background` between turns while tasks still run. |
 | `busy` | boolean | A turn-like operation runs in this process. |
 | `running` | string or null | Its name. |
@@ -1375,7 +1375,7 @@ route.
 | `GET` | `/v1/run/ID` | T | `{run, state}` for the starting token only; feature `run_stop`. | none |
 | `POST` | `/v1/run/ID/stop` | T | Stops that token's named run; `{run, state}`. | none |
 
-Feature `run_stop` lets a client name a run with `run`: 1–128 letters, digits,
+Feature `run_stop` lets a client name a run with `run`: 1 to 128 letters, digits,
 `-`, `_` or `.`. Reusing a retained name under the same token is `409 conflict`.
 `GET /v1/run/ID` returns `{run, state}`: `running`, `stopping`, `stopped` or
 `finished`; `POST /v1/run/ID/stop` requests its stop and returns the same form.
@@ -1434,7 +1434,6 @@ state](#head-state) plus:
 | `busy` | A command's worker runs (then `wake` is `{work: "running"}`). |
 | `running_request` | The `request_id` of the command whose worker runs now, or null. A `stop` can name it as `target_request` (feature `targeted_stop`). |
 | `stopping` | A stop was requested for the running command. |
-| `activity` | The stable activity code described in [Status object](#status-object). |
 | `since` | When the running command was admitted (ms since the Unix epoch), or null. |
 | `settings` | The [settings form](#settings-form). |
 | `usage` | The totals tally. |
@@ -1458,7 +1457,8 @@ of the body with keys sorted, so key order does not matter.
   session did since. This makes a retry after a lost response safe.
 - The same `request_id` with a different body is refused: `409 request_id_reused`.
 - A refusal below `500` means nothing was admitted. A `500` from this route means
-  the outcome is unknown (usually code `outcome_unknown`): send the same
+  the outcome is unknown (usually code `outcome_unknown`, which is also the answer when
+  the command was admitted but its receipt could not be read back): send the same
   `request_id` again to learn it.
 
 A receipt is `{request_id, session, kind, state, error, admitted_at}`. `state` is
@@ -1540,7 +1540,7 @@ a session bundle (the format of `export_session` and `import_session`; see
 its sandbox and with its own provider credentials; the client drives it through the
 routes above, and one export hands it back. The thread keeps its identity both ways.
 Spindle for Browser does this with a browser token (see
-[chrome.md](chrome.md#moving-threads-to-and-from-a-native-host)). Source:
+[chrome.md](chrome.md#running-a-thread-on-your-spindle-host)). Source:
 [`serve/threads.rs`](../spindle/store/src/serve/threads.rs).
 
 #### Bring a thread in
@@ -1572,8 +1572,8 @@ Spindle for Browser does this with a browser token (see
   `isolation` becomes `required` (every command runs in the host's sandbox),
   `builtin_tools` `files` becomes `all`, `runner` becomes `none`, `sources` becomes
   `[]` (the host mounts its directories only for threads it made) and `self_edit`
-  becomes false. `provider` and `model` change only as the query asks, and an `effort`
-  the model does not take becomes `default`.
+  becomes false. On the thread only, `provider` and `model` change as the query asks,
+  and an `effort` the model does not take becomes `default`.
 - The same key again with the same bytes (compared by SHA-256): `200 {session, fit,
   replayed: true}`, the same session as it is now and the same `fit`; nothing is
   imported again. The same key with other bytes: `409 conflict`. A key whose import is
@@ -1615,14 +1615,16 @@ session, if the commit happened, or a fresh import, if it did not.
   any session bundle; the head and identity are the thread's.
 - `409 busy` while a command or another export runs in the thread, or one of its
   background tasks runs. `409 moved` for `keep: true` on a thread that already moved.
-  `409 conflict` during an upgrade or restart.
+  `409 conflict` during an upgrade or restart. A thread that already moved answers an
+  export without `keep` with its sealed bundle even then, so `409 busy` and
+  `409 conflict` come only before the thread is sealed.
 - A move writes the bundle into the thread's directory, syncs it, reads it back and
   checks it, and only then seals the thread. From then on the thread is moved:
   `GET /v1/sessions` lists it with state `moved`, its session object has `moved: true`,
   and commands that would work on it are `409 moved` (see
   [Commands and receipts](#commands-and-receipts)). Every later export without `keep`,
-  after a host restart too, sends the very same bytes until the thread is deleted, so a
-  client whose answer was lost asks again. A host that stopped after writing the file
+  after a host restart too and while the thread is busy, sends the very same bytes until
+  the thread is deleted, so a client whose answer was lost asks again. A host that stopped after writing the file
   but before sealing leaves the thread live, and the next export writes a new bundle.
 - Once the client holds the thread durably, it deletes the host's copy with the
   `delete` command. That also removes the kept bundle, the owner and the key's record,
@@ -1715,9 +1717,10 @@ with `head_moved`).
 | 409 | `conflict` | Any other refusal (an app tool call not waiting, limits reached, an `Idempotency-Key` used for another bundle, ...). |
 | 413 | `too_large` | `POST /v1/threads`: the bundle is over `limits.thread_bytes`. |
 | 429 | `rate_limited` | 32 messages or state changes already waiting; 48 connections already open; 10 failed connect trades within the last minute. |
-| 500 | `outcome_unknown` | From `POST /v1/commands`: the command may or may not have been admitted; resend the same `request_id`. |
+| 500 | `outcome_unknown` | From `POST /v1/commands`: the command may or may not have been admitted, or it was admitted but its receipt could not be read back; resend the same `request_id`. |
 | 500 | `internal` | Any other server failure. |
 | 503 | `unavailable` | The remote runner has no sandbox on this host. |
+| 503 | `busy` | `POST /v1/run`: 256 named runs are already active. |
 
 ## Rust surface
 

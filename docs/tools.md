@@ -215,7 +215,8 @@ Each run goes through the [`StrictExecutor`](../dext-engine/native/src/strict.rs
    twice the tree limit, but never into the scratch headroom.
 6. It seals the result. A file whose inode, size, times and mode are unchanged can
    be reported unchanged. On Linux, inotify also tracks input files opened for
-   writing, catching shared-mapping writes that leave tmpfs stamps unchanged; a
+   writing, catching shared-mapping writes that leave tmpfs stamps unchanged; such a
+   file is compared with its input and reported changed only if its bytes differ. A
    failed watch or overflow makes every input file suspect. New and changed regular files, symbolic links
    (never followed) and empty directories make up the new tree. Sockets, pipes and
    devices are not kept, and the output says so. Hard links are sealed as plain files.

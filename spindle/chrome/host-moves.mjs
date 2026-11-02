@@ -39,12 +39,18 @@ export const STEP_TEXT = {
 };
 
 /** Refusals of an upload that the same request can never turn into a success: nothing
- * was imported, so the move rolls back. Anything else (no answer, 5xx, `busy`: the same
- * key still importing, 401: connect again) waits and sends it again. */
-function refusedForGood(error) {
+ * was imported, so the move rolls back. The host looks its key up before it reads or
+ * checks the bundle, so a bundle it cannot read or a model it cannot send to proves that
+ * no attempt imported it, whichever attempt hears it. The others (too large, a bad key or
+ * query, a conflict) come before that lookup: only the first attempt, which no earlier
+ * send can have imported, may take them as final. Anything else (no answer, 5xx, `busy`:
+ * the same key still importing, 401: connect again) waits and sends it again. */
+function refusedForGood(error, firstAttempt) {
+  if (error?.kind === 'bad_bundle' || error?.kind === 'no_credentials') return true;
+  if (!firstAttempt) return false;
   if (error?.status === 413) return true;
   if (error?.status === 400) return true;
-  if (error?.status === 409) return ['no_credentials', 'conflict'].includes(error.kind);
+  if (error?.status === 409) return error.kind === 'conflict';
   return false;
 }
 
@@ -165,15 +171,23 @@ export function hostMoves(deps) {
     if (move.step === 'upload') {
       const held = await read('bundles', MOVE(id));
       if (!held?.bytes) return wait(id, move, new Error('its recorded bundle is missing; the move stays held until it can be recovered'));
+      // No host to send to yet (not connected): nothing is attempted, so a refusal of the
+      // first real send can still roll the move back.
+      let host;
+      try {
+        host = remote(move.url);
+      } catch (error) {
+        return wait(id, move, error);
+      }
       const firstAttempt = !move.attempted;
       move = { ...move, attempted: true };
       await commit(id, pending('to', 'upload'), move);
       let reply;
       try {
-        reply = await remote(move.url).importThread(held.bytes, { key: move.key, name: move.name, provider: move.provider ?? undefined, model: move.model ?? undefined });
+        reply = await host.importThread(held.bytes, { key: move.key, name: move.name, provider: move.provider ?? undefined, model: move.model ?? undefined });
       } catch (error) {
         // A previous send may have committed even if this send is refused before lookup.
-        if (firstAttempt && refusedForGood(error)) return rollTo(id, move, `your host refused it: ${said(error)}`);
+        if (refusedForGood(error, firstAttempt)) return rollTo(id, move, `your host refused it: ${said(error)}`);
         return wait(id, move, error);
       }
       await cut('to:uploaded');
@@ -220,20 +234,34 @@ export function hostMoves(deps) {
   /** One step of a move back here; null to go on. */
   async function stepBack(id, move) {
     if (move.step === 'export') {
+      let host;
+      try {
+        host = remote(move.url);
+      } catch (error) {
+        return wait(id, move, error);
+      }
+      // Marked before it goes: after an export that may have reached the host, its own
+      // export (still writing and sealing there) can be what keeps the thread busy.
+      const firstAttempt = !move.attempted;
+      if (firstAttempt) {
+        move = { ...move, attempted: true };
+        await commit(id, pending('back', 'export'), move);
+      }
       let exported;
       try {
-        exported = await remote(move.url).exportThread(move.session);
+        exported = await host.exportThread(move.session);
         local.facts(exported.bytes);
       } catch (error) {
-        // Nothing moved: the host refused before sealing anything (a turn or task runs
-        // there), so the thread stays on the host.
-        if (error?.kind === 'busy' && error.status === 409) {
+        // Busy at the first attempt: nothing moved (a turn or task runs there), so the
+        // thread stays on the host. Busy later may be this move's own export: it waits,
+        // and the host sends the sealed bundle once it is done.
+        if (firstAttempt && error?.kind === 'busy' && error.status === 409) {
           await commit(id, { moving: null, note: `It stays on your host: ${said(error)}.` }, undefined);
           return { done: false, way: 'back', why: said(error) };
         }
         return wait(id, move, error);
       }
-      await commit(id, pending('back', 'import'), { ...move, step: 'import', head: exported.head, identity: exported.identity, error: null }, { bytes: exported.bytes, size: exported.bytes.byteLength });
+      await commit(id, pending('back', 'import'), { ...move, step: 'import', head: exported.head, identity: exported.identity, size: exported.bytes.byteLength, error: null }, { bytes: exported.bytes, size: exported.bytes.byteLength });
       await cut('back:held');
       return null;
     }
@@ -282,8 +310,8 @@ export function hostMoves(deps) {
       if (!String(key).startsWith('host-move:')) continue;
       const move = await read('kv', key);
       if (!move) continue;
-      const held = await read('bundles', key);
-      moves.push({ id: move.id, way: move.way, step: move.step, url: move.url, size: held?.size ?? held?.bytes?.byteLength ?? 0, error: move.error ?? null });
+      // Its recorded size, never the held bytes (up to 2 GiB) read just to measure them.
+      moves.push({ id: move.id, way: move.way, step: move.step, url: move.url, size: move.size ?? 0, error: move.error ?? null });
     }
     return moves;
   }
@@ -302,6 +330,9 @@ export function hostMoves(deps) {
     for (const key of await keysOf('kv')) {
       if (!String(key).startsWith('host-move:')) continue;
       const id = String(key).slice('host-move:'.length);
+      // One under way already goes on by itself (another step queued behind it would
+      // only send the same bytes again at once).
+      if (going.has(id)) continue;
       runs.push(proceed(id).catch((error) => {
         if (!(error instanceof Waiting)) console.warn(`Spindle: the move of thread ${id} stopped:`, error);
       }));

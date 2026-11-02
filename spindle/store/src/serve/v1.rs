@@ -1186,8 +1186,13 @@ fn command(
         }
         match host.submit(&session, data.clone()) {
             Ok(_) => {
-                let receipt = receipt(host, request_id)?
-                    .ok_or_else(|| internal("the admitted receipt is missing"))?;
+                // Admitted: a receipt that cannot be read now leaves its outcome unknown
+                // to the client (never a refusal it would take as final): sending the same
+                // request again reads it.
+                let unknown = |error: String| Failure::new(500, "outcome_unknown", error);
+                let receipt = receipt(host, request_id)
+                    .map_err(|failure| unknown(failure.message))?
+                    .ok_or_else(|| unknown("the admitted receipt is missing".into()))?;
                 return Ok((202, receipt));
             }
             Err(Refused(409, message)) if message == MOVED && expected.is_none() && attempt < 2 => {

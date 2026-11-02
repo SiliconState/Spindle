@@ -605,6 +605,11 @@ pub(super) fn export(
     let live = host
         .live(id)
         .map_err(|_| Failure::new(404, "not_found", "session not found"))?;
+    // Moved already: every export sends the same sealed bytes, busy or not (a client
+    // whose earlier export's answer was lost asks again while nothing else may run here).
+    if !keep && moved(&host.dir(id)) {
+        return sealed(&host.dir(id), &host.dir(id).join(MOVED_FILE));
+    }
     {
         let mut state = live.lock();
         if state.busy {

@@ -272,7 +272,7 @@ export class RemoteClient {
     return this.request('POST', `/v1/threads${query({ name, provider, model })}`, {
       body: blob, signal,
       headers: { 'content-type': 'application/octet-stream', 'idempotency-key': key },
-      // 2 minutes and a second per MiB, as the host allows the upload.
+      // The host's 2 minutes and a second per MiB for the upload, and half a minute more.
       timeout: 150_000 + Math.ceil(blob.size / 1048576) * 1000,
     });
   }
@@ -284,12 +284,31 @@ export class RemoteClient {
    * refused here (`kind` 'cut'): ask again.
    */
   async exportThread(id, { keep = false, signal } = {}) {
-    const response = await this.request('POST', `/v1/sessions/${id}/export`, { body: keep ? { keep: true } : {}, raw: true, signal, timeout: 600_000 });
+    // Up to 10 minutes for the answer (the host writes, checks and seals the bundle
+    // first), then two and a half minutes and a second per MiB it says the bundle has,
+    // as an upload is given: a large thread on a slow line still comes back.
+    const cut = new AbortController();
+    const after = (ms) => setTimeout(() => cut.abort(new DOMException('the export timed out', 'TimeoutError')), ms);
+    let timer = after(600_000);
     let bytes;
+    let response;
     try {
-      bytes = new Uint8Array(await response.arrayBuffer());
-    } catch (error) {
-      throw unreachable(error, this.base);
+      try {
+        response = await this.request('POST', `/v1/sessions/${id}/export`, { body: keep ? { keep: true } : {}, raw: true, signal: anySignal([signal, cut.signal]), timeout: 0 });
+      } catch (error) {
+        if (cut.signal.aborted && !signal?.aborted) throw unreachable(error, this.base);
+        throw error;
+      }
+      clearTimeout(timer);
+      const size = Number(response.headers.get('content-length'));
+      timer = after(150_000 + Math.ceil((Number.isFinite(size) && size > 0 ? size : 0) / 1048576) * 1000);
+      try {
+        bytes = new Uint8Array(await response.arrayBuffer());
+      } catch (error) {
+        throw unreachable(error, this.base);
+      }
+    } finally {
+      clearTimeout(timer);
     }
     const said = response.headers.get('content-length');
     const length = said == null ? null : Number(said);

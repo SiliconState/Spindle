@@ -10,6 +10,9 @@ stdout, naming sessions by directory. `HttpClient` calls the `/v1` routes of
 `spindle serve` with a bearer token, naming sessions by id. Both clients answer the
 app's own tools, and their `StdioClient` can optionally restart a
 `spindle api` process that ends unexpectedly and continue the sessions it was running.
+`RemoteClient` ([`remote.mjs`](../spindle/clients/js/remote.mjs)) is a fetch-only
+JavaScript client of the HTTP routes for pages, workers and extensions (see
+[RemoteClient](#remoteclient)).
 This page covers the client code itself. For what each method does, see
 [API.md](API.md). For Spindle running inside a JavaScript app with no subprocess, see
 [embedded.md](embedded.md).
@@ -155,9 +158,10 @@ Python takes keyword arguments with snake_case names.
 Methods without a wrapper (for example `steer` with `now`, or native
 `capabilities`) go through `call`: JavaScript `call('capabilities')`, Python
 `call("capabilities")`. Native `capabilities` reports this host's tools, sandbox,
-runners, budgets and task modes; it has no HTTP counterpart. Status and HTTP session
+runners, budgets and task modes; it has no HTTP counterpart. Stdio and embedded status
 objects expose the stable `activity` code unchanged; clients do not infer activity
-from the human-readable `state` sentence. See [API.md](API.md#status-object).
+from the human-readable `state` sentence. HTTP session objects have no `activity`:
+read `busy`, `stopping` and `phase` there. See [API.md](API.md#status-object).
 
 The embedded JS client has dedicated `capabilities()` and `fit(dir, {runner})`
 wrappers, `usage(dir)`, queued tasks with `tasks`, `taskWait` and `taskStop`,
@@ -318,13 +322,15 @@ ending, `data` lines joined, comments and heartbeats dropped, the `id` kept). `e
 a stream that says nothing for 35 seconds as cut. `follow` passes each frame to `onFrame` in
 order, stops when `onFrame` returns `false` or the session is deleted, reopens a stream that
 ends or breaks with `Last-Event-ID` after a pause that grows to 15 seconds, and reports
-`onState('open' | 'waiting', error)`. A 401, 403 or 404 rejects. It resolves with the last
-frame's id and why it ended (`deleted`, `done` or `aborted`).
+`onState('open' | 'waiting', error)`. A 401, 403 or 404 rejects. It resolves with
+`{ last, ended }`: the last frame's id and why it ended (`deleted`, `done` or `aborted`).
 
 **Errors.** A refusal rejects with a `SpindleError` whose `kind` is the host's stable code (or
 `http_STATUS` when the body has none) and whose `status` is the HTTP status. A host that could
 not be reached, or did not answer in time, gives kind `unreachable` and status 0. A bundle
-from `exportThread` that came cut short is refused with kind `cut`: ask again.
+from `exportThread` that came cut short is refused with kind `cut`: ask again. `settled`
+rejects with kind `timeout` and status 0 once its `timeout` passes, and an error from
+`command` carries the `requestId` it was sent under.
 
 ## App tools
 

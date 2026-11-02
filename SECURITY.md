@@ -45,7 +45,7 @@ them.
 ## Data at rest
 
 - Session stores keep prompts, model requests and replies, files, app state, tool results
-  and usage **unencrypted** in the session directory. The browser host also keeps
+  and usage **unencrypted** in the session directory. The web UI host also keeps
   `host.sqlite`, uploads and a trash directory; native migrations keep a backup of the
   previous store. Schema 19-to-20 embedded migration is in place without a backup;
   store compaction removes free pages, not history. Deleting a session is not secure erasure.
@@ -126,7 +126,7 @@ See [docs/tools.md](docs/tools.md) for the full execution model.
   There is no anti-rollback protection: restoring an old but consistent copy of a store
   silently drops later work.
 
-## Browser host (`spindle serve`)
+## Web UI host (`spindle serve`)
 
 ```mermaid
 flowchart LR
@@ -223,10 +223,12 @@ See [docs/host.md](docs/host.md).
   resolves into a private network is not detected, because Chrome resolves names. With a
   relay set, commands reach whatever addresses the relay allows.
 - Page tools act in the user's real browser tabs with the user's sign-ins. A browser action
-  already dispatched cannot be undone by Stop. Closing Chrome's debugging bar on a tab keeps
-  Spindle from acting on it until page actions are turned off and on; a click or typing whose
-  target is covered by something else is refused rather than landing on it; actions on one tab
-  run one at a time.
+  already dispatched cannot be undone by Stop. Chrome's debugging bar shows while Spindle
+  clicks, types, presses keys or answers a dialog on a tab; closing it stops every further
+  action on that tab, including choosing, scrolling, moving and closing it, until page actions
+  are turned off and on (reading it is not an action); a click or typing whose target is
+  covered by something else is refused rather than landing on it; actions on one tab run one
+  at a time.
 - A saved key or sign-in is bound to the provider address it was saved for: importing a
   provider list that points that provider (or its token endpoint) elsewhere does not send the
   credential there.

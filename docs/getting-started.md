@@ -1,7 +1,7 @@
 # Getting started
 
 This guide builds the `spindle` binary, signs in to a model provider, runs a first
-session from the terminal, and starts the browser host. For the embedded JavaScript
+session from the terminal, and starts the web UI host. For the embedded JavaScript
 package see [embedded.md](embedded.md); for the browser extension see [chrome.md](chrome.md).
 
 ## Requirements
@@ -106,7 +106,7 @@ spindle --dir ./elsewhere import-session calc.spindle # continue it somewhere el
 spindle --dir ./calc usage                # spend per turn and per model
 ```
 
-## The browser host
+## The web UI host
 
 `spindle serve` runs a mobile-first web UI and the HTTP `/v1` API on loopback. The
 directory it is given is a *host directory* that holds many sessions.

@@ -25,11 +25,12 @@
 <main id="main">
   <section class="hero">
     <div class="wrap">
-      <p class="eyebrow">Privacy policy · updated 31 October 2026</p>
+      <p class="eyebrow">Privacy policy · updated 2 November 2026</p>
       <h1>Your work stays yours.</h1>
       <p class="lead">Spindle for Browser is open-source software (MIT) for <strong>Google Chrome</strong> and the
-        browsers that install from its Web Store (Microsoft Edge, Brave and others). It has no account and no server
-        of ours. What it handles stays in your browser, or goes where you send it. We receive nothing.</p>
+        browsers that install from its Web Store (Microsoft Edge, Brave and others). This policy covers it however
+        you install it: from the Chrome Web Store or from a release on GitHub. It has no account and no server of
+        ours. What it handles stays in your browser, or goes only to the places below. We receive nothing.</p>
     </div>
   </section>
 
@@ -38,22 +39,33 @@
       <h2 id="where-h">What it handles, and where it goes</h2>
       <ul>
         <li><strong>Your threads</strong> (your messages, the model's replies, the files you attach and the files a
-          thread makes) are kept in the extension's own storage on this device. What a thread sends goes to the model
-          provider you chose for it, when you send.</li>
-        <li><strong>Pages</strong>, only once you turn on page reading (Settings, Pages; off when installed): the text,
-          parts and HTML of the tabs a thread reads go to that thread's model provider. With page actions also on, a
-          thread clicks, types and navigates in your tabs as you, and can record a tab's network requests when a task
-          asks for them; what it records goes to the provider too, once a thread reads it. Screenshots are kept in the
-          thread's workspace.</li>
+          thread makes) are kept in the extension's own storage on this device. As a thread works, what it sends goes
+          to the model provider you chose for it; its scripts may also call another provider you saved a key or
+          sign-in for.</li>
+        <li><strong>Pages</strong>, only once you turn on page reading (Settings, Pages; off when installed): the
+          addresses and titles of your open tabs, and the text, parts and HTML of the tabs a thread reads, go to that
+          thread's model provider. With page actions also on, a thread clicks, types and navigates in your tabs as you,
+          and can record a tab's network requests when asked to; what it records goes to the provider too, once the
+          thread reads it. Screenshots are saved in the thread's workspace; a model sees one only if a script sends it
+          to one.</li>
         <li><strong>Your keys and sign-ins</strong> are encrypted (AES-GCM) in your browser's storage, with an optional
           passphrase, and sent only to the provider they were saved for (and to OpenAI's sign-in service, if you sign in
-          with ChatGPT). A site's secret header that you save is encrypted the same way and sent only to that site.</li>
+          with ChatGPT). For a ChatGPT sign-in, the account's e-mail address is kept with it, to show in Settings. A
+          site's secret header that you save is encrypted the same way and sent only to that site.</li>
         <li><strong>Commands' network</strong>, only once you turn it on for a thread: its commands reach the websites
           they ask for, through your browser (without your cookies) or through a relay you set up. With a relay, names
           are looked up over DNS-over-HTTPS (Cloudflare), only while such a command runs.</li>
-        <li><strong>Sites scripts may call</strong>: requests go only to the sites you list.</li>
-        <li><strong>Your Spindle host</strong>, if you connect one: the commands of threads you run there, with their
-          workspace files, go to that host, which is yours.</li>
+        <li><strong>Sites scripts may call</strong>: requests go only to the sites you list, with what the script
+          sends.</li>
+        <li><strong>Pages a thread makes</strong> show in a sandboxed preview that connects nowhere. If you choose
+          <strong>Load from the web</strong> for one, it loads from websites over HTTPS, and they see those requests. If
+          you choose <strong>Run them</strong> where the browser cannot hold a preview offline, the page's scripts could
+          send what it shows to a website.</li>
+        <li><strong>Your Spindle host</strong>, if you connect one: this browser's name there; for a thread whose
+          commands run on the host, those commands and the thread's workspace files; for a thread you move there (Run
+          on my host), the whole thread, its conversation and workspace, and while it runs there, what this browser's
+          page tools read for it. The host is yours, and it sends that thread's model requests to the provider signed
+          in on it.</li>
       </ul>
     </div></div>
   </section>
@@ -61,17 +73,22 @@
   <section class="block" aria-labelledby="us-h">
     <div class="wrap"><div class="prose">
       <h2 id="us-h">What we receive</h2>
-      <p>Nothing. Spindle has no analytics, telemetry, advertising or tracking, and sends us no data. We never sell,
-        transfer or use your data for anything else, and no person at SiliconState reads it.</p>
+      <p>Nothing. Spindle has no analytics, telemetry, advertising or tracking, and sends us no data. We never sell or
+        transfer your data, and we use none of it: Spindle uses it only to do what you ask a thread to do. No person at
+        SiliconState reads it.</p>
       <h2>Who else processes it</h2>
       <p>The model providers you choose (for example OpenAI, Anthropic, DeepSeek, Z.ai, Moonshot, or a model server
-        you run) process what your threads send them under their own privacy policies. Websites your threads visit see
-        those visits, as they would yours.</p>
+        you run) process what your threads send them under their own privacy policies. So do the services you set up
+        or list: a relay (and Cloudflare's DNS, for the names commands look up through it), the sites you list for
+        scripts, and the provider signed in on your Spindle host, for threads you run there. Websites your threads
+        visit see those visits, as they would yours.</p>
       <h2>How long it is kept</h2>
-      <p>On your device, until you delete the thread or remove the extension (which deletes everything it keeps). A key
-        or sign-in stays until you remove it in Settings, and a site's secret header until you remove the site; if you
-        forget your passphrase, <strong>Forgot it</strong> deletes them all. Your threads are protected by your browser
-        profile; only keys and secrets are encrypted inside it.</p>
+      <p>On your device, until you delete the thread or remove the extension (which deletes everything it keeps; files
+        you saved, <code>.spindle</code> files and threads on your Spindle host stay where they are). A key or sign-in
+        stays until you remove it in Settings, and a site's secret header until you remove the site; if you forget your
+        passphrase, <strong>Forgot it</strong> deletes them all. Deleted records may linger in the browser's storage
+        files until it compacts them. Your threads are protected by your browser profile; only keys and secrets are
+        encrypted inside it.</p>
       <h2>Limited Use</h2>
       <p>Spindle's use of the information it handles complies with the Chrome Web Store User Data Policy, including
         the Limited Use requirements: it is used only to do what you ask a thread to do.</p>

@@ -463,7 +463,17 @@ async function hostedLeg(panel) {
     await panel.until(`spindlePanel.current === ${JSON.stringify(id)}`, { what: 'the hosted thread to open' });
   };
   /** Where the thread lives: 'host' or 'here' once no move is under way. */
-  const settledHome = (id, where, timeout = 90_000) => panel.until(`(() => { const t = spindlePanel.threads.get(${JSON.stringify(id)}); return t && !t.moving && (${where === 'host'} ? Boolean(t.home) : !t.home) && t; })()`, { timeout, what: `the thread to live ${where === 'host' ? 'on the host' : 'here'}` });
+  const settledHome = async (id, where, timeout = 90_000) => {
+    try {
+      return await panel.until(`(() => { const t = spindlePanel.threads.get(${JSON.stringify(id)}); return t && !t.moving && (${where === 'host'} ? Boolean(t.home) : !t.home) && t; })()`, { timeout, what: `the thread to live ${where === 'host' ? 'on the host' : 'here'}` });
+    } catch (error) {
+      // Say where the move stands, as the panel shows it and as the engine holds it.
+      const facts = (thread) => JSON.stringify(thread && { moving: thread.moving ?? null, home: thread.home ?? null, state: thread.state, note: thread.note ?? null });
+      const shown = await threadOf(id).then(facts).catch((why) => `unreadable (${why.message})`);
+      const held = await engineOp('hello').then((state) => facts(state.threads.find((thread) => thread.id === id))).catch((why) => `unreadable (${why.message})`);
+      throw new Error(`${error.message}; the panel shows ${shown}; the engine holds ${held}`);
+    }
+  };
   /** The thread's live copies: the host's sessions not sealed, and its store here. */
   const liveCopies = async (id) => {
     const { sessions } = await hostGet('/v1/sessions');

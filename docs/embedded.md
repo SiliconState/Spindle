@@ -528,7 +528,9 @@ stops the command (a session `stop` while it runs). After a stop the runner stop
 command and still answers, with what it printed until then: the package records the
 command as stopped, with that output, and it never runs again. A runner that has not
 answered 15 seconds after the stop is answered for: the command is recorded as stopped
-without its output. If the client has no app
+without its output. A second stop before the runner answers records the command as
+stopped at once, without its output. A command that finished successfully before the
+stop took effect is recorded as it ran. If the client has no app
 runner, the run fails with "this app has no command runner".
 
 An app runner without `identity()` isolates nothing as far as Spindle can tell. Its
@@ -544,14 +546,17 @@ sandbox, the turn fails before the command runs. New sessions default to
 `remoteRunner({ url, token, fetch })` (in [`embedded.mjs`](../spindle/clients/js/embedded.mjs))
 sends each command to a native Spindle host started with `spindle serve`, authenticated
 with a token minted by `spindle --dir HOST token new NAME --runner` (see
-[cli.md](cli.md) and [host.md](host.md)); that token reaches no sessions or transcripts. The host runs
+[cli.md](cli.md) and [host.md](host.md)); that token reaches no sessions or transcripts.
+Any token that reaches the runner routes works too; Spindle for Browser uses its
+browser token. The host runs
 the command in its sandbox, over a copy of the workspace sent with the request, and
 returns the output and the changed files. The embedded store records them as the
 call's result and new workspace, so a rewind still covers what the command did. The
 host keeps no workspace from a run. The client gives each run a `run` id and, when
 its signal aborts (the operation stopped waiting, or the user stopped the command),
-posts `/v1/run/ID/stop` with a separate 10-second deadline and returns that run's
-answer.
+posts `/v1/run/ID/stop` (its own 10-second deadline) and waits up to 10 seconds for
+that run's answer, with what the command printed; without one, the command is
+recorded as stopped without its output.
 The host retains a stop that overtakes the upload. Against an older host returning
 404 for the stop route, the remote command runs out its timeout. `GET /v1/run/ID`
 reports the run's state to its starting token only. The original request still
@@ -606,7 +611,8 @@ native code mode does, and the client performs the I/O
   refused, and a script may not set such a header itself. Before each request under
   that grant the client asks its `grantHeaders({grant, url, method, names})` option
   for the values (throwing refuses the request: nothing is sent, a known outcome).
-  Each value must be visible ASCII and goes only in that request; every echo of it (or
+  Each value, trimmed, must be 1 to 8192 characters of visible ASCII, spaces or tabs,
+  and goes only in that request; every echo of it (or
   of an auth scheme's credentials in it), as is, JSON-escaped, percent-encoded or in
   base64, is replaced with `[redacted]` in the response's headers and body and in error
   text before the package journals it or the script sees it. A value whose secret is
@@ -728,7 +734,8 @@ goes in `x-api-key`. The package receives only `{kind: 'authorized'}`. For the
 `anthropic-messages` contract the client also sends
 `anthropic-dangerous-direct-browser-access: true`, which that API requires of requests
 that carry an `Origin`. The catalog the package returns holds no credentials, and
-script HTTP grants cannot carry headers. The Node session test checks that the key
+script HTTP grants hold no header values: a grant only names headers the app adds as it
+sends (see [Script calls](#script-calls-code-mode-bridge)). The Node session test checks that the key
 appears in no file under a session directory.
 
 ## Settings and limits
