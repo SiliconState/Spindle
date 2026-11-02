@@ -55,6 +55,14 @@ them.
   directory should be private to the operator's account. On Unix, the store directory is
   created with mode `0700`, and a store directory that is a symbolic link or grants any
   permission to group or others is refused.
+- A session bundle is checked whole before any of it becomes a session: its checksum,
+  manifest, paths, every file's digest and every store. A native import
+  (`spindle import-session`, stdio `import_session`, `POST /v1/threads`) unpacks it from
+  its file into a staging directory made new beside the destination (never one already
+  there, or a link; mode `0700` on Unix), checks each store where it lies in a
+  transaction it rolls back, and only then renames the directory into place. A refused
+  bundle leaves nothing behind. The embedded package checks a bundle in memory
+  ([`bundle.rs`](spindle/store/src/bundle.rs), [`agent.rs`](spindle/store/src/agent.rs)).
 
 ## Credentials
 
@@ -125,6 +133,19 @@ See [docs/tools.md](docs/tools.md) for the full execution model.
   owner per session. Owner epochs fence store writes, not processes or remote receivers.
   There is no anti-rollback protection: restoring an old but consistent copy of a store
   silently drops later work.
+- In a browser, the embedded package keeps a session's files in a pool of OPFS slots
+  whose headers name them ([`opfs.mjs`](spindle/clients/js/opfs.mjs)). Each header
+  carries a CRC-32 and a copy of its generation beside its path, in its first 512-byte
+  sector for paths under about 470 bytes, and a rename first writes a record naming the
+  slots it moves, which the next open finishes. A header cut short by a crash, or by a
+  disk keeping only some of a write's sectors, is never read as another name: each file
+  stays whole under one of its two names, and a directory is never split. (A file whose
+  two names are too long for a record, thousands of bytes, renames without one; a
+  header of it cut short is kept apart instead.) A rename that fails after its record
+  stops the pool until it is opened again. A header damaged in another way keeps its
+  bytes out of use until the app frees them (in Spindle for Browser after 0.1.6,
+  Settings > Storage > Unreadable). This relies on OPFS honoring flushes; it is tested by
+  replaying crash points in Node, not proven against power loss.
 
 ## Web UI host (`spindle serve`)
 
@@ -228,7 +249,12 @@ See [docs/host.md](docs/host.md).
   action on that tab, including choosing, scrolling, moving and closing it, until page actions
   are turned off and on (reading it is not an action); a click or typing whose target is
   covered by something else is refused rather than landing on it; actions on one tab run one
-  at a time.
+  at a time. Under Before acting, an action the user allows (after 0.1.6) carries what
+  the question showed: the tab, its site and Chrome's id for the page it shows (its
+  address where Chrome gives none), the part of the page, or the dialog, which the
+  question quotes. The service worker checks these just before acting and refuses,
+  doing nothing, once the page has reloaded or moved on, the part has changed, or
+  another dialog is open ([`background.js`](spindle/chrome/background.js)).
 - A saved key or sign-in is bound to the provider address it was saved for: importing a
   provider list that points that provider (or its token endpoint) elsewhere does not send the
   credential there.
@@ -241,8 +267,25 @@ See [docs/host.md](docs/host.md).
   DNS prefetch is off, and markup that cannot be safely reparsed is shown as text.
   **Load from the web** allows scripts and HTTPS connections under a separate
   allowlist. Allowed uncontained scripts can disclose page data despite CSP.
+  Word, Excel and PowerPoint files (after 0.1.6; macro-enabled kinds too, whose macros
+  never run) are read from their parts in the extension's page, within size bounds;
+  they, and an SVG whose markup is not XML, are drawn as static pages in the same frame
+  under the policy of a page without scripts: no script, frame, form submission, link
+  out or load from the web.
   Sources: [`page.mjs`](spindle/chrome/page.mjs),
+  [`documents.mjs`](spindle/chrome/documents.mjs),
   [`preview.js`](spindle/chrome/preview.js), [`background.js`](spindle/chrome/background.js).
+- PDFs (after 0.1.6; Chrome 123 and later) are not contained like previews. A thread's
+  PDF opens in a tab of its own as Chrome's own PDF viewer, served by the service worker
+  at an address of the extension's that only its own pages reach: PDFs only, as
+  `application/pdf` with `nosniff`, from workspace paths only, read from the engine over
+  a channel open only while the worker asks. No Connection-Allowlist applies (the
+  viewer's own interface does not load under one), so it behaves as a PDF downloaded and
+  opened does. Probed in Chrome: a form the user submits from it posts with no cookies
+  and an opaque origin, as from a downloaded PDF; a link clicked in it navigates the tab,
+  which is why a PDF never shows inside the panel; and Chrome blocks the viewer in a
+  sandboxed frame, so the preview frame cannot hold it. Treat a thread's PDF as any PDF
+  from an untrusted source.
 - A move durably commits its bundle before sealing and removes redundant OPFS
   stores only after reading the saved bytes back. Storage > Free checks older
   moved bundles whole before deleting sealed stores. Reset backups are temporary,

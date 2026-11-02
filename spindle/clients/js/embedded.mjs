@@ -243,12 +243,21 @@ function claimOf(key, path, provider) {
  *                commands says so with `identity()` (64 hex digits, as a remote
  *                runner's): they then count as isolated. `connectRunner` changes them.
  *   deadlines    { firstByte, idle, total } in ms for model requests. */
+/** Why an app tool handler's `call.signal` ended: an AbortError (as `fetch` and
+ * `throwIfAborted` expect) with the call's `outcome` (`stopped`, `no_answer`, or `closed`
+ * when the client closed). */
+const settled = (outcome) => Object.assign(new DOMException(`the call was settled without this answer (${outcome})`, 'AbortError'), { outcome });
+
 export class EmbeddedClient extends Emitter {
   #wasm;
   #embedded;
   #pending = new Map();
   #next = 0;
   #works = new Map();
+  /** App tool calls being answered: `${session}\0${call}` (as their `app_tool` event
+   * names them) -> the AbortController whose signal their handler holds (`#answer`),
+   * ended when the package records the call without that answer (`#settleApp`). */
+  #appCalls = new Map();
   #auth = new Map();
   #closed = null;
   #opfs = null;
@@ -308,7 +317,13 @@ export class EmbeddedClient extends Emitter {
    * `label` saying what a request on that route then asks for. */
   efforts(provider, model) { return JSON.parse(this.#embedded.efforts(provider, model)); }
 
-  /** Registers an app tool (as StdioClient's `tool`); sessions this client creates offer it. */
+  /** Registers an app tool (as StdioClient's `tool`); sessions this client creates offer it.
+   * Its `run(input, call)` learns whose call it is (`call.session`, the session's dir; a
+   * task's call is named `tasks/KEY/...`) and when to stop: `call.signal` ends when the
+   * package settles the call without its answer (the turn or task that asked was stopped,
+   * or the tool's `timeoutS` passed, or this client closed; a background task's calls go
+   * on when its parent's turn stops), its reason an AbortError whose `outcome` says which
+   * (`stopped`, `no_answer`, `closed`); the answer is then not sent. */
   tool(definition) { this.tools.add(definition); return this; }
 
   /** OPFS: holds `dir`'s Web Lock (and the pool) before its files are touched. */
@@ -380,7 +395,7 @@ export class EmbeddedClient extends Emitter {
       if (frame.method === 'event') {
         const { session, request, event } = frame.params;
         if (event?.type === 'app_tool' && this.tools.byName.has(event.name)) this.#answer(session, event);
-        if (event?.type === 'app_tool_done') this.#settleApp(event.call);
+        if (event?.type === 'app_tool_done') this.#settleApp(session, event);
         this.emit('event', event, session, request);
       } else if (frame.method === 'work') {
         this.#work(frame.params);
@@ -794,8 +809,19 @@ export class EmbeddedClient extends Emitter {
   }
 
   async #answer(session, event) {
-    // The handler learns whose call it is (`call.session`, the session's dir).
-    const answer = await this.tools.answer({ ...event, session });
+    // The handler learns whose call it is (`call.session`, the session's dir) and when
+    // the package stops waiting for it (`call.signal`, `#settleApp`).
+    const key = `${session}\u0000${event.call}`;
+    const controller = new AbortController();
+    this.#appCalls.set(key, controller);
+    let answer;
+    try {
+      answer = await this.tools.answer({ ...event, session, signal: controller.signal });
+    } finally {
+      if (this.#appCalls.get(key) === controller) this.#appCalls.delete(key);
+    }
+    // No one waits for it now: nothing to send (the package would refuse it).
+    if (controller.signal.aborted) return;
     try {
       try {
         await this.call('app_tool_result', { dir: session, call: event.call, ...answer });
@@ -808,13 +834,19 @@ export class EmbeddedClient extends Emitter {
     }
   }
 
-  #settleApp(call) {
+  /** An app call the package recorded (`app_tool_done`). One still being answered here
+   * was settled without its answer (stopped with its turn or task, say): no one waits for
+   * it, so its handler is told (`call.signal`, ended with the outcome) and sends nothing. */
+  #settleApp(session, { call, outcome }) {
+    // Its work: this session's or one of its tasks' (`dir#KEY`), never another session's
+    // that happens to share a call id (two imported from one bundle).
     for (const [key, work] of this.#works) {
-      if (work.kind === 'app' && work.call === call) {
+      if (work.kind === 'app' && work.call === call && (key.startsWith(`${session}\u0000`) || key.startsWith(`${session}#`))) {
         clearTimeout(work.timer);
         this.#works.delete(key);
       }
     }
+    this.#appCalls.get(`${session}\u0000${call}`)?.abort(settled(outcome ?? 'settled'));
   }
 
   #dir(dir) { return typeof dir === 'string' ? this.resolveDir(dir) : dir; }
@@ -933,6 +965,9 @@ export class EmbeddedClient extends Emitter {
   /** Stops every running turn's outside work and refuses new calls; resolves when done. */
   async close() {
     this.#closed = 'the client was closed';
+    // No one will take their answers: the app's handlers are told.
+    for (const controller of this.#appCalls.values()) controller.abort(settled('closed'));
+    this.#appCalls.clear();
     for (const [key, work] of this.#works) {
       work.cancelled = true;
       work.controller.abort();

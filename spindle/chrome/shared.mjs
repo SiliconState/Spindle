@@ -121,6 +121,47 @@ export async function update(store, key, change, { changes = [], durability = nu
   });
 }
 
+/** Puts `value` at `key` in one transaction, combined with the record there if there is
+ * one (`combine(value, old)`): two writers never lose each other's. */
+export async function merge(store, key, value, combine, durability = null) {
+  const db = await database();
+  return new Promise((resolve, reject) => {
+    const tx = durability ? db.transaction(store, 'readwrite', { durability }) : db.transaction(store, 'readwrite');
+    const records = tx.objectStore(store);
+    let next;
+    const got = records.get(key);
+    got.onsuccess = () => {
+      try {
+        next = got.result === undefined ? value : combine(value, got.result);
+        records.put(next, key);
+      } catch (error) {
+        tx.abort();
+        reject(error);
+      }
+    };
+    tx.oncomplete = () => resolve(next);
+    tx.onerror = tx.onabort = () => reject(tx.error);
+  });
+}
+
+/** The record at `key`, removed in the same transaction (undefined when there is none):
+ * whoever takes it is the only one who does. */
+export async function take(store, key) {
+  const db = await database();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite', { durability: 'strict' });
+    const records = tx.objectStore(store);
+    let taken;
+    const got = records.get(key);
+    got.onsuccess = () => {
+      taken = got.result;
+      if (taken !== undefined) records.delete(key);
+    };
+    tx.oncomplete = () => resolve(taken);
+    tx.onerror = tx.onabort = () => reject(tx.error);
+  });
+}
+
 /** What the user let a page a thread made do in its previews (`{version, scripts,
  * web}`: `web` lets it reach the web, `scripts` lets it run where previews cannot be
  * contained; null: nothing yet), kept per thread and path and gone with the thread. It

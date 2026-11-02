@@ -13,7 +13,7 @@ worker.onmessage = async ({ data }) => {
   if (data?.type !== 'page_tool') return;
   let answer;
   try {
-    answer = await chrome.runtime.sendMessage({ type: 'page_tool', call: data.call, name: data.name, input: data.input });
+    answer = await chrome.runtime.sendMessage({ type: 'page_tool', call: data.call, name: data.name, input: data.input, allowed: data.allowed });
   } catch (error) {
     answer = uncertain(data.name, `${BROWSER}'s answer to the page tool was lost: ${error.message}`);
   }

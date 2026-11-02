@@ -334,9 +334,18 @@ struct Host {
     interrupted: Vec<String>,
     /// Outstanding one-click connect codes (connect.rs).
     connect: Mutex<connect::Codes>,
+    /// Held by a thread import while it unpacks and checks its upload, and again while
+    /// its staged session is put in place and opened (threads.rs), not in between (its
+    /// credential check): one bundle unpacked or checked at a time, however many arrive
+    /// at once.
+    importing: Mutex<()>,
     /// Points where a test stops a thread import as a stopped host would (threads.rs).
     #[cfg(test)]
     cuts: Mutex<Vec<&'static str>>,
+    /// A test's hold on the next thread import's credential check: it waits there until
+    /// the sender sends or is dropped (threads.rs).
+    #[cfg(test)]
+    checking: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     _lock: File,
 }
 /// A worker's observer: events to the thread's streams, and the thread's host for the
@@ -1013,8 +1022,11 @@ impl Host {
             attention: Mutex::new(attention::Attention::new()),
             interrupted,
             connect: Mutex::default(),
+            importing: Mutex::default(),
             #[cfg(test)]
             cuts: Mutex::default(),
+            #[cfg(test)]
+            checking: Mutex::default(),
             _lock: lock,
         })
     }

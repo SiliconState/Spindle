@@ -1033,6 +1033,52 @@ fn bundle_tasks(
     Ok(())
 }
 
+/// About how many bytes an export of the session at `dir` would hold, from what is on
+/// disk, opening no store: each place's store with its write-ahead log (an image holds
+/// no more than both) and the sidecars `export_session` takes, its tasks' as
+/// `bundle_tasks` finds them, and room for the bundle's framing and each file's manifest
+/// entry (enough for a task nested as deep as a bundle takes). An image is no larger than
+/// its store and log together, so it comes out over rather than under (a sidecar the
+/// export sets right from its store's settings aside), usually by no more than the logs'
+/// kept size (16 MiB each). A client reads it (`GET /v1/sessions/:id`, `bundle_bytes`)
+/// before a move that would seal this copy for a bundle it could not take.
+pub fn bundle_estimate(dir: &Path) -> u64 {
+    /// A file's bytes (none for anything but a regular file), counted as one more file.
+    fn add(total: &mut u64, path: &Path) {
+        if let Some(meta) = std::fs::symlink_metadata(path)
+            .ok()
+            .filter(|meta| meta.is_file())
+        {
+            *total = total.saturating_add(meta.len()).saturating_add(ENTRY);
+        }
+    }
+    /// What a manifest entry and the framing can take per file (a path up to about 460
+    /// bytes, its size and digest).
+    const ENTRY: u64 = 1024;
+    fn place(dir: &Path, sidecars: &[&str], total: &mut u64) {
+        let store = dir.join(crate::bundle::STORE);
+        add(total, &store);
+        add(total, &store.with_extension("sqlite-wal"));
+        for name in sidecars {
+            add(total, &dir.join(name));
+        }
+        for task in tasks::task_dirs(dir).unwrap_or_default() {
+            place(
+                &task,
+                &["session.json", "task.json", crate::bundle::PACK_SESSION],
+                total,
+            );
+        }
+    }
+    let mut total = 4096;
+    place(
+        dir,
+        &["session.json", crate::bundle::PACK_SESSION],
+        &mut total,
+    );
+    total
+}
+
 /// Whether the file at `path` reads back as exactly `bytes` (compared by SHA-256,
 /// read in chunks).
 fn same_on_disk(path: &Path, bytes: &[u8]) -> bool {
@@ -1058,34 +1104,134 @@ fn same_on_disk(path: &Path, bytes: &[u8]) -> bool {
 }
 
 /// Imports the session bundle at `source` into `dir` (absent, or an empty directory):
-/// see `import_bundle`.
+/// `stage_session`, then `StagedSession::finish`.
 pub fn import_session(source: &Path, dir: &Path) -> Result<Value> {
-    let mut file = std::fs::File::open(source)
-        .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
-    // Read in two passes, so the bundle is never in memory beside its files.
-    let bundle = crate::bundle::read_file(&mut file)?;
-    drop(file);
-    import_bundle(&bundle, dir)
+    stage_session(source, dir)?.finish()
 }
 
-/// Writes a checked bundle as the session directory `dir` (absent, or an empty
-/// directory): every file goes into a private staging directory beside it, synced,
-/// then the staging directory is renamed into place, so `dir` holds the whole session
-/// or nothing. The session keeps its identity: it is the same session, moved.
-pub fn import_bundle(bundle: &crate::bundle::Bundle, dir: &Path) -> Result<Value> {
-    use crate::bundle::STORE;
+/// A session bundle unpacked and checked in a private staging directory beside the
+/// session directory it is to become (`stage_session`). `finish` puts it in place;
+/// dropped unfinished, the staging directory is removed and `dir` is as it was.
+pub struct StagedSession {
+    stage: PathBuf,
+    /// The staging directory's name, as `STAGING` lists it while it is this import's.
+    stage_name: String,
+    dir: PathBuf,
+    parent: PathBuf,
+    /// `dir` was an empty directory, which the staged one replaces.
+    empty: bool,
+    unpacked: crate::bundle::Unpacked,
+    placed: bool,
+}
+
+/// Staging directories (their names) of the imports running in this process
+/// (`stage_session`), each listed before it is made and until it is gone or renamed
+/// into place: a sweep (`sweep_staging`) never takes one of them.
+static STAGING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn staging() -> std::sync::MutexGuard<'static, Vec<String>> {
+    STAGING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The process that made `entry`, if it is the name of a staging directory for a
+/// session directory named `name`: `.<name>.importing-<pid>-<16 hex digits>`, or an
+/// older build's `.<name>.importing-<pid>`.
+fn staging_pid(entry: &str, name: &str) -> Option<u32> {
+    let rest = entry
+        .strip_prefix('.')?
+        .strip_prefix(name)?
+        .strip_prefix(".importing-")?;
+    let (pid, random) = match rest.split_once('-') {
+        Some((pid, random)) => (pid, Some(random)),
+        None => (rest, None),
+    };
+    let hex = |text: &str| {
+        text.len() == 16 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) || random.is_some_and(|r| !hex(r))
+    {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// Whether the process `pid` is known to be gone, so it is making no staging directory
+/// now. Only Unix can tell (another process's, alive or not, is otherwise kept).
+fn gone(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 is never delivered; the call only asks whether `pid` exists.
+        pid > 0
+            && unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Removes the staging directories imports for a directory named `name` left in
+/// `parent` when they were stopped: each one whose process is gone (`gone`), or this
+/// process's own that no import of it is using (`STAGING`). A live import's is never
+/// touched, nor anything not a directory.
+fn sweep_staging(parent: &Path, name: &str) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let own = crate::process_id();
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = staging_pid(&entry_name, name) else {
+            continue;
+        };
+        let path = entry.path();
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        let stale = if pid == own {
+            !staging().contains(&entry_name)
+        } else {
+            gone(pid)
+        };
+        if stale {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Unpacks the session bundle at `source` for `dir` (absent, or an empty directory)
+/// into a private staging directory beside it (`.<name>.importing-<pid>-<random>`, made
+/// new: never one already there, or a link), with an `owner.lock` beside each store:
+/// every file checked as `bundle::read` checks it (`bundle::unpack_file`, which holds
+/// none of the bundle's files and no store in memory, whatever its size). Staging
+/// directories for the same name that a stopped import left are removed first
+/// (`sweep_staging`). Refused (`UnpackError::Refused`: the bundle) or failed (`Io`:
+/// reading it, writing the staging directory, or `dir` not new), nothing of it stays.
+pub fn stage_session(
+    source: &Path,
+    dir: &Path,
+) -> std::result::Result<StagedSession, crate::bundle::UnpackError> {
+    use crate::bundle::{STORE, UnpackError};
+    let failed = |message: String| UnpackError::Io(std::io::Error::other(message));
     let empty = match std::fs::read_dir(dir) {
         Ok(mut entries) => {
             if entries.next().is_some() {
-                return Err(format!(
+                return Err(failed(format!(
                     "{} is not empty; import a session into a new directory",
                     dir.display()
-                ));
+                )));
             }
             true
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
+        Err(error) => return Err(failed(format!("cannot read {}: {error}", dir.display()))),
     };
     let parent = dir
         .parent()
@@ -1093,55 +1239,162 @@ pub fn import_bundle(bundle: &crate::bundle::Bundle, dir: &Path) -> Result<Value
         .unwrap_or(Path::new("."));
     let name = dir
         .file_name()
-        .ok_or_else(|| format!("{} names no directory", dir.display()))?
+        .ok_or_else(|| failed(format!("{} names no directory", dir.display())))?
         .to_string_lossy();
-    let stage = parent.join(format!(".{name}.importing-{}", crate::process_id()));
-    let _ = std::fs::remove_dir_all(&stage);
-    let staged = (|| -> std::io::Result<()> {
-        // Private, as a native host keeps its session directories.
-        crate::durable::create_dir(&stage)?;
-        let mut directories = vec![stage.clone()];
-        for file in &bundle.files {
-            let path = stage.join(&file.path);
-            let folder = path.parent().expect("a bundle path has a directory");
-            crate::durable::create_dir(folder)?;
-            directories.push(folder.to_path_buf());
-            crate::durable::write(&path, &file.bytes)?;
-            if file.path.ends_with(STORE) {
-                let mut lock = std::fs::OpenOptions::new();
-                lock.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    lock.mode(0o600);
-                }
-                lock.open(folder.join("owner.lock"))?.sync_all()?;
-            }
-        }
-        for directory in directories.iter().rev() {
-            crate::durable::sync_dir(directory)?;
-        }
-        if empty {
-            std::fs::remove_dir(dir)?;
-        }
-        std::fs::rename(&stage, dir)?;
-        crate::durable::sync_dir(parent)
-    })();
-    if let Err(error) = staged {
-        let _ = std::fs::remove_dir_all(&stage);
-        return Err(format!("cannot import into {}: {error}", dir.display()));
+    let mut file = std::fs::File::open(source)
+        .map_err(|error| failed(format!("cannot read {}: {error}", source.display())))?;
+    let cannot =
+        |error: std::io::Error| failed(format!("cannot import into {}: {error}", dir.display()));
+    crate::durable::create_dir(parent).map_err(cannot)?;
+    sweep_staging(parent, &name);
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random)
+        .map_err(|error| cannot(std::io::Error::other(error.to_string())))?;
+    let stage_name = format!(
+        ".{name}.importing-{}-{}",
+        crate::process_id(),
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let stage = parent.join(&stage_name);
+    // Listed before it is made, so no sweep meanwhile takes it.
+    staging().push(stage_name.clone());
+    // New and private (as a native host keeps its session directories): never one
+    // already there, or a link, which `check_image_file`'s private directory must not be.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
-    // A native host opens it as one of its own sessions (checking it again).
-    let mut store = Store::open(&dir.join("store"))
-        .map_err(|error| store_open_error(&dir.join("store"), error))?;
-    let head = store.snapshot().map_err(store_error)?.revision;
-    drop(store);
-    Ok(json!({
-        "session": dir.to_string_lossy(),
-        "head": head,
-        "identity": bundle.identity,
-        "files": bundle.files.len(),
-    }))
+    if let Err(error) = builder.create(&stage) {
+        unlist(&stage_name);
+        return Err(cannot(error));
+    }
+    let staged = (|| {
+        if !std::fs::symlink_metadata(&stage)
+            .map_err(UnpackError::Io)?
+            .is_dir()
+        {
+            return Err(UnpackError::Io(std::io::Error::other(format!(
+                "{} is not the directory just made",
+                stage.display()
+            ))));
+        }
+        crate::durable::sync_parent(&stage).map_err(UnpackError::Io)?;
+        let unpacked = crate::bundle::unpack_file(&mut file, &stage)?;
+        for path in unpacked.files.iter().filter(|path| path.ends_with(STORE)) {
+            let folder = stage.join(path);
+            let folder = folder.parent().expect("a store has a directory");
+            let mut lock = std::fs::OpenOptions::new();
+            lock.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                lock.mode(0o600);
+            }
+            lock.open(folder.join("owner.lock"))
+                .and_then(|lock| lock.sync_all())
+                .map_err(UnpackError::Io)?;
+        }
+        Ok(unpacked)
+    })();
+    match staged {
+        Ok(unpacked) => Ok(StagedSession {
+            stage,
+            stage_name,
+            dir: dir.to_path_buf(),
+            parent: parent.to_path_buf(),
+            empty,
+            unpacked,
+            placed: false,
+        }),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            unlist(&stage_name);
+            Err(match error {
+                UnpackError::Io(error) => cannot(error),
+                refused => refused,
+            })
+        }
+    }
+}
+
+/// Takes `stage_name` off `STAGING` (once it is gone or in place).
+fn unlist(stage_name: &str) {
+    staging().retain(|name| name != stage_name);
+}
+
+impl StagedSession {
+    /// A sidecar the bundle brought (its path in the bundle: `session.json`, which is
+    /// the session store's settings when it has them, or a task's), as staged; None if
+    /// it brought none. Never more than a sidecar's size (as checked).
+    pub fn sidecar(&self, path: &str) -> std::io::Result<Option<Vec<u8>>> {
+        if path.ends_with(crate::bundle::STORE) || !self.unpacked.files.iter().any(|f| f == path) {
+            return Ok(None);
+        }
+        std::fs::read(self.stage.join(path)).map(Some)
+    }
+
+    /// Puts the staged session in place as `dir`: every directory synced, the staging
+    /// directory renamed into place (so `dir` holds the whole session or nothing), then
+    /// opened as one of this host's sessions (checking it again). The session keeps its
+    /// identity: it is the same session, moved.
+    pub fn finish(mut self) -> Result<Value> {
+        let mut directories: Vec<PathBuf> = self
+            .unpacked
+            .files
+            .iter()
+            .filter_map(|path| self.stage.join(path).parent().map(Path::to_path_buf))
+            .collect();
+        directories.push(self.stage.clone());
+        // Deepest first, each once.
+        directories.sort_by(|a, b| {
+            (std::cmp::Reverse(a.components().count()), a)
+                .cmp(&(std::cmp::Reverse(b.components().count()), b))
+        });
+        directories.dedup();
+        let placed = (|| -> std::io::Result<()> {
+            for directory in &directories {
+                crate::durable::sync_dir(directory)?;
+            }
+            if self.empty {
+                std::fs::remove_dir(&self.dir)?;
+            }
+            std::fs::rename(&self.stage, &self.dir)?;
+            self.placed = true;
+            crate::durable::sync_dir(&self.parent)
+        })();
+        if let Err(error) = placed {
+            return Err(format!(
+                "cannot import into {}: {error}",
+                self.dir.display()
+            ));
+        }
+        let store_dir = self.dir.join("store");
+        let mut store =
+            Store::open(&store_dir).map_err(|error| store_open_error(&store_dir, error))?;
+        let head = store.snapshot().map_err(store_error)?.revision;
+        drop(store);
+        Ok(json!({
+            "session": self.dir.to_string_lossy(),
+            "head": head,
+            "identity": self.unpacked.identity,
+            "files": self.unpacked.files.len(),
+        }))
+    }
+}
+
+impl Drop for StagedSession {
+    fn drop(&mut self) {
+        if !self.placed {
+            let _ = std::fs::remove_dir_all(&self.stage);
+        }
+        unlist(&self.stage_name);
+    }
 }
 
 /// Import a host directory as initial workspace files; returns the files and skipped count.

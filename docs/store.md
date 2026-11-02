@@ -881,6 +881,19 @@ identity, settings }`. `Store::from_image` opens a checked image as a memory sto
 `store/authority.sqlite` beside an `owner.lock`, an image also opens with `Store::open` or
 through a host connection.
 
+`check_image_file(path)` makes the same checks, with the same answer, of an image in a
+file, read where it lies, so neither the image nor a copy of it is held in memory: the
+check holds an 8 MiB page cache and one record at a time (a value is at most 32 MiB;
+task rows too are checked one by one, not gathered). The path is made absolute first,
+so SQLite never reads a relative one beginning `file:` as a URI. The header is checked
+before SQLite opens the file (a WAL header is refused), and the file is opened, never
+created, with its journal in memory and cache spill off. The checks run in a
+transaction that is rolled back, so nothing reaches the file: a schema 19 image,
+checked as the open will migrate it, stays byte for byte as it came. SQLite would
+replay a journal found beside the file, so it must lie in a directory nothing else
+writes into, such as an import's private staging directory (see
+[Moving a session](#moving-a-session)).
+
 ### Giving free pages back
 
 Every store connection sets `journal_size_limit` to 16 MiB. A large transaction can
@@ -923,12 +936,32 @@ directory's portable files, so a session can move where no directory is shared.
 - **Checks on write and read**: every path valid and unique; every store passes
   `check_image` in full for a move or import; a copy may check only pages, schema and
   bundle facts (the embedded `whole` option requests a full copy check). The session's
-  own store is present; sidecars are JSON of at most 4 MiB
-  (`task.json` an object), each beside a store; each place's `session.json` is filled in or
-  corrected from its store's `settings` metadata when the store has any. Reading also
-  verifies the framing, the format and schema, every file's size and digest, and that the
-  manifest's head and identity match the session store. Nothing is written until all of it
-  passes.
+  own store is present; sidecars are at most 4 MiB, each beside a store (`session.json`
+  and `task.json` JSON, `task.json` an object; `pack-session-id` 8 to 64 letters, digits
+  or `-`); each place's `session.json` is filled in or corrected from its store's
+  `settings` metadata when the store has any, and settings over 4 MiB are refused before
+  they are kept as one. Reading also verifies the framing, the format and schema, every
+  file's size and digest, and that the manifest's head and identity match the session
+  store.
+- **Reading**: once the checksum over the whole bundle matches, the manifest is
+  checked before any file is allocated or kept: the format and schema, every entry
+  whole, sizes that fill the body exactly, and the layout
+  (valid paths, none twice, the session's own store present, every other file beside a
+  store and, but for a `session.json` its store's settings replace, within 4 MiB; such
+  a `session.json` is hashed, never held). `bundle::read` (the embedded package) then
+  takes the files into memory and checks them, writing nothing. `bundle::unpack_file`
+  (native imports) makes the same checks with the same answers (one check routine
+  serves both) from the bundle's file, holding none of its files and no store in
+  memory: the SHA-256 over the whole file first, read through a 1 MiB buffer (nothing is
+  written for a damaged bundle), then the manifest, then each file copied through that
+  buffer into a new file (`0600` on Unix) in an empty private staging directory, synced
+  and checked against its digest, then every store checked where it lies
+  (`check_image_file`, see [Store images](#store-images)), each place's `session.json`
+  filled in from its store, and every sidecar read back and checked. A staged store
+  this host cannot check (SQLite cannot open or read it, the disk or memory runs out,
+  something else holds it) is an I/O failure of the host's, not a refusal of the
+  bundle. A refused or failed unpack may leave part of the bundle staged; its caller
+  removes it.
 - **Order**: deepest tasks first, each place's store after its sidecars, the session's own
   store last.
 
@@ -944,13 +977,23 @@ the handle refuses further work. Task copies are sealed too. If this copy cannot
 the bundle is removed and nothing moves. With `--keep`, both copies remain usable and only one
 should continue.
 
-`spindle import-session FILE` (`agent::import_bundle`) writes into an absent or empty
-directory: every file goes through `durable::write` into a private staging directory
-`.NAME.importing-PID`, an `owner.lock` is created beside each store, the directories are
-synced, and the staging directory is renamed into place, so the target holds the whole session
-or nothing. The store is then opened natively, which checks it again. The session keeps its
-identity: it is the same session, moved. The embedded package imports bundles into its own
-storage places; see [embedded.md](embedded.md).
+`spindle import-session FILE` and the API method `import_session`
+(`agent::import_session`) import into an absent or empty directory in two steps.
+`agent::stage_session` first removes the staging directories that stopped imports
+left for the same name (one whose process is gone, on Unix, or one of this process's
+that none of its imports is using; never a live import's), then makes a new private
+staging directory beside the target, `.NAME.importing-PID-RANDOM` (16 hex digits;
+never one already there, or a link; `0700` on Unix), unpacks the bundle into it with
+`bundle::unpack_file` (see [Session bundles](#session-bundles)), and creates an
+`owner.lock` (synced; `0600` on Unix) beside each store. `StagedSession::finish` then
+syncs the directories, deepest first, renames the staging directory into place, so the
+target holds the whole session or nothing, and opens the store natively, which checks
+it again. A refused or failed import removes its staging directory, as does a
+`StagedSession` dropped unfinished. The session keeps its identity: it
+is the same session, moved. The HTTP host's `POST /v1/threads` stages each import the
+same way, one import at a time unpacking and checking (see [API.md](API.md)). The
+embedded package reads a bundle in memory and imports it into its own storage places;
+see [embedded.md](embedded.md#session-bundles).
 
 ## The reference model
 

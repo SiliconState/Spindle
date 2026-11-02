@@ -4,9 +4,11 @@
 import { fileTree, markdown, size } from './text.js';
 import { BROWSER, PAGE_ACCESS, PICTURE_ACCESS, confirmMode, pageSwitches } from './page-tools.mjs';
 import { zip } from './zip.mjs';
-import { containment, kindOf, pageOf, previewFrame, previewNote, saveFile, typeOf } from './page.mjs';
+import { BUNDLE_MOST } from './host-moves.mjs';
+import { FRAMED, containment, documentFrame, kindOf, pageOf, pdfShows, pictureBlob, previewFrame, previewNote, saveFile, svgPage, typeOf } from './page.mjs';
+import { MAX_DOCUMENT, documentPage } from './documents.mjs';
 import { mdNodes } from './markdown.mjs';
-import { CHANNEL, accessFor, keepPreviewChoice, keysOf, previewChoice, read, remove, startEngine, write } from './shared.mjs';
+import { CHANNEL, accessFor, keepPreviewChoice, keysOf, merge, previewChoice, read, remove, startEngine, take, write } from './shared.mjs';
 import { connectInTab, flowOf, signInInTab, signInSites } from './signin.mjs';
 import { clock, describe, duration, elapsed, isScratch, isSpan, partsFrom, retried, shownName, tabsFrom, taskTitle } from './steps.mjs';
 
@@ -611,7 +613,7 @@ function finishDelete() {
   const { id, timer } = pendingDelete;
   pendingDelete = null;
   clearTimeout(timer);
-  ask('remove', { id }).catch((error) => {
+  ask('remove', { id }).then(() => forgetCameBack(id), (error) => {
     hiddenThreads.delete(id);
     renderThreads();
     toast(`It was not deleted: ${error.message}`);
@@ -679,9 +681,11 @@ let historyPaint = 0;
 function showHome() {
   historyPaint += 1;
   dropKept();
+  pausePlayers();
   // What the user saw of the thread they leave is read.
   if (current) markSeen(threads.get(current));
   current = null;
+  restoreCameBack(null);
   live = null;
   renderQueued(null);
   renderTasks(null, []);
@@ -754,6 +758,7 @@ async function openThread(id) {
   const paint = ++historyPaint;
   dropKept();
   current = id;
+  restoreCameBack(id);
   live = null;
   pendingCards = [];
   status = null;
@@ -805,6 +810,26 @@ function resultText(content) {
  * those cards (the last turn's open their previews; earlier ones wait to be asked). */
 let turnPaths = new Set();
 let turnCards = [];
+
+/** The files of players showing (object address -> its player): each let go of once its
+ * player is gone from the panel (a card taken away, a thread switched, a preview
+ * replaced, the workspace page left). */
+const players = new Map();
+function sweepPlayers() {
+  for (const [url, player] of players) {
+    if (player.isConnected) continue;
+    player.pause();
+    URL.revokeObjectURL(url);
+    players.delete(url);
+  }
+}
+
+/** The conversation out of sight (the start page, the workspace page): what plays in it
+ * stops. */
+function pausePlayers() {
+  for (const player of players.values()) if (!player.closest('#ws-preview')) player.pause();
+}
+
 /** What the open thread's view holds of its history: how many messages, the indexes of
  * the user's messages among them, where the running turn started (null: not known),
  * and whether a compaction changed the history since. */
@@ -870,6 +895,8 @@ function renderHistory({ thread, history, running, bundle, moving, away }, { fro
   }
   // One workspace card, for the workspace as it is now: an earlier one goes.
   for (const card of box.querySelectorAll('.workspace-card')) card.remove();
+  // Players of cards drawn over stop and let go of their files.
+  sweepPlayers();
   turnPaths = new Set();
   turnCards = [];
   const pictures = renderMessages(box, thread, messages.slice(start), from + start, { running, main: true });
@@ -1194,23 +1221,95 @@ async function rewindTo(id, at, revision) {
   if (!ok) return;
   try {
     const { text, files } = await ask('rewindTo', { id, at, revision });
-    if (current === id) {
-      await openThread(id);
-      toComposer(text, files);
-    }
-    toast('Back to before that message: it is in the box below.');
+    if (current === id) await openThread(id);
+    // Into the box only if this thread is still the one open (else kept for it, for when
+    // it is): never into another's, whatever was opened meanwhile.
+    const here = backToBox(id, text, asAttached(files));
+    toast(here ? 'Back to before that message: it is in the box below.' : `${named(id, 'That thread')} went back to before that message: it is in the box when you open it.`);
   } catch (error) {
     toast(error.message);
   }
 }
 
-/** A message and its files back in the box, to change or send again. */
-function toComposer(text, files) {
-  $('prompt').value = text;
+/** A message's files (`{path, bytes}`) as the box holds them. */
+const asAttached = (files) => files.map(({ path, bytes }) => ({ name: path, size: bytes.length, file: new File([bytes], path.split('/').pop()) }));
+
+/** A message and its files back in the box, to change or send again: before what the
+ * box holds, which stays (a file of the same name is replaced). */
+function intoBox(text, files) {
+  $('prompt').value = [text, $('prompt').value.trim()].filter(Boolean).join('\n\n');
   autosize();
-  attached = files.map(({ path, bytes }) => ({ name: path, size: bytes.length, file: new File([bytes], path.split('/').pop()) }));
+  attached = [...files, ...attached.filter((kept) => !files.some((file) => file.name === kept.name))];
   renderAttached();
   $('prompt').focus();
+}
+
+/** Messages that came back from a thread (Take back, a rewind, a send that failed) while
+ * another was open: the box is every thread's, so each goes in only once its own thread
+ * is open again, never into another's. Kept in this extension's storage (`came-back:ID`,
+ * ID `start` for the start page; its files as they are), the one record every panel
+ * shares: added to in one transaction (`merge`) and taken whole in one (`take`), so no
+ * panel's message overwrites another's, and only one panel puts it in a box. Gone with
+ * its thread (the engine's `remove`). Held here only if storage refused it. */
+const cameBack = new Map();
+const cameBackKey = (id) => `came-back:${id ?? 'start'}`;
+
+/** A thread as a toast names it: its title in quotes, or `otherwise` (unquoted). */
+const named = (id, otherwise) => (threads.get(id)?.title ? `“${threads.get(id).title}”` : otherwise);
+
+/** `back` before what `kept` holds (a file of the same name: the newer one). */
+function together(back, kept) {
+  if (!kept) return back;
+  return {
+    text: [back.text, kept.text].filter(Boolean).join('\n\n'),
+    files: [...back.files, ...kept.files.filter((file) => !back.files.some((one) => one.name === file.name))],
+  };
+}
+
+/** Kept for thread `id` (null: the start page) until it is opened. */
+function keepBack(id, message) {
+  const stored = { text: message.text, files: message.files.map(({ name, size, file }) => ({ name, size, file })) };
+  merge('kv', cameBackKey(id), stored, together, 'strict').catch((error) => {
+    console.warn('Spindle: a message that came back is kept only while this panel is open:', error);
+    cameBack.set(id, together(stored, cameBack.get(id)));
+  });
+}
+
+/** A message (`files`: as the box holds them) back from thread `id` (null: the start
+ * page): into the box if that is what is open now, else kept for when it is. True if it
+ * is in the box. */
+function backToBox(id, text, files) {
+  if (current === id) {
+    intoBox(text, files);
+    return true;
+  }
+  keepBack(id, { text, files });
+  return false;
+}
+
+/** What came back for thread `id` while it was not open, into the box now it is (once:
+ * taken from storage; kept again if another thread was opened meanwhile). */
+function restoreCameBack(id) {
+  const into = (message) => {
+    intoBox(message.text, message.files);
+    toast('A message that came back while this was not open is in the box below.');
+  };
+  const held = cameBack.get(id);
+  if (held) {
+    cameBack.delete(id);
+    into(held);
+  }
+  take('kv', cameBackKey(id)).then((stored) => {
+    if (!stored) return;
+    if (current === id) into(stored);
+    else keepBack(id, stored);
+  }, () => {});
+}
+
+/** A thread deleted: what came back for it goes with it (the engine removes it too). */
+function forgetCameBack(id) {
+  cameBack.delete(id);
+  remove('kv', cameBackKey(id)).catch(() => {});
 }
 
 /** The pictures attached to a message (a screenshot the user took, say), as cards after
@@ -1750,10 +1849,16 @@ const readBytes = async (id, path) => (await ask('read', { id, path })).bytes;
 const workspacePath = (raw) => typeof raw !== 'string' ? null
   : raw.startsWith('/workspace/') ? raw.slice('/workspace/'.length) : raw.startsWith('./') ? raw.slice(2) : raw;
 const viewUrl = (id, path) => chrome.runtime.getURL(`view.html?thread=${encodeURIComponent(id)}&path=${encodeURIComponent(path)}`);
+/** Kinds that show themselves when a step writes them (and sit below its run of steps). */
+const PRESENTED = new Set(['page', 'picture', 'markdown', 'document']);
+/** Kinds the workspace offers to open in a tab of their own (view.html). */
+const TABBED = new Set(['page', 'picture', 'pdf', 'document', 'media']);
+/** What a kind is called where a file is listed. */
+const KIND_NAMES = { page: 'page', picture: 'picture', markdown: 'Markdown', text: 'text', pdf: 'PDF', document: 'document', media: 'audio or video' };
 
-/** Where a file a step wrote shows: a page, picture or Markdown file below its run of
- * steps, in sight; any other file inside the run, after its step. One card per file in a
- * run: the latest. */
+/** Where a file a step wrote shows: a page, picture, Markdown file or document below its
+ * run of steps, in sight; any other file inside the run, after its step. One card per
+ * file in a run: the latest. */
 function placeFile(card, made) {
   const steps = card.closest('.steps');
   if (!steps) {
@@ -1761,7 +1866,7 @@ function placeFile(card, made) {
     return;
   }
   for (const old of steps.querySelectorAll(`.file-card[data-path="${CSS.escape(made.dataset.path)}"]`)) old.remove();
-  if (['page', 'picture', 'markdown'].includes(kindOf(made.dataset.path))) steps.append(made);
+  if (PRESENTED.has(kindOf(made.dataset.path))) steps.append(made);
   else card.after(made);
 }
 
@@ -1771,14 +1876,15 @@ function wroteFile(card, preview = true) {
   const path = workspacePath(card.input?.path);
   if (!current || !path || !['write_file', 'edit_file'].includes(card.dataset.tool)) return null;
   turnPaths.add(path);
-  const presentable = ['page', 'picture', 'markdown'].includes(kindOf(path));
+  const presentable = PRESENTED.has(kindOf(path));
   return fileCard(current, path, { content: card.dataset.tool === 'write_file' ? card.input.content : null, preview: preview && presentable });
 }
 
 /** A file of thread `id` in the conversation: its icon, name (opening it in the workspace
- * page), folder and type; an eye that shows its preview here (a page in a sandboxed frame,
- * a picture, Markdown, text) and a download. `content`: its text as a step wrote it, when
- * at hand. */
+ * page), folder and type; an eye that shows its preview here (a page or document in a
+ * sandboxed frame, a picture, audio or video, Markdown, text), for a PDF a button that
+ * opens it in a tab instead, and a download. `content`: its text as a step wrote it,
+ * when at hand. */
 function fileCard(id, path, { content = null, size: bytes = null, preview = false } = {}) {
   const kind = kindOf(path);
   const card = el('div', `file-card kind-${kind ?? 'bytes'}`);
@@ -1792,7 +1898,7 @@ function fileCard(id, path, { content = null, size: bytes = null, preview = fals
   name.type = 'button';
   name.title = `Open ${path} in the workspace`;
   name.onclick = () => openWorkspace(id, path);
-  const type = /\.([A-Za-z0-9]{1,8})$/.exec(path)?.[1]?.toLowerCase() ?? ({ page: 'page', picture: 'picture', markdown: 'md', text: 'text' }[kind] ?? 'file');
+  const type = /\.([A-Za-z0-9]{1,8})$/.exec(path)?.[1]?.toLowerCase() ?? ({ ...KIND_NAMES, markdown: 'md' }[kind] ?? 'file');
   const meta = el('small', 'file-meta', [at > 0 ? `${path.slice(0, at)}/` : null, type, bytes != null ? size(bytes) : null].filter(Boolean).join(' · '));
   text.append(name, meta);
   const actions = el('span', 'file-actions');
@@ -1807,16 +1913,17 @@ function fileCard(id, path, { content = null, size: bytes = null, preview = fals
   let filled = false;
   const fill = () => {
     filled = true;
-    return previewInto(view, id, path, { content });
+    return previewInto(view, id, path, { content, size: bytes });
   };
-  if (kind === 'page') {
-    // A page's preview can show more of itself.
+  if (FRAMED.has(kind)) {
+    // A page's (a document's) preview can show more of itself.
+    const what = kind === 'document' ? 'document' : 'page';
     const tools = el('div', 'file-tools');
-    const taller = iconButton('taller', 'Show more of the page here', () => {
+    const taller = iconButton('taller', `Show more of the ${what} here`, () => {
       card.classList.toggle('tall');
       const tall = card.classList.contains('tall');
       taller.replaceChildren(icon(tall ? 'shorter' : 'taller'));
-      taller.title = tall ? 'Show less of the page here' : 'Show more of the page here';
+      taller.title = tall ? `Show less of the ${what} here` : `Show more of the ${what} here`;
       taller.setAttribute('aria-label', taller.title);
     });
     tools.append(taller);
@@ -1824,10 +1931,16 @@ function fileCard(id, path, { content = null, size: bytes = null, preview = fals
   }
   body.append(view);
   let toggle = null;
-  if (kind) {
+  if (kind === 'pdf') {
+    // In Chrome's own viewer, a tab of its own (never in the panel: a link clicked in a
+    // PDF takes the page around the viewer with it).
+    action('external', `Open ${path} in a tab`, () => chrome.tabs.create({ url: viewUrl(id, path) }));
+  } else if (kind) {
     toggle = action('eye', `Preview ${path}`, () => {
       body.hidden = !body.hidden;
       const shown = !body.hidden;
+      // Folded away, what plays stops (it would go on unseen).
+      if (!shown) for (const player of body.querySelectorAll('audio, video')) player.pause();
       toggle.replaceChildren(icon(shown ? 'eye-off' : 'eye'));
       toggle.title = shown ? `Hide ${path}` : `Preview ${path}`;
       toggle.setAttribute('aria-label', toggle.title);
@@ -1848,14 +1961,17 @@ function fileCard(id, path, { content = null, size: bytes = null, preview = fals
   head.append(mark, text, actions);
   card.append(head, body);
   // Shows its preview (once, if it has one to show).
-  if (toggle && ['page', 'picture', 'markdown'].includes(kind)) card.preview = () => body.hidden && toggle.click();
+  if (toggle && PRESENTED.has(kind)) card.preview = () => body.hidden && toggle.click();
   if (preview) card.preview?.();
   return card;
 }
 
 /** A file's preview into `body`: a page in a sandboxed frame (its scripts running where
  * the frame is contained, and otherwise as the user let this version of it, which also
- * says whether it reaches the web: `previewNote`), a picture, Markdown, text; with `any`,
+ * says whether it reaches the web: `previewNote`), a Word, Excel or PowerPoint document
+ * drawn as a static page in one, a picture (an SVG that is no picture as a page), audio
+ * or video in a player, Markdown, text, and for a PDF a button that opens it in a tab
+ * (Chrome's own viewer); with `any`,
  * a file of no known kind shows as text when it is text. `content`: its text, when at
  * hand; `textId`: the id its text block takes. */
 async function previewInto(body, id, path, options = {}) {
@@ -1866,9 +1982,11 @@ async function previewInto(body, id, path, options = {}) {
   const generation = (body.previewing ?? 0) + 1;
   body.previewing = generation;
   const newest = () => body.previewing === generation;
-  // A page's preview holds its height from the start: nothing below it jumps (nor what
-  // the user is about to click) when it comes.
-  body.replaceChildren(el('p', `note${kind === 'page' ? ' file-waiting' : ''}`, 'Reading…'));
+  // A page's (a document's) preview holds its height from the start: nothing below it
+  // jumps (nor what the user is about to click) when it comes.
+  body.replaceChildren(el('p', `note${FRAMED.has(kind) ? ' file-waiting' : ''}`, 'Reading…'));
+  // What played here before is gone now: its file goes (and any other gone player's).
+  sweepPlayers();
   try {
     if (kind === 'page') {
       const contained = containment();
@@ -1885,15 +2003,60 @@ async function previewInto(body, id, path, options = {}) {
       body.replaceChildren(frame);
       const note = el('p', 'note file-web');
       if (previewNote(note, page, await contained, again)) body.prepend(note);
+    } else if (kind === 'pdf') {
+      // Opened in Chrome's own viewer, a tab of its own (view.html becomes it), never in
+      // the panel: a link clicked in a PDF takes the page around the viewer with it.
+      if (!pdfShows()) {
+        body.replaceChildren(el('p', 'note', `PDFs open here in ${BROWSER} 123 and later: download it to open it.`));
+        return;
+      }
+      const open = el('button', 'file-open-tab', 'Open in a tab');
+      open.type = 'button';
+      open.onclick = () => chrome.tabs.create({ url: viewUrl(id, path) });
+      body.replaceChildren(el('p', 'note', `A PDF opens in ${BROWSER}'s own PDF viewer, in a tab of its own.`), open);
+    } else if (kind === 'document') {
+      // Too large to draw (when its size is known): said before its bytes are read.
+      if (options.size > MAX_DOCUMENT) {
+        body.replaceChildren(el('p', 'note', `It is ${size(options.size)}: documents up to ${size(MAX_DOCUMENT)} show here. Download it to open it.`));
+        return;
+      }
+      const { html, notes } = await documentPage(path, await readBytes(id, path));
+      const frame = await documentFrame(html, path);
+      if (!newest()) return;
+      frame.className = 'file-frame';
+      body.replaceChildren(frame);
+      if (notes.length) body.prepend(el('p', 'note file-web', notes.join(' ')));
     } else if (kind === 'picture') {
       const bytes = await readBytes(id, path);
       if (!newest()) return;
-      const url = URL.createObjectURL(new Blob([bytes], { type: typeOf(path) }));
+      const url = URL.createObjectURL(pictureBlob(path, bytes));
       const image = el('img', 'file-picture');
       image.alt = shownName(path);
-      image.onload = image.onerror = () => URL.revokeObjectURL(url);
+      image.onload = () => URL.revokeObjectURL(url);
+      image.onerror = async () => {
+        URL.revokeObjectURL(url);
+        // An SVG whose markup a picture cannot read shows as a page instead.
+        if (!/\.svg$/i.test(path) || !newest() || !image.isConnected) return;
+        const frame = await documentFrame(svgPage(bytes), path);
+        frame.className = 'file-frame';
+        if (newest()) body.replaceChildren(frame);
+      };
       image.src = url;
       body.replaceChildren(image);
+    } else if (kind === 'media') {
+      const bytes = await readBytes(id, path);
+      if (!newest()) return;
+      const type = typeOf(path);
+      const url = URL.createObjectURL(new Blob([bytes], { type }));
+      const player = el(type.startsWith('audio/') ? 'audio' : 'video', 'file-media');
+      Object.assign(player, { controls: true, preload: 'metadata', src: url });
+      players.set(url, player);
+      player.setAttribute('aria-label', shownName(path));
+      player.onerror = () => {
+        if (newest()) body.replaceChildren(el('p', 'note', 'This browser cannot play it: download it to open it.'));
+        sweepPlayers();
+      };
+      body.replaceChildren(player);
     } else if (kind || any) {
       const bytes = content == null ? await readBytes(id, path) : null;
       if (!newest()) return;
@@ -2588,13 +2751,9 @@ function send() {
         }
       }
     } catch (error) {
-      if (current === target && cleared) {
-        $('prompt').value = [text, $('prompt').value].filter(Boolean).join('\n\n');
-        autosize();
-        attached = [...going, ...attached.filter((file) => !going.some((kept) => kept.name === file.name))];
-        renderAttached();
-      }
-      toast(error.message);
+      // Back in the box it left (that thread's, or the start page's), never another's.
+      const here = !cleared || backToBox(target, text, going);
+      toast(here ? error.message : `${error.message} (the message is back in the box when you ${target ? 'open that thread' : 'go back to the start page'})`);
     }
   }).catch((error) => toast(error.message)).finally(() => { if (sending === sendId) sending = null; });
 }
@@ -3135,11 +3294,12 @@ $('takeback').onclick = async () => {
   if (!id) return;
   try {
     const { text, files } = await ask('restart', { id, resend: false });
-    if (current === id) {
-      await openThread(id);
-      toComposer(text, files);
-    }
-    toast('The unfinished turn was taken back: its message is in the box below, to change or send again.');
+    if (current === id) await openThread(id);
+    // Into the box only if this thread is still the one open (else kept for it, for when
+    // it is): never into another's, whatever was opened meanwhile.
+    const here = backToBox(id, text, asAttached(files));
+    toast(here ? 'The unfinished turn was taken back: its message is in the box below, to change or send again.'
+      : `The unfinished turn of ${named(id, 'that thread')} was taken back: its message is in the box when you open it.`);
   } catch (error) {
     toast(error.message);
   }
@@ -3951,6 +4111,14 @@ async function renderStorage() {
     }
     box.append(storageRow(title, total, details.join(' · '), actions));
   }
+  // Bytes whose slot's name could not be read (its header damaged): no file leads to them.
+  if (report.lost?.bytes) {
+    counted += report.lost.bytes;
+    freeable += report.lost.bytes;
+    const one = report.lost.files === 1;
+    box.append(storageRow('Unreadable', report.lost.bytes, `${one ? 'a file' : `${report.lost.files} files`} whose name in storage could not be read (${one ? 'its record' : 'their records'} damaged); nothing reads ${one ? 'it' : 'them'}`,
+      [storageAction(`Free ${size(report.lost.bytes)}`, 'Remove the bytes no file name leads to', () => reclaimLost())]));
+  }
   if (linux.bytes) {
     counted += linux.bytes;
     box.append(storageRow('Linux snapshot', linux.bytes, 'v86 resumes from it; rebuilt in under a minute when next needed',
@@ -4008,6 +4176,13 @@ function dropAside(id, title) {
   });
 }
 
+function reclaimLost() {
+  return freeSpace('Removing unreadable files…', async () => {
+    const { freed } = await ask('reclaimLost');
+    toast(`Freed ${size(freed)}.`);
+  });
+}
+
 function removeSnapshot() {
   return freeSpace('Removing the Linux snapshot…', async () => {
     // As it is now (a newer image may have saved another since the page was drawn).
@@ -4020,9 +4195,10 @@ function removeSnapshot() {
 /** Free all: every thread with free space worth giving back, one after another, and
  * every moved thread's sealed copy. */
 $('storage-free-all').onclick = () => freeSpace('Freeing space…', async () => {
-  const { threads: usage } = await ask('storage');
+  const { threads: usage, lost } = await ask('storage');
   let freed = 0;
   try {
+    if (lost?.bytes) freed += (await ask('reclaimLost')).freed;
     for (const entry of usage) {
       const thread = threads.get(entry.id);
       if (!thread) continue;
@@ -4085,6 +4261,7 @@ const ws = { id: null, files: [], changes: new Map(), order: [], path: null, scr
 
 async function openWorkspace(id, path = null) {
   if (!id) return;
+  pausePlayers();
   // Where the conversation was scrolled to, for coming back to it.
   if (document.body.dataset.view !== 'workspace') ws.scrolled = $('main').scrollTop;
   ws.id = id;
@@ -4128,10 +4305,19 @@ async function refreshWorkspace(id) {
   } catch {}
 }
 
+/** The workspace page's preview emptied: one still on its way does not land, and what
+ * played there stops and lets go of its file. */
+function clearPreview() {
+  const preview = $('ws-preview');
+  preview.previewing = (preview.previewing ?? 0) + 1;
+  preview.replaceChildren();
+  sweepPlayers();
+}
+
 /** Back to the conversation the workspace page was opened from. */
 function closeWorkspace() {
   ws.id = null;
-  $('ws-preview').replaceChildren();
+  clearPreview();
   if (!current || !threads.has(current)) {
     showHome();
     return;
@@ -4160,7 +4346,8 @@ function drawFiles() {
   ws.order = drawTree($('file-list'), files, changes, { onOpen: openFile, filter: $('ws-filter').value, links: fileLinks, key: ws.id, redraw: drawFiles });
 }
 
-/** A file row's links: download, and open in a tab of its own for a page or picture. */
+/** A file row's links: download, and open in a tab of its own for a page, picture, PDF,
+ * document, audio or video. */
 function fileLinks(file) {
   const id = ws.id;
   const get = el('a', 'file-get');
@@ -4176,7 +4363,7 @@ function fileLinks(file) {
       toast(error.message);
     }
   };
-  if (!['page', 'picture'].includes(kindOf(file.path))) return [get];
+  if (!TABBED.has(kindOf(file.path))) return [get];
   const open = el('a', 'file-get');
   open.href = '#';
   open.title = `Open ${file.path} in a tab`;
@@ -4192,7 +4379,7 @@ function fileLinks(file) {
 function showFiles() {
   const was = ws.path;
   ws.path = null;
-  $('ws-preview').replaceChildren();
+  clearPreview();
   $('ws-list').hidden = false;
   $('ws-file').hidden = true;
   // Back on the list: on the row of the file just shown, or (its folder shut, or it
@@ -4226,10 +4413,10 @@ function openFile(path) {
   $('ws-path').replaceChildren(...parts.flatMap((part, index) => [el('span', 'ws-sep', '/'), index === parts.length - 1 ? el('strong', '', shownName(path)) : el('span', '', part)]));
   const change = ws.changes.get(path);
   const kind = kindOf(path);
-  $('ws-meta').replaceChildren(document.createTextNode([{ page: 'page', picture: 'picture', markdown: 'Markdown', text: 'text' }[kind] ?? 'file', size(file.size)].join(' · ')));
+  $('ws-meta').replaceChildren(document.createTextNode([KIND_NAMES[kind] ?? 'file', size(file.size)].join(' · ')));
   if (change) $('ws-meta').append(el('span', `badge ${change}`, change));
   const actions = [copyButton(() => path, 'Copy its path')];
-  if (kind === 'page' || kind === 'picture') actions.push(iconButton('external', `Open ${path} in a tab`, () => chrome.tabs.create({ url: viewUrl(id, path) })));
+  if (TABBED.has(kind)) actions.push(iconButton('external', `Open ${path} in a tab`, () => chrome.tabs.create({ url: viewUrl(id, path) })));
   actions.push(iconButton('download', `Download ${path}`, async () => {
     try {
       await saveFile(await readBytes(id, path), path.split('/').pop(), typeOf(path));
@@ -4248,7 +4435,7 @@ function openFile(path) {
   $('ws-next').onclick = () => at < order.length - 1 && openFile(order[at + 1]);
   const preview = $('ws-preview');
   preview.className = `kind-${kind ?? 'bytes'}`;
-  previewInto(preview, id, path, { any: true, textId: 'file-content' });
+  previewInto(preview, id, path, { any: true, textId: 'file-content', size: file.size });
   $('main').scrollTop = 0;
   if (!$('ws-file').contains(document.activeElement)) $('ws-path').focus({ preventScroll: true });
 }
@@ -4658,13 +4845,11 @@ $('queued-back').onclick = async () => {
   const id = current;
   try {
     const back = await ask('unqueue', { id });
-    if (!back || current !== id) return;
-    $('prompt').value = [back.text, $('prompt').value.trim()].filter(Boolean).join('\n\n');
-    autosize();
+    if (!back) return;
     const files = back.files.map((file) => ({ name: String(file.path), size: file.bytes.length, file: new File([file.bytes], String(file.path)) }));
-    attached = [...files, ...attached.filter((kept) => !files.some((file) => file.name === kept.name))];
-    renderAttached();
-    $('prompt').focus();
+    // Into the box only if this thread is still the one open (else kept for it, for when
+    // it is): never into another's, and never dropped (the engine let its copy go).
+    if (!backToBox(id, back.text, files)) toast(`The waiting message of ${named(id, 'that thread')} was taken back: it is in the box when you open it.`);
   } catch (error) {
     toast(error.message);
   }
@@ -4842,6 +5027,11 @@ $('import-file').onchange = async (event) => {
   const file = event.target.files[0];
   event.target.value = '';
   if (!file) return;
+  // Before it is read (BUNDLE_MOST: a larger one would end the engine rather than fail).
+  if (file.size > BUNDLE_MOST) {
+    toast(`${file.name} is ${size(file.size)}: a thread file over ${size(BUNDLE_MOST)} is too large to bring into this browser (a native Spindle takes it).`);
+    return;
+  }
   try {
     const { id, said = [] } = await ask('import', { bytes: new Uint8Array(await file.arrayBuffer()), name: file.name });
     // A thread that runs differently here (one from a native host, or set up for one by

@@ -834,7 +834,13 @@ native stdio or HTTP routes; see [embedded.md](embedded.md#giving-space-back).
 ### `import_session`
 
 Writes a session bundle as a new session directory and opens it. The session keeps
-its identity: it is the same session, moved.
+its identity: it is the same session, moved. The bundle is unpacked from its file into
+a new staging directory beside `dir` (owner-only on Unix) and checked there, every
+store where it lies (as `POST /v1/threads` checks it, holding no store in memory), and
+only then renamed into place; a refused bundle leaves nothing behind. A staging
+directory that a stopped import left for the same `dir` is removed by the next import
+there, never a live import's (another process's only on Unix, once that process is
+gone).
 
 | Param | Type | Required | Notes |
 | --- | --- | --- | --- |
@@ -1442,6 +1448,7 @@ state](#head-state) plus:
 | `app_tools` | Every waiting call. |
 | `self_edit` | Self-edit state of a thread holding Spindle's source (see [host.md](host.md)), or null. |
 | `moved` | True once the thread moved back to its client (feature `threads`; see [Bringing threads to the host](#bringing-threads-to-the-host)). |
+| `bundle_bytes` | About how many bytes the thread's bundle would hold if it were exported now: its stores, their write-ahead logs and sidecars as they are on disk, its tasks' included, plus room for the bundle's framing. Read from file sizes alone, opening no store; over rather than under, usually by no more than each log's kept size (16 MiB). A client reads it before a move that would seal the thread here for a bundle it could not take (see [Take a thread back](#take-a-thread-back)). |
 
 Before a new session's store exists, `phase` is `starting` (while its command runs)
 or `missing`.
@@ -1559,11 +1566,21 @@ Spindle for Browser does this with a browser token (see
   characters, not blank; default `Imported thread`), and `provider` with `model` (both
   or neither) to run the thread on that model of this host's instead of its own. A
   provider or model this host does not know is `400 bad_request`.
-- The host reads and checks the whole bundle before it writes a session. A bundle it
-  cannot read (damaged, cut short, of a schema this build does not read, with a path a
-  session does not hold, or without settings) is `400 bad_bundle`, with the reason.
-  Otherwise it imports the bundle as a new session with a new `id`, owned by the
-  credential that brought it.
+- The host checks the whole bundle before any of it becomes a session. It unpacks the
+  upload from its file into a private staging directory (made new, owner-only), copying
+  each file through a 1 MiB buffer and checking it against its digest, then checks every
+  store where it lies, through a bounded page cache: it holds no store, and at most one
+  sidecar (4 MiB), in memory. A bundle it cannot read (damaged, cut short, of a schema
+  this build does not read, with a path a session does not hold, a store whose settings
+  are over 4 MiB, or without settings) is `400 bad_bundle`, with the reason, and leaves
+  nothing staged. A store the host cannot check for reasons of its own (it cannot open or
+  read the file, the disk or memory runs out) is `500 internal`, not `bad_bundle`.
+- One import at a time unpacks and checks; others wait their turn, their uploads on the
+  host's disk meanwhile (uploads themselves run side by side). The credential check that
+  follows (see `409 no_credentials`; it may refresh a sign-in over the network or run a
+  key command) holds no other import back, the staged copy waiting on the disk. Then,
+  again one at a time, the host puts the staged session in place and opens it: a new
+  session with a new `id`, owned by the credential that brought it.
 - `201 {session, fit, replayed: false}`. `session` is the
   [session object](#session-object); its `head` is the bundle's. `fit` is
   `{changes, notes}`: `changes` maps each setting the host changed to its new value,
@@ -1610,6 +1627,12 @@ session, if the commit happened, or a fresh import, if it did not.
 - Without `keep` (or with `keep: false`) the thread moves back to its client. With
   `keep: true` the host sends a copy and keeps the thread; continue only one of the
   copies.
+- Before asking, a client that takes bundles only up to some size can read the thread's
+  `bundle_bytes` ([session object](#session-object)) and leave a thread too large for it
+  here: nothing is sealed until an export without `keep` is asked for. Spindle for
+  Browser does so (after 0.1.6): it takes a bundle of up to 1 GB, as it takes a thread
+  file it imports, and a larger thread stays on the host, its note saying why. A host
+  that does not report `bundle_bytes` (an older one) is asked for the bundle as before.
 - `200`, `application/octet-stream`: the bundle, with `Content-Length` its size,
   `X-Spindle-Head` its head and `X-Spindle-Identity` the thread's identity. Import it as
   any session bundle; the head and identity are the thread's.

@@ -307,7 +307,9 @@ flowchart TB
 
 A session moves between hosts: a Node session directory is a native session directory,
 and any session can be exported to a single-file bundle and imported elsewhere
-([store.md](store.md), [embedded.md](embedded.md)).
+([store.md](store.md), [embedded.md](embedded.md)). The embedded package checks a bundle
+in memory; a native host unpacks it from its file into a private staging directory and
+checks it there, every store where it lies, before renaming it into place.
 
 ## On disk
 
@@ -365,7 +367,7 @@ effects a rewind cannot undo. See [SECURITY.md](../SECURITY.md).
 | [`spindle/store/src/broker.rs`](../spindle/store/src/broker.rs), [`completion.rs`](../spindle/store/src/completion.rs) | Reservation before dispatch, receipt ingestion |
 | [`spindle/store/src/workspace.rs`](../spindle/store/src/workspace.rs), [`artifact.rs`](../spindle/store/src/artifact.rs) | Workspace trees and content-addressed objects |
 | [`spindle/store/src/rewind.rs`](../spindle/store/src/rewind.rs) | Rewind targets and rewind |
-| [`spindle/store/src/bundle.rs`](../spindle/store/src/bundle.rs) | Session bundles for moving sessions |
+| [`spindle/store/src/bundle.rs`](../spindle/store/src/bundle.rs) | Session bundles for moving sessions, checked in memory or unpacked from a file and checked there |
 | [`spindle/store/src/driver.rs`](../spindle/store/src/driver.rs) | The portable turn driver |
 | [`spindle/store/src/shape.rs`](../spindle/store/src/shape.rs) | Pure request shaping |
 | [`spindle/store/src/spend.rs`](../spindle/store/src/spend.rs) | Shared ledger, pricing, usage forms and budget checks for both hosts |

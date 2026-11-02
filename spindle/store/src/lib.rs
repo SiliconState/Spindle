@@ -971,14 +971,70 @@ pub fn image_facts(image: &[u8]) -> Result<ImageFacts> {
     checked_image(image, false)
 }
 
+/// Page cache of a store checked where it lies (`check_image_file`), in KiB: all of it
+/// SQLite holds of the store at once, however large the store is.
+const IMAGE_FILE_CACHE_KIB: i64 = 8 * 1024;
+
+/// Whether `header` (an image's first bytes, at least 100 of them) is a store image's:
+/// an unencrypted SQLite file whose format bytes say rollback journal (1/1, not WAL).
+fn image_header(header: &[u8]) -> bool {
+    header.len() >= 100 && header.starts_with(SQLITE_HEADER) && header[18..20] == [1, 1]
+}
+
 fn checked_image(image: &[u8], whole: bool) -> Result<ImageFacts> {
-    if image.len() < 100 || !image.starts_with(SQLITE_HEADER) || image[18..20] != [1, 1] {
+    if !image_header(image) {
         return Err(Error::Incompatible);
     }
     let mut db = Connection::open_in_memory()?;
     // Writable: a previous schema's image is checked as the open will migrate it. The
     // image itself is never changed (SQLite reads it into memory of its own).
     db.deserialize_read_exact(rusqlite::MAIN_DB, image, image.len(), false)?;
+    image_checks(&db, whole)
+}
+
+/// `check_image` of the image in the file at `path`, read where it lies through a
+/// bounded page cache (`IMAGE_FILE_CACHE_KIB`), so neither the image nor a copy of it is
+/// ever held in memory: the same checks and the same answer. The file is never written:
+/// the checks run in a transaction that is rolled back, its journal kept in memory and
+/// its pages never spilled to the file, so a previous schema's image (checked as the
+/// open will migrate it) stays byte for byte as it came. SQLite would replay a journal
+/// found beside the file, so `path` is in a directory no other file is written into
+/// (a private staging directory: a bundle never carries a journal). The path is made
+/// absolute first, so SQLite never reads a relative one beginning `file:` as a URI: the
+/// header read and the open are of the same file.
+pub fn check_image_file(path: &Path) -> Result<ImageFacts> {
+    use std::io::Read;
+    let path = std::path::absolute(path)?;
+    let mut header = Vec::with_capacity(100);
+    File::open(&path)?.take(100).read_to_end(&mut header)?;
+    if !image_header(&header) {
+        return Err(Error::Incompatible);
+    }
+    // Opened, never created: the file is the image.
+    let db = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    db.pragma_update(None, "trusted_schema", "OFF")?;
+    let journal: String =
+        db.pragma_update_and_check(None, "journal_mode", "MEMORY", |r| r.get(0))?;
+    db.pragma_update(None, "cache_spill", "OFF")?;
+    db.pragma_update(None, "cache_size", -IMAGE_FILE_CACHE_KIB)?;
+    if !journal.eq_ignore_ascii_case("memory") {
+        return Err(Error::Unsupported);
+    }
+    db.execute_batch("BEGIN")?;
+    let checked = image_checks(&db, true);
+    // Whatever the checks found, nothing they did reaches the file. (SQLite has rolled
+    // back already if a write failed.)
+    if !db.is_autocommit() {
+        db.execute_batch("ROLLBACK")?;
+    }
+    checked
+}
+
+/// The checks of `checked_image` on `db`, which holds the image.
+fn image_checks(db: &Connection, whole: bool) -> Result<ImageFacts> {
     db.pragma_update(None, "trusted_schema", "OFF")?;
     let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
     let schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -987,15 +1043,15 @@ fn checked_image(image: &[u8], whole: bool) -> Result<ImageFacts> {
     if app != APP_ID || (schema != SCHEMA && !(whole && schema == PREVIOUS_SCHEMA)) {
         return Err(Error::Incompatible);
     }
-    validate_schema(&db, schema)?;
-    check_pages(&db)?;
+    validate_schema(db, schema)?;
+    check_pages(db)?;
     if schema != SCHEMA {
         // Rows kept as they are are valid at this schema: only the column is needed.
-        artifact::upgrade(&db, false)?;
+        artifact::upgrade(db, false)?;
     }
-    validate_row_types(&db)?;
+    validate_row_types(db)?;
     if whole {
-        validate_all(&db, true)?;
+        validate_all(db, true)?;
     }
     let head: i64 = db.query_row("SELECT revision FROM head WHERE id=1", [], |r| r.get(0))?;
     let identity: Vec<u8> =
@@ -1006,7 +1062,7 @@ fn checked_image(image: &[u8], whole: bool) -> Result<ImageFacts> {
     Ok(ImageFacts {
         head: u64::try_from(head).map_err(|_| Error::Incompatible)?,
         identity: identity.iter().map(|byte| format!("{byte:02x}")).collect(),
-        settings: meta::get(&db, "settings")?,
+        settings: meta::get(db, "settings")?,
     })
 }
 

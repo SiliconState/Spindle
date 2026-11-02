@@ -366,6 +366,12 @@ api.tool("lookup", "Looks notes up.",
 `tools.definitions()` returns the definitions in the form `create` and `settings`
 take. `call` is the `app_tool` event (`call`, `tool_use_id`, `name`, `input`,
 `again`, `rerun`, `timeout_s`). Its `call` id stays the same across restarts.
+Under the embedded client, `call` also carries `session` (the session's directory)
+and `signal`, an `AbortSignal` that ends with an `AbortError` carrying `outcome`
+(`stopped`, `no_answer` or `closed`) when the call is settled without the handler's
+answer or the client closes; that answer is then not sent (see
+[embedded.md](embedded.md#app-tools)). `StdioClient` and `HttpClient` pass the event
+alone.
 
 **Shaping the answer.** The handler's return value becomes the answer:
 

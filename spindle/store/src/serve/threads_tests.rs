@@ -417,7 +417,10 @@ fn a_thread_comes_and_goes_back_with_its_head_and_identity() {
     assert!(back.files.iter().any(|file| file.path == "pack-session-id"));
     // The client imports it as the same session.
     let place = root.join("client");
-    let imported = spindle_store::agent::import_bundle(&back, &place).unwrap();
+    let file = root.join("back.spindle");
+    std::fs::write(&file, &bytes).unwrap();
+    let imported = spindle_store::agent::import_session(&file, &place).unwrap();
+    assert_eq!(imported["files"], back.files.len());
     assert_eq!(imported["head"], head);
     assert_eq!(imported["identity"], identity.as_str());
     let (_, listed) = get(&host, "/v1/sessions", &token);
@@ -665,6 +668,100 @@ fn an_import_stopped_at_any_point_is_whole_or_absent_after_a_restart() {
     let _ = super::super::disk::remove_tree(&root);
 }
 
+/// Imports that arrive together upload side by side, then take turns unpacking and
+/// checking: one waits (refused nothing) while another holds the turn, and all arrive.
+#[test]
+fn imports_that_arrive_together_take_turns_and_all_arrive() {
+    let (root, host) = temp_host("turns");
+    let token = browser_token(&host, "edge");
+    let (a, _, _) = bundle_of(&root, "a", &browser_settings("local"), &["a"]);
+    let (b, _, _) = bundle_of(&root, "b", &browser_settings("local"), &["b"]);
+    let later = |key: &'static str, bundle: &[u8]| {
+        let (host, token, bundle) = (host.clone(), token.clone(), bundle.to_vec());
+        std::thread::spawn(move || bring(&host, &token, key, "", &bundle))
+    };
+    // Another import's turn: this one uploads, records its key, and waits.
+    let turn = lock(&host.importing);
+    let waiting = later("turns-key-0000000001", &a);
+    let started = Instant::now();
+    while count(&host, "SELECT count(*) FROM threads WHERE state='pending'") == 0 {
+        assert!(started.elapsed() < Duration::from_secs(20), "no upload");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!waiting.is_finished(), "imported during another's turn");
+    assert_eq!(count(&host, "SELECT count(*) FROM sessions"), 0);
+    // Its key is still importing meanwhile, as any running import's is.
+    let (status, busy) = bring(&host, &token, "turns-key-0000000001", "", &a);
+    assert_eq!((status, busy["code"].clone()), (409, json!("busy")));
+    drop(turn);
+    let (status, reply) = waiting.join().unwrap();
+    assert_eq!(status, 201, "{reply}");
+    // Two at once: both arrive.
+    for import in [
+        later("turns-key-0000000002", &a),
+        later("turns-key-0000000003", &b),
+    ] {
+        let (status, reply) = import.join().unwrap();
+        assert_eq!(status, 201, "{reply}");
+    }
+    assert_eq!(count(&host, "SELECT count(*) FROM sessions"), 3);
+    nothing_registered(&host, &root, 3);
+    drop(host);
+    let _ = super::super::disk::remove_tree(&root);
+}
+
+/// An import whose credential check takes its time (a sign-in refreshed over the
+/// network, a key command) holds no other import back: one sent meanwhile is unpacked,
+/// checked and registered while the first waits, and then the first arrives too.
+#[test]
+fn an_import_checking_its_credentials_holds_no_other_back() {
+    let (root, host) = temp_host("checking");
+    let token = browser_token(&host, "edge");
+    let (a, _, _) = bundle_of(&root, "a", &browser_settings("local"), &["a"]);
+    let (b, _, _) = bundle_of(&root, "b", &browser_settings("local"), &["b"]);
+    let later = |key: &'static str, bundle: &[u8]| {
+        let (host, token, bundle) = (host.clone(), token.clone(), bundle.to_vec());
+        std::thread::spawn(move || bring(&host, &token, key, "", &bundle))
+    };
+    let (release, hold) = std::sync::mpsc::channel();
+    *lock(&host.checking) = Some(hold);
+    let first = later("checking-key-0000001", &a);
+    let started = Instant::now();
+    while lock(&host.checking).is_some() {
+        assert!(started.elapsed() < Duration::from_secs(20), "no check");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // It waits at its check, its staged copy on the disk.
+    assert!(
+        std::fs::read_dir(root.join("incoming"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".importing-")),
+        "nothing staged"
+    );
+    let second = later("checking-key-0000002", &b);
+    let started = Instant::now();
+    while !second.is_finished() && started.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let through = second.is_finished();
+    assert!(!first.is_finished(), "the first did not wait");
+    drop(release);
+    assert!(through, "an import waited for another's credential check");
+    let (status, reply) = second.join().unwrap();
+    assert_eq!(status, 201, "{reply}");
+    let (status, reply) = first.join().unwrap();
+    assert_eq!(status, 201, "{reply}");
+    assert_eq!(count(&host, "SELECT count(*) FROM sessions"), 2);
+    nothing_registered(&host, &root, 2);
+    drop(host);
+    let _ = super::super::disk::remove_tree(&root);
+}
+
 #[test]
 fn exports_refuse_busy_threads_and_never_send_a_stale_file() {
     let (root, host) = temp_host("export");
@@ -680,11 +777,21 @@ fn exports_refuse_busy_threads_and_never_send_a_stale_file() {
         (409, json!("busy"))
     );
     host.live(&id).unwrap().lock().busy = false;
+    // Its size is said before any export: never under the bundle, over by at most a
+    // write-ahead log's kept size.
+    let estimate = get(&host, &format!("/v1/sessions/{id}"), &token).1["bundle_bytes"]
+        .as_u64()
+        .unwrap();
     // A copy: the session stays, nothing is left behind.
     let (status, _, copy) = take(&host, &token, &id, true);
     assert_eq!(status, 200);
     assert_eq!(spindle_store::bundle::read(&copy).unwrap().head, head);
     assert!(!super::moved(&host.dir(&id)));
+    assert!(
+        estimate >= copy.len() as u64 && estimate <= copy.len() as u64 + (16 << 20) + 65536,
+        "estimate {estimate}, bundle {}",
+        copy.len()
+    );
     assert!(
         std::fs::read_dir(root.join("incoming"))
             .unwrap()

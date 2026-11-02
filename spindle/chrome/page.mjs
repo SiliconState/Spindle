@@ -1,9 +1,10 @@
 // A file of a thread's workspace made ready to show: its type, whether it can be shown
-// as a page, a picture, Markdown or text, and a web page with what it refers to by
-// relative address put in (its scripts, styles and pictures, and the small data files
-// it fetches), for preview.html, a sandboxed page that cannot reach Spindle or its keys
-// and, where Chrome holds it to a Connection-Allowlist, nothing else either (`POLICY`).
-// view.html (a file in a tab) and the panel (a file in the conversation) share it.
+// as a page, a picture, Markdown, text, a PDF, a document or audio and video, and a web
+// page with what it refers to by relative address put in (its scripts, styles and
+// pictures, and the small data files it fetches), for preview.html, a sandboxed page
+// that cannot reach Spindle or its keys and, where Chrome holds it to a
+// Connection-Allowlist, nothing else either (`POLICY`). view.html (a file in a tab) and
+// the panel (a file in the conversation) share it.
 
 const TYPES = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
@@ -11,17 +12,103 @@ const TYPES = {
   csv: 'text/csv', tsv: 'text/tab-separated-values', txt: 'text/plain', md: 'text/markdown', xml: 'application/xml',
   geojson: 'application/geo+json', html: 'text/html', htm: 'text/html', woff2: 'font/woff2', woff: 'font/woff',
   mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav', pdf: 'application/pdf',
+  avif: 'image/avif', bmp: 'image/bmp', apng: 'image/apng', m4v: 'video/mp4', ogv: 'video/ogg', mov: 'video/quicktime',
+  m4a: 'audio/mp4', aac: 'audio/aac', ogg: 'audio/ogg', oga: 'audio/ogg', opus: 'audio/ogg', flac: 'audio/flac',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  docm: 'application/vnd.ms-word.document.macroEnabled.12',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  xlsm: 'application/vnd.ms-excel.sheet.macroEnabled.12',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  pptm: 'application/vnd.ms-powerpoint.presentation.macroEnabled.12',
 };
 export const typeOf = (name) => TYPES[name.split('.').pop().toLowerCase()] ?? 'application/octet-stream';
 
-/** How a file shows: 'page', 'picture', 'markdown', 'text' or null (bytes only). */
+/** How a file shows: 'page', 'picture', 'markdown', 'text', 'pdf' (Chrome's own viewer),
+ * 'document' (Word, Excel, PowerPoint: drawn as a page, documents.mjs), 'media' (audio
+ * or video) or null (bytes only). */
 export function kindOf(name) {
   if (/\.html?$/i.test(name)) return 'page';
-  if (/\.(png|jpe?g|gif|webp|svg)$/i.test(name)) return 'picture';
+  if (/\.(png|jpe?g|gif|webp|svg|avif|bmp|ico|apng)$/i.test(name)) return 'picture';
+  if (/\.pdf$/i.test(name)) return 'pdf';
+  if (/\.(docx|docm|xlsx|xlsm|pptx|pptm)$/i.test(name)) return 'document';
+  if (/\.(mp4|m4v|webm|ogv|mov|mp3|m4a|aac|wav|ogg|oga|opus|flac)$/i.test(name)) return 'media';
   if (/\.(md|markdown)$/i.test(name)) return 'markdown';
   if (/\.(txt|css|js|mjs|cjs|ts|tsx|jsx|json|csv|tsv|xml|ya?ml|toml|ini|py|rb|go|rs|java|c|h|cpp|hpp|sh|bash|sql|log|geojson|svelte|vue)$/i.test(name)
     || !/\.[^/]+$/.test(name)) return 'text';
   return null;
+}
+
+/** Kinds that show in a preview frame, as a page does (taller when asked). */
+export const FRAMED = new Set(['page', 'document']);
+
+/** Where a thread's PDF shows: the address Spindle's service worker answers with the
+ * file (background.js), opened as a tab of its own in Chrome's own PDF viewer (its name
+ * last, which the viewer shows). Never in a frame of Spindle's: the viewer takes the page
+ * around it to a link the user clicks in the PDF, which would take the side panel away. */
+export function pdfAddress(thread, path) {
+  return chrome.runtime.getURL(`file/${thread}/${path.split('/').map(encodeURIComponent).join('/')}`);
+}
+
+/** Whether PDFs show here: Spindle's service worker answers their addresses where Chrome
+ * routes requests to it (123 and later, as previews need). */
+export function pdfShows() {
+  const brand = navigator.userAgentData?.brands?.find((entry) => /chrom/i.test(entry.brand));
+  const version = Number(brand?.version ?? /Chrom(?:e|ium)\/(\d+)/.exec(navigator.userAgent)?.[1] ?? 0);
+  return version >= 123;
+}
+
+/** An SVG file as a picture takes it: with the SVG namespace on its root element (a
+ * picture is read as XML, and one written without it, as models often write SVG for a
+ * page, draws nothing), and the xlink one where it uses xlink. */
+function svgPicture(bytes) {
+  const text = svgText(bytes);
+  // Its root: the first tag, past any declaration, comment, instruction or doctype, as
+  // written without a prefix (`<svg:svg>` has its namespace by that prefix); a `>` in
+  // a quoted value does not end it.
+  const lead = /^(?:\s|<\?[\s\S]*?\?>|<!--[\s\S]*?-->|<!DOCTYPE[^[>]*(?:\[[\s\S]*?\])?\s*>)*/i.exec(text)[0];
+  const found = /^<svg(?=[\s/>])(?:[^>"']|"[^"]*"|'[^']*')*>/i.exec(text.slice(lead.length));
+  const root = found && Object.assign(found, { index: lead.length });
+  let tag = root?.[0] ?? '';
+  if (root && !/\sxmlns\s*=/.test(tag)) tag = tag.replace(/^<svg/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+  if (root && /\bxlink:/.test(text) && !/\sxmlns:xlink\s*=/.test(tag)) tag = tag.replace(/^<svg/i, '<svg xmlns:xlink="http://www.w3.org/1999/xlink"');
+  // Nothing to put right: its bytes as they are (in whatever encoding it declares).
+  if (!root || tag === root[0]) return new Blob([bytes], { type: 'image/svg+xml' });
+  // Written again in UTF-8, so no other encoding is declared.
+  const fixed = text.slice(0, root.index) + tag + text.slice(root.index + root[0].length);
+  return new Blob([fixed.replace(/^(\s*<\?xml[^>]*?)\s+encoding\s*=\s*["'][^"']*["']/i, '$1')], { type: 'image/svg+xml' });
+}
+
+/** An SVG's text, read in the encoding its XML declaration names (UTF-8 otherwise). */
+function svgText(bytes) {
+  const declared = /^\s*<\?xml[^>]*\sencoding\s*=\s*["']([\w.:-]+)["']/i.exec(new TextDecoder('latin1').decode(bytes.subarray(0, 200)))?.[1];
+  try {
+    return new TextDecoder(declared ?? 'utf-8').decode(bytes);
+  } catch {
+    return new TextDecoder().decode(bytes);
+  }
+}
+
+/** A picture's bytes as a Blob to show (an SVG's namespace made sure of, `svgPicture`). */
+export function pictureBlob(name, bytes) {
+  return /\.svg$/i.test(name) ? svgPicture(bytes) : new Blob([bytes], { type: typeOf(name) });
+}
+
+/** An SVG that is no picture (its markup does not read as XML: an HTML entity, a stray
+ * `&`) as a page, drawn as a browser draws SVG inside HTML, which forgives that; nothing
+ * in it runs (`documentFrame`). */
+export function svgPage(bytes) {
+  // Its XML declaration and doctype (an internal subset too) out: HTML would show them.
+  const text = svgText(bytes).replace(/^\uFEFF/, '').replace(/<\?xml[^>]*\?>/i, '')
+    .replace(/<!DOCTYPE[^[>]*(?:\[[\s\S]*?\])?\s*>/i, '');
+  return '<!doctype html>\n<html><head><meta charset="utf-8"><style>html,body{margin:0;background:#fff}'
+    + 'body>svg{display:block;max-width:100%;height:auto;margin:0 auto}</style></head><body>' + text + '</body></html>';
+}
+
+/** A frame showing `html`, a page made here (a document drawn, an SVG), static: no
+ * script, no frame, no link out, nothing from the web (`pageOf`'s 'static'). */
+export async function documentFrame(html, title) {
+  const page = await pageOf({ path: 'document.html', files: [], read: async () => new Uint8Array(), html, contained: false });
+  return previewFrame(page, title);
 }
 
 /** How a page shows (`pageOf`'s `mode`), and the policy it shows under.

@@ -54,7 +54,8 @@ use `--workspace --all-features` to include `spindle-store` and `spindle-embed`.
 | `pack_session.rs` | Session packs across whole turns |
 | `migration.rs` | Older-schema upgrades, packed schema-20 objects with stable digests, migration backups and refusal of damaged records |
 | `power_loss.rs` | Power loss and disk-full through a crash-simulating SQLite VFS (`support/crash_vfs.rs`; Linux) |
-| `bundle.rs` | Store images and session bundles, including damaged and hostile input |
+| `bundle.rs` | Store images and session bundles, including damaged and hostile input. Every case is read both in memory and unpacked from a file into a staging directory, with the same answer word for word (or the same files, byte for byte); a bundle's manifest is checked before any file is read; a store's settings too large for a sidecar are refused before they are kept; a previous-schema store is checked where it lies and left byte for byte as it came |
+| `import.rs` | Native imports (`agent::import_session`): a bundle refused at any step (its checksum, a file's digest after others were staged, a store, a sidecar) leaves nothing staged or in place; each import stages in a new, private directory, and one a stopped import left is swept while a live import's is kept; a relative path beginning `file:` is checked as a path. On Linux, child-process probes of peak memory: an import of a store over 64 MiB grows the peak by less than half the store (a read in memory grows past it), a store of 64 tasks' 1 MiB answers is checked one task at a time, and stores with settings far over 4 MiB are refused before their settings are kept |
 | `api.rs` | `spindle api` end to end over JSON-RPC (Unix), plus the Node and Python client smoke tests when those interpreters are installed. The golden frames in `fixtures/protocol/` are checked by a unit test in `src/api/stdio.rs` |
 | `embedded.rs` | Native/embedded parity, shared usage and budgets (nested calls, summaries and task trees), queued tasks, stopped reports, resume and settings fit |
 | `bench.rs` | Ignored local benchmark of the embedded host built natively: small sessions, long history reads/reopens/exports, compaction, timings and peak resident memory |
@@ -93,7 +94,22 @@ The embedded [`browser_opfs.mjs`](../spindle/embed/tests/browser_opfs.mjs) check
 worker/session exclusion, reopen after Chrome restarts, and OPFS compaction with
 history and files intact when sibling Node glue and `node:sqlite` can create the
 fragmented fixture. [`node_opfs_replace.mjs`](../spindle/embed/tests/node_opfs_replace.mjs)
-also checks short header I/O, same-path rename, and interrupted replacements.
+also checks short header I/O, same-path rename, and interrupted replacements: a rename
+whose record cannot be written changes nothing and the pool goes on; one that fails
+after its record stops the pool (every later call fails) until the next open finishes
+it; a file whose two names fill more than a header renames without a record.
+[`node_opfs_torn.mjs`](../spindle/embed/tests/node_opfs_torn.mjs) replays each rename
+(a directory set aside, a file replacing another, a file renamed to a new name with bytes
+or empty), a file made and one deleted, cut at every byte and every set of 512-byte
+sectors of each header write, and with each write its file had not flushed left out,
+over slots this version and an older one wrote. Every reopened pool must hold each file
+whole under one of its two names, a directory never split, no name made of two, and
+every header must read the same with the older version's reader; a header damaged
+otherwise is kept apart until reclaimed. [`node_session.mjs`](../spindle/embed/tests/node_session.mjs)
+runs the package's sessions under Node end to end (app tools and runners, stops, a killed
+owner, budgets, background tasks), including a stopped turn ending its own app call (its
+handler's `call.signal` aborts with an `AbortError` whose `outcome` is `stopped`, and no
+answer is sent for it) while a background task's call goes on and is answered.
 
 The browser extension and the browser Linuxes have their own suites; see
 [chrome.md](chrome.md#tests) and [browser-linux.md](browser-linux.md). Tests that take a
@@ -145,7 +161,32 @@ and navigation through large trees; `linux_warm.mjs` checks lazy v86 starts;
 template/reparse sanitizing, WebRTC and DNS leakage checks with a positive netlog
 control, background task cards/reports, queued file messages, reset backup cleanup,
 one copy per moved thread, move and index updates sharing one strict transaction, and
-Storage > Free. These tests use scripted services, not provider accounts.
+Storage > Free. Its document previews (after 0.1.6) use
+[`office_fixtures.mjs`](../spindle/chrome/tests/office_fixtures.mjs): a Word, an Excel
+and a PowerPoint file written as those programs write them (stored and deflated parts),
+a PDF, an SVG without its namespace, one whose markup is not XML, a short WAV, and
+documents whose numbers are out of every bound. The reader's output is checked (text,
+styles, lists, merged cells, pictures, number formats; hidden text and very hidden sheets
+left out; a sheet too large to parse saying so), the out-of-bound documents still drawn
+within 15 seconds with their numbers bounded, and a damaged or renamed file refused with
+the reason. Then each file opens in a tab of its own: the PDF's tab becomes Chrome's own
+viewer of it, served by the service worker; each document shows its text in the preview
+frame under a `script-src 'none'` policy; the SVGs draw (the loose one as a page) and
+the WAV is ready to play. The workspace page shows the same previews and offers each in
+a tab. `review_regressions.mjs` also checks what came after 0.1.6: the service worker's
+PDF address (a thread's PDF answered as `application/pdf` with `nosniff`, read from the
+engine over a channel closed after each read; a page, an SVG, a bad thread id, an empty,
+`..` or encoded-slash path and a bad escape refused before anything is read; a site's
+`/file/` address, another method and Spindle's other pages left untouched by its fetch
+handler); an allowed action refused, nothing done, once its tab is on another site, page
+or address, its part changed, or another dialog is open; a turn's Stop ending its own
+page actions, not its background tasks'; a thread file over 1 GB refused before it is
+read; the engine freeing the pool's unreadable slots (Settings, Storage, Unreadable),
+saying how many bytes; a message that comes back
+going only into its own thread's box, kept in storage until that thread opens; and Bring
+back leaving a thread whose `bundle_bytes` is over 1 GB on the host, nothing exported or
+sealed, while an older host that does not report it is asked for the bundle as before.
+These tests use scripted services, not provider accounts.
 
 ## Local engine benchmarks
 

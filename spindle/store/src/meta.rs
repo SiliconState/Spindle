@@ -133,30 +133,38 @@ pub struct TaskRun {
     pub lease: Option<f64>,
 }
 
+/// The columns of a `task_runs` row, as `task_run` reads them.
+const TASK_COLUMNS: &str = "task,origin,input,base,revision,queued,state,answer,delivered,lease";
+
+/// A `task_runs` row (`TASK_COLUMNS`), each value within its bounds.
+fn task_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRun> {
+    Ok(TaskRun {
+        task: crate::bounded_label(row, 0)?,
+        origin: row.get(1)?,
+        input: crate::bounded_blob(row, 2, 128 * 1024)?,
+        base: crate::bounded_label(row, 3)?,
+        revision: crate::nonnegative_id(row, 4)?,
+        queued: row.get(5)?,
+        state: crate::bounded_label(row, 6)?,
+        answer: if row.get_ref(7)? == rusqlite::types::ValueRef::Null {
+            None
+        } else {
+            Some(crate::bounded_blob(row, 7, crate::MAX_PAYLOAD)?)
+        },
+        delivered: row
+            .get::<_, Option<i64>>(8)?
+            .map(|value| u64::try_from(value).map_err(|_| rusqlite::Error::InvalidQuery))
+            .transpose()?,
+        lease: row.get(9)?,
+    })
+}
+
 pub(crate) fn tasks_on(db: &Connection) -> Result<Vec<TaskRun>> {
-    let mut query = db.prepare("SELECT task,origin,input,base,revision,queued,state,answer,delivered,lease FROM task_runs ORDER BY revision,task LIMIT 4097")?;
+    let mut query = db.prepare(&format!(
+        "SELECT {TASK_COLUMNS} FROM task_runs ORDER BY revision,task LIMIT 4097"
+    ))?;
     let rows = query
-        .query_map([], |row| {
-            Ok(TaskRun {
-                task: crate::bounded_label(row, 0)?,
-                origin: row.get(1)?,
-                input: crate::bounded_blob(row, 2, 128 * 1024)?,
-                base: crate::bounded_label(row, 3)?,
-                revision: crate::nonnegative_id(row, 4)?,
-                queued: row.get(5)?,
-                state: crate::bounded_label(row, 6)?,
-                answer: if row.get_ref(7)? == rusqlite::types::ValueRef::Null {
-                    None
-                } else {
-                    Some(crate::bounded_blob(row, 7, crate::MAX_PAYLOAD)?)
-                },
-                delivered: row
-                    .get::<_, Option<i64>>(8)?
-                    .map(|value| u64::try_from(value).map_err(|_| rusqlite::Error::InvalidQuery))
-                    .transpose()?,
-                lease: row.get(9)?,
-            })
-        })?
+        .query_map([], task_run)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if rows.len() > 4096 {
         return Err(Error::Exhausted);
@@ -346,44 +354,62 @@ fn end_task(tx: &Connection, task: &str, input: &[u8], end: TaskEnd<'_>) -> Resu
     }
 }
 
+/// Validates every `task_runs` row (at most 4096 of them) as a store's check does: row
+/// by row, each dropped once checked, so a check holds one task's answer at a time
+/// however many tasks a store keeps (`tasks_on` would hold all of them). Rows are read
+/// in the table's own order (no sort to hold them either); the rows accepted are the
+/// same in any order.
 pub(crate) fn validate_tasks(db: &Connection) -> Result<()> {
-    for run in tasks_on(db)? {
-        if !crate::valid_label(&run.task)
-            || !crate::artifact::valid_digest(&run.base)
-            || !matches!(
-                run.state.as_str(),
-                "running" | "stopped" | "finished" | "abandoned"
-            )
-            || run
-                .lease
-                .is_some_and(|lease| !lease.is_finite() || lease < 0.0)
-            || (run.state == "finished" && run.answer.is_none())
-            || (run.delivered.is_some() && !run.queued)
-        {
+    let mut query = db.prepare(&format!("SELECT {TASK_COLUMNS} FROM task_runs LIMIT 4097"))?;
+    let mut rows = query.query([])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        if count > 4096 {
+            return Err(Error::Exhausted);
+        }
+        validate_task(db, &task_run(row)?)?;
+    }
+    Ok(())
+}
+
+/// One `task_runs` row as `validate_tasks` checks it.
+fn validate_task(db: &Connection, run: &TaskRun) -> Result<()> {
+    if !crate::valid_label(&run.task)
+        || !crate::artifact::valid_digest(&run.base)
+        || !matches!(
+            run.state.as_str(),
+            "running" | "stopped" | "finished" | "abandoned"
+        )
+        || run
+            .lease
+            .is_some_and(|lease| !lease.is_finite() || lease < 0.0)
+        || (run.state == "finished" && run.answer.is_none())
+        || (run.delivered.is_some() && !run.queued)
+    {
+        return Err(Error::Incompatible);
+    }
+    crate::workspace::validate_root(db, "operator", &run.base)?;
+    #[cfg(feature = "dext-turn")]
+    {
+        let input: serde_json::Value =
+            serde_json::from_slice(&run.input).map_err(|_| Error::Incompatible)?;
+        if !input.is_object() {
             return Err(Error::Incompatible);
         }
-        crate::workspace::validate_root(db, "operator", &run.base)?;
-        #[cfg(feature = "dext-turn")]
-        {
-            let input: serde_json::Value =
-                serde_json::from_slice(&run.input).map_err(|_| Error::Incompatible)?;
-            if !input.is_object() {
+        if let Some(answer) = &run.answer {
+            crate::turn::task_report_text(&run.task, answer)?;
+        }
+        if let Some(delivered) = run.delivered {
+            let payload: Vec<u8> = crate::cached_row(
+                db,
+                "SELECT a.payload FROM consumed c JOIN admissions a ON a.sequence=c.admission WHERE c.revision=?1",
+                [delivered as i64],
+                |row| crate::packed_blob(db, row, 0, crate::MAX_PAYLOAD),
+            )?;
+            if !matches!(crate::turn::Action::decode(&payload)?, crate::turn::Action::TaskReport { task, .. } if task==run.task)
+            {
                 return Err(Error::Incompatible);
-            }
-            if let Some(answer) = &run.answer {
-                crate::turn::task_report_text(&run.task, answer)?;
-            }
-            if let Some(delivered) = run.delivered {
-                let payload: Vec<u8> = crate::cached_row(
-                    db,
-                    "SELECT a.payload FROM consumed c JOIN admissions a ON a.sequence=c.admission WHERE c.revision=?1",
-                    [delivered as i64],
-                    |row| crate::packed_blob(db, row, 0, crate::MAX_PAYLOAD),
-                )?;
-                if !matches!(crate::turn::Action::decode(&payload)?, crate::turn::Action::TaskReport { task, .. } if task==run.task)
-                {
-                    return Err(Error::Incompatible);
-                }
             }
         }
     }

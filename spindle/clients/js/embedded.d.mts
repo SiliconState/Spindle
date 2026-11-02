@@ -75,8 +75,12 @@ export interface ToolDefinition {
   rerun?: 'safe' | 'no' | boolean;
   timeoutS?: number;
   maxOutput?: number;
-  run(input: any, call: SpindleEvent & { type: 'app_tool' }): ToolAnswer | Promise<ToolAnswer>;
-  again?(input: any, call: SpindleEvent & { type: 'app_tool' }): ToolAnswer | Promise<ToolAnswer>;
+  /** `call.session`: the session's dir; `call.signal`: ends when Spindle settles the
+   * call without this answer (the turn or task that asked was stopped, or `timeoutS`
+   * passed, or the client closed; its reason an AbortError whose `outcome` is `stopped`,
+   * `no_answer` or `closed`), whose answer is then not sent. */
+  run(input: any, call: SpindleEvent & { type: 'app_tool'; session: string; signal?: AbortSignal }): ToolAnswer | Promise<ToolAnswer>;
+  again?(input: any, call: SpindleEvent & { type: 'app_tool'; session: string; signal?: AbortSignal }): ToolAnswer | Promise<ToolAnswer>;
 }
 
 /** The facts of a model request the app authorizes (no secret is ever in them). */

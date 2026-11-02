@@ -23,7 +23,7 @@
 //      as text or in the thread, and removed with the site; a file attached to a message
 //      lands in the workspace and what a thread made downloads, alone or as a .zip; a
 //      thread browses (page_elements, type, click, screenshot, page_html, network,
-//      navigate); (scripted) Before acting: Ask asks and No does nothing, Auto asks only
+//      navigate); (scripted) Before acting: Ask asks and No does nothing, Yes after the page reloaded presses nothing, Auto asks only
 //      before Enter; (scripted, with the wasm Linux built in) a plain sh command runs in
 //      the wasm Linux; (scripted) a command stopped while it runs is kept as stopped,
 //      with what it printed, and a reply goes on with the turn;
@@ -1728,8 +1728,19 @@ try {
     await panel.click('#asking button.primary');
     const allowed = await settled(panel, autoThread, 120_000);
     const pressCards = await panel.eval(`[...document.querySelectorAll('#history .tool')].filter((c) => c.dataset.tool === 'press').map((c) => ({ failed: c.classList.contains('failed'), text: c.querySelector('pre.result')?.textContent ?? '' }))`);
+    // Asked about the page a tab shows, Yes acts only while it still shows that page: the
+    // page reloaded while the question waited, so nothing is pressed (said to the model).
+    await confirmTo('ask');
+    scripted.replies.push(call('press', { key: 'Enter' }), text('Not pressed.'));
+    const staleThread = await newThread(panel, 'Press Enter on that page.');
+    const staleAsked = await question();
+    await page.eval('window.beforeReload = true; location.reload()');
+    await page.until(`!window.beforeReload && document.readyState === 'complete'`, { what: 'the page to reload' });
+    await panel.click('#asking button.primary');
+    const staleState = await settled(panel, staleThread, 120_000);
+    const staleCard = await panel.eval(`(() => { const card = [...document.querySelectorAll('#history .tool')].find((c) => c.dataset.tool === 'press'); return card ? card.querySelector('pre.result')?.textContent ?? '' : null; })()`);
     await confirmTo('full');
-    check('Before acting: Ask asks before an action and No does nothing; Auto lets a plain key go and asks before Enter; Yes goes ahead', () => {
+    check('Before acting: Ask asks before an action and No does nothing; Auto lets a plain key go and asks before Enter; Yes goes ahead, but not on a page reloaded since the question', () => {
       assert.match(askedText, /Go to http:\/\/127\.0\.0\.1:\d+\/page\.html/, askedText);
       assert.equal(denied, 'idle', `state ${denied}`);
       assert.match(deniedCard ?? '', /said no/, `the navigate card: ${deniedCard}`);
@@ -1739,6 +1750,9 @@ try {
       assert.equal(pressCards.length, 2, JSON.stringify(pressCards));
       assert.ok(pressCards.every((card) => !card.failed), JSON.stringify(pressCards));
       if (askedRow !== null) assert.match(askedRow, /Asks you/, askedRow);
+      assert.match(staleAsked, /Press Enter in tab \d+/, staleAsked);
+      assert.equal(staleState, 'idle', `state ${staleState}`);
+      assert.match(staleCard ?? '', /shows another page than the one the user allowed this on[\s\S]*not done/, `the press card: ${staleCard}`);
     });
   }
 

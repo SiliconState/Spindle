@@ -7,7 +7,7 @@ import { local, storeRefusal, wireNetwork } from '../linux-net.mjs';
 import { ACTING_NAMES, ASKING_NAMES, actionText, confirmMode, sends, uncertain } from '../page-tools.mjs';
 import { refusedAnswer } from '../../clients/js/common.mjs';
 import { EventParser, RemoteClient, requestId, worthRepeating } from '../../clients/js/remote.mjs';
-import { MOVE, STEP_TEXT, Waiting, hostMoves, moveKey, said as sentence } from '../host-moves.mjs';
+import { BUNDLE_MOST, MOVE, STEP_TEXT, Waiting, hostMoves, moveKey, said as sentence } from '../host-moves.mjs';
 import { connectAnswer, pkce } from '../signin.mjs';
 
 const tick = () => new Promise((done) => setImmediate(done));
@@ -31,8 +31,8 @@ const warnings = [];
 const context = vm.createContext({
   crypto: globalThis.crypto, console: { ...console, warn: (...args) => warnings.push(args) }, setTimeout, clearTimeout, Uint8Array, URL, URLSearchParams, btoa,
   BroadcastChannel: class { postMessage(message) { messages.push(message); } },
-  CHANNEL: 'test', self: { location: { href: 'chrome-extension://id/engine-worker.mjs' } }, linuxRunner: () => ({ warm() {} }), PAGE_TOOLS: [], uncertain, ASKING_NAMES, actionText, confirmMode, sends, BROWSER: 'Chrome', storeRefusal, firstGlue: {},
-  refusedAnswer, RemoteClient, requestId, worthRepeating, MOVE, STEP_TEXT, Waiting, hostMoves, sentence,
+  CHANNEL: 'test', self: { location: { href: 'chrome-extension://id/engine-worker.mjs' } }, linuxRunner: () => ({ warm() {}, forget() {} }), PAGE_TOOLS: [], uncertain, ASKING_NAMES, actionText, confirmMode, sends, BROWSER: 'Chrome', storeRefusal, firstGlue: {},
+  refusedAnswer, RemoteClient, requestId, worthRepeating, MOVE, STEP_TEXT, Waiting, hostMoves, sentence, BUNDLE_MOST,
   read: async (store, key) => records.get(`${store}:${key}`),
   write: async (store, key, value) => records.set(`${store}:${key}`, value),
   writeDurably: async (store, key, value) => records.set(`${store}:${key}`, value),
@@ -59,7 +59,7 @@ const context = vm.createContext({
     return next;
   },
 });
-vm.runInContext(`${engineSource}\nglobalThis.test = { operate, ops, running, snapshot, restoreQueued, queued, renew, replaceFirst, creationSettings, pageTool, cancelPageTools, secretHeader, changeSites, grantsFor, underPrefix, withSecrets, beforeActing, actOnPage, hostedFrame, answerHosted, endHosted, startHosted, admitHosted, sendHostedStop, hostedTurns, followed, pollHosted, setHost: (value) => { hostState = { connected: true, kind: 'browser', url: 'http://host' }; hostRemote = value; }, setClient: (value) => { client = value; poolOpening = Promise.resolve({ free: 100, rmSync() {} }); } };`, context);
+vm.runInContext(`${engineSource}\nglobalThis.test = { operate, ops, running, snapshot, restoreQueued, queued, renew, replaceFirst, creationSettings, pageTool, cancelPageTools, secretHeader, changeSites, grantsFor, underPrefix, withSecrets, beforeActing, actOnPage, ownedByTask, hostedFrame, answerHosted, endHosted, startHosted, admitHosted, sendHostedStop, hostedTurns, followed, pollHosted, setHost: (value) => { hostState = { connected: true, kind: 'browser', url: 'http://host' }; hostRemote = value; }, setClient: (value) => { client = value; poolOpening = Promise.resolve({ free: 100, rmSync() {} }); } };`, context);
 const engine = context.test;
 const id = '0123456789abcdef';
 let entered = 0;
@@ -239,10 +239,32 @@ const event = { addListener() {} };
 const bgWrites = [];
 let accessRemoved = null;
 const closedTabs = [];
+// The engine as the service worker reaches it (a thread's PDF): what it was asked, and
+// its answers (a file named gone.pdf is not there).
+const engineAsked = [];
+class EngineChannel {
+  static made = [];
+  constructor() { EngineChannel.made.push(this); }
+  close() { this.closed = true; }
+  postMessage(message) {
+    engineAsked.push(message);
+    queueMicrotask(() => {
+      const missing = message.op === 'read' && message.args.path.endsWith('gone.pdf');
+      this.onmessage?.({ data: missing
+        ? { to: message.from, id: message.id, ok: false, error: { message: 'no such file' } }
+        : { to: message.from, id: message.id, ok: true, result: message.op === 'read' ? { bytes: new Uint8Array([37, 80, 68, 70]) } : {} } });
+    });
+  }
+}
+// The service worker's events (its fetch handler is checked below), in a Chrome with
+// static routes.
+const workerEvents = {};
 const pageContext = vm.createContext({
-  // The service worker's own: where it was loaded from, and its events (previews, unused here).
-  location: new URL('chrome-extension://spindle/background.js'), self: { addEventListener() {} },
+  // The service worker's own: where it was loaded from, and its events.
+  location: new URL('chrome-extension://spindle/background.js'),
+  self: { InstallEvent: class { addRoutes() {} }, addEventListener(type, listener) { workerEvents[type] = listener; } },
   console, setTimeout, clearTimeout, URL, crypto: globalThis.crypto, read: async () => ({ reading: true, acting: true }), PAGE_ACCESS: [], ACTING_NAMES, uncertain, BROWSER: 'Chrome',
+  BroadcastChannel: EngineChannel, CHANNEL: 'spindle-engine', startEngine: async () => {}, Response, queueMicrotask,
   write: async (store, key, value) => { bgWrites.push([store, key, value]); },
   pageSwitches: () => ({ reading: true, acting: true }),
   chrome: {
@@ -262,8 +284,52 @@ const pageContext = vm.createContext({
     })() },
   },
 });
-vm.runInContext(`${background}\nglobalThis.test = { watched, attached, network, recordNetwork, cdp, calls, inPage, attach, veto, unveto, vetoed, onTab, run };`, pageContext);
+vm.runInContext(`${background}\nglobalThis.test = { watched, attached, network, recordNetwork, cdp, calls, inPage, attach, veto, unveto, vetoed, onTab, run, pdf };`, pageContext);
 const bg = pageContext.test;
+// A thread's PDF is answered as a PDF, for Chrome's own viewer, read from the engine;
+// nothing else is answered there (no page, no SVG, no path out of the workspace).
+{
+  const answer = await bg.pdf(new URL('chrome-extension://spindle/file/0123456789abcdef/out%20dir/report.pdf'));
+  assert.equal(answer.status, 200);
+  assert.equal(answer.headers.get('content-type'), 'application/pdf');
+  assert.equal(answer.headers.get('x-content-type-options'), 'nosniff');
+  assert.match(answer.headers.get('content-disposition'), /^inline; filename\*=UTF-8''report\.pdf$/);
+  assert.deepEqual([...new Uint8Array(await answer.arrayBuffer())], [37, 80, 68, 70]);
+  const asked = engineAsked.find((message) => message.op === 'read');
+  assert.deepEqual({ ...asked.args }, { id: '0123456789abcdef', path: 'out dir/report.pdf' });
+  // (An address's `..` parts are resolved by URL parsing itself, before the worker sees
+  // them: `%2E%2E` here becomes /file/report.pdf, which names no thread; an encoded slash
+  // stays, and is refused.)
+  for (const refused of ['0123456789abcdef/page.html', '0123456789abcdef/drawing.svg', '0123456789abcdef/report.pdf.html', 'NOTAHEXTHREAD000/report.pdf',
+    '0123456789abcdef//report.pdf', '0123456789abcdef/%2E%2E/report.pdf', '0123456789abcdef/a%2F..%2F..%2Freport.pdf', '0123456789abcdef/%E0%A4%A.pdf', '0123456789abcdef/']) {
+    const before = engineAsked.length;
+    const reply = await bg.pdf(new URL(`chrome-extension://spindle/file/${refused}`));
+    assert.ok(reply.status >= 400, refused);
+    assert.equal(reply.headers.get('content-type'), 'text/plain; charset=utf-8', refused);
+    assert.equal(engineAsked.length, before, `nothing read for ${refused}`);
+  }
+  const gone = await bg.pdf(new URL('chrome-extension://spindle/file/0123456789abcdef/gone.pdf'));
+  assert.equal(gone.status, 404);
+  assert.match(await gone.text(), /^gone\.pdf could not be read: no such file$/);
+  // Each read opened the engine's channel only while it asked (no page's file bytes come
+  // to the worker otherwise).
+  assert.ok(EngineChannel.made.length >= 2 && EngineChannel.made.every((channel) => channel.closed), 'the channel closed after each read');
+  // The fetch handler answers Spindle's own PDF addresses (GET) and previews (navigations)
+  // only: a site's `/file/...` a thread fetches, or another method, goes on untouched.
+  const fetched = (url, method = 'GET', mode = 'navigate') => {
+    let answered = false;
+    workerEvents.fetch({ request: { url, method, mode }, respondWith(answer) { answered = true; answer.catch?.(() => {}); } });
+    return answered;
+  };
+  assert.equal(typeof workerEvents.fetch, 'function', 'a fetch handler where Chrome has static routes');
+  assert.equal(fetched('chrome-extension://spindle/file/0123456789abcdef/report.pdf'), true);
+  assert.equal(fetched('chrome-extension://spindle/file/0123456789abcdef/report.pdf', 'GET', 'no-cors'), true, 'a PDF also for a fetch (the viewer may fetch it again)');
+  assert.equal(fetched('https://drive.google.com/file/d/1/view'), false, "a site's /file/ untouched");
+  assert.equal(fetched('chrome-extension://spindle/file/0123456789abcdef/report.pdf', 'POST'), false, 'only GET');
+  assert.equal(fetched('chrome-extension://spindle/preview.html'), true, 'a preview frame served');
+  assert.equal(fetched('chrome-extension://spindle/preview.html', 'GET', 'cors'), false, 'a preview only as a navigation');
+  assert.equal(fetched('chrome-extension://spindle/panel.html'), false, "Spindle's other pages untouched");
+}
 // Chrome's site access taken back turns both switches off and keeps Before acting.
 pageContext.read = async () => ({ reading: true, acting: true, confirm: 'ask' });
 pageContext.PAGE_ACCESS = ['https://*/*'];
@@ -358,6 +424,95 @@ assert.match((await bg.run('close_tab', { tab: 19 })).content, /^Closed tab 19/)
 assert.deepEqual(moved, ['update 18 https://public.example/next', 'create https://public.example/new', 'create chrome-extension://spindle/view.html?thread=t&path=a.md', 'remove 19']);
 pageContext.chrome.tabs.update = async () => { throw new Error('Tabs cannot be edited right now'); };
 assert.match((await bg.run('navigate', { url: 'https://public.example/x', tab: 18 })).error, /could not go there/);
+// An action the user allowed (Before acting) acts only on what they were shown: the same
+// tab, site and page (Chrome's document id: another after a reload or a link followed),
+// and for a dialog the same dialog. Anything else is refused before acting (a plain
+// failure: nothing done), checked just before the action goes; unasked actions skip it.
+{
+  const sentNow = [];
+  let documentId = 'doc-1';
+  let url = 'https://mail.example/inbox';
+  pageContext.chrome.tabs.get = async (tab) => ({ id: tab, url, status: 'complete', title: 'Inbox' });
+  pageContext.chrome.scripting.executeScript = async () => [{ documentId, result: true }];
+  pageContext.chrome.debugger.attach = async () => {};
+  pageContext.chrome.debugger.sendCommand = async (_, method) => { sentNow.push(method); return {}; };
+  Object.assign(pageContext.chrome.tabs, {
+    update: async (tab, change) => { moved.push(`update ${tab} ${change.url}`); },
+    reload: async (tab) => { moved.push(`reload ${tab}`); },
+    remove: async (tab) => { moved.push(`remove ${tab}`); },
+  });
+  moved.length = 0;
+  const shown = await bg.run('tab_of', { tab: 21 });
+  assert.deepEqual([shown.details.tab, shown.details.host, shown.details.document, shown.details.url], [21, 'mail.example', 'doc-1', 'https://mail.example/inbox'], 'tab_of names the page shown and its address');
+  const allowed = { tab: 21, host: 'mail.example', document: 'doc-1', url: 'https://mail.example/inbox' };
+  assert.match((await bg.run('press', { key: 'Enter', tab: 21 }, 'same', allowed)).content, /^Pressed Enter/, 'the same page: it acts');
+  assert.ok(sentNow.includes('Input.dispatchKeyEvent'));
+  sentNow.length = 0;
+  documentId = 'doc-2';
+  for (const [name, input] of [['press', { key: 'Enter', tab: 21 }], ['navigate', { action: 'reload', tab: 21 }], ['close_tab', { tab: 21 }]]) {
+    await assert.rejects(bg.run(name, input, `reloaded-${name}`, allowed), /tab 21 shows another page than the one the user allowed this on[\s\S]*not done/, `${name} after a reload`);
+  }
+  url = 'https://payments.example/';
+  await assert.rejects(bg.run('press', { key: 'Enter', tab: 21 }, 'moved', allowed), /moved from mail\.example to payments\.example/);
+  await assert.rejects(bg.run('press', { key: 'Enter', tab: 22 }, 'other', allowed), /allowed this on tab 21, not tab 22/);
+  // Chrome cannot say which page it shows now (a page that hangs, one it keeps extensions
+  // out of): its address then, but its #part. Another address: not done.
+  pageContext.chrome.scripting.executeScript = async () => { throw new Error('Cannot access contents of the page'); };
+  url = 'https://mail.example/compose';
+  await assert.rejects(bg.run('press', { key: 'Enter', tab: 21 }, 'unseen', allowed), /tab 21 is at another address than the one the user allowed this on[\s\S]*not done/);
+  assert.ok(!sentNow.includes('Input.dispatchKeyEvent'), 'nothing pressed');
+  assert.deepEqual(moved, [], 'nothing reloaded or closed');
+  url = 'https://mail.example/inbox#thread-7';
+  assert.match((await bg.run('close_tab', { tab: 21 }, 'same-address', allowed)).content, /^Closed tab 21/, 'the same address (a #part aside): a tab that will not answer still closes');
+  url = 'https://mail.example/inbox';
+  assert.match((await bg.run('press', { key: 'Enter', tab: 21 }, 'unasked')).content, /^Pressed Enter/, 'an action not asked about is not held to a page');
+  // A dialog: only the one the question showed is answered; tab_of says what it asks
+  // (and reads no page: the dialog holds it).
+  sentNow.length = 0;
+  vm.runInContext("dialogs.set(23, { id: 7, type: 'confirm', message: 'Pay?', at: Date.now() });", pageContext);
+  const asking = await bg.run('tab_of', { tab: 23 });
+  assert.deepEqual({ ...asking.details.dialog }, { id: 7, type: 'confirm', message: 'Pay?' });
+  assert.equal(asking.details.document, undefined);
+  await assert.rejects(bg.run('dialog', { accept: true, tab: 23 }, 'stale', { tab: 23, host: 'mail.example', dialog: 6 }), /not the one the user allowed answering/);
+  assert.ok(!sentNow.includes('Page.handleJavaScriptDialog'), 'another dialog is not answered');
+  assert.match((await bg.run('dialog', { accept: true, tab: 23 }, 'fresh', { tab: 23, host: 'mail.example', dialog: 7 })).content, /^Accepted the confirm "Pay\?"/);
+  // A click the user allowed takes the part's description into the page, where it is
+  // measured: changed there, nothing is clicked.
+  const measured = [];
+  pageContext.chrome.scripting.executeScript = async ({ args }) => {
+    measured.push(args);
+    return [{ result: { error: `[qx1] is now button "Delete", not the button "Send" the user allowed this on, so it was not done` } }];
+  };
+  sentNow.length = 0;
+  await assert.rejects(bg.run('click', { ref: 'qx1', tab: 21 }, 'click', { tab: 21, host: 'mail.example', what: 'button "Send"' }), /is now button "Delete"/);
+  assert.equal(measured.at(-1)[0], 'point');
+  assert.equal(measured.at(-1)[1].what, 'button "Send"', 'the description goes with the measure');
+  assert.ok(!sentNow.includes('Input.dispatchMouseEvent'), 'nothing clicked');
+  vm.runInContext('for (const timer of attached.values()) clearTimeout(timer);', pageContext);
+  // In the page, a part the user allowed acting on is acted on only while it is what the
+  // question named (the same element, its role and name unchanged).
+  const options = [{ value: 'alice', text: 'Alice', selected: false }, { value: 'mallory', text: 'Mallory', selected: false }];
+  const list = { tagName: 'SELECT', localName: 'select', isConnected: true, multiple: false, options, label: 'Pay to', getAttribute: (name) => (name === 'aria-label' ? list.label : null), hasAttribute: () => false, dispatchEvent() {} };
+  pageContext.Event = Event;
+  pageContext.__spindle = { mark: 'qx', next: 1, refs: new Map([['qx1', new WeakRef(list)]]), ids: new WeakMap([[list, 'qx1']]) };
+  assert.deepEqual([...bg.inPage('select', { ref: 'qx1', values: ['mallory'], what: 'combobox "Pay to"' }).value], ['Mallory'], 'as shown: chosen');
+  options[1].selected = false;
+  list.label = 'Send money to';
+  assert.match(bg.inPage('select', { ref: 'qx1', values: ['mallory'], what: 'combobox "Pay to"' }).error, /\[qx1\] is now combobox "Send money to", not the combobox "Pay to" the user allowed this on, so it was not done/);
+  assert.equal(options[1].selected, false, 'nothing chosen');
+  assert.deepEqual([...bg.inPage('select', { ref: 'qx1', values: ['alice'] }).value], ['Alice'], 'not asked about: no check');
+  // A count or a time in its name may change on its own: still what the user was shown.
+  list.label = 'Send money to 3 people (2 min ago)';
+  assert.deepEqual([...bg.inPage('select', { ref: 'qx1', values: ['alice'], what: 'combobox "Send money to 4 people (5 min ago)"' }).value], ['Alice'], 'numbers aside, the same words');
+  list.label = 'Send money to';
+  // A click or typing measures its part first (`point`): changed, nothing is done to the
+  // page (not even scrolled to it).
+  let scrolled = 0;
+  list.scrollIntoView = () => { scrolled += 1; };
+  assert.match(bg.inPage('point', { ref: 'qx1', what: 'combobox "Pay to"' }).error, /\[qx1\] is now combobox "Send money to", not the combobox "Pay to" the user allowed this on/);
+  assert.equal(scrolled, 0, 'refused before anything is done to the page');
+  delete pageContext.__spindle;
+}
 assert.deepEqual(uncertain('click', 'lost'), { unknown: true, content: 'lost' });
 for (const name of ['read_page', 'screenshot', 'wait_for']) assert.deepEqual(uncertain(name, 'lost'), { error: 'lost' }, name);
 // The engine's document carries calls to Chrome and Chrome's answers back; an answer that
@@ -377,6 +532,9 @@ const relayed = async (name, reply) => {
 assert.deepEqual(await relayed('click', async () => ({ content: 'Clicked' })), { type: 'page_tool_answer', call: 'relay-click', answer: { content: 'Clicked' } });
 assert.deepEqual((await relayed('click', async () => { throw new Error('The message port closed'); })).answer, { unknown: true, content: "Chrome's answer to the page tool was lost: The message port closed" });
 assert.deepEqual((await relayed('read_page', async () => undefined)).answer, { error: 'Chrome gave no answer' });
+// What the user allowed goes on to Chrome's side with the call.
+await relay.onmessage({ data: { type: 'page_tool', call: 'relay-press', name: 'press', input: { key: 'Enter' }, allowed: { tab: 4, document: 'doc-1' } } });
+assert.deepEqual(toBackground.at(-1).allowed, { tab: 4, document: 'doc-1' });
 await relay.onmessage({ data: { type: 'page_tool_cancel', call: 'relay-click' } });
 assert.deepEqual(toBackground.at(-1), { type: 'page_tool_cancel', call: 'relay-click' });
 delete globalThis.Worker;
@@ -703,8 +861,334 @@ delete globalThis.chrome;
   await engine.operate('approve', { approval: waiting()[0].id, allow: false });
   assert.match(await unread, /said no/);
   context.read = reading;
+  // Allowed, an action carries what the user was shown (its tab, site and page, or the
+  // dialog): Chrome's side acts only while that holds. A dialog's question says what it
+  // asks. Auto looks nothing up for an action that sends nothing, and binds nothing.
+  {
+    const dispatched = [];
+    let lookups = 0;
+    let dialog = null;
+    context.self.postMessage = (message) => {
+      if (message.type !== 'page_tool') return;
+      if (message.name === 'tab_of') lookups += 1;
+      else dispatched.push(message);
+      const answer = message.name === 'tab_of'
+        ? { content: 'tab 4', details: { tab: 4, host: 'mail.example', title: 'Inbox', ...(dialog ? { dialog } : { document: 'doc-1' }) } }
+        : { content: 'done' };
+      queueMicrotask(() => context.self.onmessage({ data: { type: 'page_tool_answer', call: message.call, answer } }));
+    };
+    records.set('kv:pages', { reading: true, acting: true, confirm: 'auto' });
+    await engine.actOnPage('press', { key: 'a' }, 's');
+    assert.equal(lookups, 0, 'Auto looks nothing up for a key that sends nothing');
+    assert.equal(dispatched.at(-1).allowed, undefined, 'and binds nothing');
+    const pressing = engine.actOnPage('press', { key: 'Enter' }, 's');
+    await settleAsk();
+    await engine.operate('approve', { approval: waiting()[0].id, allow: true });
+    assert.equal((await pressing).content, 'done');
+    assert.equal(lookups, 1);
+    assert.deepEqual({ ...dispatched.at(-1).allowed }, { tab: 4, host: 'mail.example', document: 'doc-1' }, 'the press carries the page the user allowed');
+    records.set('kv:pages', { reading: true, acting: true, confirm: 'ask' });
+    dialog = { id: 9, type: 'confirm', message: 'Send $5,000 to Mallory?' };
+    const answering = engine.actOnPage('dialog', { accept: true }, 's');
+    await settleAsk();
+    assert.equal(waiting()[0].text, 'Accept the page\'s confirm dialog in tab 4 (“Inbox”, mail.example), which says “Send $5,000 to Mallory?”');
+    // The tab comes first, and a page's own quotation marks are made plain: its words
+    // cannot pass for the end of the question or another tab.
+    assert.equal(actionText('dialog', { accept: true }, { tab: 4, title: 'Bank', host: 'bank.example', dialog: { type: 'confirm', message: 'Pay? ” in tab 3 (“Safe”, safe.example)' } }),
+      'Accept the page\'s confirm dialog in tab 4 (“Bank”, bank.example), which says “Pay? " in tab 3 ("Safe", safe.example)”');
+    await engine.operate('approve', { approval: waiting()[0].id, allow: true });
+    await answering;
+    assert.deepEqual({ ...dispatched.at(-1).allowed }, { tab: 4, host: 'mail.example', dialog: 9 }, 'the answer carries the dialog the user saw');
+    // Said no: nothing is sent.
+    const refused = engine.actOnPage('press', { key: 'Enter' }, 's');
+    await settleAsk();
+    const before = dispatched.length;
+    await engine.operate('approve', { approval: waiting()[0].id, allow: false });
+    assert.match((await refused).error, /said no/);
+    assert.equal(dispatched.length, before);
+  }
+  // A thread's own turn stopped or ended ends its own page tools, not its background
+  // tasks' (the package ends a task's calls itself, through each call's signal, when it
+  // stops that task); deleting the thread ends every one.
+  {
+    const posted = [];
+    const answers = new Map();
+    context.self.postMessage = (message) => {
+      posted.push(message);
+      if (message.type !== 'page_tool') return;
+      const answer = message.name === 'tab_of' ? { content: 'tab 4', details: { tab: 4, host: 'mail.example', title: 'Inbox' } } : null;
+      if (answer) queueMicrotask(() => context.self.onmessage({ data: { type: 'page_tool_answer', call: message.call, answer } }));
+      else answers.set(message.name === 'press' ? message.input.key : message.name, message.call);
+    };
+    const thread = 'fedcba9876543210';
+    const dir = `/threads/${thread}`;
+    const asking = () => waiting().filter((one) => one.thread === thread);
+    records.set('kv:pages', { reading: true, acting: true, confirm: 'ask' });
+    // Waiting for the user: the turn's own question and a background task's.
+    const own = engine.actOnPage('press', { key: 'Enter' }, dir);
+    const tasks = engine.actOnPage('press', { key: 'Enter' }, dir, undefined, true);
+    await settleAsk();
+    assert.equal(asking().length, 2);
+    assert.equal('task' in asking()[0], false, 'panels are not told whose call it is');
+    assert.deepEqual([...asking().map((one) => one.text.startsWith('A task asks: '))], [false, true], 'a task\'s question says so');
+    engine.running.set(thread, { stopped: true });
+    engine.cancelPageTools(thread, { tasks: false });
+    assert.match((await own).error, /the turn ended or was stopped/, 'the turn\'s own question goes');
+    assert.equal(asking().length, 1, 'the task\'s question stays');
+    await engine.operate('approve', { approval: asking()[0].id, allow: true });
+    await tick();
+    assert.ok(answers.has('Enter'), 'allowed, the task\'s action goes on while the turn is stopped');
+    // In flight: the turn's own action is cancelled (unknown), the task's is not.
+    const ownPress = engine.pageTool('press', { key: 'a' }, dir);
+    const taskPress = engine.pageTool('press', { key: 'b' }, dir, null, null, true);
+    assert.equal((await ownPress).error, 'the turn was stopped', 'nothing new starts for the stopped turn');
+    engine.running.delete(thread);
+    const ownAgain = engine.pageTool('press', { key: 'c' }, dir);
+    await tick();
+    engine.cancelPageTools(thread, { tasks: false });
+    assert.equal((await ownAgain).unknown, true);
+    assert.ok(posted.some((message) => message.type === 'page_tool_cancel' && message.call === answers.get('c')));
+    assert.equal(posted.some((message) => message.type === 'page_tool_cancel' && message.call === answers.get('b')), false, 'the task\'s action is not cancelled');
+    context.self.onmessage({ data: { type: 'page_tool_answer', call: answers.get('b'), answer: { content: 'pressed b' } } });
+    assert.equal((await taskPress).content, 'pressed b');
+    // The package cancelling one call (its signal ends): that call alone is cancelled.
+    const cancelled = new AbortController();
+    const signalled = engine.pageTool('press', { key: 'd' }, dir, null, cancelled.signal, true);
+    const other = engine.pageTool('press', { key: 'e' }, dir, null, null, true);
+    await tick();
+    cancelled.abort(Object.assign(new DOMException('settled', 'AbortError'), { outcome: 'stopped' }));
+    const ended = await signalled;
+    assert.equal(ended.unknown, true);
+    assert.match(ended.content, /the turn or task that asked for it was stopped before the page tool finished/);
+    assert.ok(posted.some((message) => message.type === 'page_tool_cancel' && message.call === answers.get('d')));
+    // Deleting the thread (every call): the task's too.
+    engine.cancelPageTools(thread);
+    assert.equal((await other).unknown, true, 'every call ends when the thread goes');
+    // A task's call is told by its name (as the package names it) or its session.
+    assert.deepEqual([{ call: 'tasks/k1/c9', session: dir }, { call: 'c9', session: `${dir}#k1` }, { call: 'c9', session: dir }, undefined].map((call) => engine.ownedByTask(call)), [true, true, false, false]);
+    // Which tab a key would land on cannot be told, and none was named: not asked, not done.
+    context.self.postMessage = (message) => {
+      if (message.type === 'page_tool' && message.name === 'tab_of') queueMicrotask(() => context.self.onmessage({ data: { type: 'page_tool_answer', call: message.call, answer: { error: 'no tab is open' } } }));
+    };
+    assert.match(await engine.beforeActing('press', { key: 'Enter' }, dir), /did not say which tab this would act on, so it was not done/);
+    assert.equal((await tasks).unknown, true, "the task's allowed action, unanswered, ends with the thread");
+  }
   context.self.postMessage = posting;
   records.delete('kv:pages');
+}
+
+// ---- The engine's own limits and tidying -------------------------------------------
+{
+  // A thread file larger than this browser takes is refused before the engine reads it.
+  await assert.rejects(engine.ops.import({ bytes: { byteLength: 2 ** 31 }, name: 'big.spindle' }), /big\.spindle is too large to bring into this browser \(over 1 GB\)/);
+  // Settings, Storage, Unreadable: the pool's lost slots are freed (the bytes said).
+  vm.runInContext('poolOpening = Promise.resolve({ reclaim: () => 4096 })', context);
+  assert.deepEqual({ ...(await engine.ops.reclaimLost()) }, { freed: 4096 });
+  // At start, a message kept for a thread since deleted goes; one for a thread that is
+  // there stays for its panel.
+  records.set('kv:came-back:fedcba9876543210', { text: 'for a deleted thread', files: [] });
+  records.set(`kv:came-back:${id}`, { text: 'for a thread that is there', files: [] });
+  records.set(`threads:${id}`, records.get(`threads:${id}`) ?? { id, state: 'idle' });
+  await engine.restoreQueued();
+  assert.equal(records.has('kv:came-back:fedcba9876543210'), false);
+  assert.equal(records.get(`kv:came-back:${id}`).text, 'for a thread that is there');
+  records.delete(`kv:came-back:${id}`);
+}
+
+// ---- A message that comes back goes to its own thread's box, never another's -------
+// The panel's box is every thread's. Take back, a rewind and a failed send put their message
+// in it only while that message's thread is open (checked after reopening it); otherwise it
+// waits and goes in when that thread is opened again. What the box held stays.
+{
+  const panelSource = readFileSync(new URL('../panel.mjs', import.meta.url), 'utf8');
+  const cut = (from, to) => {
+    const start = panelSource.indexOf(from);
+    assert.notEqual(start, -1, from);
+    return panelSource.slice(start, panelSource.indexOf(to, start));
+  };
+  const box = { value: '', focus() {} };
+  const button = {};
+  const toasts = [];
+  let answer;
+  let opening;
+  // The extension's storage, in memory (what a panel keeps there outlives the panel).
+  // Transactions on one store run one after another, in the order they were asked for.
+  const kept = new Map();
+  let transactions = Promise.resolve();
+  const inOrder = (work) => (transactions = transactions.then(work));
+  const storage = {
+    merge: (store, key, value, combine) => inOrder(() => {
+      const name = `${store}:${key}`;
+      const next = kept.has(name) ? combine(value, kept.get(name)) : value;
+      kept.set(name, next);
+      return next;
+    }),
+    take: (store, key) => inOrder(() => {
+      const name = `${store}:${key}`;
+      const value = kept.get(name);
+      kept.delete(name);
+      return value;
+    }),
+    remove: (store, key) => inOrder(() => { kept.delete(`${store}:${key}`); }),
+  };
+  const handlers = cut('async function rewindTo(', '/** The pictures attached to a message') + cut("$('takeback').onclick = async () => {", '// ---- Settings')
+    + cut("$('queued-back').onclick = async () => {", 'function carry(thread)');
+  // Take back of a message waiting for the turn has a button of its own.
+  const queuedButton = {};
+  const newPanel = (own = box) => {
+    const made = vm.createContext({
+      current: 'A', attached: [], threads: new Map([['A', { title: 'Alpha', state: 'idle' }], ['B', { title: 'Beta', state: 'idle' }]]), File, console,
+      $: (name) => (name === 'prompt' ? own : name === 'queued-back' ? queuedButton : button), autosize() {}, renderAttached() {}, toast: (text) => toasts.push(text),
+      ask: () => answer.promise, confirmed: async () => true, ...storage,
+      openThread: (id) => { made.current = id; made.restoreCameBack(id); return opening?.promise; },
+    });
+    vm.runInContext(handlers, made);
+    return made;
+  };
+  let panel = newPanel();
+  const takeBack = async (during) => {
+    answer = deferred();
+    opening = deferred();
+    const done = button.onclick();
+    await tick();
+    await during();
+    await done;
+  };
+  // Switched to B while A reopened: nothing of A's in the box; it waits for A.
+  await takeBack(async () => {
+    answer.resolve({ text: 'private draft A', files: [{ path: 'notes.txt', bytes: new Uint8Array([1]) }] });
+    await tick();
+    panel.openThread('B');
+    opening.resolve();
+  });
+  assert.equal(box.value, '', 'B\'s box gets nothing of A\'s');
+  assert.equal(panel.attached.length, 0);
+  assert.match(toasts.at(-1), /“Alpha” was taken back: its message is in the box when you open it/);
+  box.value = 'typed for B';
+  panel.openThread('A');
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(box.value, 'private draft A\n\ntyped for B', 'back on A it is in the box, before what the box held');
+  assert.deepEqual([...panel.attached.map((file) => file.name)], ['notes.txt']);
+  // Switched away before the answer came: A is not reopened, and its message waits too.
+  box.value = '';
+  panel.attached = [];
+  await takeBack(async () => {
+    panel.openThread('B');
+    answer.resolve({ text: 'second draft A', files: [] });
+    opening.resolve();
+  });
+  assert.equal(box.value, '');
+  panel.openThread('A');
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(box.value, 'second draft A');
+  // Staying on A: in the box at once.
+  box.value = '';
+  await takeBack(async () => {
+    answer.resolve({ text: 'third draft A', files: [] });
+    opening.resolve();
+  });
+  assert.equal(box.value, 'third draft A');
+  assert.match(toasts.at(-1), /its message is in the box below/);
+  // A rewind: the same. And what waits is kept in storage: a panel closed meanwhile (a new
+  // one here) still puts it in that thread's box, once, and only there.
+  box.value = '';
+  panel.attached = [];
+  answer = deferred();
+  opening = deferred();
+  const rewinding = panel.rewindTo('A', 3, 7);
+  await tick();
+  panel.openThread('B');
+  answer.resolve({ text: 'rewound A', files: [{ path: 'a.txt', bytes: new Uint8Array([2]) }] });
+  opening.resolve();
+  await rewinding;
+  assert.equal(box.value, '', 'B\'s box gets nothing of A\'s rewound message');
+  assert.match(toasts.at(-1), /“Alpha” went back to before that message: it is in the box when you open it/);
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(kept.get('kv:came-back:A')?.text, 'rewound A', 'kept in storage');
+  panel = newPanel();
+  panel.current = 'B';
+  panel.openThread('B');
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(box.value, '', 'nothing of A\'s in B after the panel came back');
+  panel.openThread('A');
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(box.value, 'rewound A', 'the new panel puts it in A\'s box');
+  assert.deepEqual([...panel.attached.map((file) => file.name)], ['a.txt']);
+  assert.equal(kept.has('kv:came-back:A'), false, 'and lets it go');
+  box.value = '';
+  panel.openThread('B');
+  panel.openThread('A');
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(box.value, '', 'once');
+  // A message waiting for the turn, taken back: the same. Switched to B before the engine
+  // answered (it has let its own copy go), it waits for A, never lost, never in B's box.
+  box.value = '';
+  panel.attached = [];
+  panel.openThread('A');
+  answer = deferred();
+  const unqueueing = queuedButton.onclick();
+  await tick();
+  panel.openThread('B');
+  answer.resolve({ text: 'waiting for A', files: [{ path: 'w.txt', bytes: new Uint8Array([3]) }] });
+  await unqueueing;
+  assert.equal(box.value, '', "B's box gets nothing of A's waiting message");
+  assert.match(toasts.at(-1), /^The waiting message of “Alpha” was taken back: it is in the box when you open it\.$/);
+  panel.openThread('A');
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(box.value, 'waiting for A', 'back on A it is in the box');
+  assert.deepEqual([...panel.attached.map((file) => file.name)], ['w.txt']);
+  // Staying on A: in the box at once.
+  box.value = '';
+  panel.attached = [];
+  answer = deferred();
+  const staying = queuedButton.onclick();
+  answer.resolve({ text: 'waiting again', files: [] });
+  await staying;
+  assert.equal(box.value, 'waiting again');
+  box.value = '';
+  panel.attached = [];
+  panel.openThread('B');
+  panel.openThread('A');
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(box.value, '', 'and nothing more after');
+  // Two waiting for the same thread go in together, a file of the same name once (the newer).
+  panel.attached = [];
+  panel.openThread('B');
+  panel.backToBox('A', 'first', [{ name: 'x.txt', size: 1 }]);
+  panel.backToBox('A', 'second', [{ name: 'x.txt', size: 2 }]);
+  panel.openThread('A');
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(box.value, 'second\n\nfirst');
+  assert.deepEqual([...panel.attached.map((file) => file.size)], [2]);
+  // Two windows: what each keeps for one thread adds up (neither overwrites the other), and
+  // only the first to open that thread puts it in its box.
+  const boxOne = { value: '', focus() {} };
+  const boxTwo = { value: '', focus() {} };
+  const one = newPanel(boxOne);
+  const two = newPanel(boxTwo);
+  one.current = 'B';
+  two.current = 'C';
+  one.backToBox('A', 'from window one', []);
+  two.backToBox('A', 'from window two', []);
+  for (let i = 0; i < 6; i++) await tick();
+  two.openThread('A');
+  one.openThread('A');
+  for (let i = 0; i < 6; i++) await tick();
+  assert.deepEqual([boxOne.value, boxTwo.value], ['', 'from window two\n\nfrom window one'], 'both kept, put in one box once');
+  assert.equal(kept.has('kv:came-back:A'), false);
+  // A deleted thread's message goes with it.
+  box.value = '';
+  panel.attached = [];
+  panel.openThread('B');
+  panel.backToBox('A', 'for a thread about to go', []);
+  for (let i = 0; i < 4; i++) await tick();
+  assert.ok(kept.has('kv:came-back:A'));
+  panel.forgetCameBack('A');
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(kept.has('kv:came-back:A'), false);
+  panel.openThread('A');
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(box.value, '');
 }
 
 // ---- Hosted effects survive a lost answer or an engine restart ---------------------
@@ -1106,6 +1590,19 @@ delete globalThis.chrome;
   records.delete(`kv:${MOVE(thread)}`);
 }
 
+// A thread deleted here takes a message kept for it (`came-back:ID`) with it.
+{
+  const thread = 'eeeeeeeeeeeeeeee';
+  records.set(`threads:${thread}`, { id: thread, state: 'idle', home: null });
+  records.set(`kv:came-back:${thread}`, { text: 'waiting for it', files: [] });
+  records.set('kv:came-back:start', { text: 'for the start page', files: [] });
+  engine.setClient({ async closeSession() {}, async tasks() { return { tasks: [] }; } });
+  assert.deepEqual({ ...(await engine.operate('remove', { id: thread })) }, { removed: true });
+  assert.equal(records.has(`kv:came-back:${thread}`), false);
+  assert.equal(records.has('kv:came-back:start'), true, 'not another\'s');
+  records.delete('kv:came-back:start');
+}
+
 // ---- Threads on the user's host: the /v1 client, connect's PKCE, and the moves ----
 
 // (Sessions the tests above opened close on the engine's timers meanwhile.)
@@ -1324,6 +1821,13 @@ function moveWorld() {
           throw fail(0, 'unreachable', 'the reply was lost');
         }
         return { session: { id, settings: { provider: 'hp', model: 'hm', runner: 'none', network: true } }, fit: { changes: {} }, replayed: Boolean(known) };
+      },
+      // A current host says how large the thread's bundle would be (`bundle_bytes`);
+      // an older one says nothing of it (`host.saysSize` false).
+      async session(id) {
+        const session = host.sessions.get(id);
+        if (!session) throw fail(404, 'not_found', 'session not found');
+        return { id, ...(host.saysSize !== false && { bundle_bytes: session.size ?? session.bytes.length }) };
       },
       async exportThread(id) {
         const session = host.sessions.get(id);
@@ -1657,6 +2161,26 @@ for (const step of ['back:recorded', 'back:held', 'back:imported', 'back:release
   assert.match(busy.thread().note, /stays on your host: a command is running/);
   assert.deepEqual(busy.leftOver(), []);
 
+  // Too large for this browser: it stays on the host as it was, nothing sealed or sent
+  // there (the host says the size before any export). An older host, saying nothing,
+  // is asked for the bundle as before.
+  const large = await hosted();
+  const [hostedId] = large.host.sessions.keys();
+  large.host.sessions.get(hostedId).size = 2 ** 31;
+  const exportsBefore = large.host.exports;
+  assert.equal((await (await large.moves().back('t1')).done).done, false);
+  assert.equal(large.host.exports, exportsBefore, 'no export was asked for');
+  assert.equal(large.host.sessions.get(hostedId).sealed, false, 'nothing sealed on the host');
+  assert.equal(large.liveCopies(), 1);
+  assert.equal(large.local.live, false, 'it stays on the host');
+  assert.match(large.thread().note, /stays on your host: it would come back as about 2\.0 GB, more than this browser takes \(1\.0 GB\)/);
+  assert.deepEqual(large.leftOver(), []);
+  const older = await hosted();
+  older.host.saysSize = false;
+  await (await older.moves().back('t1')).done;
+  assert.equal(older.local.live, true, 'an older host: brought back as before');
+  assert.deepEqual(older.leftOver(), []);
+
   const slow = await hosted();
   slow.world.cutAt = 'back:imported';
   await assert.rejects((await slow.moves().back('t1')).done, crashed);
@@ -1706,4 +2230,4 @@ assert.match(moveKey('ab:cd/ef', 12), /^abcdef-12-[0-9a-f]{12}$/);
 }
 assert.equal(sentence(Object.assign(new Error('busy: a command is running'), { kind: 'busy' })), 'a command is running');
 
-console.log('review-regressions passed: waiting messages kept on disk (until their turn has taken them; restored at start, held, unless taken), a message stopped before its turn began coming back held, a message to a thread that takes none refused at once, the tab a question is about named and pinned, an unreadable Before acting asking, a script\'s question withdrawn when its command ends, icon buttons named Send asked about, moves rolled back after a lost first request and a refusal only a new key gets (never after a lost answer), a move back waiting on its own export, a snapshot holding threads as they are when it answers, the host /v1 client (event stream parsing and resuming, commands sent again with their request ID, bundles in and out), connect PKCE and its state, moves to the host and back cut at every step (one live copy each time), operation races, Before acting (Full, Auto, Ask; allowed, refused, ended), the Dim theme (the old Dark shows Dim), site secret headers checked (names, values, HTTPS only) and named to the package without their values, reset safety, early Stop, a message with files waiting for the turn to end, a turn stopped part way taking a reply (text alone) and Retry after a stopped step, gateway bounds/redirects (the extension store told as closed), IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too, and for actions without the debugger), Before acting kept when site access is taken back, Return asked about as Enter, one action per tab, uncertain actions unknown (engine, its document and the background)');
+console.log('review-regressions passed: waiting messages kept on disk (until their turn has taken them; restored at start, held, unless taken), a message stopped before its turn began coming back held, a message to a thread that takes none refused at once, the tab a question is about named and pinned, an allowed action held to the page, part or dialog the question showed (refused before acting once the tab reloaded, moved on or shows another dialog; Auto looks nothing up for one that sends nothing), a message coming back (Take back, rewind, a failed send) only into its own thread\'s box, an unreadable Before acting asking, a script\'s question withdrawn when its command ends, icon buttons named Send asked about, moves rolled back after a lost first request and a refusal only a new key gets (never after a lost answer), a move back waiting on its own export, a snapshot holding threads as they are when it answers, the host /v1 client (event stream parsing and resuming, commands sent again with their request ID, bundles in and out), connect PKCE and its state, moves to the host and back cut at every step (one live copy each time), operation races, Before acting (Full, Auto, Ask; allowed, refused, ended), the Dim theme (the old Dark shows Dim), site secret headers checked (names, values, HTTPS only) and named to the package without their values, reset safety, early Stop, a message with files waiting for the turn to end, a turn stopped part way taking a reply (text alone) and Retry after a stopped step, gateway bounds/redirects (the extension store told as closed), IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too, and for actions without the debugger), Before acting kept when site access is taken back, Return asked about as Enter, one action per tab, uncertain actions unknown (engine, its document and the background)');

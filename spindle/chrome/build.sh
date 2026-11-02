@@ -75,7 +75,7 @@ cat chrome/glue-drop.js >> "$out/web/spindle_embed.js"
 cp chrome/manifest.json chrome/background.js chrome/engine.html chrome/engine.mjs chrome/engine-worker.mjs \
     chrome/linux-frames.mjs chrome/linux-net.mjs chrome/linux-route.mjs chrome/linux-runner.mjs chrome/linux-worker.mjs chrome/linux-workspace.mjs \
     chrome/wasm-linux-worker.mjs chrome/page-tools.mjs chrome/shared.mjs chrome/signin.mjs chrome/vault.mjs chrome/host-moves.mjs chrome/panel.html \
-    chrome/panel.css chrome/panel.mjs chrome/steps.mjs chrome/page.mjs chrome/markdown.mjs chrome/zip.mjs chrome/view.html chrome/view.mjs chrome/preview.html \
+    chrome/panel.css chrome/panel.mjs chrome/steps.mjs chrome/page.mjs chrome/documents.mjs chrome/markdown.mjs chrome/zip.mjs chrome/view.html chrome/view.mjs chrome/preview.html \
     chrome/preview.js "$out/"
 cp -r "$linux" "$out/linux"
 if [ -n "$wasm_linux" ]; then

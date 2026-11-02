@@ -308,12 +308,23 @@ thread; an export (`POST /v1/sessions/ID/export`) hands it back. The host import
 as one of its own threads and always fits its settings: every command in the sandbox,
 file tools become the full tool set, no runner, no host source directories, no self-edit; it runs on the
 host's own credentials, on another model only when the request names one. The upload
-goes to `HOST/incoming/` and is checked whole before anything is written; the thread is
+goes to `HOST/incoming/`, is unpacked from there into a private staging directory (made
+new, owner-only) and checked whole before any of it becomes a session: every file
+against its digest, and every store where it lies, through a bounded page cache, so no
+store is held in memory. A refused bundle (`400 bad_bundle`; a store's settings over
+4 MiB among the reasons) leaves nothing staged; a store the host cannot check for its
+own reasons, such as a full disk, is a `500`, not a refusal. Uploads run side by side,
+but one import at a time unpacks and checks, and again puts its session in place; the
+credential check between (which may refresh a sign-in or run a key command) holds no
+other import back. The thread is
 registered, with its owner and the request's idempotency key, in one `host.sqlite`
-transaction, and anything half-made is removed when the host opens. A thread that moved
+transaction, and anything half-made is removed when the host opens. Before a move
+back, the client can read the thread's `bundle_bytes` (an estimate from its files'
+sizes, over rather than under) and leave a thread too large for it here, unsealed;
+Spindle for Browser does for a thread over 1 GB (after 0.1.6). A thread that moved
 back keeps its checked bundle (`moved.spindle`) and refuses new work (every command
 but rename, delete and stop) until its app deletes it. A browser token sees only the threads it brought;
-the phone UI sees every thread.
+the phone UI sees every thread. See [API.md](API.md#bringing-threads-to-the-host).
 
 Like every native entry point, the host refuses an embedded-owned or moved store
 and writes no metadata into it, including while the package closes SQLite to

@@ -117,7 +117,8 @@ your key.
   of your host's models runs it. The panel still drives the thread and answers its page
   tools while the browser engine is open. Closing or restarting that engine does not
   stop the hosted turn. **Bring back to this browser** moves it back, first listing what
-  must change for it to run here.
+  must change for it to run here; a thread over 1 GB (your host says its size first)
+  stays on your host, as it was, and says why.
   A move under way shows its step and picks up again after a crash, a restart or a lost
   connection; this browser keeps its copy until your host holds the thread, so nothing
   is lost if either side stops meanwhile, and the thread never runs in two places. A
@@ -171,7 +172,12 @@ your key.
   that turn had already taken it. Messages a turn ended before reading wait the same
   way, held ("Not sent (the turn ended before reading it)"), kept on disk, to send or
   take back. A message to a thread whose last turn did not finish, and takes no reply
-  now, is refused at once, your draft kept: Retry, Continue or Take back first.
+  now, is refused at once, your draft kept: Retry, Continue or Take back first. A message
+  that comes back (Take back, of a turn or of a message waiting for one, going back to
+  before a message, a send that failed) goes into the box only while its own thread is
+  open (the box is every thread's); if you are on another, it waits, saved in the
+  browser's storage, files and all, and goes in when you open that thread (in this window
+  or another, once), or goes with the thread if you delete it.
 - **Page actions** (the **Act on pages** switch, off until you turn it on; turning it on
   turns page reading on too; Chrome's debugger, which Chrome does not offer as an
   optional permission, so the extension holds it and the switch decides): threads browse
@@ -195,10 +201,21 @@ your key.
   list; a question about pressing a key, answering a dialog, closing a tab or moving a
   tab in place (to an address, back, forward, reload) names that tab (the one named, or
   the one you look at when it asks), and the action stays on that tab whatever you look
-  at when you answer. A thread waits up to ten minutes for your answer. Deny, no answer,
+  at when you answer. An action you allow is done only on what the question showed you,
+  checked just before it goes: a key, a move in place or closing a tab only while that
+  tab still shows the same page (reloaded, moved to another site or on to another page
+  since, it is not done), a click, typing or choice only while its part of the page is
+  still what the question named, and a dialog's answer only to the dialog the question
+  showed, whose words the question quotes (the page itself where Chrome says which it
+  is, else the same address). A question that cannot name the tab a key or a dialog's
+  answer would go to is not asked: nothing is done. Otherwise nothing is done and the
+  thread is told why, so it can ask again. A task's question says it is a task's. A thread waits up to ten minutes for your answer. Deny, no answer,
   or Stop: the action is not done, which the thread is told (a known outcome, not an
   unknown one); a script's action waiting for your answer is withdrawn when the command
-  that asked ends. While a page dialog Spindle saw is open, it keeps the debugger on
+  that asked ends. Stop ends the turn's own page actions and those of the tasks it waits
+  for; a task running in the background goes on, page actions too, until its own Stop
+  (or the thread is deleted, moved back, or its host changes). A thread on your host
+  ends every page action at its Stop. While a page dialog Spindle saw is open, it keeps the debugger on
   that tab (up to 11 minutes), so your answer still reaches it. Opening a file of the
   workspace for you never asks.
 - **Your browser's name:** in Edge, Brave or Opera, the panel and the messages it shows
@@ -217,7 +234,18 @@ your key.
   files they name, the only workspace files it may fetch; any of them changing asks
   again). **Load from the web** lets that version load over HTTPS (and run its scripts);
   **Go offline** takes that back. Markdown is drawn, pictures show, text and code show
-  as they are; each card's name opens it in the workspace page, and its icon buttons
+  as they are. A PDF opens in a tab of its own, as Chrome's own PDF viewer (Chrome 123
+  and later; its card and the workspace page offer it). A Word, Excel or PowerPoint file
+  (`.docx`, `.xlsx`, `.pptx`, and their macro-enabled kinds, whose macros never run) is
+  read in the browser and drawn as a static page, in the preview frame with nothing
+  running: its text, headings, lists, tables, pictures, sheets (formulas saved without
+  their results shown as formulas) and slides, with fonts and spacing only roughly and
+  shapes as their text on a plain fill; charts and diagrams are marked where they were
+  (said under it, as are pictures left out and sheets cut short); headers, footers,
+  comments and speaker notes are left out; the download is the file. Audio and video
+  play in a player. An SVG shows as a picture, given the namespace a picture needs when
+  it was written without one; one whose markup is not XML is drawn as a page instead.
+  Each card's name opens it in the workspace page, and its icon buttons
   show it here (the eye) or download it (their words in their tooltips). The workspace
   is listed once, in a card folded until you open it, just above the last turn's final
   answer: as a tree whose folders stay shut until you open one (a folder holding only a
@@ -228,7 +256,8 @@ your key.
   with Download all (.zip); it has a page of its own in the panel (Workspace in the
   thread's menu, or a card's workspace button): its files to filter and open, one at a
   time with its preview, the files before and after it a click (or an arrow key) away,
-  its path to copy, Download, and for a page or picture Open in a tab of its own. With
+  its path to copy, Download, and for a page, picture, PDF, document, audio or video
+  Open in a tab of its own. With
   page tools on, a thread can open a file for you itself: `navigate` to
   `/workspace/NAME`. Downloads go through Chrome's downloads API (the `downloads`
   permission), which saves them even when the browser would hold back a download a page
@@ -324,7 +353,8 @@ your key.
   workspace and none of its conversation (its model too, to change in the model page).
 - **Moving:** a thread moves into a `.spindle` file (Thread menu, Move to a file) and
   continues in native Spindle (`spindle --dir DIR import-session FILE`), or in Spindle
-  in another browser (Import a .spindle thread). Native Spindle's `export-session FILE`
+  in another browser (Import a .spindle thread; up to 1 GB, as bringing one in holds it
+  about three times over in the engine's memory). Native Spindle's `export-session FILE`
   moves one back. The moved copy keeps the file until you delete it (Save the file
   again), so a save you cancelled loses nothing; once Spindle has kept the file in this
   browser's storage (a strict IndexedDB commit) and it reads back as written, it is the
@@ -354,7 +384,10 @@ your key.
   attempts** removes them (what they may have cost stays counted). A moved thread that
   still has its sealed store (one moved by an earlier version) frees it once its file
   checks whole. **Remove** takes the Linux snapshot away: the next command for v86 boots
-  it afresh (under a minute).
+  it afresh (under a minute). **Unreadable** shows only if a file's name in storage was
+  found damaged (not something a crash leaves: every rename and delete is finished or
+  undone whole); its bytes are kept apart, never reused, until **Free** (or Free all)
+  removes them.
 - **Appearance:** the native UI's Paper, Light, Dim or System (Light or Dim as the
   system is) theme, with a Textured or Plain background. Dim is the dark theme: a soft
   warm charcoal rather than near-black (a panel that chose the old Dark shows Dim).
@@ -435,10 +468,11 @@ from the folder's path).
 | `linux-route.mjs` | the engine worker | which Linux runs a command, and when the wasm Linux's result means running it again on v86 |
 | `wasm-linux-worker.mjs` | a worker of its own | the wasm Linux, with linux-worker.mjs's messages: its image, a few commands at once |
 | `wasm-linux/` | that worker, and workers it starts | the wasm Linux's runtime (`machine.mjs` boots the kernel and starts a worker per task, `runner.mjs` runs commands and restarts a machine only to end a runaway, the virtio devices, v86's 9p server vendored) and, built in, its kernel and image; `guest/` is its agent and sandbox (Rust) |
-| `background.js` | the service worker | opens the panel from the toolbar; does every page tool's work (reading and, through Chrome's debugger, acting); serves the preview frame under its Connection-Allowlist |
+| `background.js` | the service worker | opens the panel from the toolbar; does every page tool's work (reading and, through Chrome's debugger, acting); serves the preview frame under its Connection-Allowlist, and a thread's PDFs (`/file/THREAD/PATH`, read from the engine) for Chrome's own viewer |
 | `shared.mjs` | panel, engine, background | the channel (a `BroadcastChannel`) and the extension's IndexedDB |
 | `page-tools.mjs` | panel, engine, background | the page tools' definitions and the access they need |
-| `page.mjs`, `preview.html`, `preview.js` | the panel and `view.html`; the sandboxed preview frame | a workspace file made ready to show (a page with what it refers to put in), the frame a page runs in, downloads |
+| `page.mjs`, `preview.html`, `preview.js` | the panel and `view.html`; the sandboxed preview frame | a workspace file made ready to show (its kind; a page with what it refers to put in; an SVG as a picture takes it), the frame a page runs in, downloads |
+| `documents.mjs` | the panel, `view.html` | a Word, Excel or PowerPoint file read from its parts and drawn as a static page |
 | `view.html`, `view.mjs` | a tab | one workspace file opened in a tab of its own |
 | `markdown.mjs`, `zip.mjs` | the panel, `view.html` | Markdown drawn (with `text.js`); all of a thread's files as one .zip |
 | `glue-drop.js` | (appended to wasm-bindgen's glue by build.sh) | lets a renewed engine give the old instance's memory back |
@@ -554,7 +588,10 @@ to check permission/send races, camera gating, interrupted-reset and sealed-move
 recovery (no reset backup kept after), a moved thread keeping one copy, Storage freeing
 a thread's free space (a store fragmented under Node by the build's own wasm, then
 imported) and a set-aside first attempt, page Stop, a covered click refused, file
-previews (contained: no WebRTC, hint or navigation leaves a running one), tasks (their
+previews (contained: no WebRTC, hint or navigation leaves a running one), documents
+(Word, Excel and PowerPoint drawn as pages, nothing hidden shown; a PDF's tab becoming
+Chrome's viewer of it, served by the worker; SVGs; audio; in a tab and on the workspace
+page), tasks (their
 cards, the chip, Stop on the waiting) and a message with a screenshot waiting for the
 turn. The package's `embed/tests/browser_opfs.mjs` checks two workers contending for one
 session, 80 close/reopen cycles in one worker with reads at once, and compacting a store
@@ -658,3 +695,11 @@ always removed; `SPINDLE_SHOTS=DIR` keeps only screenshots, in DIR.
   and a page's own DNS-prefetch switch are taken out either way. A page that tries
   WebRTC from a `srcdoc` or `data:` frame it makes loses its preview (Chrome ends the
   frame's process; nothing leaves).
+- A PDF opens in a tab of its own, in Chrome's own viewer, as a PDF you download and
+  open does (its links and buttons work as there; where Chrome is set to download PDFs,
+  it is saved instead), not in the panel: the viewer takes the page around it to a link
+  you click, which would take the panel away. Documents drawn as pages are read from
+  their contents and only roughly laid out; older Office files (`.doc`, `.xls`, `.ppt`)
+  and OpenDocument files are not drawn (download them). A sheet shows its first 2,000
+  rows and 100 columns at most, and one whose part is over 16 MiB (a very large sheet)
+  says so in its place; a document over 128 MB is not drawn.

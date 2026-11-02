@@ -248,7 +248,7 @@ overlap, and each returns a Promise of its result. `prompt`, `resume`, `retry`,
 | `code(dir, request, { signal })` | One request from a script running in the app's runner (see [Script calls](#script-calls-code-mode-bridge)) |
 | `catalog()`, `efforts(provider, model)` | The catalog in use; the effort levels a route accepts |
 | `call(method, params)` | Any method by name (for example `list`, which has no wrapper) |
-| `close()` | Cancels all outstanding work, rejects pending calls with kind `closed`, frees the `Embedded` instance (closing every store), and closes the OPFS pool |
+| `close()` | Ends every app tool handler's `call.signal` (outcome `closed`), cancels all outstanding work, rejects pending calls with kind `closed`, frees the `Embedded` instance (closing every store), and closes the OPFS pool |
 | `ready` | A Promise that settles once the runners given at construction are connected |
 
 The embedded backend ([`backend.rs`](../spindle/store/src/embedded/backend.rs))
@@ -261,6 +261,26 @@ answers `info`, `providers`, `list`, `create`, `open`, `status`, `close`, `promp
 includes `usage`, `capabilities` and `tasks` for these additions. Status has stable
 `activity` codes shared with the native host, plus `waiting_tasks` and `background`,
 and a `background` count; `list` entries instead carry boolean `background`. See [API.md](API.md).
+
+### App tools
+
+`tool(definition)` registers an app tool with the same fields and answer shaping as
+the other clients' ([clients.md](clients.md#app-tools)); sessions this client creates
+offer it. The handler's `call` is the `app_tool` event with two more fields:
+
+- `call.session`: the session's `dir`. A task's call is announced among the
+  session's own events, its `call.call` beginning `tasks/<task key>/` (once per level
+  of nesting).
+- `call.signal`: an `AbortSignal` that ends when the package settles the call without
+  the handler's answer, or when the client closes. Its reason is an `AbortError` (as
+  `fetch` and `throwIfAborted` expect) whose `outcome` says why: `stopped` (the turn or
+  task that asked was stopped), `no_answer` (the call's `timeout_s` passed) or `closed`
+  (`close()`). The handler's answer is then not sent, so no `app_tool_error` follows.
+  A background task's calls go on when its parent's turn stops.
+
+An `app_tool_done` settles a call only within its own session (and that session's
+tasks): another session's call with the same id, such as a second copy imported from
+one bundle, is left waiting.
 
 ### Events and errors
 
@@ -447,23 +467,81 @@ runs over that pool.
 - `openOpfsPool({ directory = 'spindle', slots = 48 })` opens or creates
   `slot-<n>` files in that OPFS directory: at least `slots` of them, plus every slot an
   earlier `grow` added. It fails with `EBUSY` while another worker or tab holds the
-  pool.
-- Each slot holds one file. Its first 4096 bytes are a header with the magic
-  `spindle-opfs-slot-v1` and the path the slot holds, and the file's data follows.
-  Directories are path prefixes, `mkdirSync` does nothing, and a rename rewrites slot
-  headers. Header reads and writes complete the full 4096 bytes even when an access
-  handle transfers fewer bytes per call; renaming a file to itself is a no-op. A file
-  that replaces another takes the name first, under a newer generation
-  (the header's last 8 bytes), and the old slot is emptied after, so a crash between
-  leaves the new file under the name and the next open empties the older slot. A
-  directory of several files moves under a record of the move, kept in a free slot from
-  before its first file moves until after its last; the next open finishes a move a crash
-  cut short, so a directory is never split between its two names. `fsyncSync` is the
-  handle's `flush()`. When no slot is free, opening a new
-  file fails with `ENOSPC`. `free` counts empty slots, and `grow(count)` adds slots
-  between operations.
+  pool. It then reads every slot's header and settles what a crash left (see below).
+- Each slot holds one file. Its first 4096 bytes are a header, and the file's data
+  follows. The header holds the magic `spindle-opfs-slot-v1`, the path's length and
+  the path the slot holds; right after the path, a check (a copy of the slot's
+  generation and a CRC-32 of the header up to there); the slot's mark `chk1`; and, in
+  its last 8 bytes, the generation. Older versions of this adapter read only the magic,
+  the path and the last 8 bytes, so the check and the mark lie in bytes they never
+  read: they still read the headers written here, and theirs read here.
+  Directories are path prefixes, `mkdirSync` does nothing, and a rename or delete
+  rewrites slot headers. Header reads and writes complete the full 4096 bytes even
+  when an access handle transfers fewer bytes per call (a header write that stops
+  making progress fails with `EIO`, and a header read short fails the open), and each
+  header write is flushed. `fsyncSync` is the handle's `flush()`. When no slot is free,
+  opening a new file fails with `ENOSPC`. `free` counts the slots that hold no file (a
+  `lost` slot is not free), and `grow(count)` adds slots between operations.
+- **Headers cut short.** A slot keeps its mark in every header written over it, so a
+  header cut short, by a write that stopped part way or by power lost while the disk
+  wrote only some of its sectors, fails its check: it is told from a whole one and
+  never read as a name made of two. The path and its check share the header's first
+  512-byte sector (for paths under about 470 bytes), so a disk that keeps some of a
+  write's sectors and not others still leaves the old header or the new one whole. An
+  open that finds a header whole but its last 8 bytes cut writes it again whole, so an
+  older version reads the same generation. A slot an older version named gets its
+  check, then its mark (each flushed), before it is first written over. A header an
+  older version wrote has no check: one cut short shows as a path that runs past its
+  end or holds a NUL, or as a rename record (below) that is not its two whole names.
+- **Renames.** Every rename, of a file or a directory, first writes a record of it in
+  a free slot: the old and new names and, for each moving file, its slot and its name
+  inside the directory (a large directory's rename takes several). Then each file's
+  header takes its new name under a newer generation; a file that replaces another
+  takes the name first and the old slot is emptied after; the records are emptied
+  last. The next open finishes a rename it finds recorded, for the files the rename
+  began with (a directory made again under the old name since is not taken with it),
+  so a file is always under one of its two names and a directory is never split
+  between them. Of two slots left holding one name, the newer generation is the file
+  and the other is emptied. A rename with no free slot for its record fails with
+  `ENOSPC` and changes nothing. A rename whose record cannot be written undoes itself
+  (its records are emptied) and the pool goes on; if even that fails, the pool stops
+  as below. One that fails after its record (a file's header, or emptying the file it
+  replaced) stops the pool: every call that reads or changes files then
+  fails with `EIO` ("the OPFS pool stopped after a storage error during a rename")
+  until the pool is opened again, which finishes the rename, so a failed rename is
+  never redone later over a live file. An older version's rename record is read only
+  as its two whole names. A file whose two names are too long for one record
+  (thousands of bytes) is renamed without one, as an older version did. A name renamed
+  to itself is left as it is, and a directory never moves inside itself.
+- **What an open settles.** A header cut short in a slot a recorded rename lists, and
+  holding only bytes of the old name's header or the new one's, gets the new name. Any
+  other header cut short is emptied when it names nothing (a delete) or its slot holds
+  no data (an open). Anything else that cannot be read whole is kept apart as `lost`,
+  never read and never reused: a header damaged otherwise, a delete cut short over a
+  name of 256 bytes or more, or a header an older version wrote over a marked slot
+  (after a rollback) and cut short there. `lost` counts those slots, `lostBytes` is the
+  data they hold, and `reclaim()` empties them and returns the bytes freed; it is the
+  app's to call. Spindle for Browser offers it under Settings, Storage, Unreadable
+  (after 0.1.6).
 - `lockSession(dir)` takes the exclusive Web Lock `spindle:<dir>` if it is available
   and returns `null` when another worker or tab holds it.
+
+[`node_opfs_torn.mjs`](../spindle/embed/tests/node_opfs_torn.mjs) cuts, over slots in
+memory, every header write of a directory set aside, a file replacing another, a file
+renamed to a new name (with bytes, and empty), a file made and a file deleted (an
+older version's with a 300-byte name too), over slots this version wrote and slots an
+older one wrote. Each write is cut at every byte and with every set of its 512-byte
+sectors, and, for each earlier write its file had not flushed, with that write left
+out. Each reopened pool
+must hold every file whole under one of its two names, a directory under one of its
+two, no name made of two and nothing lost (but for the older version's long-named file
+deleted, which may keep its one slot apart); every header must read the same through
+the older version's reader; and a second open must change nothing. It also checks that
+a damaged header is kept apart until `reclaim()`, that an older version's cut rename
+record moves nothing, and that a directory too large for one record moves under
+several. [`node_opfs_replace.mjs`](../spindle/embed/tests/node_opfs_replace.mjs)
+covers handles that read or write less than asked, failed flushes, and a pool stopped
+by a failed rename. Both run in [`package.sh`](../spindle/embed/tests/package.sh).
 
 `EmbeddedClient` takes a session's Web Lock before touching any of its files. Every
 call with a `dir` (except `close`) acquires the lock first, and a call that cannot get
@@ -647,14 +725,20 @@ rollback-journal database that records a clean close. The file layout:
 | Checksum | SHA-256 of everything before it |
 
 A bundle may carry only paths a session directory has: `store/authority.sqlite`,
-`session.json`, and under `tasks/<key>/` (nested at most 16 deep) the same files plus
-`task.json`. It holds at most 4096 files, and each sidecar is JSON of at most 4 MiB.
-Reading checks the framing, every digest, the manifest, every path and every store
-(as a full check would); stores use schema 20 or schema 19, which migrates on open. Each
-`session.json` is rebuilt from its store's own settings. All of this happens before a
-host writes any file. Files are ordered deepest task first, with each place's store
-after its sidecars and the session's own store last, so an import cut short leaves no
-session behind.
+`session.json`, `pack-session-id` (a native host's pack session id), and under
+`tasks/<key>/` (nested at most 16 deep) the same files plus `task.json`. It holds at
+most 4096 files, and each sidecar is at most 4 MiB (`session.json` and `task.json`
+JSON). Reading checks the framing, then the manifest and the layout it describes
+(every path, none twice, the session's own store, each sidecar beside a store) before
+any file is taken, then every digest and every store (as a full check would); stores
+use schema 20 or schema 19, which migrates on open. Each `session.json` is rebuilt
+from its store's own settings, and settings over 4 MiB are refused before they are
+kept. The package reads a bundle in memory, and all of this happens before it writes
+any file. A native host instead unpacks the bundle into a private staging directory
+and checks it there, holding neither the bundle's files nor any store in memory (see
+[store.md](store.md#session-bundles)). Files are ordered deepest task first, with each
+place's store after its sidecars and the session's own store last, so an import cut
+short leaves no session behind.
 
 `exportSession(dir, { keep, settings, whole })` is refused while an operation or
 background task runs. A move checks every store record before sealing. A copy

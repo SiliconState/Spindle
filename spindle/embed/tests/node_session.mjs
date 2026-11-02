@@ -516,6 +516,55 @@ async function aBackgroundTask() {
   await c.close();
 }
 
+/** Stopping a turn ends its own app call (its handler's `call.signal`, and no answer is
+ * sent for it) but not a background task's: the task's call goes on, is answered, and
+ * the task finishes. */
+async function aStopLeavesBackgroundTasksCalls() {
+  const dir = join(root, 'stopped-parent');
+  const fetch = scriptedFetch([text('ready'), call('hold', { who: 'task' }), call('hold', { who: 'turn' }), text('task done')]);
+  const c = client(fetch);
+  const held = new Map();
+  // An answer the package no longer waits for is not sent (it would be refused).
+  const refused = [];
+  c.on('app_tool_error', (error) => refused.push(error));
+  c.tool({
+    name: 'hold', description: 'Waits until it is let go', rerun: 'safe',
+    inputSchema: { type: 'object', properties: { who: { type: 'string' } }, required: ['who'], additionalProperties: false },
+    run: ({ who }, asked) => new Promise((resolve) => held.set(who, { asked, release: resolve })),
+  });
+  const until = async (what, why) => {
+    for (let tries = 0; tries < 500 && !what(); tries++) await new Promise((done) => setTimeout(done, 10));
+    assert.ok(what(), why);
+  };
+  await c.create(dir, 'fake', { tasks: true });
+  await c.prompt(dir, 'hello');
+  await c.taskStart(dir, 'later', 'hold on', { report: 'queue' });
+  await until(() => held.has('task'), 'the background task asks for its app call');
+  assert.match(held.get('task').asked.call, /^tasks\//, 'a task\'s call is named under its task');
+  const turn = c.prompt(dir, 'go').then((value) => ({ value }), (error) => ({ error }));
+  await until(() => held.has('turn'), 'the turn asks for its own');
+  assert.doesNotMatch(held.get('turn').asked.call, /^tasks\//);
+  await c.stop(dir);
+  await until(() => held.get('turn').asked.signal?.aborted, 'the stopped turn\'s call is told it ended');
+  assert.equal(held.get('turn').asked.signal.reason.name, 'AbortError');
+  assert.equal(held.get('turn').asked.signal.reason.outcome, 'stopped');
+  assert.equal(held.get('task').asked.signal.aborted, false, 'the background task\'s call goes on');
+  await turn;
+  held.get('turn').release('too late');
+  held.get('task').release('let go');
+  let task;
+  for (let tries = 0; tries < 300; tries++) {
+    task = await c.taskWait(dir, 'later');
+    if (task.state === 'finished') break;
+    await new Promise((done) => setTimeout(done, 10));
+  }
+  assert.equal(task.state, 'finished', JSON.stringify(task));
+  assert.match(task.answer.content, /^task done/);
+  assert.ok(fetch.seen.at(-1).body.includes('let go'), 'the task\'s call was answered');
+  assert.deepEqual(refused, [], 'no answer was sent for the stopped call');
+  await c.close();
+}
+
 async function aRemoteRunner() {
   const binary = process.env.SPINDLE_BIN;
   if (!binary) {
@@ -670,6 +719,7 @@ try {
   await aModelWrittenSummary();
   await aBudget();
   await aBackgroundTask();
+  await aStopLeavesBackgroundTasksCalls();
   await aRemoteRunner();
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
@@ -679,6 +729,6 @@ console.log(
     'Responses reasoning snapshots budgeted as a batch, final copies replayed only within their turn, duplicate placeholders rejected without resend, ' +
     'credentials kept out of the store, app tool with files/state, app runner, a command the user stops (recorded with its output, a reply going on after a reopen, never run again), app and remote runners at once (a declared sandbox isolates), Spindle calls from a script journaled and replayed (http() only where a grant allows; a secret header a grant adds, never kept or shown), reopen, second ' +
     'owner refused, killed owner: unknown kept and sent once by retry, killed between a stop and its record: not completed, never run again, read-it-now cut, stop, ' +
-    'compaction by a model-written summary, a budget (refused unsent, raised, sent once, costed, usage), a background task (queued, driven after its answer, reported next turn), ' +
+    'compaction by a model-written summary, a budget (refused unsent, raised, sent once, costed, usage), a background task (queued, driven after its answer, reported next turn; its app call going on when its parent\'s turn is stopped, while the turn\'s own call is told it ended), ' +
     'remote runner on spindle serve with a runner token, and Stop stopping its command, when SPINDLE_BIN is set)',
 );

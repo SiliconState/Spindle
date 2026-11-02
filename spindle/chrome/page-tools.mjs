@@ -314,7 +314,12 @@ export function actionText(name, input, target) {
       if (action === 'reload') return `Reload the page${inTab}`;
       return input?.new_tab ? `Open in a new tab ${String(input?.url ?? '')}` : `Go to ${String(input?.url ?? '')}${inTab}`;
     }
-    case 'dialog': return `${input?.accept ? 'Accept' : 'Dismiss'} the page's dialog${input?.text ? ` with ${quote(input.text)}` : ''}${inTab}`;
+    // The tab first, then what the dialog says, whole and with its own quotation marks
+    // made plain, so a page's words cannot pass for the tab or the end of the question.
+    case 'dialog': {
+      const says = target?.dialog?.message ? `, which says ${quote(String(target.dialog.message).replace(/[“”«»„]/g, '"'), 500)}` : '';
+      return `${input?.accept ? 'Accept' : 'Dismiss'} the page's ${target?.dialog?.type ? `${target.dialog.type} ` : ''}dialog${inTab}${says}${input?.text ? `, answering ${quote(input.text)}` : ''}`;
+    }
     case 'close_tab': return `Close tab ${input?.tab}${target?.title ? ` (${quote(target.title, 60)}${target.host ? `, ${target.host}` : ''})` : target?.host ? ` (${target.host})` : ''}`;
     default: return name;
   }

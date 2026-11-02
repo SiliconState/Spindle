@@ -952,6 +952,9 @@ fn session(host: &Host, id: &str) -> std::result::Result<Value, Failure> {
     value["pending_settings"] = agent::pending_settings(&dir).unwrap_or(Value::Null);
     // Moved back to its client: sealed here, only exported again or deleted.
     value["moved"] = json!(super::threads::moved(&dir));
+    // About how large its bundle would be, so a client that could not take one that size
+    // leaves it here rather than have this copy sealed for it.
+    value["bundle_bytes"] = json!(agent::bundle_estimate(&dir));
     let live = host.live(id).map_err(missing)?;
     // A call waiting for the app's answer, so a client that connects late can answer it.
     let pending: Vec<Value> = live

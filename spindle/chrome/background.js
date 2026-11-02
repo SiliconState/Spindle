@@ -1,10 +1,11 @@
 // Spindle's service worker: the toolbar button opens the panel, it serves the frame
-// previews show pages in, and it does the page tools' work for the engine (the engine's
-// document cannot reach tabs). Reading needs page reading on; acting needs page actions
-// on as well (chrome.debugger: clicks, keys and typing reach the page as the user's
-// would, and a tab's network can be watched).
+// previews show pages in and a thread's PDFs for Chrome's own viewer, and it does the
+// page tools' work for the engine (the engine's document cannot reach tabs). Reading
+// needs page reading on; acting needs page actions on as well (chrome.debugger: clicks,
+// keys and typing reach the page as the user's would, and a tab's network can be
+// watched).
 import { ACTING_NAMES, BROWSER, PAGE_ACCESS, PICTURE_ACCESS, pageSwitches, uncertain } from './page-tools.mjs';
-import { read, write } from './shared.mjs';
+import { CHANNEL, read, startEngine, write } from './shared.mjs';
 
 // (A browser without the side panel API still runs the rest.)
 chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
@@ -27,24 +28,112 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
 // served from here (one that skipped this worker, or came before it was active) shows
 // pages as if it did not.
 const PREVIEW = new URL('preview.html', location.href).pathname;
+/** Where a thread's PDFs are answered (`pdf`). */
+const FILES = '/file/';
 const REACH = { none: '()', web: '("https://*:*")' };
 
-// Only where Chrome has static routes (123 and later): there only previews come to the
-// handler, and every other request of Spindle's pages and workers goes on as if there
-// were none (the worker is not woken for each). Without them it serves nothing (no
-// Chrome that old holds a Connection-Allowlist anyway): previews show uncontained.
+// Only where Chrome has static routes (123 and later): there only previews and PDFs come
+// to the handler, and every other request of Spindle's pages and workers goes on as if
+// there were none (the worker is not woken for each). Without them it serves nothing (no
+// Chrome that old holds a Connection-Allowlist anyway): previews show uncontained, and
+// PDFs only as downloads (page.mjs's pdfShows).
 if ('addRoutes' in (self.InstallEvent?.prototype ?? {})) {
   self.addEventListener('install', (event) => {
     event.waitUntil(event.addRoutes([
-      { condition: { urlPattern: new URLPattern({ pathname: PREVIEW }) }, source: 'fetch-event' },
+      // Spindle's own addresses only (a site's `/file/...`, fetched for a thread, never
+      // wakes this worker).
+      { condition: { urlPattern: new URLPattern({ pathname: PREVIEW, baseURL: location.href }) }, source: 'fetch-event' },
+      { condition: { urlPattern: new URLPattern({ pathname: `${FILES}*`, baseURL: location.href }) }, source: 'fetch-event' },
       { condition: { urlPattern: new URLPattern({}) }, source: 'network' },
     ]).catch((error) => console.warn('Spindle: previews go through the fetch handler with everything else:', error)));
   });
   self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
-    if (url.origin !== location.origin || url.pathname !== PREVIEW || event.request.mode !== 'navigate') return;
-    event.respondWith(preview(url));
+    if (url.origin !== location.origin || event.request.method !== 'GET') return;
+    if (url.pathname === PREVIEW && event.request.mode === 'navigate') event.respondWith(preview(url));
+    else if (url.pathname.startsWith(FILES)) event.respondWith(pdf(url));
   });
+}
+
+// A thread's PDF (`/file/THREAD/PATH`, page.mjs's pdfAddress) opens in a tab of its own
+// as Chrome's own PDF viewer: this worker answers its address with the file, read from
+// the engine. Only Spindle's pages reach the address (a site cannot: it is no resource
+// the extension shares), only PDFs are given, and only as PDFs (never read as a page).
+// It acts as a PDF downloaded and opened does (no Connection-Allowlist: the viewer's own
+// interface does not load under one): probed, a form a user submits from it goes out
+// with no cookies and an opaque origin either way.
+async function pdf(url) {
+  const plain = (status, text) => new Response(text, {
+    status,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' },
+  });
+  const [thread = '', ...parts] = url.pathname.slice(FILES.length).split('/');
+  let names;
+  try {
+    names = parts.map(decodeURIComponent);
+  } catch {
+    return plain(400, 'This address names no file.');
+  }
+  const path = names.join('/');
+  // A workspace path, as written: no empty part, no `.` or `..`, no slash inside a name.
+  if (!/^[0-9a-f]{16}$/.test(thread) || !names.length || names.some((name) => !name || name === '.' || name === '..' || /[/\\]/.test(name)) || !/\.pdf$/i.test(path)) {
+    return plain(404, "Spindle shows a thread's PDFs here, nothing else.");
+  }
+  try {
+    const { bytes } = await fromEngine('read', { id: thread, path });
+    return new Response(bytes, {
+      headers: {
+        'Content-Type': 'application/pdf',
+        'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(path.split('/').pop())}`,
+        'X-Content-Type-Options': 'nosniff',
+        'Cache-Control': 'no-store',
+      },
+    });
+  } catch (error) {
+    return plain(404, `${path} could not be read: ${error.message}`);
+  }
+}
+
+/** `op`'s answer once the engine runs (started here if it is not: it may be starting).
+ * The channel is open only while this asks: every page's answers go through it, a file's
+ * bytes included, and this worker takes none it did not ask for. */
+async function fromEngine(op, args) {
+  const engine = new BroadcastChannel(CHANNEL);
+  const me = `worker-${crypto.randomUUID()}`;
+  const waiting = new Map();
+  let asked = 0;
+  engine.onmessage = ({ data }) => {
+    if (data?.to !== me || !waiting.has(data.id)) return;
+    const answer = waiting.get(data.id);
+    waiting.delete(data.id);
+    clearTimeout(answer.timer);
+    if (data.ok) answer.resolve(data.result);
+    else answer.reject(new Error(data.error?.message ?? 'the engine failed'));
+  };
+  const ask = (what, given, timeout) => new Promise((resolve, reject) => {
+    const id = ++asked;
+    const timer = setTimeout(() => {
+      waiting.delete(id);
+      reject(Object.assign(new Error("Spindle's engine did not answer"), { kind: 'timeout' }));
+    }, timeout);
+    waiting.set(id, { resolve, reject, timer });
+    engine.postMessage({ to: 'engine', from: me, id, op: what, args: given });
+  });
+  try {
+    await startEngine();
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await ask('ping', {}, 3_000);
+        break;
+      } catch (error) {
+        if (error.kind !== 'timeout' || attempt >= 20) throw error;
+      }
+    }
+    return await ask(op, args, 120_000);
+  } finally {
+    for (const { timer } of waiting.values()) clearTimeout(timer);
+    engine.close();
+  }
 }
 
 async function preview(url) {
@@ -90,7 +179,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     return false;
   }
   if (message?.type !== 'page_tool') return false;
-  run(message.name, message.input ?? {}, message.call).then(reply, (error) => reply({ error: String(error?.message ?? error) }));
+  run(message.name, message.input ?? {}, message.call, message.allowed).then(reply, (error) => reply({ error: String(error?.message ?? error) }));
   return true;
 });
 
@@ -99,11 +188,12 @@ const OFF =
 const NO_ACTIONS =
   'Spindle may not act on pages: page actions are off. The user can turn them on in the Spindle panel (Settings, Pages).';
 
-async function run(name, input, call = crypto.randomUUID()) {
+async function run(name, input, call = crypto.randomUUID(), allowed = null) {
   const work = TOOLS[name];
   if (!work) return { error: `there is no page tool ${name}` };
   // `acted`: input reached the page, or Chrome was told to move or close a tab.
-  const control = { until: Date.now() + TOOL_MS, cancelled: false, acted: false };
+  // `allowed`: what the user was shown when asked before this action (`asAllowed`).
+  const control = { until: Date.now() + TOOL_MS, cancelled: false, acted: false, allowed };
   calls.set(call, control);
   try {
     return await deadline((async () => {
@@ -394,6 +484,7 @@ async function navigate({ url, action = 'go', tab: id, new_tab: fresh }, control
     return onTab(tab.id, async () => {
       refuseWhileDialog(tab.id);
       await refuseVetoed(tab.id);
+      await asAllowed(tab.id, control);
       check(control);
       control.acted = true;
       try {
@@ -430,7 +521,7 @@ async function aim(tabId, ref, control) {
   check(control);
   await attach(tabId);
   await pause(60);
-  return page(tabId, 'point', { ref }, control);
+  return page(tabId, 'point', { ref, ...(control?.allowed?.what && { what: control.allowed.what }) }, control);
 }
 
 /** What `ref` is (its description, whether a click on it submits a form, its words) and
@@ -447,11 +538,72 @@ async function target({ ref, tab: id }, control) {
 async function tabOf({ tab: id }) {
   const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt();
   if (!tab) return { error: id != null ? `there is no tab ${id}` : 'no tab is open' };
-  let host = '';
+  // The page it shows (so the action, once allowed, lands on that page or not at all),
+  // and a dialog open on it (so the question says what the dialog asks).
+  const document = /^https?:/.test(tab.url ?? '') ? await documentOf(tab.id) : null;
+  const open = dialogs.get(tab.id);
+  return {
+    content: `tab ${tab.id}`,
+    details: {
+      tab: tab.id, host: hostOf(tab.url), url: withoutPart(tab.url), title: tab.title ?? '',
+      ...(document && { document }), ...(open && { dialog: { id: open.id, type: open.type, message: open.message } }),
+    },
+  };
+}
+
+/** An address without its `#` part (a page moving within itself changes only that). */
+const withoutPart = (url) => String(url ?? '').split('#')[0];
+
+const hostOf = (url) => {
   try {
-    host = tab.url ? new URL(tab.url).host : '';
-  } catch {}
-  return { content: `tab ${tab.id}`, details: { tab: tab.id, host, title: tab.title ?? '' } };
+    return url ? new URL(url).host : '';
+  } catch {
+    return '';
+  }
+};
+
+/** The document a tab shows now (Chrome's id for it: another after a reload or a link
+ * followed), or null when Spindle cannot look (no access to the page, a dialog holding it). */
+async function documentOf(tabId) {
+  if (dialogs.has(tabId)) return null;
+  try {
+    const [shown] = await deadline(chrome.scripting.executeScript({ target: { tabId }, func: () => true, injectImmediately: true }), 5_000, `tab ${tabId}`);
+    return shown?.documentId ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** An action the user was asked about first (Settings, Pages, Before acting) acts only
+ * on what the question showed them: the same tab, still on the same site and the same
+ * page (Chrome's id for it: a reload or a link followed since makes another; where Chrome
+ * does not say, when asked or now, the same address but its `#` part), its part still
+ * what it was, and for a dialog the same dialog. Else this throws before anything is
+ * done. Checked just before the action goes (after any wait for the tab), so nothing the
+ * user did not see is acted on meanwhile; actions not asked about pass at once. */
+async function asAllowed(tabId, control) {
+  const allowed = control?.allowed;
+  if (!allowed) return;
+  const notDone = 'so it was not done; it can be asked about again';
+  if (allowed.tab != null && allowed.tab !== tabId) throw new Error(`the user allowed this on tab ${allowed.tab}, not tab ${tabId}, ${notDone}`);
+  if ('dialog' in allowed) {
+    if ((dialogs.get(tabId)?.id ?? 0) !== allowed.dialog) throw new Error(`the dialog on tab ${tabId} is not the one the user allowed answering, ${notDone}`);
+    return;
+  }
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) throw new Error(`there is no tab ${tabId}`);
+  const host = hostOf(tab.url);
+  if (allowed.host != null && host !== allowed.host) {
+    throw new Error(`tab ${tabId} moved from ${allowed.host || 'the page the user saw'} to ${host || 'another page'} since the user allowed this, ${notDone}`);
+  }
+  const document = allowed.document ? await documentOf(tabId) : null;
+  if (document) {
+    if (document !== allowed.document) throw new Error(`tab ${tabId} shows another page than the one the user allowed this on (it reloaded or moved on since), ${notDone}`);
+    return;
+  }
+  if (allowed.url != null && withoutPart(tab.url) !== allowed.url) {
+    throw new Error(`tab ${tabId} is at another address than the one the user allowed this on (it moved on since), ${notDone}`);
+  }
 }
 
 /** Something else lies over the target: nothing is clicked or typed there. */
@@ -499,7 +651,7 @@ async function select({ ref, values, tab: id }, control) {
 }
 
 async function selectIn(tab, ref, values, control) {
-  const chosen = await page(tab.id, 'select', { ref, values: values.map(String) }, control);
+  const chosen = await page(tab.id, 'select', { ref, values: values.map(String), ...(control?.allowed?.what && { what: control.allowed.what }) }, control);
   await settle(tab.id, 5_000, control);
   return { content: `Chose ${chosen.map((text) => JSON.stringify(text)).join(', ')} in [${ref}]. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
 }
@@ -508,6 +660,14 @@ async function press({ key: name, tab: id }, control) {
   const tab = await pageTab(id);
   return onTab(tab.id, async () => {
     refuseWhileDialog(tab.id);
+    await asAllowed(tab.id, control);
+    // Checked again once the debugger is attached (that can take a moment): the last
+    // thing before the key goes.
+    if (control?.allowed) {
+      check(control);
+      await attach(tab.id);
+      await asAllowed(tab.id, control);
+    }
     await key(tab.id, name, control);
     await settle(tab.id, 5_000, control);
     return { content: `Pressed ${name}. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
@@ -549,6 +709,7 @@ async function dialog({ accept, text, tab: id }, control) {
   if (!tab) return { error: id != null ? `there is no tab ${id}` : 'no tab is open' };
   const open = dialogs.get(tab.id);
   if (!open) return { error: `no dialog is open on tab ${tab.id}` };
+  await asAllowed(tab.id, control);
   await cdp(tab.id, 'Page.handleJavaScriptDialog', { accept: Boolean(accept), ...(text != null && { promptText: String(text) }) }, control);
   dialogs.delete(tab.id);
   await settle(tab.id, 5_000, control);
@@ -560,6 +721,7 @@ async function closeTab({ tab: id }, control) {
   if (!tab) return { error: `there is no tab ${id}` };
   if (!webTab(tab)) return { error: `tab ${id} does not show a web page: Spindle closes only those` };
   await refuseVetoed(id);
+  await asAllowed(id, control);
   check(control);
   control.acted = true;
   await chrome.tabs.remove(id);
@@ -610,7 +772,9 @@ function onTab(tabId, work) {
   settled.then(() => { if (tabTurns.get(tabId) === settled) tabTurns.delete(tabId); });
   return run;
 }
-/** Tabs showing a JavaScript dialog -> {type, message}; callers waiting for one. */
+/** Tabs showing a JavaScript dialog -> {id, type, message, at} (`id`: each dialog's own,
+ * never another's, even after this worker restarts, so an answer the user allowed goes to
+ * that dialog only); callers waiting for one. */
 const dialogs = new Map();
 const dialogWaiters = new Map();
 /** Tabs whose network is watched -> their requests, oldest first, by entry id. */
@@ -701,7 +865,7 @@ chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
 });
 chrome.debugger.onEvent.addListener(({ tabId }, method, params) => {
   if (method === 'Page.javascriptDialogOpening') {
-    dialogs.set(tabId, { type: params.type, message: String(params.message ?? '').slice(0, 500), at: Date.now() });
+    dialogs.set(tabId, { id: crypto.randomUUID(), type: params.type, message: String(params.message ?? '').slice(0, 500), at: Date.now() });
     for (const resolve of dialogWaiters.get(tabId) ?? []) resolve();
     dialogWaiters.delete(tabId);
   } else if (method === 'Page.javascriptDialogClosed') {
@@ -1066,8 +1230,19 @@ function inPage(op, args) {
       if (cut) lines.push('[more of the page: ask with a ref, a lower depth or a larger max_chars]');
       return { value: { url: location.href, title: document.title, text: lines.join('\n') || '(nothing shown)' } };
     }
+    // A part the user was asked about is acted on only while it is what they were shown:
+    // its role and words, numbers and punctuation aside (a count or a time it shows may
+    // change on its own; "Save draft" becoming "Send", or an icon "➤" becoming "🗑", may
+    // not).
+    const gist = (text) => String(text).toLowerCase().replace(/[\p{N}\p{P}]+/gu, ' ').replace(/\s+/g, ' ').trim();
+    const asShown = (element) => {
+      if (args.what && gist(describe(element)) !== gist(args.what)) {
+        throw new Error(`[${args.ref}] is now ${describe(element)}, not the ${args.what} the user allowed this on, so it was not done; it can be asked about again`);
+      }
+      return element;
+    };
     if (op === 'point') {
-      const element = elementOf(args.ref);
+      const element = asShown(elementOf(args.ref));
       element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
       // The first of its boxes that is on screen (a link wrapping two lines has two).
       const boxes = [...element.getClientRects()].filter((box) => box.width && box.height);
@@ -1118,7 +1293,7 @@ function inPage(op, args) {
       return { value: 'value' in element ? String(element.value).slice(0, 200) : clean(element.innerText, 200) };
     }
     if (op === 'select') {
-      const element = elementOf(args.ref);
+      const element = asShown(elementOf(args.ref));
       if (element.tagName !== 'SELECT') throw new Error(`${args.ref} is not a <select> list: click it, then the option you want`);
       const matches = [...element.options].filter((option) => args.values.includes(option.value) || args.values.includes(option.text.trim()));
       if (!matches.length) {

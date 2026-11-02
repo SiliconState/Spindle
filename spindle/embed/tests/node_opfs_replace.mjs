@@ -5,7 +5,8 @@
 // under a record of the move, so power lost midway is finished by the next open: never a
 // directory split between its two names. A handle may also read or write less than asked
 // and say so only by its count: a slot's header is still read and written whole, and a
-// rename that cannot write it fails before it lets anything go.
+// rename that cannot write it fails before it lets anything go; one that fails after its record
+// was written stops the pool (it takes nothing more) for the next open to finish it.
 import assert from 'node:assert/strict';
 import { OpfsFs, adoptSlots, openOpfsPool } from '../../clients/js/opfs.mjs';
 
@@ -15,7 +16,8 @@ const HEADER = 4096;
  * `headers` is how many header write calls it takes before power is lost. Short counts:
  * `short` is the most one header write call takes, `progress` how many header write calls
  * take anything (then they take nothing), `shortRead` the most one read gives, and nothing
- * is read from `unreadableFrom` on. `flushFails` makes flush throw. */
+ * is read from `unreadableFrom` on. `flushFails` makes flush throw; `failOnce`, the next
+ * header write alone. */
 class Handle {
   bytes = new Uint8Array(0);
   fail = false;
@@ -25,6 +27,7 @@ class Handle {
   shortRead = Infinity;
   unreadableFrom = Infinity;
   flushFails = false;
+  failOnce = false;
   open = false;
   getSize() { return this.bytes.length; }
   truncate(size) {
@@ -40,6 +43,10 @@ class Handle {
   }
   write(from, { at }) {
     if (at < HEADER) {
+      if (this.failOnce) {
+        this.failOnce = false;
+        throw new Error('power lost');
+      }
       if (this.fail || this.headers-- <= 0) throw new Error('power lost');
       if (this.progress-- <= 0) return 0;
       from = from.subarray(0, this.short);
@@ -88,17 +95,30 @@ assert.equal(named.length, 1, 'one slot holds the name after the reopen');
 assert.equal(after.fs.readFileSync('/s/session.json'), 'newer', 'the new file is the one kept');
 assert.equal(after.fs.existsSync('/s/session.json.tmp'), false);
 
-// Power lost before the new file took the name: the old file is still there, whole.
+// Power lost before the new file took the name. Before the rename's record was written:
+// nothing changed, the old file is still there, whole (and the new one beside it).
 ({ fs } = open());
 put(fs, '/s/task.json.tmp', 'next');
 const moving = open().pool.findIndex((slot) => slot.path === '/s/task.json.tmp');
 put(fs, '/s/task.json', 'kept');
-handles[moving].fail = true;
+const recordSlot = open().pool.findIndex((slot) => !slot.path);
+handles[recordSlot].fail = true;
 assert.throws(() => fs.renameSync('/s/task.json.tmp', '/s/task.json'), /power lost/);
-handles[moving].fail = false;
+handles[recordSlot].fail = false;
 const before = open().fs;
 assert.equal(before.readFileSync('/s/task.json'), 'kept');
 assert.equal(before.readFileSync('/s/task.json.tmp'), 'next');
+// After it (the new file's own header not written): the next open finishes the rename,
+// as rename(2) may end after a crash; one slot holds the name.
+({ fs } = open());
+handles[moving].fail = true;
+assert.throws(() => fs.renameSync('/s/task.json.tmp', '/s/task.json'), /power lost/);
+handles[moving].fail = false;
+const finished = open();
+assert.equal(finished.fs.readFileSync('/s/task.json'), 'next');
+assert.equal(finished.fs.existsSync('/s/task.json.tmp'), false);
+assert.equal(finished.pool.filter((slot) => slot.path === '/s/task.json').length, 1);
+assert.ok(finished.pool.every((slot) => !slot.path.includes('\0')), 'no record is left');
 
 // A directory moved aside (a session's store, as Start over does): power lost after its
 // first file moved. The reopened pool finishes the move and lets its record go.
@@ -126,11 +146,12 @@ moved = open();
 for (const name of store) assert.equal(moved.fs.readFileSync(`/d/store/${name}`), `new ${name}`);
 assert.equal(moved.fs.existsSync('/d/store.abandoned-2'), false);
 
-// Power lost after the last file moved, before the record goes: the open just lets it go.
+// The record cannot be let go of after the last file moved: the rename is whole (said so),
+// and the next open lets the record go.
 ({ fs } = moved);
 const last = moved.pool.findIndex((slot) => !slot.path);
 handles[last].headers = 1;
-assert.throws(() => fs.renameSync('/d/store', '/d/store.abandoned-2'), /power lost/);
+fs.renameSync('/d/store', '/d/store.abandoned-2');
 handles[last].headers = Infinity;
 moved = open();
 for (const name of store) assert.equal(moved.fs.readFileSync(`/d/store.abandoned-2/${name}`), `new ${name}`);
@@ -151,33 +172,62 @@ short = open(spare);
 assert.equal(short.fs.readFileSync('/s/session.json'), 'new', 'a header taken in short pieces is whole');
 assert.equal(short.fs.existsSync('/s/session.json.tmp'), false);
 
-// A header write that stops making progress, or loses power after a short piece: the
-// rename fails, and the file it would have replaced is kept, now and after a reopen
-// (the 12 bytes taken are the slot's magic, the same as before).
+// A header write that stops making progress, or loses power after a short piece (the
+// 12 bytes taken are the slot's magic, the same as before): the rename fails after its
+// record was written, so this pool takes nothing more (what is in memory may no longer be
+// what is on disk), and the next open finishes the rename.
 for (const [stop, why] of [[{ progress: 1 }, /EIO/], [{ headers: 1 }, /power lost/]]) {
   short = open(spare);
+  short.fs.rmSync('/s/session.json', { force: true });
+  put(short.fs, '/s/session.json', 'new');
   put(short.fs, '/s/session.json.tmp', 'newer');
   source = spare[slotOf(short.pool, '/s/session.json.tmp')];
   Object.assign(source, { short: 12, ...stop });
   assert.throws(() => short.fs.renameSync('/s/session.json.tmp', '/s/session.json'), why);
   Object.assign(source, { short: Infinity, progress: Infinity, headers: Infinity });
-  assert.equal(short.fs.readFileSync('/s/session.json'), 'new', 'the old file is kept when the new one cannot take the name');
-  assert.equal(short.fs.readFileSync('/s/session.json.tmp'), 'newer');
-  const kept = open(spare).fs;
-  assert.equal(kept.readFileSync('/s/session.json'), 'new');
-  assert.equal(kept.readFileSync('/s/session.json.tmp'), 'newer');
-  kept.unlinkSync('/s/session.json.tmp');
+  for (const call of [() => short.fs.readFileSync('/s/session.json'), () => short.fs.unlinkSync('/s/session.json.tmp'), () => short.fs.openSync('/s/x', 'w')]) {
+    assert.throws(call, /EIO: the OPFS pool stopped/, 'a stopped pool takes nothing more');
+  }
+  const reopened = open(spare);
+  assert.equal(reopened.fs.readFileSync('/s/session.json'), 'newer', 'the next open finishes the rename');
+  assert.equal(reopened.fs.existsSync('/s/session.json.tmp'), false);
+  assert.equal(reopened.pool.filter((slot) => slot.path === '/s/session.json').length, 1);
+  assert.ok(reopened.pool.every((slot) => !slot.path.includes('\0')), 'no record is left');
 }
+// A record that cannot be written: nothing was renamed, the records go, and the pool goes
+// on as before (the file it would have replaced kept, now and after a reopen). One that
+// cannot be let go of either stops the pool; it named nothing, so nothing is renamed.
+short = open(spare);
+put(short.fs, '/s/session.json.tmp', 'next');
+let recordAt = short.pool.findIndex((slot) => !slot.path);
+spare[recordAt].failOnce = true;
+assert.throws(() => short.fs.renameSync('/s/session.json.tmp', '/s/session.json'), /power lost/);
+assert.equal(short.fs.readFileSync('/s/session.json'), 'newer');
+assert.equal(short.fs.readFileSync('/s/session.json.tmp'), 'next', 'the pool goes on');
+assert.equal(open(spare).fs.readFileSync('/s/session.json'), 'newer', 'and the next open does not rename it');
+short = open(spare);
+recordAt = short.pool.findIndex((slot) => !slot.path);
+spare[recordAt].fail = true;
+assert.throws(() => short.fs.renameSync('/s/session.json.tmp', '/s/session.json'), /power lost/);
+spare[recordAt].fail = false;
+assert.throws(() => short.fs.readFileSync('/s/session.json'), /EIO: the OPFS pool stopped/);
+short = open(spare);
+assert.equal(short.fs.readFileSync('/s/session.json'), 'newer', 'no record was written: nothing renamed');
+assert.equal(short.fs.readFileSync('/s/session.json.tmp'), 'next');
+short.fs.unlinkSync('/s/session.json.tmp');
+short.fs.rmSync('/s/session.json', { force: true });
+put(short.fs, '/s/session.json', 'new');
 
-// The new header written but not flushed: the old slot is not let go of either, and the
-// reopen keeps one file under the name.
+// The new header written but not flushed: the old slot is not let go of either (the pool
+// stops, as after any failure past the record), and the reopen keeps one file under the name.
 short = open(spare);
 put(short.fs, '/s/session.json.tmp', 'newest');
 source = spare[slotOf(short.pool, '/s/session.json.tmp')];
 source.flushFails = true;
 assert.throws(() => short.fs.renameSync('/s/session.json.tmp', '/s/session.json'), /flush failed/);
 source.flushFails = false;
-assert.equal(short.fs.readFileSync('/s/session.json'), 'new', 'nothing is let go of after a failed flush');
+assert.deepEqual(short.pool.filter((slot) => slot.path.startsWith('/s/session.json')).map((slot) => slot.path).sort(), ['/s/session.json', '/s/session.json.tmp'], 'nothing is let go of after a failed flush');
+assert.throws(() => short.fs.readFileSync('/s/session.json'), /EIO: the OPFS pool stopped/);
 short = open(spare);
 assert.equal(short.pool.filter((slot) => slot.path === '/s/session.json').length, 1);
 assert.equal(short.fs.readFileSync('/s/session.json'), 'newest');
@@ -229,9 +279,9 @@ assert.ok(spare.every((handle) => handle.open), 'every slot opened');
 ordered.close();
 assert.ok(spare.every((handle) => !handle.open), 'closing lets every handle go');
 
-// A directory move that fails midway (the process goes on): its record stays for the next
-// open to finish. Set aside again, the rest goes under another name, and a store is made
-// again under the old one: newer than the record, so no open takes it with the move.
+// A directory move that fails midway: this pool takes nothing more (going on, a store
+// made again under the old name could be split from what moved), and the next open
+// finishes the move, every file under the new name; a store made again after that stays.
 const later = Array.from({ length: 8 }, () => new Handle());
 let aside = open(later);
 put(aside.fs, '/t/store/db', 'old db');
@@ -240,15 +290,30 @@ const stuck = later[slotOf(aside.pool, '/t/store/journal')];
 stuck.progress = 0;
 assert.throws(() => aside.fs.renameSync('/t/store', '/t/store.abandoned-1'), /EIO/);
 stuck.progress = Infinity;
-aside.fs.renameSync('/t/store', '/t/store.abandoned-2');
+assert.throws(() => aside.fs.renameSync('/t/store', '/t/store.abandoned-2'), /EIO: the OPFS pool stopped/);
+aside = open(later);
+assert.equal(aside.fs.readFileSync('/t/store.abandoned-1/db'), 'old db');
+assert.equal(aside.fs.readFileSync('/t/store.abandoned-1/journal'), 'old journal');
+assert.equal(aside.fs.existsSync('/t/store'), false);
 put(aside.fs, '/t/store/db', 'new db');
 for (let round = 0; round < 2; round++) {
   aside = open(later);
-  assert.ok(aside.fs.existsSync('/t/store/db'), 'the store made again stays');
-  assert.equal(aside.fs.readFileSync('/t/store/db'), 'new db');
-  assert.equal(aside.fs.readFileSync('/t/store.abandoned-1/db'), 'old db');
-  assert.equal(aside.fs.readFileSync('/t/store.abandoned-2/journal'), 'old journal');
+  assert.equal(aside.fs.readFileSync('/t/store/db'), 'new db', 'the store made again stays');
+  assert.equal(aside.fs.readFileSync('/t/store.abandoned-1/journal'), 'old journal');
   assert.ok(aside.pool.every((slot) => !slot.path.includes('\0')), 'no record is left');
+}
+
+// A file whose two names together fill more than a header (thousands of bytes) is renamed
+// without a record, as an older version did; its record would not fit.
+{
+  const longs = Array.from({ length: 6 }, () => new Handle());
+  const pool = open(longs);
+  const from = `/l/${'a'.repeat(2100)}`;
+  const to = `/l/${'b'.repeat(2100)}`;
+  put(pool.fs, from, 'long');
+  pool.fs.renameSync(from, to);
+  assert.equal(pool.fs.readFileSync(to), 'long');
+  assert.equal(open(longs).fs.readFileSync(to), 'long');
 }
 
 // A name renamed to itself is left as it is (as rename(2)), a file or a directory; a

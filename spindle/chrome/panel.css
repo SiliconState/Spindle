@@ -397,6 +397,9 @@ pre.code { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; paddin
 .file-card.tall .file-frame { height: 75vh; }
 .file-waiting { height: 360px; padding: 10px 12px; }
 .file-picture { display: block; max-width: 100%; margin: 0 auto; }
+.file-media { display: block; width: 100%; max-height: 60vh; margin: 0 auto; }
+.file-open-tab { margin: 0 12px 12px; }
+video.file-media { background: #000; }
 .file-markdown { padding: 10px 12px; font-size: 13px; line-height: 1.55; max-height: 60vh; overflow: auto; }
 .file-text-body { margin: 0; border: 0; max-height: 50vh; overflow: auto; }
 .file-view > .note { padding: 8px 12px; }
@@ -475,6 +478,8 @@ pre.code { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; paddin
 #ws-preview { border: 1px solid var(--edge); background: var(--surface); flex: 1; min-height: 240px; }
 #ws-preview .file-frame { height: calc(100vh - 150px); min-height: 320px; }
 #ws-preview.kind-picture { display: flex; align-items: flex-start; justify-content: center; }
+#ws-preview.kind-media { padding: 12px; }
+#ws-preview video.file-media { max-height: calc(100vh - 170px); }
 #ws-preview .file-markdown { max-height: none; }
 #ws-preview .file-text-body, #file-content { margin: 0; border: 0; max-height: none; min-height: 100%; padding: 10px 12px; background: var(--terminal); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 #ws-preview .file-waiting { height: 240px; }

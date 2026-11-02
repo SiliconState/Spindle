@@ -7,7 +7,8 @@ import dgram from 'node:dgram';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { launch, open } from './cdp.mjs';
+import { attach, launch, open } from './cdp.mjs';
+import { hostileFixtures, officeFixtures } from './office_fixtures.mjs';
 
 const [distArg] = process.argv.slice(2);
 assert.ok(distArg && process.env.SPINDLE_BROWSER, 'SPINDLE_BROWSER=... node review_browser.mjs DIST');
@@ -700,6 +701,172 @@ try {
   assert.equal(requests, heldRequests + 1, 'the waiting message went once');
   assert.ok(lastBody.includes('look at this') && lastBody.includes('[Attached, in the workspace: shot.png (8 bytes)]'), 'with its screenshot');
   console.log('ok a message with a screenshot waits for the running turn, then goes');
+
+  // Documents. The reader first, in an extension page: what each document comes to.
+  const fixtures = officeFixtures();
+  const encoded = Object.fromEntries(Object.entries(fixtures).map(([name, bytes]) => [name, Buffer.from(bytes).toString('base64')]));
+  const drawn = await page.eval(`(async () => {
+    const { documentPage } = await import('./documents.mjs');
+    const out = {};
+    const decoded = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+    for (const name of ['plan.docx', 'budget.xlsx', 'deck.pptx']) out[name] = await documentPage(name, decoded(${JSON.stringify(encoded)}[name]));
+    out.damaged = await documentPage('damaged.docx', new Uint8Array([80, 75, 3, 4, 1, 2, 3])).catch((error) => error.message);
+    out.renamed = await documentPage('notes.docx', new TextEncoder().encode('just text')).catch((error) => error.message);
+    return out;
+  })()`);
+  const plan = drawn['plan.docx'].html;
+  assert.match(plan, /<title>Quarterly &amp; Plan<\/title>/, 'its title from its properties');
+  assert.match(plan, /<h1 class="title">Quarterly Plan<\/h1><h1>Goals &lt;2026&gt;<\/h1>/, 'its title and heading styles');
+  assert.match(plan, /<b>bold<\/b> and <i><span style="color:#c00000">red italic<\/span><\/i>/, 'its runs formatted');
+  assert.match(plan, /<span class="mark">1\.<\/span>First step.*<span class="mark">1\.a\)<\/span>Detail.*<span class="mark">2\.<\/span>Second step.*<span class="mark">•<\/span>A bullet/s, 'its lists numbered as Word numbers them');
+  assert.match(plan, /<span class="mark">I\)<\/span>Styled item/, 'a list numbered through its list style');
+  assert.match(plan, /<s>struck<\/s>/, 'struck through when either strike is on');
+  assert.match(plan, /<span class="link" title="https:\/\/example\.com\/a\?b=1&amp;c=2">the site<\/span> on page 1/, 'a link shown, not followed; a field shows its result');
+  assert.doesNotMatch(plan, /deleted words|hidden words|PAGE|<a /, 'no deleted or hidden text, no field code, no link to follow');
+  assert.match(plan, /<td colspan="2" style="background:#d9e2f3"><p>Wide head<\/p><\/td><td rowspan="2"><p>Tall<\/p><\/td>/, 'merged cells');
+  assert.match(plan, /<img src="data:image\/png;base64,[^"]+" alt="A square" style="width:100px">/, 'its picture put in');
+  assert.match(plan, /<section class="notes"><div class="note"><sup>1<\/sup><p> A footnote\.<\/p><\/div><div class="note"><sup>i<\/sup><p> An endnote\.<\/p><\/div><\/section>/, 'its footnote and endnote at the end, numbered apart');
+  assert.match(plan, /<span class="mark">3\.<\/span>Third step/, "a numbering of the same list goes on with the list's numbers");
+  assert.doesNotMatch(plan, /secret words/, 'text its paragraph style hides stays hidden');
+  assert.match(plan, /<ruby>漢字<rt>kanji<\/rt><\/ruby> odd   spaced<sup class="ref">i<\/sup>/, 'a reading over its base text, spaces kept, an endnote mark');
+  assert.doesNotMatch(plan, /function|native code/, 'a name a map does not hold (constructor) gives nothing');
+  assert.match(plan, /<span class="crop" style="width:100px;aspect-ratio:100\/50"><img src="data:image\/png;base64,[^"]+" alt="Half" style="position:absolute;max-width:none;left:0\.000%;top:0\.000%;width:100\.000%;height:200\.000%"><\/span>/, 'a cropped picture shows only what it keeps');
+  const budget = drawn['budget.xlsx'].html;
+  assert.doesNotMatch(budget, /Secret|hush/, 'a very hidden sheet stays hidden');
+  assert.match(budget, /Notes <small>\(hidden\)<\/small>/, 'a hidden sheet is marked');
+  assert.match(budget, /<td>Rent &amp; power<\/td><td class="num">\$1,234\.50<\/td><td class="num">2026-01-01<\/td><td class="num">12\.50%<\/td>/, 'strings, money, dates and percentages as formatted');
+  assert.match(budget, /<td colspan="4"><\/td>/, 'merged cells');
+  assert.match(budget, /<td>TRUE<\/td><td class="num">0\.3<\/td>/, 'a boolean, and a sum without float noise');
+  assert.match(budget, /<th>5<\/th><td class="num">1\.5<\/td><td class="num">1\.23E\+03<\/td>/, 'a fraction as the number it is, a scientific number as Excel writes it');
+  assert.match(budget, /<th>6<\/th><td class="num">1\.5M<\/td><td class="num">1,234\.50 €<\/td><td class="num">36:00:00<\/td><td>=SUM\(B2:B4\)<\/td><td>Line\ntwo<\/td>/, 'thousands scaled, a currency symbol kept, elapsed hours, a formula saved without its result, an escaped line break read');
+  assert.match(budget, /<th>7<\/th><td class="num">02134<\/td><td class="num">123-45-6789<\/td><td class="num">1,234\.50р\.<\/td><td class="num">Rs\. 1,234<\/td><td class="num">500<\/td>/, 'zeros padded, digits among literals, words around the number, a condition no section meets');
+  assert.match(budget, /<th>8<\/th><td class="num">1\.5K<\/td><td><\/td><td><\/td><td>2026-03-04<\/td><td class="num">1900-02-29<\/td>/, "a condition met, ;;; hiding, a formula's empty text, a date held as text, Excel's own 29 February 1900");
+  assert.match(budget, /<th>9<\/th><td class="num">90<\/td><td class="num">2\.5M<\/td>/, 'elapsed seconds, the first condition met');
+  assert.match(budget, /<h2 id="sheet-3">Huge<\/h2><p class="missing">Not shown: this sheet is too large for a preview; download the file to open it\.<\/p>/, 'a sheet too large to parse says so, and the others show');
+  const deck = drawn['deck.pptx'].html;
+  assert.match(deck, /Slide 1<\/figcaption>.*justify-content:flex-end"><p style="font-size:6\.250cqw;color:#0e2841;text-align:center">Launch &lt;Day&gt;<\/p>/s, 'a title sized, placed, colored and centered by its layout, master and theme');
+  assert.match(deck, /<p style="font-size:2\.500cqw;text-align:center">A subtitle<\/p>/, 'a subtitle unbulleted and centered, as its layout says');
+  assert.match(deck, /background:#c1e5f5/, 'a theme color lightened');
+  assert.match(deck, /background:#800040/, 'a color just below red darkened in its own hue');
+  assert.match(deck, /background:rgba\(0,0,0,0\.400\)/, 'a see-through fill as see-through');
+  assert.match(deck, /<div class="shape crop" style="left:30\.000%;top:87\.489%;width:5\.000%;height:10\.000%"><img src="data:image\/png;base64,[^"]+" alt="cut" style="position:absolute;max-width:none;left:-50\.000%;top:0\.000%;width:200\.000%;height:100\.000%"><\/div>/, 'a cropped picture on a slide');
+  assert.match(deck, /<span class="mark">•<\/span>Point one.*<span class="mark">–<\/span><span style="font-weight:bold">Sub point<\/span>/s, "bullets as the master's levels set them");
+  assert.match(deck, /<img class="shape picture" style="left:82\.021%;top:72\.908%;width:8\.202%;height:14\.582%" src="data:image\/png;base64,/, 'a picture placed');
+  assert.doesNotMatch(deck, /invisible shape/, 'a hidden shape stays hidden');
+  assert.match(deck, /<p style="font-size:3\.750cqw"><span class="mark">•<\/span>Big<span style="font-size:2\.917cqw"> then normal<\/span><\/p>/, 'a paragraph sized by its first run, another run by its own');
+  assert.match(deck, /<img class="shape picture" style="left:50\.000%;top:26\.620%;width:43\.125%;height:63\.449%" src="data:image\/png;base64,[^"]+" alt="placed">/, 'a picture placeholder placed by its layout');
+  // Numbers out of every bound: each document still draws at once, its numbers bounded.
+  const unruly = await page.eval(`(async () => {
+    const { documentPage } = await import('./documents.mjs');
+    const out = {};
+    for (const [name, text] of Object.entries(${JSON.stringify(Object.fromEntries(Object.entries(hostileFixtures()).map(([name, bytes]) => [name, Buffer.from(bytes).toString('base64')])))})) {
+      const started = performance.now();
+      const drawn = await documentPage(name, Uint8Array.from(atob(text), (c) => c.charCodeAt(0))).catch((error) => ({ html: 'failed: ' + error.message }));
+      out[name] = { html: drawn.html, ms: performance.now() - started };
+    }
+    return out;
+  })()`);
+  for (const [name, { ms }] of Object.entries(unruly)) assert.ok(ms < 15000, `${name} drew in ${ms} ms`);
+  assert.match(unruly['hostile.docx'].html, /<p class="li" style="margin-left:1\.6em"><span class="mark">g{1261}\)<\/span>Bounded item<\/p>/, 'a start beyond 32767 bounded, an outline level below zero no heading');
+  assert.match(unruly['hostile.docx'].html, /<td colspan="1000"><p>wide<\/p><\/td>/, 'a span bounded');
+  assert.match(unruly['hostile.xlsx'].html, /<td class="num">1\.2340000000000000000\dE\+03<\/td><td class="num">0<\/td>/, 'decimals and thousands bounded');
+  assert.match(unruly['hostile.pptx'].html, /<p style="font-size:[\d.]+cqw"><span class="mark">32767\.<\/span>Low level<\/p>/, 'a level below zero read as the first, a start bounded');
+  for (const [name, { notes }] of Object.entries(drawn).filter(([, value]) => value.html)) {
+    assert.deepEqual(notes, name === 'budget.xlsx' ? ['Some formulas were saved without their results: they show as formulas.'] : [], `what ${name} leaves out, said`);
+  }
+  assert.match(drawn.damaged, /zip|damaged|cut short/, `a damaged document says so: ${drawn.damaged}`);
+  assert.match(drawn.renamed, /not a zip file/, `a file that is no document says so: ${drawn.renamed}`);
+  console.log('ok Word, Excel and PowerPoint documents are drawn as pages: text, styles, lists, tables, sheets, slides, pictures; nothing hidden shown');
+
+  // Then each opened in a tab of its own (view.html), from a thread's workspace.
+  replies.push({ for: 'documents', content: 'ok' });
+  const docThread = await page.eval(`(async () => {
+    const files = Object.entries(${JSON.stringify(encoded)}).map(([path, text]) => ({ path, bytes: Uint8Array.from(atob(text), (c) => c.charCodeAt(0)) }));
+    return rpc('create', { provider: 'review', runner: 'none', text: 'documents', files });
+  })()`);
+  await settled(docThread.id);
+  /** What the preview frame `tab` shows says (its text, its policy, whether it holds an
+   * SVG): a sandboxed frame, in a process of its own (a target whose parent is the tab), or
+   * else in the tab's (read in a world of its own). */
+  const frames = new Map();
+  const frameText = async (tab) => {
+    const expression = `JSON.stringify({ text: document.body?.innerText ?? '', policy: document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.content ?? null, svg: Boolean(document.querySelector('svg')) })`;
+    const { targetInfos } = await browser.send('Target.getTargets');
+    const target = targetInfos.find((info) => info.type === 'iframe' && info.parentId === tab.targetId && info.url.includes('preview.html'));
+    if (target) {
+      if (!frames.has(target.targetId)) frames.set(target.targetId, await attach(browser, target.targetId));
+      return JSON.parse(await frames.get(target.targetId).eval(expression));
+    }
+    const { frameTree } = await browser.send('Page.getFrameTree', {}, tab.sessionId);
+    const frame = (frameTree.childFrames ?? []).find((child) => child.frame.url.includes('preview.html'))?.frame;
+    if (!frame) return null;
+    const { executionContextId } = await browser.send('Page.createIsolatedWorld', { frameId: frame.id, worldName: 'review' }, tab.sessionId);
+    const { result } = await browser.send('Runtime.evaluate', { contextId: executionContextId, returnByValue: true, expression }, tab.sessionId);
+    return JSON.parse(result.value);
+  };
+  const viewOf = (path) => open(browser, `chrome-extension://${extension}/view.html?thread=${docThread.id}&path=${encodeURIComponent(path)}`);
+  /** A picture of `tab` at a side panel's width, with SPINDLE_SHOTS. */
+  const docShot = async (tab, name) => {
+    if (!shots) return;
+    fs.mkdirSync(shots, { recursive: true });
+    // In front: a tab behind others may never draw a frame to picture.
+    await tab.activate();
+    await tab.size(420, 820);
+    await new Promise((done) => setTimeout(done, 1200));
+    await tab.screenshot(join(shots, name));
+  };
+  // A PDF's tab becomes Chrome's own viewer of it, served by Spindle's worker.
+  const pdfTab = await viewOf('report.pdf');
+  await pdfTab.until(`(location.pathname === '/file/${docThread.id}/report.pdf' && document.contentType === 'application/pdf') || null`, { what: "the tab to become the PDF in Chrome's viewer", timeout: 30_000 });
+  await docShot(pdfTab, 'doc-report-pdf.png');
+  for (const [path, words] of [['plan.docx', /Quarterly Plan[\s\S]*Second step[\s\S]*A footnote\./], ['budget.xlsx', /Rent & power\s+\$1,234\.50/], ['deck.pptx', /Launch <Day>[\s\S]*Agenda/]]) {
+    const tab = await viewOf(path);
+    const shown = await tab.until(`document.querySelector('iframe#view')?.src.includes('preview.html') || null`, { what: `${path} drawn` })
+      .then(async () => { for (const until = Date.now() + 15_000; Date.now() < until; await new Promise((done) => setTimeout(done, 200))) { const seen = await frameText(tab); if (seen?.text) return seen; } return null; });
+    assert.ok(shown, `${path} shows in its frame`);
+    assert.match(shown.text, words, `${path} reads as it should: ${shown.text.slice(0, 200)}`);
+    assert.match(shown.policy ?? '', /script-src 'none'/, `${path} shows with nothing running`);
+    await docShot(tab, `doc-${path.replace('.', '-')}.png`);
+    await browser.send('Target.closeTarget', { targetId: tab.targetId });
+  }
+  const svgTab = await viewOf('drawing.svg');
+  await svgTab.until(`document.querySelector('#view img')?.naturalWidth > 0 || null`, { what: 'an SVG written without its namespace drawn as a picture' });
+  const looseTab = await viewOf('loose.svg');
+  await looseTab.until(`document.querySelector('iframe#view')?.src.includes('preview.html') || null`, { what: 'an SVG that is no XML drawn as a page' });
+  for (const until = Date.now() + 15_000; !(await frameText(looseTab))?.svg;) {
+    assert.ok(Date.now() < until, 'the loose SVG drawn in its frame');
+    await new Promise((done) => setTimeout(done, 200));
+  }
+  const soundTab = await viewOf('tone.wav');
+  await soundTab.until(`document.querySelector('#view audio')?.readyState >= 1 || null`, { what: 'the WAV ready to play' });
+  await docShot(svgTab, 'doc-drawing-svg.png');
+  await docShot(looseTab, 'doc-loose-svg.png');
+  await docShot(soundTab, 'doc-tone-wav.png');
+  for (const tab of [pdfTab, svgTab, looseTab, soundTab]) await browser.send('Target.closeTarget', { targetId: tab.targetId });
+  console.log("ok in a tab: a PDF as Chrome's own viewer (from Spindle's worker), documents drawn with nothing running, an SVG without its namespace, a loose SVG as a page, a WAV to play");
+
+  // And on the workspace page of the panel.
+  await page.activate();
+  await page.eval(`document.querySelector('#home').click()`);
+  await page.click(`#threads .thread-row[data-id="${docThread.id}"]`);
+  await page.until(`spindlePanel.current === '${docThread.id}' && spindlePanel.status`);
+  await page.click('#title-button');
+  await page.click('#menu-files');
+  await page.until(`document.querySelector('#file-list .file-row[data-path="report.pdf"]') && true`, { what: 'the workspace page' });
+  const shownOn = async (path, selector, ready = `document.querySelector('#ws-preview ${selector}') && true`) => {
+    await page.eval(`document.querySelector('#file-list .file-row[data-path=' + CSS.escape(${JSON.stringify(path)}) + '] .file-open').click()`);
+    await page.until(ready, { what: `${path} on the workspace page` });
+    const tab = await page.eval(`[...document.querySelectorAll('#ws-actions button')].some((button) => /in a tab/.test(button.title))`);
+    await page.eval(`document.querySelector('#ws-files').click()`);
+    return tab;
+  };
+  assert.ok(await shownOn('report.pdf', 'button.file-open-tab'), 'a PDF is offered in a tab (never in the panel), from the page and its header');
+  assert.ok(await shownOn('plan.docx', 'iframe.file-frame[src*="preview.html"]'), 'a document opens in a tab too');
+  // The SVG written without its namespace draws here too (as a picture, not broken).
+  assert.ok(await shownOn('drawing.svg', 'img.file-picture', `document.querySelector('#ws-preview img.file-picture')?.naturalWidth > 0 || null`), 'a picture opens in a tab too');
+  assert.ok(await shownOn('tone.wav', 'audio.file-media'), 'audio opens in a tab too');
+  await page.eval(`document.querySelector('#ws-done').click()`);
+  console.log('ok on the workspace page: the same previews (a PDF offered in a tab), each offered in a tab');
 
   // Which names Chrome looked up, now its log is whole: none a preview tried, and (so the
   // log is known to hold them) the one a page let run uncontained did.

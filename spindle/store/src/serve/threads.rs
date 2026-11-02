@@ -5,8 +5,9 @@
 //! Nothing here may lose a thread or leave two live copies, whenever the host stops:
 //!
 //! - An import writes the upload to `incoming/` (synced), records the key as pending
-//!   (committed), stages the session in `incoming/<id>` (synced, as `import_bundle`
-//!   stages), renames it into `sessions/` (both directories synced), and only then
+//!   (committed), stages the session in `incoming/<id>` (synced, as
+//!   `agent::stage_session` stages: unpacked and checked beside it, then renamed),
+//!   renames it into `sessions/` (both directories synced), and only then
 //!   registers it: the `sessions` row, its owner and the key's record in one
 //!   transaction. A host that stopped before that commit finds the pending record when
 //!   it opens and takes the half-made session away (`recover`), so the key imports
@@ -23,6 +24,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use spindle_store::agent::{self, BuiltinTools, Effort, Isolation, Session, Settings};
+use spindle_store::bundle::UnpackError;
 use spindle_store::driver::Runner;
 use std::io::Write;
 use std::net::TcpStream;
@@ -333,21 +335,38 @@ pub(super) fn import(
     if host.cut("pending") {
         return Err(crash(&mut admission, &mut upload));
     }
-    let bundle = {
-        let mut file = std::fs::File::open(&path).map_err(super::v1::internal)?;
-        spindle_store::bundle::read_file(&mut file)
-            .map_err(|why| Failure::new(400, "bad_bundle", why))?
-    };
+    // One import at a time unpacks and checks: each copies its bundle into staging and
+    // checks every store there (a bounded page cache, never the bundle or a store in
+    // memory), so imports that arrive together wait their turn (their uploads ran side
+    // by side, and stay on the disk while they wait). Refused or failed, the staging is
+    // gone (`StagedSession`), whether or not the turn is held then.
+    let staged = host.root.join(INCOMING).join(&id);
+    let turn = lock(&host.importing);
+    let import = agent::stage_session(&path, &staged).map_err(|error| match error {
+        UnpackError::Refused(why) => Failure::new(400, "bad_bundle", why),
+        UnpackError::Io(error) => super::v1::internal(error),
+    })?;
+    // The credential check below may refresh a sign-in over the network or run a key
+    // command: other imports take their turn meanwhile, while this one's staged copy
+    // waits on the disk.
+    drop(turn);
     drop(upload);
-    let brought = bundle
-        .files
-        .iter()
-        .find(|file| file.path == "session.json")
-        .and_then(|file| serde_json::from_slice::<Value>(&file.bytes).ok())
+    let brought = import
+        .sidecar("session.json")
+        .map_err(super::v1::internal)?
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .ok_or_else(|| Failure::new(400, "bad_bundle", "the bundle's session has no settings"))?;
     let mut settings = Settings::from_json(&brought)
         .map_err(|why| Failure::new(400, "bad_bundle", format!("the bundle's settings: {why}")))?;
     let fit = fit(&mut settings, route);
+    #[cfg(test)]
+    {
+        // Taken, and the lock let go, before it waits.
+        let hold = lock(&host.checking).take();
+        if let Some(wait) = hold {
+            let _ = wait.recv();
+        }
+    }
     // The thread runs on this host's credentials (they may run a command: no lock held).
     if Settings::route_of(&settings.provider, Some(&settings.model))
         .and_then(|(provider, model)| Settings::resolve(&provider, Some(model)))
@@ -363,9 +382,10 @@ pub(super) fn import(
             ),
         ));
     }
-    let staged = host.root.join(INCOMING).join(&id);
-    agent::import_bundle(&bundle, &staged).map_err(super::v1::internal)?;
-    drop(bundle);
+    // Put in place and opened (checked again) in turn, as one at a time is checked.
+    let turn = lock(&host.importing);
+    import.finish().map_err(super::v1::internal)?;
+    drop(turn);
     settings.save(&staged).map_err(super::v1::internal)?;
     fit_tasks(&staged).map_err(super::v1::internal)?;
     if host.cut("staged") {

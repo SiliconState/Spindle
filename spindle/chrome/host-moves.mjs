@@ -25,6 +25,14 @@
 /** The record's key (kv and bundles). */
 export const MOVE = (id) => `host-move:${id}`;
 
+/** The largest thread bundle this browser takes (a file brought in, or a thread coming
+ * back from the host): bringing one in holds it about three times over in the engine's
+ * memory (4 GB at most), so a larger one would end the engine rather than fail. */
+export const BUNDLE_MOST = 1 << 30;
+
+/** Bytes as the panel says them (1.0 GB). */
+const gigabytes = (bytes) => `${(bytes / 2 ** 30).toFixed(1)} GB`;
+
 /** Steps after which the thread here takes no work until the move ends. */
 const HOLDING = new Set(['upload', 'seal', 'drop', 'export', 'import']);
 
@@ -244,6 +252,15 @@ export function hostMoves(deps) {
       // export (still writing and sealing there) can be what keeps the thread busy.
       const firstAttempt = !move.attempted;
       if (firstAttempt) {
+        // One too large for this browser to take stays on the host, as it was: the host
+        // says its bundle's size before anything is sealed there (`bundle_bytes`; a host
+        // that does not say, an older one, is asked for the bundle as before).
+        const size = await host.session(move.session).then((session) => session?.bundle_bytes, () => null);
+        if (size > BUNDLE_MOST) {
+          const why = `it would come back as about ${gigabytes(size)}, more than this browser takes (${gigabytes(BUNDLE_MOST)})`;
+          await commit(id, { moving: null, note: `It stays on your host: ${why}.` }, undefined);
+          return { done: false, way: 'back', why };
+        }
         move = { ...move, attempted: true };
         await commit(id, pending('back', 'export'), move);
       }

@@ -6,7 +6,7 @@ import init, * as firstGlue from './web/spindle_embed.js';
 import { EmbeddedClient, remoteRunner } from './clients/embedded.mjs';
 import { refusedAnswer } from './clients/common.mjs';
 import { RemoteClient, requestId, worthRepeating } from './clients/remote.mjs';
-import { MOVE, STEP_TEXT, Waiting, hostMoves, said as sentence } from './host-moves.mjs';
+import { BUNDLE_MOST, MOVE, STEP_TEXT, Waiting, hostMoves, said as sentence } from './host-moves.mjs';
 import { linuxRunner } from './linux-runner.mjs';
 import { storeRefusal } from './linux-net.mjs';
 import { openOpfsPool } from './clients/opfs.mjs';
@@ -410,7 +410,7 @@ function makeClient(saved) {
     // the package waits longer than all of that, so the engine always answers first (no
     // action the package gave up on, said unknown, happens after).
     const timeoutS = ASKING_NAMES.has(tool.name) ? 100 + APPROVAL_WAIT / 1000 : 30;
-    made.tool({ ...tool, timeoutS, run: (input, call) => actOnPage(tool.name, opened(tool.name, input, call?.session), call?.session, call?.signal) });
+    made.tool({ ...tool, timeoutS, run: (input, call) => actOnPage(tool.name, opened(tool.name, input, call?.session), call?.session, call?.signal, ownedByTask(call)) });
   }
   made.on('event', (event, dir) => {
     const id = idOf(dir);
@@ -835,38 +835,71 @@ function opened(name, input, session) {
   return { ...input, url: view.href, new_tab: true };
 }
 
+/** Whether an app call is a task's: its call named under its task (`tasks/KEY/...`, as a
+ * task's calls come from the package), or asked in a task's session (`dir#KEY`, a script's).
+ * A thread's own turn ending or stopped leaves its background tasks' page tools be: the
+ * package ends a task's call itself when it stops the task (`call.signal`). */
+const ownedByTask = (call) => String(call?.call ?? '').startsWith('tasks/') || String(call?.session ?? '').includes('#');
+
+/** Each thread's page tool generations: `all` moves on when every call of the thread
+ * ends (deleted, moved, its host changed), `own` when its own turn's do (Stop, the turn's
+ * end); a call started under one generation that has moved on does nothing. */
 const pageEpochs = new Map();
-const pageEpoch = (session) => pageEpochs.get(idOf(session?.split('#')[0] ?? '')) ?? 0;
-function pageStopped(session) {
+function pageEpoch(session, task = false) {
+  const epoch = pageEpochs.get(idOf(session?.split('#')[0] ?? '')) ?? { all: 0, own: 0 };
+  return task ? `${epoch.all}` : `${epoch.all}.${epoch.own}`;
+}
+/** Whether the thread's turn was stopped: here, that holds back its own calls (a task's
+ * go on: see `ownedByTask`); on the host, every call (the host tells no call's end). */
+function pageStopped(session, task = false) {
   const id = idOf(session?.split('#')[0] ?? '');
-  return running.get(id)?.stopped || hostedTurns.get(id)?.stopped;
+  return hostedTurns.get(id)?.stopped || (!task && running.get(id)?.stopped);
+}
+/** Why a call's `signal` ended: the package settled it without this answer (its reason's
+ * `outcome`: `stopped` when its turn or task was stopped), or the command of the script
+ * that asked ended (an abort with no outcome). */
+function endedWhy(signal) {
+  const outcome = signal?.reason?.outcome;
+  if (outcome === 'stopped') return 'the turn or task that asked for it was stopped';
+  return outcome ? 'Spindle stopped waiting for it' : 'the command that asked for it ended';
 }
 
-function pageTool(name, input, session) {
-  if (pageStopped(session)) return Promise.resolve({ error: 'the turn was stopped' });
+/** `allowed`: what the user was shown when asked before this action (null: not asked);
+ * Chrome's side acts only while the tab still shows it. `signal`: ends the call (its
+ * page action is cancelled, its outcome then unknown); `task`: a task's (`ownedByTask`). */
+function pageTool(name, input, session, allowed = null, signal = null, task = false) {
+  if (pageStopped(session, task)) return Promise.resolve({ error: 'the turn was stopped' });
+  if (signal?.aborted) return Promise.resolve({ error: `${endedWhy(signal)} first, so it was not done` });
   const call = crypto.randomUUID();
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       self.postMessage({ type: 'page_tool_cancel', call });
       answerTool(call, uncertain(name, `${BROWSER} did not answer the page tool in time`));
     }, PAGE_TOOL_WAIT);
+    const stop = () => {
+      self.postMessage({ type: 'page_tool_cancel', call });
+      answerTool(call, uncertain(name, `${endedWhy(signal)} before the page tool finished`));
+    };
     toolCalls.set(call, Object.assign((answer) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', stop);
       resolve(answer);
-    }, { session, tool: name }));
-    self.postMessage({ type: 'page_tool', call, name, input });
+    }, { session, tool: name, task }));
+    signal?.addEventListener('abort', stop, { once: true });
+    self.postMessage({ type: 'page_tool', call, name, input, ...(allowed && { allowed }) });
   });
 }
 
 /** How long a page action the user is asked about waits for their answer. */
 const APPROVAL_WAIT = 10 * 60_000;
 /** Page actions waiting for the user's answer (Settings, Pages, Before acting): id ->
- * `{id, thread, tool, text, at, answer}`; `answer(refusal)` settles one (null: go ahead). */
+ * `{id, thread, tool, text, at, task, answer}` (`task`: a task's, `ownedByTask`);
+ * `answer(refusal)` settles one (null: go ahead). */
 const approvals = new Map();
 
 /** The waiting actions as panels show them. */
 function approvalsShown() {
-  return [...approvals.values()].map(({ answer, ...shown }) => shown);
+  return [...approvals.values()].map(({ answer, task, ...shown }) => shown);
 }
 
 function announceApprovals() {
@@ -876,21 +909,27 @@ function announceApprovals() {
 /** A page tool for a thread: at once under Full (the default); under Auto or Ask once the
  * user allows it when it is one they asked to be asked about. A refusal is a known
  * outcome: nothing was done. */
-async function actOnPage(name, input, session, signal) {
-  const epoch = pageEpoch(session);
-  const refusal = await beforeActing(name, input, session, signal);
-  if (epoch !== pageEpoch(session) || pageStopped(session)) return { error: 'the turn ended or was stopped before the page tool started' };
-  // A script's call whose command ended meanwhile: no one awaits it (it was said unknown).
-  if (signal?.aborted) return { error: 'the command that asked for it ended first, so it was not done' };
-  return refusal ? { error: refusal } : pageTool(name, input, session);
+async function actOnPage(name, input, session, signal, task = false) {
+  const epoch = pageEpoch(session, task);
+  const asked = { task };
+  const refusal = await beforeActing(name, input, session, signal, asked);
+  if (epoch !== pageEpoch(session, task) || pageStopped(session, task)) return { error: 'the turn ended or was stopped before the page tool started' };
+  // A call ended meanwhile (a script's command, or the package cancelled it): no one
+  // awaits it.
+  if (signal?.aborted) return { error: `${endedWhy(signal)} first, so it was not done` };
+  return refusal ? { error: refusal } : pageTool(name, input, session, asked.allowed, signal, task);
 }
 
 /** Null when `name` with `input` may go ahead now; else, once the user answers (or does
- * not, or the turn stops), null to go ahead or why it was not done. */
-async function beforeActing(name, input, session, signal) {
-  const epoch = pageEpoch(session);
-  if (signal?.aborted) return 'the command that asked for it ended first, so it was not done';
-  if (pageStopped(session)) return 'the turn was stopped, so it was not done';
+ * not, or the turn stops), null to go ahead or why it was not done. `asked.task`: a
+ * task's call (`ownedByTask`). Allowed by the user, what they were shown goes in
+ * `asked.allowed` (the tab, its site and page, the part or the dialog), for Chrome's side
+ * to act only while it still holds. */
+async function beforeActing(name, input, session, signal, asked = {}) {
+  const task = Boolean(asked.task);
+  const epoch = pageEpoch(session, task);
+  if (signal?.aborted) return `${endedWhy(signal)} first, so it was not done`;
+  if (pageStopped(session, task)) return 'the turn was stopped, so it was not done';
   if (!ASKING_NAMES.has(name)) return null;
   // Opening a file of the thread's workspace for the user changes no page.
   if (name === 'navigate' && typeof input?.url === 'string' && input.url.startsWith(new URL('view.html?', self.location.href).href)) return null;
@@ -898,22 +937,29 @@ async function beforeActing(name, input, session, signal) {
   // unasked on a choice it could not see).
   const kept = await read('kv', 'pages').then((value) => ({ value }), () => null);
   const mode = kept ? confirmMode(kept.value) : 'ask';
-  if (epoch !== pageEpoch(session) || pageStopped(session)) return 'the turn ended or was stopped, so it was not done';
+  if (epoch !== pageEpoch(session, task) || pageStopped(session, task)) return 'the turn ended or was stopped, so it was not done';
   if (mode === 'full') return null;
+  // Under Auto, an action that sends nothing goes ahead unasked, nothing looked up (what
+  // a click lands on tells whether it sends, so that one is looked up first).
+  if (mode === 'auto' && name !== 'click' && !sends(name, input, null)) return null;
   let target = null;
   if (input?.ref && (name === 'click' || name === 'type' || name === 'select')) {
-    const found = await pageTool('target', { ref: input.ref, ...(input.tab != null && { tab: input.tab }) }, session);
+    const found = await pageTool('target', { ref: input.ref, ...(input.tab != null && { tab: input.tab }) }, session, null, signal, task);
     target = found?.details ?? null;
   } else if (name === 'press' || name === 'dialog' || name === 'close_tab' || (name === 'navigate' && !input?.new_tab)) {
-    const found = await pageTool('tab_of', { ...(input?.tab != null && { tab: input.tab }) }, session).catch(() => null);
+    const found = await pageTool('tab_of', { ...(input?.tab != null && { tab: input.tab }) }, session, null, signal, task).catch(() => null);
     target = found?.details ?? null;
+    // Which tab it would land on could not be told: asked about no tab, it would go to
+    // whatever tab is shown when it runs. Not done; it can be asked about again.
+    if (!target && input?.tab == null) return `${BROWSER} did not say which tab this would act on, so it was not done; it can be asked about again`;
   }
   if (mode === 'auto' && !sends(name, input, target)) return null;
   // Asked about one tab, it acts on that tab, whatever the user looks at when they answer.
   if (target?.tab != null && input && typeof input === 'object') input.tab = target.tab;
   const thread = idOf(session?.split('#')[0] ?? '');
-  if (epoch !== pageEpoch(session) || pageStopped(session)) return 'the turn ended or was stopped, so it was not done';
-  return new Promise((resolve) => {
+  if (epoch !== pageEpoch(session, task) || pageStopped(session, task)) return 'the turn ended or was stopped, so it was not done';
+  if (signal?.aborted) return `${endedWhy(signal)} first, so it was not done`;
+  const answer = await new Promise((resolve) => {
     const id = crypto.randomUUID();
     const settle = (refusal) => {
       if (!approvals.has(id)) return;
@@ -923,21 +969,36 @@ async function beforeActing(name, input, session, signal) {
       resolve(refusal);
     };
     const timer = setTimeout(() => settle(`the user did not answer within ${APPROVAL_WAIT / 60_000} minutes (Settings, Pages, Before acting asks first), so it was not done`), APPROVAL_WAIT);
-    approvals.set(id, { id, thread, tool: name, text: actionText(name, input, target), at: Date.now(), answer: settle });
-    // A script's call whose command ends first: the question goes, unanswered.
-    signal?.addEventListener('abort', () => settle('the command that asked for it ended before the user answered, so it was not done'), { once: true });
+    // A task's question says so (it may go on after its thread's turn has stopped).
+    approvals.set(id, { id, thread, tool: name, text: `${task ? 'A task asks: ' : ''}${actionText(name, input, target)}`, at: Date.now(), task, answer: settle });
+    // A call ended first (a script's command, or the package cancelled it): the question
+    // goes, unanswered.
+    signal?.addEventListener('abort', () => settle(`${endedWhy(signal)} before the user answered, so it was not done`), { once: true });
     announceApprovals();
   });
+  if (answer == null && target) {
+    asked.allowed = {
+      tab: target.tab ?? null, host: target.host ?? null,
+      ...(target.document && { document: target.document }), ...(target.url != null && { url: target.url }),
+      ...(input?.ref && target.what && { what: target.what }),
+      ...(name === 'dialog' && { dialog: target.dialog?.id ?? 0 }),
+    };
+  }
+  return answer;
 }
 
-function cancelPageTools(id) {
-  pageEpochs.set(id, (pageEpochs.get(id) ?? 0) + 1);
+/** Ends thread `id`'s page tools: its own turn's (`tasks: false`: the turn ended or was
+ * stopped; its background tasks' calls go on, the package ending a task's itself), or
+ * every one (the thread deleted, moved back, its host changed). */
+function cancelPageTools(id, { tasks = true } = {}) {
+  const epoch = pageEpochs.get(id) ?? { all: 0, own: 0 };
+  pageEpochs.set(id, tasks ? { ...epoch, all: epoch.all + 1 } : { ...epoch, own: epoch.own + 1 });
   // An action still waiting for the user's answer is not done.
   for (const approval of [...approvals.values()]) {
-    if (approval.thread === id) approval.answer('the turn ended before the user answered, so it was not done');
+    if (approval.thread === id && (tasks || !approval.task)) approval.answer('the turn ended before the user answered, so it was not done');
   }
   for (const [call, answer] of toolCalls) {
-    if (idOf(answer.session?.split('#')[0] ?? '') !== id) continue;
+    if (idOf(answer.session?.split('#')[0] ?? '') !== id || (!tasks && answer.task)) continue;
     self.postMessage({ type: 'page_tool_cancel', call });
     answerTool(call, uncertain(answer.tool, 'the turn ended before the page tool finished'));
   }
@@ -1114,7 +1175,8 @@ function turn(id, work) {
       }
     } finally {
       running.delete(id);
-      cancelPageTools(id);
+      // Its own page tools end with it; its background tasks' go on.
+      cancelPageTools(id, { tasks: false });
       const took = carrying.get(id);
       carrying.delete(id);
       await afterTurn(id, unsent, took, { sending: entry.sending, failed }).catch((error) => console.warn('Spindle: after a turn:', error));
@@ -1225,6 +1287,10 @@ function tookMessage(id, waiting) {
 async function restoreQueued() {
   const records = [];
   for (const key of await keysOf('kv')) {
+    // A message that came back for a thread since deleted (its panel closed first): gone
+    // with it (panels keep the others, `came-back:ID`, until that thread is opened).
+    const cameBack = /^came-back:([0-9a-f]{16})$/.exec(String(key));
+    if (cameBack && !(await read('threads', cameBack[1]).catch(() => true))) await remove('kv', key).catch(() => {});
     if (!String(key).startsWith(QUEUED)) continue;
     const record = await read('kv', key).catch(() => null);
     if (record) records.push({ ...record, key: String(key) });
@@ -1667,7 +1733,9 @@ const ops = {
   stop: ({ id }) => within(id, () => {
     const entry = running.get(id);
     if (entry) entry.stopped = true;
-    cancelPageTools(id);
+    // The turn's own page tools end now; the package ends those of the tasks it stops with
+    // the turn (their calls' signals), and its background tasks go on, page tools too.
+    cancelPageTools(id, { tasks: false });
     return client.stop(dirOf(id));
   }),
 
@@ -1892,7 +1960,8 @@ const ops = {
     bundleSizes.delete(id);
     await dropPriors(id);
     for (const key of await keysOf('kv')) {
-      if (key.startsWith(`preview:${id}:`) || key.startsWith(`${QUEUED}${id}:`)) await remove('kv', key);
+      // Its preview choices, waiting messages, and a message that came back for it.
+      if (key.startsWith(`preview:${id}:`) || key.startsWith(`${QUEUED}${id}:`) || key === `came-back:${id}`) await remove('kv', key);
     }
     await remove('threads', id);
     queued.delete(id);
@@ -1986,7 +2055,13 @@ const ops = {
       if (!known.has(move.id)) continue;
       Object.assign(entry(move.id), { held: move.size, move: { way: move.way, step: move.step, error: move.error } });
     }
-    return { threads: [...usage.values()] };
+    // Bytes no file name leads to: slots whose header was found damaged (opfs.mjs `lost`).
+    return { threads: [...usage.values()], lost: { files: fs.lost, bytes: fs.lostBytes } };
+  },
+
+  /** Lets go of the bytes `storage` says no file name leads to (`lost`): `{freed}`. */
+  async reclaimLost() {
+    return { freed: (await openPool()).reclaim() };
   },
 
   /** Gives a thread's free pages back (its store and its tasks'), checked whole before
@@ -2053,6 +2128,9 @@ const ops = {
   },
 
   async import({ bytes, name }) {
+    // As the panel checks before reading the file: a larger one would end the engine (it
+    // is held about three times over) rather than fail.
+    if (bytes?.byteLength > BUNDLE_MOST) throw failure('too_large', `${name ?? 'this file'} is too large to bring into this browser (over ${BUNDLE_MOST / 2 ** 30} GB)`);
     await headroom();
     const id = newId();
     const dir = dirOf(id);
