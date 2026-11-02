@@ -74,11 +74,11 @@ fn image(dir: &Path, objects: usize) -> Vec<u8> {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         for _ in 0..objects {
             let mut bytes = vec![0u8; 1 << 20];
-            for word in bytes.chunks_exact_mut(8) {
+            for word in bytes.as_chunks_mut::<8>().0 {
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
-                word.copy_from_slice(&state.to_le_bytes());
+                *word = state.to_le_bytes();
             }
             store.put_object(&stage, &bytes).unwrap();
         }
