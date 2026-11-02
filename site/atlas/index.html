@@ -1,0 +1,1398 @@
+<!doctype html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spindle Atlas: the architecture on three plates</title>
+<meta name="description" content="An illustrated map of Spindle: every surface and the host boundary, the turn route from transport to committed head, the schema-20 store and the Dext engine, and Spindle for Browser's local-first engine.">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Spindle Atlas: the architecture on three plates">
+<meta property="og:description" content="Spindle's hosts, store, engine and browser extension, mapped from the code.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Spindle">
+<meta property="og:url" content="https://siliconstate.github.io/Spindle/atlas/">
+<meta property="og:image" content="https://siliconstate.github.io/Spindle/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Spindle: an agent that lives wherever you work, above a thread of committed revisions.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="canonical" href="https://siliconstate.github.io/Spindle/atlas/">
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml">
+<style>
+:root{
+  color-scheme:light;
+  --paper:#f1ecdf;--panel:#faf6ec;--panel-2:#e8e0cf;
+  --ink:#1b1d18;--muted:#56574d;--faint:#626055;
+  --line:#c9c0ad;--line-strong:#9d9583;
+  --accent:#ad3f2d;--accent-2:#235e66;--accent-3:#9b752b;
+  --blue-wash:#dce7e5;--red-wash:#ecd8d1;--gold-wash:#eee3c8;
+  --iso-top:#f8f2e6;--iso-left:#e9dfcd;--iso-right:#d9cdb8;
+  --floor:#e7decd;--shadow:rgba(51,42,24,.16);
+  --grid:rgba(27,29,24,.055);
+  --code:rgba(173,63,45,.08);
+  --screen:#22251f;--screen-ink:#dce9df;
+}
+html[data-theme="dark"]{
+  color-scheme:dark;
+  --paper:#141510;--panel:#1c1e18;--panel-2:#292b22;
+  --ink:#eee8d7;--muted:#a9a491;--faint:#979484;
+  --line:#3b3d32;--line-strong:#5a5d4e;
+  --accent:#e47358;--accent-2:#6daab3;--accent-3:#d6b15f;
+  --blue-wash:#24383a;--red-wash:#382623;--gold-wash:#332d1d;
+  --iso-top:#262821;--iso-left:#20221b;--iso-right:#191b15;
+  --floor:#1b1d17;--shadow:rgba(0,0,0,.35);
+  --grid:rgba(238,232,215,.05);
+  --code:rgba(228,115,88,.12);
+  --screen:#0d0e0b;--screen-ink:#b7d9d0;
+}
+html[data-theme="dim"]{
+  color-scheme:dark;
+  --paper:#22241f;--panel:#282a24;--panel-2:#34362d;
+  --ink:#e7e0ce;--muted:#aaa590;--faint:#a39f8d;
+  --line:#46483c;--line-strong:#626553;
+  --accent:#d77a60;--accent-2:#75aeb4;--accent-3:#c8aa63;
+  --blue-wash:#2a3b3c;--red-wash:#3d2b27;--gold-wash:#3b341f;
+  --iso-top:#303229;--iso-left:#292b23;--iso-right:#22241d;
+  --floor:#24261f;--shadow:rgba(0,0,0,.28);
+  --grid:rgba(231,224,206,.055);
+  --code:rgba(215,122,96,.12);
+  --screen:#11130f;--screen-ink:#b7d9d0;
+}
+*{box-sizing:border-box}
+html{background:var(--paper)}
+body{
+  margin:0;color:var(--ink);background:var(--paper);
+  font-family:"Berkeley Mono","Iosevka","SFMono-Regular","Cascadia Code","Roboto Mono",ui-monospace,monospace;
+  font-size:14px;line-height:1.55;
+  background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+  background-size:32px 32px;-webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--accent);color:var(--paper)}
+.wrap{max-width:1320px;margin:0 auto;padding:26px clamp(14px,3vw,38px) 54px}
+.hero{display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:28px;border-bottom:1px solid var(--line);padding:4px 0 24px}
+.kicker{font-size:10px;letter-spacing:.17em;text-transform:uppercase;color:var(--muted)}
+h1{margin:14px 0 12px;font-size:clamp(38px,7vw,78px);line-height:.9;letter-spacing:-.075em;font-weight:800;text-transform:uppercase}
+h1 .slash{color:var(--accent);font-weight:400}
+.dek{max-width:790px;margin:0;color:var(--muted);font-size:clamp(12px,1.35vw,15px);line-height:1.65}
+.revision{display:inline-block;margin-top:17px;border:1px solid var(--accent);color:var(--accent);padding:8px 10px;font-size:9px;line-height:1.6;letter-spacing:.08em;text-transform:uppercase}
+.hero-side{display:flex;flex-direction:column;align-items:flex-end;gap:14px}
+.theme{display:flex;border:1px solid var(--line);background:var(--panel)}
+.theme button{appearance:none;border:0;border-left:1px solid var(--line);background:transparent;color:var(--muted);font:inherit;font-size:9px;letter-spacing:.12em;padding:8px 9px;cursor:pointer}
+.theme button:first-child{border-left:0}
+.theme button[aria-pressed="true"]{background:var(--ink);color:var(--paper)}
+.stamp{width:100%;border:1px solid var(--accent);padding:12px;color:var(--accent);font-size:9px;line-height:1.75;letter-spacing:.11em;text-transform:uppercase;text-align:right}
+.facts{display:grid;grid-template-columns:repeat(6,1fr);border-left:1px solid var(--line);border-bottom:1px solid var(--line);margin:22px 0 20px}
+.fact{padding:12px 13px;border-right:1px solid var(--line);border-top:1px solid var(--line)}
+.fact b{display:block;font-size:22px;line-height:1.1;letter-spacing:-.05em;font-weight:750}
+.fact span{display:block;margin-top:5px;color:var(--muted);font-size:9px;letter-spacing:.08em;text-transform:uppercase}
+.tabbar{position:sticky;top:0;z-index:20;display:flex;gap:1px;background:var(--line);border:1px solid var(--line);margin:20px 0 0;box-shadow:0 8px 20px var(--paper)}
+.tabbar button{flex:1;appearance:none;border:0;background:var(--panel);color:var(--muted);font:inherit;font-size:10px;letter-spacing:.11em;text-transform:uppercase;padding:12px 10px;cursor:pointer;text-align:left}
+.tabbar button[aria-selected="true"]{background:var(--ink);color:var(--paper)}
+.tabbar button:not([aria-selected="true"]):hover{background:var(--panel-2)}
+.panel{padding-top:24px}
+[hidden]{display:none!important}
+.section{margin-top:38px}
+.section:first-child{margin-top:0}
+.section-head{display:grid;grid-template-columns:52px minmax(0,1fr) auto;gap:16px;align-items:end;border-top:2px solid var(--ink);padding-top:11px}
+.section-num{font-size:10px;color:var(--accent);letter-spacing:.12em}
+.section-head h2{margin:0;font-size:clamp(18px,2.5vw,27px);letter-spacing:-.04em;text-transform:uppercase;line-height:1}
+.section-head p{margin:7px 0 0;color:var(--muted);font-size:11.5px;max-width:780px}
+.section-meta{font-size:8.5px;color:var(--muted);letter-spacing:.12em;text-align:right;text-transform:uppercase}
+.legend{display:flex;flex-wrap:wrap;gap:10px 22px;align-items:center;border-bottom:1px solid var(--line);padding:15px 0 12px;font-size:9px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase}
+.legend span{display:flex;align-items:center;gap:8px}
+.key{display:inline-block;width:25px;height:0;border-top:1px solid var(--ink)}
+.key.dashed{border-top-style:dashed;border-top-color:var(--muted)}
+.key.red{border-top-color:var(--accent);border-top-width:2px}
+.key.blue{border-top-color:var(--accent-2);border-top-width:2px}
+.map-grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:14px;margin-top:14px}
+.map-main{display:grid;gap:12px}
+.lane{border:1px solid var(--line);background:var(--panel);padding:13px}
+.lane.host{border-color:var(--accent-2)}
+.lane.store{border-color:var(--accent-3)}
+.lane-head{display:flex;justify-content:space-between;gap:10px;align-items:center;border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:11px;font-size:9px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted)}
+.lane-num{color:var(--accent)}
+.lane-note{color:var(--faint);font-size:9px;letter-spacing:.08em}
+.nodes{display:grid;gap:0;background:var(--panel);border:1px solid var(--line)}
+.nodes.four{grid-template-columns:repeat(4,1fr)}
+.nodes.three{grid-template-columns:repeat(3,1fr)}
+.node{background:var(--panel);padding:12px;min-height:134px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+.node h3{margin:0 0 4px;font-size:11.5px;line-height:1.25;letter-spacing:.01em}
+.node code{display:block;border:0;background:none;padding:0;margin:0 0 8px;color:var(--accent-2);font-size:8.5px;line-height:1.5;white-space:normal;overflow-wrap:anywhere}
+.node p{margin:0;color:var(--muted);font-size:9.5px;line-height:1.6}
+.node .tag{display:inline-block;margin-top:8px;border:1px solid var(--line);color:var(--faint);padding:2px 4px;font-size:9px;letter-spacing:.09em;text-transform:uppercase}
+.flowline{display:flex;align-items:center;gap:9px;color:var(--faint);font-size:9px;letter-spacing:.11em;text-transform:uppercase;padding:1px 0 1px 14px}
+.flowline::before{content:"↓";color:var(--accent);font-size:12px;line-height:1}
+.flowline::after{content:"";height:1px;flex:1;border-top:1px dashed var(--line)}
+.engine-panel{border:1px solid var(--accent);background:var(--panel);padding:13px;align-self:start}
+.engine-panel header{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:11px;font-size:9px;letter-spacing:.13em;text-transform:uppercase;color:var(--accent)}
+.engine-stack{display:grid;gap:1px;background:var(--line);border:1px solid var(--line)}
+.engine-card{background:var(--panel);padding:11px}
+.engine-card h3{margin:0 0 4px;font-size:11px;color:var(--accent-2)}
+.engine-card code{display:block;background:none;border:0;padding:0;margin-bottom:6px;color:var(--accent);font-size:9px;white-space:normal}
+.engine-card p{margin:0;color:var(--muted);font-size:9px;line-height:1.55}
+.engine-card.app{border:1px dashed var(--muted)}
+.engine-card.app h3{color:var(--muted)}
+.engine-foot{margin-top:10px;color:var(--muted);font-size:8.5px;line-height:1.6}
+.oracle{display:grid;grid-template-columns:88px 1fr;gap:14px;border:1px dashed var(--muted);background:var(--panel);padding:13px 15px;margin-top:12px}
+.oracle b{font-size:9px;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}
+.oracle p{margin:0;color:var(--muted);font-size:9.5px;line-height:1.65}
+.oracle code{background:none;border:0;padding:0;color:var(--ink);font-size:9px}
+.readouts{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-top:0;margin-top:12px}
+.readouts article{background:var(--panel);padding:13px 15px}
+.readouts b{display:block;font-size:8.5px;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}
+.readouts span{display:block;margin-top:5px;color:var(--muted);font-size:9.5px;line-height:1.6}
+.route-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-top:14px}
+.route-card{background:var(--panel);padding:15px;min-height:188px}
+.route-card .n{display:flex;justify-content:space-between;color:var(--accent);font-size:8.5px;letter-spacing:.11em}
+.route-card .n::after{content:"";width:22px;border-top:1px solid var(--line)}
+.route-card h3{margin:16px 0 7px;font-size:10.5px;text-transform:uppercase;letter-spacing:.07em}
+.route-card p{margin:0;color:var(--muted);font-size:9.5px;line-height:1.65}
+.route-card code{display:block;margin-top:8px;background:none;border:0;padding:0;color:var(--accent-2);font-size:9px;white-space:normal;line-height:1.5}
+.invariants{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-top:0}
+.invariant{background:var(--panel);padding:11px 13px}
+.invariant b{display:block;color:var(--accent);font-size:9px;letter-spacing:.1em;text-transform:uppercase}
+.invariant span{display:block;margin-top:4px;color:var(--muted);font-size:9px;line-height:1.5}
+.face-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-top:14px}
+.face{background:var(--panel);padding:16px;min-height:150px}
+.face b{display:block;color:var(--accent);font-size:9px;letter-spacing:.12em;text-transform:uppercase}
+.face h3{margin:12px 0 6px;font-size:12px}
+.face p{margin:0;color:var(--muted);font-size:9.5px;line-height:1.65}
+.face code{display:block;margin-top:9px;background:none;border:0;padding:0;color:var(--accent-2);font-size:9px;white-space:normal;line-height:1.5}
+.browser-frame{border:1px solid var(--ink);background:var(--panel);overflow-x:auto;margin-top:14px;scrollbar-color:var(--line-strong) transparent}
+.browser-frame svg{display:block;width:100%;min-width:1040px;height:auto}
+.scroll-hint{display:none;padding:7px 10px;border-top:1px solid var(--line);color:var(--muted);font-size:8.5px;letter-spacing:.1em;text-transform:uppercase}
+.browser-svg text{font-family:inherit}
+.browser-svg .bg{fill:var(--panel)}
+.browser-svg .frame{fill:var(--panel-2);stroke:var(--ink);stroke-width:1.2}
+.browser-svg .panel{fill:var(--panel);stroke:var(--line-strong);stroke-width:1}
+.browser-svg .accent{fill:var(--red-wash);stroke:var(--accent);stroke-width:1.3}
+.browser-svg .blue{fill:var(--blue-wash);stroke:var(--accent-2);stroke-width:1.3}
+.browser-svg .gold{fill:var(--gold-wash);stroke:var(--accent-3);stroke-width:1.3}
+.browser-svg .dashed{fill:var(--panel);stroke:var(--muted);stroke-width:1;stroke-dasharray:5 5}
+.browser-svg .title{font-size:14px;font-weight:750;fill:var(--ink)}
+.browser-svg .sub{font-size:10.5px;fill:var(--muted)}
+.browser-svg .tiny{font-size:8.5px;fill:var(--muted);letter-spacing:.03em}
+.browser-svg .code{font-size:9px;fill:var(--accent);letter-spacing:.05em}
+.browser-svg .code-blue{font-size:9px;fill:var(--accent-2);letter-spacing:.05em}
+.browser-svg .eyebrow{font-size:9px;fill:var(--muted);letter-spacing:.13em;text-transform:uppercase}
+.browser-svg .line{fill:none;stroke:var(--ink);stroke-width:1.2}
+.browser-svg .line-red{fill:none;stroke:var(--accent);stroke-width:1.7}
+.browser-svg .line-blue{fill:none;stroke:var(--accent-2);stroke-width:1.5}
+.browser-svg .line-dash{fill:none;stroke:var(--muted);stroke-width:1.1;stroke-dasharray:5 5}
+.browser-svg .screen{fill:var(--screen);stroke:var(--ink);stroke-width:1.1}
+.browser-svg .screen-text{fill:var(--screen-ink);font-size:9px}
+.browser-svg .halo{paint-order:stroke;stroke:var(--panel);stroke-width:4px;stroke-linejoin:round}
+.face-notes{display:grid;grid-template-columns:1.2fr .8fr;gap:14px;margin-top:14px}
+.note-box{border:1px solid var(--line);background:var(--panel);padding:14px}
+.note-box h3{margin:0 0 8px;font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+.note-box p{margin:0;color:var(--muted);font-size:9.5px;line-height:1.7}
+.note-box code{background:none;border:0;padding:0;color:var(--ink);font-size:9px}
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.detail-card{border:1px solid var(--line);background:var(--panel);padding:16px}
+.detail-card h3{margin:0 0 9px;font-size:10px;letter-spacing:.1em;text-transform:uppercase}
+.detail-card p{margin:0;color:var(--muted);font-size:9.5px;line-height:1.7}
+.detail-card code{background:none;border:0;padding:0;color:var(--ink);font-size:9px}
+.cap-list{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-top:12px}
+.cap{background:var(--panel);padding:10px 12px}
+.cap b{display:block;font-size:9px;color:var(--accent);letter-spacing:.1em;text-transform:uppercase}
+.cap span{display:block;margin-top:3px;font-size:9px;color:var(--muted)}
+.warn{border-color:var(--accent)}
+.warn h3{color:var(--accent)}
+.footer{margin-top:38px;border-top:1px solid var(--line);padding-top:14px;display:flex;justify-content:space-between;gap:18px;color:var(--muted);font-size:8.5px;letter-spacing:.06em;text-transform:uppercase}
+.footer p{margin:0}
+@media(max-width:1080px){
+  .map-grid{grid-template-columns:1fr}
+  .engine-panel{order:-1}
+  .engine-stack{grid-template-columns:repeat(2,1fr)}
+  .nodes.four,.nodes.three{grid-template-columns:repeat(2,1fr)}
+  .route-grid{grid-template-columns:repeat(2,1fr)}
+  .detail-grid{grid-template-columns:1fr}
+}
+@media(max-width:900px){
+  .hero{grid-template-columns:1fr}
+  .hero-side{align-items:flex-start;flex-direction:row;justify-content:space-between}
+  .stamp{width:auto;min-width:200px}
+  .facts{grid-template-columns:repeat(3,1fr)}
+  .section-head{grid-template-columns:42px 1fr}
+  .section-meta{display:none}
+  .face-grid{grid-template-columns:1fr}
+  .face-notes{grid-template-columns:1fr}
+  .scroll-hint{display:block}
+}
+@media(max-width:620px){
+  .wrap{padding:18px 12px 38px}
+  .hero-side{flex-direction:column;align-items:stretch}
+  .stamp{text-align:left}
+  .facts{grid-template-columns:repeat(2,1fr)}
+  .fact:last-child{grid-column:span 2}
+  .tabbar{position:static;flex-direction:column}
+  .tabbar button{text-align:left}
+  .nodes.four,.nodes.three{grid-template-columns:1fr}
+  .readouts,.invariants{grid-template-columns:1fr}
+  .route-grid{grid-template-columns:1fr}
+  .section-head{grid-template-columns:1fr;gap:7px}
+  .section-num{display:none}
+  .oracle{grid-template-columns:1fr}
+  .footer{display:block}
+  .footer p + p{margin-top:8px}
+}
+@media(prefers-reduced-motion:no-preference){
+  .node,.route-card,.face,.readouts article,.detail-card,.note-box{transition:background-color .16s ease}
+  .node:hover,.route-card:hover,.face:hover,.readouts article:hover,.detail-card:hover,.note-box:hover{background:var(--panel-2)}
+}
+code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code);border:1px solid var(--line);padding:1px 4px;white-space:nowrap}
+.works-frame{border:1px solid var(--ink);background:var(--panel);overflow-x:auto;margin-top:14px;scrollbar-color:var(--line-strong) transparent}
+.works-frame svg{display:block;width:100%;min-width:1040px;height:auto}
+.scroll-hint{display:none;padding:7px 10px;border-top:1px solid var(--line);color:var(--muted);font-size:8.5px;letter-spacing:.1em;text-transform:uppercase}
+.works-svg text{font-family:inherit}
+.works-svg .bg{fill:var(--panel)}
+.works-svg .floor{fill:var(--floor);stroke:var(--line-strong);stroke-width:1.3}
+.works-svg .floor-grid{fill:none;stroke:var(--line);stroke-width:1;opacity:.55}
+.works-svg .iso-top{fill:var(--iso-top);stroke:var(--ink);stroke-width:1.2}
+.works-svg .iso-left{fill:var(--iso-left);stroke:var(--ink);stroke-width:1.2}
+.works-svg .iso-right{fill:var(--iso-right);stroke:var(--ink);stroke-width:1.2}
+.works-svg .engine-top{fill:var(--blue-wash);stroke:var(--accent-2);stroke-width:1.2}
+.works-svg .engine-left{fill:var(--iso-left);stroke:var(--accent-2);stroke-width:1.2}
+.works-svg .engine-right{fill:var(--iso-right);stroke:var(--accent-2);stroke-width:1.2}
+.works-svg .screen{fill:var(--screen);stroke:var(--ink);stroke-width:1.1}
+.works-svg .kicker{font-size:9px;letter-spacing:.18em;fill:var(--muted)}
+.works-svg .h1{font-size:27px;font-weight:800;letter-spacing:-.055em;fill:var(--ink)}
+.works-svg .sub{font-size:10px;fill:var(--muted)}
+.works-svg .label{font-size:10px;font-weight:750;fill:var(--ink);letter-spacing:.07em}
+.works-svg .small{font-size:9px;fill:var(--muted);letter-spacing:.05em}
+.works-svg .code{font-size:9px;fill:var(--accent);letter-spacing:.06em}
+.works-svg .blue-code{font-size:9px;fill:var(--accent-2);letter-spacing:.06em}
+.works-svg .halo{paint-order:stroke;stroke:var(--panel);stroke-width:4px;stroke-linejoin:round}
+.works-svg .line{fill:none;stroke:var(--ink);stroke-width:1}
+.works-svg .thin{fill:none;stroke:var(--line-strong);stroke-width:1}
+.works-svg .red{fill:none;stroke:var(--accent);stroke-width:1.8}
+.works-svg .red-dash{fill:none;stroke:var(--accent);stroke-width:1.2;stroke-dasharray:5 5}
+.works-svg .blue-line{fill:none;stroke:var(--accent-2);stroke-width:1.4}
+.works-svg .dash{fill:none;stroke:var(--muted);stroke-width:1;stroke-dasharray:5 5}
+.notes{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-top:0;margin-top:0}
+.note{background:var(--panel);padding:14px;min-height:128px}
+.note b{display:block;color:var(--accent);font-size:9px;letter-spacing:.12em;text-transform:uppercase}
+.note h3{margin:11px 0 6px;font-size:10px;text-transform:uppercase;letter-spacing:.03em}
+.note p{margin:0;color:var(--muted);font-size:9px;line-height:1.6}
+.note code{background:none;border:0;padding:0;color:var(--ink);font-size:9px}
+.callout{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.callout article{border:1px solid var(--line);background:var(--panel);padding:14px}
+.callout b{display:block;color:var(--accent);font-size:8.5px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:7px}
+.callout p{margin:0;color:var(--muted);font-size:9.5px;line-height:1.7}
+
+@media(max-width:980px){.notes{grid-template-columns:1fr}.callout{grid-template-columns:1fr}}
+@media(max-width:620px){.works-frame{--works-pad:0}.works-frame svg{min-width:980px}}
+
+@media (prefers-color-scheme: dark){html:not([data-theme]){
+  color-scheme:dark;
+  --paper:#141510;--panel:#1c1e18;--panel-2:#292b22;
+  --ink:#eee8d7;--muted:#a9a491;--faint:#979484;
+  --line:#3b3d32;--line-strong:#5a5d4e;
+  --accent:#e47358;--accent-2:#6daab3;--accent-3:#d6b15f;
+  --blue-wash:#24383a;--red-wash:#382623;--gold-wash:#332d1d;
+  --iso-top:#262821;--iso-left:#20221b;--iso-right:#191b15;
+  --floor:#1b1d17;--shadow:rgba(0,0,0,.35);
+  --grid:rgba(238,232,215,.05);
+  --code:rgba(228,115,88,.12);
+  --screen:#0d0e0b;--screen-ink:#b7d9d0;
+}}
+.no-js .tabbar,.no-js .theme{display:none}
+.sitebar{display:flex;flex-wrap:wrap;align-items:center;gap:6px 18px;padding:2px 0 16px;margin-bottom:18px;border-bottom:1px solid var(--line);font-size:11px;letter-spacing:.06em}
+.sitebar a{color:var(--ink);text-decoration:none;border-bottom:1px solid transparent}
+.sitebar a:hover,.sitebar a:focus-visible{border-bottom-color:var(--accent)}
+.sitebar .home{font-weight:800;letter-spacing:.12em;text-transform:uppercase;margin-right:auto}
+.sitebar .home span{color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.works-frame:focus-visible,.browser-frame:focus-visible{outline-offset:-2px}
+.site-foot{display:flex;flex-wrap:wrap;gap:6px 18px;justify-content:space-between;align-items:baseline}
+.site-foot nav{display:flex;flex-wrap:wrap;gap:6px 16px}
+.site-foot a{color:var(--muted)}
+.node p code,.engine-card p code,.face p code,.route-card p code{display:inline;margin:0;color:inherit;font-size:inherit;font-weight:600;overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="sitebar" aria-label="Site">
+  <a class="home" href="../">Spindle <span>/</span> Atlas</a>
+  <a href="../browser/">Spindle for Browser</a>
+  <a href="https://github.com/SiliconState/Spindle/blob/main/docs/architecture.md">Architecture in prose</a>
+  <a href="https://github.com/SiliconState/Spindle/tree/main/docs">Docs</a>
+  <a href="https://github.com/SiliconState/Spindle">GitHub</a>
+</nav>
+
+<header class="hero">
+  <div>
+    <div class="kicker">Spindle / Dext engine / architecture atlas</div>
+    <h1>Spindle <span class="slash">/</span><br>Dext Engine</h1>
+    <p class="dek">The whole system on three plates: every surface and the host it reaches, the route a turn takes to a committed head, the store and engine underneath, and Spindle for Browser, which runs the same engine inside your browser.</p>
+    <div class="revision">Schema 20 · API v1 · Spindle for Browser 0.1.6 · drawn from the code, November 2026</div>
+  </div>
+  <div class="hero-side">
+    <div class="theme" role="group" aria-label="Theme">
+      <button type="button" data-set-theme="light">PAPER</button>
+      <button type="button" data-set-theme="dark">DARK</button>
+      <button type="button" data-set-theme="dim">DIM</button>
+    </div>
+    <div class="stamp">Schema 20<br>API v1<br>Browser 0.1.6</div>
+  </div>
+</header>
+
+<div class="facts">
+  <div class="fact"><b>20</b><span>SQLite schema</span></div>
+  <div class="fact"><b>32 MiB</b><span>max step payload</span></div>
+  <div class="fact"><b>1,048,576</b><span>admission ceiling</span></div>
+  <div class="fact"><b>50,000</b><span>files per workspace</span></div>
+  <div class="fact"><b>64 MiB</b><span>object cap</span></div>
+  <div class="fact"><b>v1</b><span>shared API contract</span></div>
+</div>
+
+<div class="tabbar" role="tablist" aria-label="Atlas sections">
+  <button type="button" role="tab" id="tab-host" aria-controls="panel-host" data-tab="host" aria-selected="true">01 / Host map</button>
+  <button type="button" role="tab" id="tab-browser" aria-controls="panel-browser" data-tab="browser" aria-selected="false" tabindex="-1">02 / Spindle for Browser</button>
+  <button type="button" role="tab" id="tab-details" aria-controls="panel-details" data-tab="details" aria-selected="false" tabindex="-1">03 / Store + Engine</button>
+</div>
+
+<main>
+  <section class="panel" id="panel-host" data-panel="host" role="tabpanel" aria-labelledby="tab-host">
+    <div class="section-head">
+      <div class="section-num">01</div>
+      <div>
+        <h2>Full host map</h2>
+        <p>Seven surfaces and the preview sandbox, one host boundary, one schema-20 store, and the four Dext engine crates underneath. The browser and the web app are first-class here, not side notes.</p>
+      </div>
+      <div class="section-meta">Schema 20 · API v1</div>
+    </div>
+
+    <div class="legend">
+      <span><i class="key"></i> module boundary</span>
+      <span><i class="key dashed"></i> model / unlinked app</span>
+      <span><i class="key red"></i> authority / trust boundary</span>
+      <span><i class="key blue"></i> engine substrate</span>
+    </div>
+
+    <div class="map-grid">
+      <div class="map-main">
+        <div class="lane">
+          <div class="lane-head"><span><b class="lane-num">01</b> TRANSPORTS + SURFACES</span><span class="lane-note">API v1 · the web app on /api</span></div>
+          <div class="nodes four">
+            <article class="node">
+              <h3>CLI / TTY</h3>
+              <code>cli.rs · cli_ui.rs</code>
+              <p>Operator shell; TTY-side pack forms, selects, confirms, input, and progress.</p>
+              <span class="tag">LOCAL</span>
+            </article>
+            <article class="node">
+              <h3>Rust API</h3>
+              <code>agent.rs · api.rs</code>
+              <p>Embeddable Session API and stable JSON forms for events, messages, settings, status, and reads.</p>
+              <span class="tag">API v1</span>
+            </article>
+            <article class="node">
+              <h3>JSON-RPC stdio</h3>
+              <code>api/stdio.rs</code>
+              <p>NDJSON protocol, one worker per session, 64 MiB lines, 4 MiB prompts, 32 queued steers.</p>
+              <span class="tag">STDIO</span>
+            </article>
+            <article class="node">
+              <h3>HTTP /v1 + UI</h3>
+              <code>serve/mod.rs · serve/v1.rs</code>
+              <p>Loopback default, optional public origin, bearer/device/API tokens, and SSE event rings.</p>
+              <span class="tag">WEB</span>
+            </article>
+            <article class="node">
+              <h3>Browser extension</h3>
+              <code>chrome/ · spindle-embed</code>
+              <p>MV3 for Chrome, Edge and Brave: side panel, offscreen engine, WASM host, OPFS, page tools, browser Linux, optional host.</p>
+              <span class="tag">0.1.6</span>
+            </article>
+            <article class="node">
+              <h3>Web PWA</h3>
+              <code>store/ui · serve</code>
+              <p>The host-served web app. Talks to the host's private <code>/api</code> routes and their SSE stream (not part of API v1); its service worker handles notifications, not caching.</p>
+              <span class="tag">SERVED UI</span>
+            </article>
+            <article class="node">
+              <h3>Embed SDK</h3>
+              <code>embed/ · store/src/embedded</code>
+              <p>WASM/JS host for apps, with Node and OPFS storage and the shared protocol.</p>
+              <span class="tag">EMBED</span>
+            </article>
+            <article class="node">
+              <h3>Preview sandbox</h3>
+              <code>chrome/preview.html · serve/preview.rs</code>
+              <p>Sandboxed page output, served (by the extension's service worker, or the host) under a sandbox CSP and a Connection-Allowlist, which Chrome 152+ enforces.</p>
+              <span class="tag">BROWSER</span>
+            </article>
+          </div>
+        </div>
+
+        <div class="flowline"><span>shared API v1 · trust boundary · head session</span></div>
+
+        <div class="lane host">
+          <div class="lane-head"><span><b class="lane-num">02</b> HOST RUNTIME</span><span class="lane-note">commit before dispatch</span></div>
+          <div class="nodes four">
+            <article class="node">
+              <h3>serve + connect</h3>
+              <code>serve/* · serve/connect.rs</code>
+              <p>V1 routes, pairing, Access, preview, self-edit, sync, threads, tar, disk, pack UI, and PKCE browser tokens.</p>
+            </article>
+            <article class="node">
+              <h3>Session / agent</h3>
+              <code>agent.rs · agent/*</code>
+              <p>Prompt, steering, resume, provider catalog, durable cost ledger, host tools, app tools, pack turn boundaries.</p>
+            </article>
+            <article class="node">
+              <h3>Turn driver</h3>
+              <code>driver.rs · driver_api.rs</code>
+              <p>Decides the next step from the committed head and commits it; sends, execution, clocks, and waits belong to the host.</p>
+            </article>
+            <article class="node">
+              <h3>Broker</h3>
+              <code>broker.rs</code>
+              <p>Reserve attempt, then dispatch model, strict workspace, host tool, image, job, pack, or turn effect. No retry loop.</p>
+            </article>
+            <article class="node">
+              <h3>Effects</h3>
+              <code>jobs.rs · code_mode.rs · code_http.rs</code>
+              <p>16 jobs running per process, 32 kept per session; 1,024 code calls; 64 HTTP grants; 640 KiB response ceiling.</p>
+            </article>
+            <article class="node">
+              <h3>Pack runtime</h3>
+              <code>pack_runtime.rs</code>
+              <p>Stateful Pack Runtime v1, ledger anchors, continuation accounting, promoted tools, and UI rounds.</p>
+            </article>
+            <article class="node">
+              <h3>Embedded host</h3>
+              <code>store/src/embedded/* · embed/</code>
+              <p>Sessions an app drives: backend, code, storage, host, places, WASM JS surface, Node and OPFS adapters.</p>
+            </article>
+            <article class="node">
+              <h3>Rewind / ownership</h3>
+              <code>rewind.rs · ownership.rs</code>
+              <p>Execution cuts, forks, scope trees, services, waits, suspensions, epoch confirmation.</p>
+            </article>
+          </div>
+        </div>
+
+        <div class="flowline"><span>proposal → revision → attempt → receipt; View reads committed state</span></div>
+
+        <div class="lane store">
+          <div class="lane-head"><span><b class="lane-num">03</b> DURABLE SUBSTRATE</span><span class="lane-note">schema 20</span></div>
+          <div class="nodes three">
+            <article class="node">
+              <h3>Schema 20</h3>
+              <code>lib.rs · transition.rs</code>
+              <p>WAL + FULL, owner lock, migrations from 14–19, previous schema 19, validation watermark, provider refusals.</p>
+              <span class="tag">1M ADMITS</span>
+            </article>
+            <article class="node">
+              <h3>Codec / chunks</h3>
+              <code>codec.rs</code>
+              <p>Pure-Rust deflate and content-defined 4–64 KiB chunks; 16 KiB inline; every chunk checked by digest.</p>
+              <span class="tag">DEDUP</span>
+            </article>
+            <article class="node">
+              <h3>Objects / files</h3>
+              <code>artifact.rs · workspace.rs</code>
+              <p>64 MiB object cap, 16 GiB total, 50,000-file maps, 64 MiB files, immutable manifests and staging pins.</p>
+              <span class="tag">IMMUTABLE</span>
+            </article>
+            <article class="node">
+              <h3>View / reads</h3>
+              <code>view.rs · reads.rs</code>
+              <p>Read-only <code>query_only</code> view, no owner lock; stable message, file, state, and rewind-target reads.</p>
+              <span class="tag">OBSERVE</span>
+            </article>
+            <article class="node">
+              <h3>Durable files</h3>
+              <code>durable.rs</code>
+              <p>Temp write, fsync, rename, parent sync. Apple uses fullfsync; disk-full is an ambiguous fence.</p>
+              <span class="tag">CRASH-SAFE</span>
+            </article>
+            <article class="node">
+              <h3>Migrations</h3>
+              <code>lib.rs · durable.rs</code>
+              <p>A native open migrates schema 14–19 in place after copying the store to <code>authority.vN.sqlite</code>; browser stores and imports migrate 19 in one checked transaction.</p>
+              <span class="tag">COPY FIRST</span>
+            </article>
+          </div>
+        </div>
+      </div>
+
+      <aside class="engine-panel">
+        <header><span>DEXT ENGINE</span><span>4 + 1</span></header>
+        <div class="engine-stack">
+          <article class="engine-card">
+            <h3>dext-core</h3>
+            <code>core/src/*.rs</code>
+            <p>Pure decisions. No host I/O, forbid unsafe: model wait, turn, response, recovery.</p>
+          </article>
+          <article class="engine-card">
+            <h3>dext-transcript</h3>
+            <code>transcript/src/*.rs</code>
+            <p>Messages, blocks, checkpoints, runtime state, continuations, tool results.</p>
+          </article>
+          <article class="engine-card">
+            <h3>dext-provider</h3>
+            <code>provider/src/*.rs</code>
+            <p>Catalog, login/OAuth, request contracts, wire shaping, host commands.</p>
+          </article>
+          <article class="engine-card">
+            <h3>dext-native</h3>
+            <code>native/src/*.rs</code>
+            <p>SSE, streaming, model transport, strict and host runners, jobs, cgroups, process trees, image policy.</p>
+          </article>
+          <article class="engine-card app">
+            <h3>dext CLI app</h3>
+            <code>src/main.rs + modules</code>
+            <p>Tools, packs, sandbox, TUI, orchestration. Not a dependency of <code>spindle-store</code>.</p>
+          </article>
+        </div>
+        <div class="engine-foot">Direct links: core, transcript, provider, native. Strict native limits and job support are part of the current build.</div>
+      </aside>
+    </div>
+
+    <div class="oracle">
+      <b>Reference model<br>not runtime</b>
+      <p><code>spindle-reference</code> · schema 2 · 14 operations · 8 entries per record map · 16 commits · no I/O · no live dispatch. It is not a store dependency and cannot authorize work.</p>
+    </div>
+
+    <div class="readouts">
+      <article><b>Authority</b><span>A proposal becomes a revision and up to eight inert intents in one SQLite transaction. An effect runs only after the broker reserves an attempt.</span></article>
+      <article><b>Surfaces</b><span>HTTP /v1, stdio, the CLI, the Rust API, the extension and the embed SDK share the API v1 contract; the host-served web app uses the host's private /api. The browser extension runs the embedded host.</span></article>
+      <article><b>Observation</b><span><code>View</code> reads committed history without the owner lock; the writer remains the sole owner of the store.</span></article>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-num">01b</div>
+        <div>
+          <h2>Turn route</h2>
+          <p>One checked route from transport to head; browser traffic uses the same embedded driver when it runs locally.</p>
+        </div>
+        <div class="section-meta">Runtime sequence</div>
+      </div>
+      <div class="route-grid">
+        <article class="route-card"><div class="n">01</div><h3>Enter</h3><p>CLI, HTTP /v1 (the web app through /api), stdio, Rust API, the browser extension, or the embed SDK.</p><code>cli.rs · serve/v1.rs · api/stdio.rs</code></article>
+        <article class="route-card"><div class="n">02</div><h3>Authorize</h3><p>Pairing/device tokens; optional Cloudflare Access; browser PKCE connect for a host token.</p><code>serve/auth.rs · serve/access.rs · serve/connect.rs</code></article>
+        <article class="route-card"><div class="n">03</div><h3>Restore</h3><p>Open the session, take the owner lock, restore the head continuation; reads use View.</p><code>agent.rs · driver.rs · view.rs</code></article>
+        <article class="route-card"><div class="n">04</div><h3>Propose</h3><p>DTA1 action and next state form a proposal: expected revision, workspace root, up to eight intents.</p><code>turn.rs · transition.rs</code></article>
+        <article class="route-card"><div class="n">05</div><h3>Commit</h3><p>SQLite checks epoch and scope revision; consume observation, append revision, write intents, move head.</p><code>lib.rs · transition.rs</code></article>
+        <article class="route-card"><div class="n">06</div><h3>Reserve</h3><p>Broker verifies retained bindings and reserves an attempt. <code>CommittedEffect</code> is the dispatch ticket.</p><code>broker.rs</code></article>
+        <article class="route-card"><div class="n">07</div><h3>Run</h3><p>Model transport, strict workspace, host tools, jobs, packs, granted HTTP, image read, or embedded host work.</p><code>broker.rs · embedded/host.rs</code></article>
+        <article class="route-card"><div class="n">08</div><h3>Seal</h3><p>Receipt adoption advances the head; rewind forks the line; jobs die with the process; pack ledger follows ancestry.</p><code>rewind.rs · view.rs · pack_runtime.rs</code></article>
+      </div>
+      <div class="invariants">
+        <div class="invariant"><b>Commit</b><span>WAL + FULL, one owner lock</span></div>
+        <div class="invariant"><b>Payload</b><span>32 MiB per step</span></div>
+        <div class="invariant"><b>Admissions</b><span>1,048,576 maximum</span></div>
+        <div class="invariant"><b>Proposal</b><span>up to 8 intents</span></div>
+        <div class="invariant"><b>Contract</b><span>API v1 across transports</span></div>
+      </div>
+    </div>
+
+    <section class="section works-section">
+      <div class="section-head">
+        <div class="section-num">01w</div>
+        <div>
+          <h2>The Spindle Works</h2>
+          <p>The illustrated host plate: API and browser gate, session/driver, schema-20 vault, codec, object silo, broker, effect yard, rewind, and the Dext engine.</p>
+        </div>
+        <div class="section-meta">Illustrated host plate</div>
+      </div>
+      <div class="works-frame" tabindex="0" role="region" aria-label="The Spindle Works plate (scrolls sideways)">
+      <svg class="works-svg" viewBox="0 0 1200 800" role="img" aria-labelledby="hostWorksTitle hostWorksDesc">
+        <title id="hostWorksTitle">The Spindle Works</title>
+        <desc id="hostWorksDesc">An isometric works: API and browser gate, session and driver desk, schema-20 authority vault, codec press, object silo, broker gate, jobs/packs/HTTP effect yard, Dext engine tower, and a separate reference model.</desc>
+        <defs>
+          <pattern id="hostGrid" width="26" height="26" patternUnits="userSpaceOnUse">
+            <path d="M26 0H0V26" fill="none" stroke="var(--grid)" stroke-width="1"/>
+          </pattern>
+          <pattern id="hostFloor" width="58" height="58" patternUnits="userSpaceOnUse">
+            <path d="M29 0L58 29L29 58L0 29Z" fill="none" stroke="var(--line)" stroke-width="1" opacity=".55"/>
+          </pattern>
+          <marker id="hostArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="var(--accent)"/></marker>
+          <marker id="hostBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="var(--accent-2)"/></marker>
+        </defs>
+        <rect width="1200" height="800" class="bg"/>
+        <rect width="1200" height="800" fill="url(#hostGrid)"/>
+        <text x="30" y="34" class="kicker">PLATE 01 / THE SPINDLE WORKS / REV 20</text>
+        <text x="1170" y="34" text-anchor="end" class="kicker">RUST SOURCE / NOT TO SCALE</text>
+        <line x1="30" y1="48" x2="1170" y2="48" class="thin"/>
+        <text x="30" y="76" class="h1">THE SPINDLE WORKS</text>
+        <text x="30" y="96" class="sub">proposal → revision → reserve → effect → receipt → head</text>
+        <text x="1170" y="76" text-anchor="end" class="code">SCHEMA 20 / API V1</text>
+        <text x="1170" y="94" text-anchor="end" class="code">32 MiB / 1M ADMITS</text>
+
+        <ellipse cx="600" cy="545" rx="450" ry="116" fill="var(--shadow)" opacity=".42"/>
+        <polygon points="600,300 1080,510 600,720 120,510" class="floor"/>
+        <polygon points="600,300 1080,510 600,720 120,510" fill="url(#hostFloor)"/>
+        <path d="M600 300V720M120 510H1080" class="floor-grid" stroke-dasharray="3 10"/>
+
+        <!-- Reference model, separate -->
+        <g id="host-reference">
+          <rect x="76" y="222" width="214" height="228" fill="var(--panel)" stroke="var(--muted)" stroke-dasharray="5 5" opacity=".8"/>
+          <text x="94" y="246" class="code">REFERENCE MODEL / NO RUNTIME EDGE</text>
+          <text x="94" y="262" class="small">schema 2 · 14 operations</text>
+          <text x="94" y="276" class="small">8 entries/map · 16 commits</text>
+          <g transform="translate(184 400) scale(.34)">
+            <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="iso-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="iso-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <polygon points="184,316 226,337 184,358 142,337" fill="var(--blue-wash)" stroke="var(--accent-2)" stroke-width="1" stroke-dasharray="4 4" opacity=".8"/>
+          <path d="M142 337V389M226 337V389M184 358V400" class="dash"/>
+          <path d="M142 389L184 410L226 389" class="dash"/>
+          <circle cx="184" cy="337" r="8" fill="none" stroke="var(--accent-2)" stroke-width="1.4"/>
+          <path d="M184 325V331M184 343V349M172 337H178M190 337H196M176 329L180 333M188 341L192 345" stroke="var(--accent-2)" stroke-width="1.1"/>
+          <text x="184" y="432" text-anchor="middle" class="code">MODEL ONLY / NOT A HOST</text>
+        </g>
+
+        <!-- API and browser gate -->
+        <g id="host-api">
+          <path d="M300 368C310 355 327 355 337 368C345 379 341 390 330 397C318 404 305 399 298 390C293 382 294 374 300 368Z" fill="var(--blue-wash)" stroke="var(--accent-2)" stroke-width="1.2"/>
+          <path d="M312 373V382M318 369L312 377L306 369" class="blue-line" stroke-width="1.2"/>
+          <text x="300" y="353" text-anchor="middle" class="code">PUBLIC ORIGIN / ACCESS</text>
+          <path d="M300 402V424" class="dash"/>
+          <path d="M286 431L300 424L314 431V448C314 461 307 470 300 475C293 470 286 461 286 448Z" fill="var(--red-wash)" stroke="var(--accent)" stroke-width="1.2"/>
+          <circle cx="300" cy="445" r="3" fill="var(--accent)"/>
+          <text x="300" y="489" text-anchor="middle" class="code">PAIRING / ACCESS / CONNECT</text>
+          <rect x="256" y="511" width="88" height="26" fill="var(--panel)" stroke="var(--ink)" stroke-width="1.2"/>
+          <text x="300" y="528" text-anchor="middle" class="label">API v1</text>
+          <g transform="translate(300 565) scale(.46)">
+            <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="iso-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="iso-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <path d="M278 552L322 574M278 561L322 583" stroke="var(--screen-ink)" stroke-width="1.2" opacity=".8"/>
+          <text x="300" y="645" text-anchor="middle" class="label halo">API + BROWSER GATE</text>
+          <text x="300" y="661" text-anchor="middle" class="small">CLI · HTTP · STDIO · RUST</text>
+          <text x="300" y="676" text-anchor="middle" class="code">WEB PWA · CHROME · EMBED</text>
+        </g>
+
+        <!-- Session and driver -->
+        <g id="host-session">
+          <g transform="translate(455 505) scale(.38)">
+            <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="iso-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="iso-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <rect x="428" y="482" width="54" height="22" fill="var(--screen)" stroke="var(--ink)"/>
+          <path d="M434 488H474M434 493H466M434 498H458" stroke="var(--screen-ink)" stroke-width="1"/>
+          <text x="455" y="557" text-anchor="middle" class="label halo">SESSION + DRIVER</text>
+          <text x="455" y="573" text-anchor="middle" class="small">head · cost · steer</text>
+          <text x="455" y="587" text-anchor="middle" class="code">TURN CONTINUATION</text>
+        </g>
+
+        <!-- Schema 20 vault -->
+        <g id="host-vault">
+          <g transform="translate(650 520) scale(.55)">
+            <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="iso-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="iso-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <rect x="596" y="430" width="108" height="74" fill="var(--gold-wash)" stroke="var(--ink)" stroke-width="1.2"/>
+          <ellipse cx="650" cy="430" rx="54" ry="20" fill="var(--iso-top)" stroke="var(--ink)" stroke-width="1.2"/>
+          <ellipse cx="650" cy="504" rx="54" ry="20" fill="var(--iso-left)" stroke="var(--ink)" stroke-width="1.2"/>
+          <path d="M596 449H704M596 468H704M596 487H704" class="thin"/>
+          <text x="650" y="475" text-anchor="middle" class="label">AUTHORITY</text>
+          <text x="650" y="342" text-anchor="middle" class="code">AUTHORITY.SQLITE / SCHEMA 20</text>
+          <text x="650" y="358" text-anchor="middle" class="small">32 MiB PAYLOAD · 1,048,576 ADMITS</text>
+          <text x="650" y="374" text-anchor="middle" class="small">WAL + FULL · ONE OWNER.LOCK</text>
+          <path d="M650 380V420" class="thin"/>
+          <text x="650" y="555" text-anchor="middle" class="code">MIGRATIONS 14–19 · COPY FIRST</text>
+        </g>
+
+        <!-- Codec press -->
+        <g id="host-codec">
+          <g transform="translate(550 660) scale(.34)">
+            <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="iso-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="iso-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <path d="M600 510L580 625" class="thin"/>
+          <rect x="515" y="625" width="20" height="12" fill="var(--blue-wash)" stroke="var(--accent-2)"/>
+          <rect x="540" y="632" width="20" height="12" fill="var(--blue-wash)" stroke="var(--accent-2)"/>
+          <rect x="565" y="625" width="20" height="12" fill="var(--blue-wash)" stroke="var(--accent-2)"/>
+          <text x="550" y="720" text-anchor="middle" class="label halo">CODEC / CHUNKS</text>
+          <text x="550" y="736" text-anchor="middle" class="small">deflate · 4–64 KiB · 16 KiB inline</text>
+        </g>
+
+        <!-- Object silo -->
+        <g id="host-objects">
+          <g transform="translate(760 662) scale(.34)">
+            <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="iso-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="iso-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <path d="M760 548V625" class="thin"/>
+          <rect x="733" y="610" width="54" height="12" fill="var(--panel)" stroke="var(--ink)"/>
+          <rect x="733" y="628" width="54" height="12" fill="var(--panel)" stroke="var(--ink)"/>
+          <rect x="733" y="646" width="54" height="12" fill="var(--panel)" stroke="var(--ink)"/>
+          <text x="760" y="720" text-anchor="middle" class="label halo">OBJECTS + FILES</text>
+          <text x="760" y="736" text-anchor="middle" class="small">64 MiB object · 16 GiB total</text>
+          <text x="760" y="750" text-anchor="middle" class="code">50,000 FILES</text>
+        </g>
+
+        <!-- Broker -->
+        <g id="host-broker">
+          <path d="M816 440V505M884 440V505" class="line" stroke-width="4"/>
+          <path d="M816 440H884" class="line" stroke-width="4"/>
+          <rect x="810" y="414" width="80" height="24" fill="var(--panel)" stroke="var(--accent)" stroke-width="1.4"/>
+          <text x="850" y="430" text-anchor="middle" class="label">BROKER</text>
+          <path d="M816 482L884 463" stroke="var(--accent)" stroke-width="7"/>
+          <path d="M816 482L828 479M840 476L852 473M864 470L876 467" stroke="var(--panel)" stroke-width="2"/>
+          <text x="850" y="530" text-anchor="middle" class="code halo">RESERVE → RUN</text>
+          <text x="850" y="546" text-anchor="middle" class="small">attempt before effect</text>
+        </g>
+
+        <!-- Effect yard -->
+        <g id="host-effects">
+          <polygon points="980,562 1140,620 980,678 820,620" fill="var(--iso-top)" stroke="var(--ink)" stroke-width="1.3"/>
+          <polygon points="820,620 980,678 980,740 820,682" fill="var(--iso-left)" stroke="var(--ink)" stroke-width="1.3"/>
+          <polygon points="980,678 1140,620 1140,682 980,740" fill="var(--iso-right)" stroke="var(--ink)" stroke-width="1.3"/>
+          <path d="M820 648L980 706L1140 648" class="thin"/>
+          <text x="900" y="693" text-anchor="middle" class="small">JOBS 16/32</text>
+          <text x="980" y="713" text-anchor="middle" class="small">PACKS</text>
+          <text x="1060" y="693" text-anchor="middle" class="small">HTTP</text>
+          <text x="980" y="760" text-anchor="middle" class="label halo">EFFECT YARD</text>
+          <text x="980" y="775" text-anchor="middle" class="small">reserved effects · ledger · grants</text>
+        </g>
+
+        <!-- Engine tower -->
+        <g id="host-engine">
+          <path d="M1000 238V210" class="blue-line" stroke-width="1.5"/>
+          <path d="M992 202C996 194 1004 194 1008 202M985 191C994 178 1006 178 1015 191" class="blue-line" opacity=".8"/>
+          <path d="M1018 198L1130 154" class="dash"/>
+          <text x="1136" y="151" class="code">PROVIDER HTTPS</text>
+          <g transform="translate(1000 260) scale(.52)">
+            <polygon class="engine-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="engine-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="engine-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <text x="1000" y="264" text-anchor="middle" class="small">CORE</text>
+          <g transform="translate(1000 320) scale(.52)">
+            <polygon class="engine-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="engine-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="engine-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <text x="1000" y="324" text-anchor="middle" class="small">TRANSCRIPT</text>
+          <g transform="translate(1000 380) scale(.52)">
+            <polygon class="engine-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="engine-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="engine-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <text x="1000" y="384" text-anchor="middle" class="small">PROVIDER</text>
+          <g transform="translate(1000 440) scale(.52)">
+            <polygon class="engine-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="engine-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="engine-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <text x="1000" y="444" text-anchor="middle" class="small">NATIVE</text>
+          <path d="M1072 244V500M1072 260H1065M1072 320H1065M1072 380H1065M1072 440H1065" class="thin"/>
+          <text x="1090" y="370" text-anchor="middle" class="code" transform="rotate(-90 1090 370)">DEXT ENGINE / 4 CRATES</text>
+          <text x="1090" y="520" text-anchor="middle" class="code">APP NOT LINKED</text>
+          <path d="M884 455C930 443 960 435 982 435" class="dash" marker-end="url(#hostBlue)"/>
+        </g>
+
+        <!-- Revision rail and rewind -->
+        <path d="M350 590C430 608 500 614 590 614C680 614 755 590 815 560C850 566 875 585 895 605" class="red" stroke-dasharray="7 5" marker-end="url(#hostArrow)"/>
+        <rect x="446" y="604" width="28" height="12" fill="var(--panel)" stroke="var(--accent)"/>
+        <text x="460" y="613" text-anchor="middle" class="small" fill="var(--accent)">r1</text>
+        <rect x="584" y="608" width="28" height="12" fill="var(--panel)" stroke="var(--accent)"/>
+        <text x="598" y="617" text-anchor="middle" class="small" fill="var(--accent)">r2</text>
+        <rect x="694" y="586" width="38" height="12" fill="var(--accent)" stroke="var(--accent)"/>
+        <text x="713" y="595" text-anchor="middle" class="small" fill="var(--panel)">HEAD</text>
+        <path d="M620 614C560 632 500 650 455 668" class="red-dash" marker-end="url(#hostArrow)"/>
+        <text x="624" y="654" class="code halo">REVISION RAIL</text>
+        <g id="host-rewind">
+          <polygon points="420,664 440,674 420,684 400,674" fill="var(--red-wash)" stroke="var(--accent)" stroke-width="1.2"/>
+          <path d="M420 664V642M420 642L446 632" stroke="var(--accent)" stroke-width="2"/>
+          <circle cx="420" cy="640" r="4" fill="var(--accent)"/>
+          <text x="420" y="708" text-anchor="middle" class="label halo">REWIND</text>
+          <text x="420" y="723" text-anchor="middle" class="small">fork / cut / resume</text>
+        </g>
+
+        <text x="600" y="788" text-anchor="middle" class="code">solid = code path · dashed = model or external edge</text>
+      </svg>
+      <div class="scroll-hint">Scroll horizontally to inspect the plate</div>
+    </div>
+
+    <div class="notes">
+      <article class="note"><b>01 / GATE</b><h3>Every surface, one gate</h3><p>CLI, HTTP, stdio, Rust API, the extension and embed share the API v1 contract; the web app talks to the host's /api. Pairing/device tokens and optional Access sit in front.</p></article>
+      <article class="note"><b>02 / VAULT</b><h3>Schema 20</h3><p>WAL + FULL, owner lock, migrations from 14–19 (a copy kept first), 32 MiB steps, one million admissions.</p></article>
+      <article class="note"><b>03 / AUTHORITY</b><h3>Commit, then reserve</h3><p>Proposal → revision and intents → broker attempt → effect → receipt → head. The driver sends and runs nothing itself: the host does.</p></article>
+    </div>
+
+    <div class="callout">
+      <article><b>Host vs browser</b><p>The host plate shows the shared session/store/engine machine. The browser plate is a distinct local-first extension running the embedded WASM host in OPFS.</p></article>
+      <article><b>Conservative contract</b><p><code>CAPABILITIES</code> still advertises no native execution, no durable rewind, and no power-loss certification. The modules exist; the published contract stays narrower.</p></article>
+    </div>
+    </section>
+
+  </section>
+
+  <section class="panel" id="panel-browser" data-panel="browser" role="tabpanel" aria-labelledby="tab-browser">
+    <div class="section-head">
+      <div class="section-num">02</div>
+      <div>
+        <h2>Spindle for Browser</h2>
+        <p>The browser extension is not the served web app. It is a local-first WASM Spindle running in the browser profile, beside a host-served PWA and a reusable embed package.</p>
+      </div>
+      <div class="section-meta">Chrome, Edge, Brave · MV3 · 0.1.6</div>
+    </div>
+
+    <div class="face-grid">
+      <article class="face">
+        <b>FACE 01 / EXTENSION</b>
+        <h3>Spindle for Browser</h3>
+        <p>A standalone side panel in Chrome, Edge or Brave. A WASM host, OPFS sessions, encrypted vault, page tools, local Linux, and optional remote host.</p>
+        <code>chrome/ · chrome/dist/</code>
+      </article>
+      <article class="face">
+        <b>FACE 02 / SERVED PWA</b>
+        <h3>Host web UI</h3>
+        <p>Loaded from <code>spindle serve</code>. Uses the host's private <code>/api</code> and its SSE stream for a host session; its service worker handles notifications, not caching.</p>
+        <code>store/ui/</code>
+      </article>
+      <article class="face">
+        <b>FACE 03 / EMBED</b>
+        <h3>Spindle inside an app</h3>
+        <p>The reusable WASM/JS host package: backend, protocol, places, Node VFS and browser OPFS.</p>
+        <code>embed/ · store/src/embedded/</code>
+      </article>
+    </div>
+
+    <div class="browser-frame" tabindex="0" role="region" aria-label="Spindle for Browser map (scrolls sideways)">
+      <svg class="browser-svg" viewBox="0 0 1200 800" role="img" aria-labelledby="browserTitle browserDesc">
+        <title id="browserTitle">Spindle for Browser architecture</title>
+        <desc id="browserDesc">A Chrome side panel, active tab, and sandboxed preview connect through a service worker and offscreen engine worker to a WASM host over OPFS, a vault, providers, local Linux, and an optional remote Spindle host.</desc>
+        <rect width="1200" height="800" class="bg"/>
+        <text x="30" y="32" class="eyebrow">SPINDLE FOR BROWSER / 0.1.6</text>
+        <text x="1170" y="32" text-anchor="end" class="eyebrow">MV3 / CHROMIUM 116+</text>
+        <line x1="30" y1="45" x2="1170" y2="45" stroke="var(--line)"/>
+        <text x="30" y="76" class="title">BROWSER ARCHITECTURE</text>
+        <text x="30" y="94" class="sub">panel → BroadcastChannel → offscreen engine → WASM host / OPFS → executors → events</text>
+
+        <!-- Chrome shell -->
+        <rect x="35" y="120" width="390" height="590" class="frame"/>
+        <rect x="35" y="120" width="390" height="34" fill="var(--panel)" stroke="var(--line)"/>
+        <text x="86" y="142" class="code-blue">BROWSER / EXTENSION SHELL</text>
+        <circle cx="50" cy="137" r="3" fill="var(--accent)"/>
+        <circle cx="62" cy="137" r="3" fill="var(--line-strong)"/>
+        <circle cx="74" cy="137" r="3" fill="var(--line-strong)"/>
+
+        <rect x="50" y="170" width="175" height="500" class="panel"/>
+        <text x="64" y="192" class="title">SIDE PANEL</text>
+        <text x="64" y="209" class="code">panel.html · panel.mjs</text>
+        <rect x="64" y="228" width="147" height="44" class="accent"/>
+        <text x="74" y="246" class="tiny">thread list</text>
+        <text x="74" y="260" class="tiny">settings · spend · vault</text>
+        <rect x="64" y="286" width="147" height="72" class="panel"/>
+        <text x="74" y="305" class="tiny">chat / workspace</text>
+        <text x="74" y="321" class="tiny">files · previews</text>
+        <text x="74" y="337" class="tiny">page access switches</text>
+        <rect x="64" y="372" width="147" height="68" class="gold"/>
+        <text x="74" y="391" class="tiny">provider / host</text>
+        <text x="74" y="407" class="tiny">sign-in selection</text>
+        <text x="74" y="423" class="tiny">local or remote thread</text>
+        <text x="64" y="475" class="code">BroadcastChannel</text>
+        <path d="M64 490H211M64 506H211M64 522H184M64 538H205" stroke="var(--line-strong)" stroke-width="1"/>
+        <text x="64" y="575" class="tiny">turns continue while closed</text>
+        <text x="64" y="591" class="code-blue">panel ↔ engine worker</text>
+
+        <rect x="242" y="170" width="168" height="218" class="panel"/>
+        <text x="256" y="192" class="title">ACTIVE TAB</text>
+        <text x="256" y="209" class="code">chrome.debugger</text>
+        <path d="M256 232H394M256 248H380M256 264H388M256 280H366M256 296H394M256 312H374" stroke="var(--line-strong)" stroke-width="2"/>
+        <rect x="256" y="330" width="140" height="35" fill="var(--blue-wash)" stroke="var(--accent-2)"/>
+        <text x="268" y="352" class="tiny">page tools / gated</text>
+
+        <rect x="242" y="410" width="168" height="235" class="panel"/>
+        <text x="256" y="432" class="title">PREVIEW</text>
+        <text x="256" y="449" class="code">preview.html · sandbox</text>
+        <rect x="256" y="468" width="138" height="103" fill="var(--screen)" stroke="var(--ink)"/>
+        <text x="270" y="492" class="screen-text">opaque origin</text>
+        <text x="270" y="507" class="screen-text">allow-scripts</text>
+        <text x="270" y="522" class="screen-text">no same-origin</text>
+        <text x="270" y="537" class="screen-text">Connection-Allowlist</text>
+        <text x="256" y="592" class="tiny">Chrome 152+ enforces the list</text>
+        <text x="256" y="608" class="tiny">older: scripts wait for you</text>
+        <text x="256" y="630" class="code-blue">served by the worker</text>
+
+        <!-- Service worker -->
+        <rect x="465" y="120" width="300" height="218" class="accent"/>
+        <text x="480" y="144" class="title">SERVICE WORKER</text>
+        <text x="480" y="161" class="code">background.js</text>
+        <text x="480" y="182" class="tiny">page reading / acting switches</text>
+        <text x="480" y="198" class="tiny">chrome.debugger actions</text>
+        <text x="480" y="214" class="tiny">tabs · screenshots · network</text>
+        <text x="480" y="230" class="tiny">preview CSP + allowlist</text>
+        <text x="480" y="246" class="tiny">only engine.html may ask tools</text>
+        <rect x="480" y="262" width="270" height="44" fill="var(--panel)" stroke="var(--line)"/>
+        <text x="492" y="280" class="code-blue">page-tools.mjs · shared.mjs</text>
+        <text x="492" y="296" class="tiny">20 s per page call · unknown, never repeated</text>
+        <path d="M438 190V635" class="line-red" stroke-dasharray="4 4" opacity=".55"/>
+
+        <!-- Offscreen engine -->
+        <rect x="465" y="375" width="340" height="260" class="blue"/>
+        <text x="480" y="399" class="title">OFFSCREEN / ENGINE</text>
+        <text x="480" y="416" class="code">engine-worker.mjs</text>
+        <text x="480" y="438" class="tiny">one Dedicated Worker, all threads</text>
+        <text x="480" y="454" class="tiny">BroadcastChannel event fanout</text>
+        <text x="480" y="470" class="tiny">operations serialize per thread</text>
+        <rect x="480" y="488" width="300" height="64" fill="var(--panel)" stroke="var(--line)"/>
+        <text x="492" y="507" class="code-blue">spindle_embed_bg.wasm</text>
+        <text x="492" y="523" class="tiny">embedded host · schema-20 sessions</text>
+        <text x="492" y="539" class="tiny">driver · store · API methods</text>
+        <rect x="480" y="566" width="135" height="50" class="gold"/>
+        <text x="492" y="585" class="tiny">OPFS pool</text>
+        <text x="492" y="600" class="code">threads/</text>
+        <rect x="625" y="566" width="155" height="50" class="accent"/>
+        <text x="637" y="585" class="tiny">vault.mjs</text>
+        <text x="637" y="600" class="code">AES-GCM / PBKDF2</text>
+        <path d="M600 312V375" class="line-blue" marker-end="url(#arrowBlue)"/>
+
+        <!-- Executors -->
+        <rect x="845" y="120" width="300" height="160" class="gold"/>
+        <text x="860" y="144" class="title">PROVIDERS</text>
+        <text x="860" y="161" class="code">HTTPS / direct</text>
+        <text x="860" y="182" class="tiny">model request from WASM host</text>
+        <text x="860" y="198" class="tiny">key added by the worker</text>
+        <text x="860" y="214" class="tiny">stream events back to engine</text>
+        <text x="860" y="242" class="code-blue">no Spindle server required</text>
+
+        <rect x="845" y="310" width="300" height="168" class="panel"/>
+        <text x="860" y="334" class="title">REMOTE HOST</text>
+        <text x="860" y="351" class="code">/v1 · optional</text>
+        <text x="860" y="372" class="tiny">paired Spindle host</text>
+        <text x="860" y="388" class="tiny">PKCE browser token</text>
+        <text x="860" y="404" class="tiny">threads can move host ↔ browser</text>
+        <text x="860" y="420" class="tiny">remote sandbox runs commands</text>
+        <text x="860" y="444" class="code-blue">serve/connect.rs</text>
+
+        <rect x="845" y="510" width="300" height="150" class="blue"/>
+        <text x="860" y="534" class="title">LOCAL LINUX</text>
+        <text x="860" y="551" class="code">v86 / wasm Linux</text>
+        <text x="860" y="572" class="tiny">commands run in the profile</text>
+        <text x="860" y="588" class="tiny">v86 Alpine runs commands</text>
+        <text x="860" y="604" class="tiny">plain sh: wasm Linux if built</text>
+        <text x="860" y="628" class="code-blue">linux-runner.mjs</text>
+
+        <!-- Lines -->
+        <path d="M137 670V704H432V454H465" class="line-blue" marker-end="url(#arrowBlue)"/>
+        <text x="150" y="718" class="tiny">BroadcastChannel</text>
+        <path d="M600 375V338" class="line-blue" marker-end="url(#arrowBlue)"/>
+        <text x="610" y="357" class="tiny">page tools</text>
+        <path d="M465 250H410" class="line-red" marker-end="url(#arrowRed)"/>
+        <text x="420" y="242" text-anchor="end" class="tiny">page tools</text>
+        <path d="M465 320H440V470H410" class="line-red" marker-end="url(#arrowRed)"/>
+        <text x="444" y="462" class="tiny">preview</text>
+        <path d="M735 420H845" class="line-dash" marker-end="url(#arrowInk)"/>
+        <text x="746" y="411" class="tiny">remote</text>
+        <path d="M735 570H845" class="line-dash" marker-end="url(#arrowInk)"/>
+        <text x="746" y="561" class="tiny">local</text>
+        <path d="M735 375C780 340 810 280 845 220" class="line-dash" marker-end="url(#arrowInk)"/>
+        <text x="757" y="341" class="tiny">model + keys</text>
+
+        <!-- Footer note -->
+        <text x="30" y="748" class="code">solid blue = internal extension rail · red = Chrome API boundary · dashed = host / network / sandbox edge</text>
+        <text x="30" y="768" class="tiny">The extension owns the engine; the host-served web app talks to the host's /api. Previews are contained where Chrome enforces Connection-Allowlist (152+).</text>
+
+        <defs>
+          <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="var(--accent-2)"/></marker>
+          <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="var(--accent)"/></marker>
+          <marker id="arrowInk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="var(--ink)"/></marker>
+        </defs>
+      </svg>
+      <div class="scroll-hint">Scroll horizontally to inspect the browser map</div>
+    </div>
+
+    <div class="face-notes">
+      <div class="note-box">
+        <h3>Local-first execution</h3>
+        <p>The side panel never holds the engine. It talks over <code>BroadcastChannel</code> to a dedicated worker in the offscreen document. That worker loads <code>spindle_embed_bg.wasm</code>, keeps sessions in OPFS, and continues running turns while the panel is closed.</p>
+      </div>
+      <div class="note-box">
+        <h3>Trust boundaries</h3>
+        <p>Reading and acting on pages are separate switches, both off until you turn them on. Page tools are accepted only from <code>engine.html</code>; actions use <code>chrome.debugger</code>. Under Before acting (Auto or Ask), an action you allow is done only while the tab still shows the page, part or dialog the question showed you. Provider keys, host tokens, and site secrets are sealed by AES-GCM in the vault.</p>
+      </div>
+      <div class="note-box">
+        <h3>Preview containment</h3>
+        <p><code>preview.html</code> is a manifest-sandboxed page with no extension APIs. The service worker serves it under the sandbox CSP and a <code>Connection-Allowlist</code>, which Chrome 152+ enforces for the page and every frame and worker it makes. On older Chrome a preview shows without its scripts, frames or outside links until you run it, and then runs uncontained.</p>
+      </div>
+      <div class="note-box">
+        <h3>Remote host is optional</h3>
+        <p>A browser can connect to a running Spindle host through the PKCE <code>/connect</code> flow, obtaining a browser token for <code>/v1</code>. Local threads can move to the host; embedded threads use the browser's WASM host.</p>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-num">02b</div>
+        <div>
+          <h2>Browser route</h2>
+          <p>From panel input to a local OPFS session, then through the selected executor and back as events.</p>
+        </div>
+        <div class="section-meta">Browser sequence</div>
+      </div>
+      <div class="route-grid">
+        <article class="route-card"><div class="n">01</div><h3>Panel</h3><p>The side panel reads a prompt, files, page mode, vault state, and the thread's local/remote runner.</p><code>panel.html · panel.mjs</code></article>
+        <article class="route-card"><div class="n">02</div><h3>Channel</h3><p>BroadcastChannel carries requests and event fanout; operations serialize per thread, while turns remain in the worker.</p><code>engine-worker.mjs</code></article>
+        <article class="route-card"><div class="n">03</div><h3>Open session</h3><p>The embedded host opens the thread directory on the OPFS pool and reads the committed head.</p><code>spindle_embed_bg.wasm · OPFS</code></article>
+        <article class="route-card"><div class="n">04</div><h3>Drive</h3><p>The shared driver decides the next model or tool need from the committed state; the browser host performs it.</p><code>driver.rs · embedded/host.rs</code></article>
+        <article class="route-card"><div class="n">05</div><h3>Execute</h3><p>Provider HTTPS, local WASM Linux/v86, page tools through the service worker, or a remote host /v1.</p><code>linux-runner.mjs · page-tools.mjs</code></article>
+        <article class="route-card"><div class="n">06</div><h3>Seal</h3><p>The embedded store commits the result and the worker sends the event back to every open panel.</p><code>embedded/backend.rs</code></article>
+        <article class="route-card"><div class="n">07</div><h3>Preview</h3><p>Preview responses come from the service worker with sandbox CSP and a restrictive Connection-Allowlist.</p><code>background.js · preview.html</code></article>
+        <article class="route-card"><div class="n">08</div><h3>Move</h3><p>A thread can move between browser and a connected host; the host runs its own sandbox when it owns the turn.</p><code>host-moves.mjs · serve/threads.rs</code></article>
+      </div>
+    </div>
+
+    <section class="section works-section">
+      <div class="section-head">
+        <div class="section-num">02w</div>
+        <div>
+          <h2>The Browser Works</h2>
+          <p>The illustrated browser plate: Chrome shell, service worker, offscreen engine, WASM/OPFS, vault, page tools, preview, local Linux, providers, and remote host.</p>
+        </div>
+        <div class="section-meta">Illustrated browser plate</div>
+      </div>
+      <div class="works-frame" tabindex="0" role="region" aria-label="The Browser Works plate (scrolls sideways)">
+      <svg class="works-svg" viewBox="0 0 1200 800" role="img" aria-labelledby="browserWorksTitle browserWorksDesc">
+        <title id="browserWorksTitle">The Browser Works, Spindle for Browser 0.1.6</title>
+        <desc id="browserWorksDesc">An isometric browser cutaway: Chrome side panel and tab feed a service worker and offscreen engine, which loads a WASM host over OPFS, an encrypted vault, providers, local Linux, preview sandbox, and optional remote host.</desc>
+        <defs>
+          <pattern id="browserGrid" width="26" height="26" patternUnits="userSpaceOnUse">
+            <path d="M26 0H0V26" fill="none" stroke="var(--grid)" stroke-width="1"/>
+          </pattern>
+          <pattern id="browserFloor" width="58" height="58" patternUnits="userSpaceOnUse">
+            <path d="M29 0L58 29L29 58L0 29Z" fill="none" stroke="var(--line)" stroke-width="1" opacity=".55"/>
+          </pattern>
+          <marker id="browserArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="var(--accent)"/></marker>
+          <marker id="browserBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="var(--accent-2)"/></marker>
+        </defs>
+        <rect width="1200" height="800" class="bg"/>
+        <rect width="1200" height="800" fill="url(#browserGrid)"/>
+        <text x="30" y="34" class="kicker">PLATE 02 / THE BROWSER WORKS / 0.1.6</text>
+        <text x="1170" y="34" text-anchor="end" class="kicker">CHROME MV3 / NOT TO SCALE</text>
+        <line x1="30" y1="48" x2="1170" y2="48" class="thin"/>
+        <text x="30" y="76" class="h1">THE BROWSER WORKS</text>
+        <text x="30" y="96" class="sub">panel → BroadcastChannel → offscreen engine → WASM host → executor → events</text>
+        <text x="1170" y="76" text-anchor="end" class="code">SCHEMA 20 / OPFS</text>
+        <text x="1170" y="94" text-anchor="end" class="code">CHROMIUM 116+ / 0.1.6</text>
+
+        <ellipse cx="600" cy="550" rx="450" ry="116" fill="var(--shadow)" opacity=".42"/>
+        <polygon points="600,300 1080,510 600,720 120,510" class="floor"/>
+        <polygon points="600,300 1080,510 600,720 120,510" fill="url(#browserFloor)"/>
+        <path d="M600 300V720M120 510H1080" class="floor-grid" stroke-dasharray="3 10"/>
+
+        <!-- Chrome shell -->
+        <g id="chrome-shell">
+          <rect x="60" y="420" width="370" height="310" fill="var(--panel-2)" stroke="var(--ink)" stroke-width="1.3"/>
+          <rect x="60" y="420" width="370" height="28" fill="var(--panel)" stroke="var(--line)"/>
+          <circle cx="75" cy="434" r="3" fill="var(--accent)"/>
+          <circle cx="87" cy="434" r="3" fill="var(--line-strong)"/>
+          <circle cx="99" cy="434" r="3" fill="var(--line-strong)"/>
+          <text x="114" y="438" class="code">CHROME / SPINDLE FOR BROWSER</text>
+          <rect x="74" y="460" width="150" height="250" class="panel"/>
+          <text x="86" y="480" class="title">SIDE PANEL</text>
+          <text x="86" y="496" class="code">panel.html</text>
+          <rect x="86" y="510" width="126" height="38" fill="var(--red-wash)" stroke="var(--accent)"/>
+          <text x="96" y="526" class="small">threads</text>
+          <text x="96" y="540" class="small">chat · files</text>
+          <rect x="86" y="558" width="126" height="38" class="panel"/>
+          <text x="96" y="574" class="small">settings · spend</text>
+          <text x="96" y="588" class="small">page switches</text>
+          <rect x="86" y="606" width="126" height="38" class="gold"/>
+          <text x="96" y="622" class="small">vault · host</text>
+          <text x="96" y="636" class="small">thread menu</text>
+          <text x="86" y="668" class="code">BroadcastChannel</text>
+
+          <rect x="238" y="460" width="178" height="126" class="panel"/>
+          <text x="250" y="480" class="title">ACTIVE TAB</text>
+          <text x="250" y="496" class="code">chrome.debugger</text>
+          <path d="M250 516H402M250 530H388M250 544H396M250 558H374" stroke="var(--line-strong)" stroke-width="2"/>
+          <rect x="250" y="568" width="158" height="44" class="blue"/>
+          <text x="262" y="585" class="small">page tools · reading/acting</text>
+          <text x="262" y="600" class="small">actions · screenshots · network</text>
+
+          <rect x="238" y="596" width="178" height="114" class="panel"/>
+          <text x="250" y="616" class="title">PREVIEW</text>
+          <rect x="250" y="626" width="154" height="54" class="screen"/>
+          <text x="262" y="644" class="small" fill="var(--screen-ink)">sandbox · opaque origin</text>
+          <text x="262" y="658" class="small" fill="var(--screen-ink)">Connection-Allowlist</text>
+          <text x="250" y="696" class="code">Chrome 152+ containment</text>
+          <text x="60" y="752" class="code">CHROME WINDOW / LOCAL PROFILE</text>
+        </g>
+
+        <!-- Service worker -->
+        <g id="browser-service">
+          <g transform="translate(530 430) scale(.42)">
+            <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="iso-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="iso-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <rect x="470" y="380" width="136" height="28" fill="var(--red-wash)" stroke="var(--accent)" stroke-width="1.2"/>
+          <text x="538" y="399" text-anchor="middle" class="label">SERVICE WORKER</text>
+          <text x="538" y="484" text-anchor="middle" class="small">page-tools.mjs</text>
+          <text x="538" y="499" text-anchor="middle" class="small">permissions / debugger</text>
+          <text x="538" y="514" text-anchor="middle" class="code">only engine.html asks</text>
+          <text x="538" y="535" text-anchor="middle" class="small">preview CSP + allowlist</text>
+        </g>
+
+        <!-- Engine worker and WASM host -->
+        <g id="browser-engine">
+          <g transform="translate(690 530) scale(.52)">
+            <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="iso-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="iso-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <rect x="640" y="435" width="112" height="24" fill="var(--blue-wash)" stroke="var(--accent-2)" stroke-width="1.2"/>
+          <text x="696" y="452" text-anchor="middle" class="label">OFFSCREEN ENGINE</text>
+          <text x="696" y="550" text-anchor="middle" class="small">engine-worker.mjs</text>
+          <text x="696" y="565" text-anchor="middle" class="small">one worker · all threads</text>
+          <text x="696" y="580" text-anchor="middle" class="code">spindle_embed_bg.wasm</text>
+          <text x="696" y="595" text-anchor="middle" class="small">driver · schema-20 sessions</text>
+          <text x="696" y="616" text-anchor="middle" class="code">BroadcastChannel fanout</text>
+        </g>
+
+        <!-- OPFS and vault -->
+        <g id="browser-store">
+          <g transform="translate(795 660) scale(.32)">
+            <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="iso-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="iso-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <path d="M735 600L790 640" class="thin"/>
+          <rect x="755" y="650" width="54" height="12" fill="var(--panel)" stroke="var(--ink)"/>
+          <rect x="755" y="667" width="54" height="12" fill="var(--panel)" stroke="var(--ink)"/>
+          <rect x="755" y="684" width="54" height="12" fill="var(--panel)" stroke="var(--ink)"/>
+          <text x="795" y="728" text-anchor="middle" class="label halo">OPFS</text>
+          <text x="795" y="743" text-anchor="middle" class="small">threads · sessions · state</text>
+        </g>
+
+        <g id="browser-vault">
+          <g transform="translate(860 440) scale(.36)">
+            <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
+            <polygon class="iso-left" points="-120,0 0,40 0,100 -120,60"/>
+            <polygon class="iso-right" points="0,40 120,0 120,60 0,100"/>
+          </g>
+          <rect x="830" y="402" width="58" height="42" fill="var(--gold-wash)" stroke="var(--accent-3)" stroke-width="1.2"/>
+          <path d="M850 420V407C850 395 865 395 865 407V420" class="line" stroke-width="2"/>
+          <circle cx="858" cy="428" r="4" fill="var(--accent)"/>
+          <text x="860" y="468" text-anchor="middle" class="label halo">VAULT</text>
+          <text x="860" y="483" text-anchor="middle" class="small">AES-GCM · PBKDF2</text>
+          <text x="860" y="497" text-anchor="middle" class="code">KEYS / HOST TOKEN</text>
+        </g>
+
+        <!-- Provider, remote, local -->
+        <g id="browser-provider">
+          <path d="M986 174C996 156 1016 156 1026 174C1039 170 1050 180 1050 194C1050 211 1038 220 1023 220H1002C985 220 975 208 980 194C982 185 983 179 986 174Z" fill="var(--gold-wash)" stroke="var(--accent-3)" stroke-width="1.2"/>
+          <text x="1014" y="199" text-anchor="middle" class="label">PROVIDERS</text>
+          <text x="1014" y="150" text-anchor="middle" class="code">PROVIDER HTTPS / KEY FROM VAULT</text>
+        </g>
+
+        <g id="browser-remote">
+          <polygon points="930,330 1040,380 930,430 820,380" fill="var(--iso-top)" stroke="var(--ink)" stroke-width="1.2"/>
+          <polygon points="820,380 930,430 930,470 820,420" fill="var(--iso-left)" stroke="var(--ink)" stroke-width="1.2"/>
+          <polygon points="930,430 1040,380 1040,420 930,470" fill="var(--iso-right)" stroke="var(--ink)" stroke-width="1.2"/>
+          <text x="930" y="353" text-anchor="middle" class="label halo">REMOTE HOST</text>
+          <text x="930" y="388" text-anchor="middle" class="small">/v1 · PKCE browser token</text>
+          <text x="930" y="458" text-anchor="middle" class="code">THREAD MOVE / SANDBOX</text>
+        </g>
+
+        <g id="browser-local">
+          <polygon points="1030,580 1140,630 1030,680 920,630" fill="var(--blue-wash)" stroke="var(--accent-2)" stroke-width="1.2"/>
+          <polygon points="920,630 1030,680 1030,720 920,670" fill="var(--iso-left)" stroke="var(--accent-2)" stroke-width="1.2"/>
+          <polygon points="1030,680 1140,630 1140,670 1030,720" fill="var(--iso-right)" stroke="var(--accent-2)" stroke-width="1.2"/>
+          <text x="1030" y="603" text-anchor="middle" class="label halo">LOCAL LINUX</text>
+          <text x="1030" y="638" text-anchor="middle" class="small">v86 / wasm Linux</text>
+          <text x="1030" y="708" text-anchor="middle" class="code">COMMANDS</text>
+        </g>
+
+        <!-- Lines -->
+        <path d="M210 720V748H560V610H640" class="blue-line" marker-end="url(#browserBlue)"/>
+        <text x="220" y="764" class="code">BROADCASTCHANNEL / EVENTS</text>
+        <path d="M600 455H640" class="blue-line" marker-end="url(#browserBlue)"/>
+        <text x="602" y="447" class="code">page tools</text>
+        <path d="M470 425H400" class="red" marker-end="url(#browserArrow)"/>
+        <text x="405" y="417" text-anchor="end" class="code">debugger</text>
+        <path d="M470 500H415V610H400" class="red" marker-end="url(#browserArrow)"/>
+        <text x="430" y="604" class="code">preview</text>
+        <path d="M696 590H760V650" class="thin"/>
+        <path d="M735 550H790V430H830" class="dash" marker-end="url(#browserBlue)"/>
+        <path d="M780 470C850 420 940 300 980 250" class="dash" marker-end="url(#browserBlue)"/>
+        <text x="850" y="300" class="code">model</text>
+        <path d="M735 600H930V470" class="dash" marker-end="url(#browserBlue)"/>
+        <text x="848" y="586" class="code">remote</text>
+        <path d="M735 620H920V640" class="dash" marker-end="url(#browserBlue)"/>
+        <text x="850" y="635" class="code">local</text>
+
+        <text x="600" y="788" text-anchor="middle" class="code">browser engine · WASM + OPFS · sandbox preview · Chrome API boundary</text>
+      </svg>
+      <div class="scroll-hint">Scroll horizontally to inspect the browser plate</div>
+    </div>
+
+    <div class="notes">
+      <article class="note"><b>01 / PANEL</b><h3>Chrome shell</h3><p>The side panel holds threads, files, settings, spend, page switches, vault state, and the local/remote runner choice.</p></article>
+      <article class="note"><b>02 / ENGINE</b><h3>Offscreen, not in the panel</h3><p>The dedicated worker runs every thread. It loads <code>spindle_embed_bg.wasm</code> over OPFS and continues while the panel is closed.</p></article>
+      <article class="note"><b>03 / EDGES</b><h3>Page, model, local, remote</h3><p>Page tools go through the service worker and debugger; models use direct HTTPS; commands use local WASM Linux/v86 or an optional host.</p></article>
+    </div>
+
+    <div class="callout">
+      <article><b>Preview caveat</b><p>Service-worker CSP and <code>Connection-Allowlist</code> contain previews where Chrome enforces the list (152+). Older Chrome shows a preview without its scripts until you run it.</p></article>
+      <article><b>Vault model</b><p>Device keys are non-extractable IndexedDB keys; passphrase vaults wrap the key with AES-KW and PBKDF2-SHA-256 at 600,000 rounds. Provider, site, and host records are AES-GCM sealed.</p></article>
+    </div>
+    </section>
+
+  </section>
+
+  <section class="panel" id="panel-details" data-panel="details" role="tabpanel" aria-labelledby="tab-details">
+    <div class="section-head">
+      <div class="section-num">03</div>
+      <div>
+        <h2>Store + engine evidence</h2>
+        <p>The hard numbers behind the maps, plus the boundaries that keep the browser, host, embedded package, and engine from being confused.</p>
+      </div>
+      <div class="section-meta">As of 0.1.6</div>
+    </div>
+
+    <div class="detail-grid">
+      <article class="detail-card">
+        <h3>Schema 20</h3>
+        <p><code>SCHEMA = 20</code>, <code>LEGACY_SCHEMAS = [14,15,16,17,18,19]</code>, <code>PREVIOUS_SCHEMA = 19</code>. A native open migrates in place after copying the store to <code>authority.vN.sqlite</code>; browser stores and imports migrate 19 in one checked transaction. WAL and <code>synchronous=FULL</code> remain the store profile.</p>
+        <div class="cap-list">
+          <div class="cap"><b>Payload</b><span>32 MiB</span></div>
+          <div class="cap"><b>Admissions</b><span>1,048,576</span></div>
+          <div class="cap"><b>Workspace files</b><span>50,000</span></div>
+          <div class="cap"><b>Object</b><span>64 MiB</span></div>
+          <div class="cap"><b>Objects total</b><span>16 GiB</span></div>
+          <div class="cap"><b>Effects / proposal</b><span>8</span></div>
+        </div>
+      </article>
+      <article class="detail-card">
+        <h3>Capabilities contract</h3>
+        <p><code>CAPABILITIES</code> advertises transactional receipts and revision-pinned file maps, but still says no native execution, no Dext engine, no durable rewind, no power-loss certification, no backup restore. The code exists; the public contract is deliberately conservative.</p>
+        <div class="cap-list">
+          <div class="cap"><b>Schema</b><span>20</span></div>
+          <div class="cap"><b>API</b><span>v1</span></div>
+          <div class="cap"><b>Browser</b><span>0.1.6</span></div>
+          <div class="cap"><b>Chromium</b><span>116+</span></div>
+          <div class="cap"><b>Engine</b><span>4 + app</span></div>
+          <div class="cap"><b>Reference</b><span>schema 2</span></div>
+        </div>
+      </article>
+      <article class="detail-card">
+        <h3>The schema-20 pipeline</h3>
+        <p>The host has a shared turn driver and embedded host, reads helpers, protocol/meta/spend modules, connect and thread services, browser PKCE onboarding, and the browser extension's WASM host. The store still owns the atomic admission → revision → intent → attempt → receipt chain.</p>
+      </article>
+      <article class="detail-card warn">
+        <h3>Boundary checks</h3>
+        <p>The browser extension is not <code>spindle serve</code>; the PWA is not the extension; <code>spindle-reference</code> is not a runtime; <code>dext</code> app is not a <code>spindle-store</code> dependency.</p>
+      </article>
+    </div>
+
+    <div class="detail-grid" style="margin-top:14px">
+      <article class="detail-card">
+        <h3>Approvals held to the page</h3>
+        <p>Before acting is Full (the default), Auto (asks before what sends or submits) or Ask (before every action). An action you allow carries what the question showed: the tab, the page's document, the part's description, or the dialog. The service worker checks it just before acting; if the page reloaded or moved on, nothing is done and the thread is told.</p>
+      </article>
+      <article class="detail-card">
+        <h3>Storage a crash cannot tear</h3>
+        <p>Every OPFS slot header carries a CRC-32 beside its path, in its first sector, and every rename writes a record of itself first. A crash at any byte of any header write reopens with each file whole under one of its two names, and a directory never split; tests cut every byte and every set of sectors.</p>
+      </article>
+      <article class="detail-card">
+        <h3>One live copy</h3>
+        <p>A thread moves between browser and host by bundle and lives in one place: sealed where it left, staged where it arrives. A host unpacks an import into a private staging directory and checks every store there, one import at a time, never holding the bundle in memory; browser tokens see only their own threads.</p>
+      </article>
+      <article class="detail-card">
+        <h3>Unknown stays unknown</h3>
+        <p>A step cut off is recorded as stopped or unknown, never sent again on its own: Retry sends it once, Take back returns its message. A page action interrupted mid-way is reported unknown; in the browser, a parent's Stop leaves its background tasks running, their page actions too.</p>
+      </article>
+    </div>
+
+    <div class="engine-panel" style="margin-top:14px">
+      <header><span>DEXT ENGINE / EVIDENCE</span><span>4 + 1</span></header>
+      <div class="engine-stack">
+        <article class="engine-card"><h3>dext-core</h3><code>core/src/*.rs</code><p>Pure model wait, turn, response, and recovery decisions. No host I/O; unsafe code forbidden.</p></article>
+        <article class="engine-card"><h3>dext-transcript</h3><code>transcript/src/*.rs</code><p>Messages, blocks, checkpoints, runtime, continuations, and tool results.</p></article>
+        <article class="engine-card"><h3>dext-provider</h3><code>provider/src/*.rs</code><p>Catalog, auth/OAuth, wire shaping, request contracts.</p></article>
+        <article class="engine-card"><h3>dext-native</h3><code>native/src/*.rs</code><p>SSE, streaming, model transport, strict/host runners, jobs, cgroups, process tree, image policy.</p></article>
+        <article class="engine-card app"><h3>dext CLI app</h3><code>src/main.rs + modules</code><p>Full app; not linked by <code>spindle-store</code>.</p></article>
+      </div>
+      <div class="engine-foot">Engine limits (<code>native/src/limits.rs</code>): 64 MiB files, 2 GiB trees, 1,800 s runs, 16 jobs. Toolchain memory and process limits are separate from the Spindle admission model.</div>
+    </div>
+
+    <div class="oracle" style="margin-top:14px">
+      <b>Reference model<br>not runtime</b>
+      <p><code>spindle-reference</code> remains the bounded in-memory lifecycle model: schema 2, 14 operations, 8 entries per record map, 16 commits, no live dispatch. It is not the store schema and not the browser engine.</p>
+    </div>
+  </section>
+</main>
+
+<footer class="footer site-foot">
+  <p>Spindle · MIT · &copy; SiliconState · drawn from the code as of Spindle for Browser 0.1.6; the docs say more.</p>
+  <nav aria-label="Footer">
+    <a href="../">Spindle</a>
+    <a href="../browser/">Spindle for Browser</a>
+    <a href="https://github.com/SiliconState/Spindle/tree/main/docs">Documentation</a>
+    <a href="https://github.com/SiliconState/Spindle/blob/main/SECURITY.md">Security</a>
+    <a href="../privacy/">Privacy</a>
+  </nav>
+</footer>
+
+</div>
+
+<script>
+(() => {
+  const root = document.documentElement;
+  root.classList.remove("no-js");
+  const KEY = "spindle-atlas-theme";
+  const themeButtons = Array.from(document.querySelectorAll("[data-set-theme]"));
+  const validThemes = new Set(["light", "dark", "dim"]);
+  let kept = null;
+  try { kept = localStorage.getItem(KEY); } catch {}
+  const system = () => (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const markTheme = (theme) => {
+    themeButtons.forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.setTheme === theme)));
+  };
+  root.dataset.theme = validThemes.has(kept) ? kept : system();
+  markTheme(root.dataset.theme);
+  themeButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      root.dataset.theme = button.dataset.setTheme;
+      markTheme(button.dataset.setTheme);
+      try { localStorage.setItem(KEY, button.dataset.setTheme); } catch {}
+    });
+  });
+
+  const tabs = Array.from(document.querySelectorAll("[data-tab]"));
+  const panels = Array.from(document.querySelectorAll("[data-panel]"));
+  const ids = tabs.map((tab) => tab.dataset.tab);
+  const show = (id, { hash = true, focus = false } = {}) => {
+    tabs.forEach((tab) => {
+      const on = tab.dataset.tab === id;
+      tab.setAttribute("aria-selected", String(on));
+      tab.tabIndex = on ? 0 : -1;
+      if (on && focus) tab.focus();
+    });
+    panels.forEach((panel) => { panel.hidden = panel.dataset.panel !== id; });
+    if (hash && location.hash.slice(1) !== id) history.pushState(null, "", `#${id}`);
+  };
+  tabs.forEach((tab, at) => {
+    tab.addEventListener("click", () => { show(tab.dataset.tab); window.scrollTo({ top: 0, behavior: "auto" }); });
+    tab.addEventListener("keydown", (event) => {
+      const step = { ArrowRight: 1, ArrowLeft: -1, Home: -at, End: tabs.length - 1 - at }[event.key];
+      if (step === undefined) return;
+      event.preventDefault();
+      show(ids[(at + step + tabs.length) % tabs.length], { focus: true });
+    });
+  });
+  const fromHash = () => show(ids.includes(location.hash.slice(1)) ? location.hash.slice(1) : ids[0], { hash: false });
+  window.addEventListener("hashchange", fromHash);
+  window.addEventListener("popstate", fromHash);
+  fromHash();
+})();
+</script>
+</body>
+</html>

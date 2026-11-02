@@ -11,6 +11,7 @@ implement what each page describes.
 | [Getting started](getting-started.md) | Build, sign in to a provider, run and resume a session, start the web UI host |
 | [Concepts](concepts.md) | Sessions, revisions, effects, unknown outcomes, rewind, tools, tasks, bundles |
 | [Architecture](architecture.md) | System context, layers, crates, a turn end to end, hosts, deployment shapes |
+| [Atlas](https://siliconstate.github.io/Spindle/atlas/) | The architecture on illustrated plates: surfaces and host, the turn route, store and engine, Spindle for Browser |
 | [Security](../SECURITY.md) | Trust model, credentials, command isolation, recovery semantics, the web UI host |
 
 ## Reference

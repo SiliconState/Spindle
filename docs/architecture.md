@@ -1,5 +1,8 @@
 # Architecture
 
+> The same system on illustrated plates: the [Spindle Atlas](https://siliconstate.github.io/Spindle/atlas/)
+> (every surface and the host, the turn route, the store and engine, Spindle for Browser).
+
 Spindle is a durable coding agent built around one rule: **the store decides, hosts act.**
 A SQLite store holds every committed revision of a session (conversation, workspace files
 and app state together). A portable decision driver reads the committed head and says
