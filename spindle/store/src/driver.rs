@@ -2370,6 +2370,8 @@ pub(crate) fn store_error(error: Error) -> String {
 
 /// A reply that could not be read, saying why when the parser said (`why`): an error
 /// the provider streamed after its reply began is the provider's own, not unreadable.
+/// Only the hosts that parse replies (native `agent`, `embedded`) use it.
+#[cfg(any(feature = "agent", feature = "embedded"))]
 pub(crate) fn unreadable(why: Option<&str>) -> String {
     let failed = model_error(crate::ModelError::Protocol);
     let Some(why) = why else {
