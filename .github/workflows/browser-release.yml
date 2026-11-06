@@ -4,7 +4,9 @@ name: browser release
 # where VERSION is spindle/chrome/manifest.json's version; the job builds the extension
 # from that commit (the browser Linux included), checks the unpacked zip in Chrome
 # against a scripted provider, attests where it was built, and attaches it to the
-# tag's release. Running it by hand on an existing tag builds and replaces the zip.
+# tag's release, beside the Chrome Web Store's build of the same commit (ChatGPT signs in
+# there only with OpenAI's Sign in with ChatGPT). Running it by hand on an existing tag
+# builds and replaces the zips.
 on:
   push:
     tags: ["browser-v*"]
@@ -45,6 +47,7 @@ jobs:
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
           echo "ASSET=spindle-browser-$version.zip" >> "$GITHUB_ENV"
+          echo "STORE_ASSET=spindle-browser-store-$version.zip" >> "$GITHUB_ENV"
           echo "MINIMUM=$(node -p "require('./spindle/chrome/manifest.json').minimum_chrome_version")" >> "$GITHUB_ENV"
       - name: Tools
         run: |
@@ -88,9 +91,31 @@ jobs:
             for (const part of ["spindle", "engine"]) if (!/^[0-9a-f]{12}$/.test(build[part])) throw new Error(`build.json ${part}: ${build[part]}`);
             console.log(JSON.stringify(build));
           ' "$RUNNER_TEMP/spindle-browser/build.json"
+      - name: The Chrome Web Store's build, checked in Chrome
+        working-directory: spindle
+        run: |
+          # Without the ChatGPT sign-in through the Codex CLI's client (build.sh checks
+          # none of it is in the files); everything else as the zip above.
+          SPINDLE_STORE=1 chrome/build.sh "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen" "$RUNNER_TEMP/store-dist"
+          cp ../LICENSE "$RUNNER_TEMP/store-dist/LICENSE"
+          if grep -r -a -l -F -e "$HOME" -e "$GITHUB_WORKSPACE" "$RUNNER_TEMP/store-dist"; then
+            echo "build paths in the files above" >&2
+            exit 1
+          fi
+          (cd "$RUNNER_TEMP/store-dist" && zip -q -r -X "$RUNNER_TEMP/$STORE_ASSET" .)
+          (cd "$RUNNER_TEMP" && sha256sum "$STORE_ASSET" > "$STORE_ASSET.sha256")
+          unzip -q "$RUNNER_TEMP/$STORE_ASSET" -d "$RUNNER_TEMP/spindle-browser-store"
+          SPINDLE_BROWSER="$(command -v google-chrome)" \
+            node chrome/tests/extension_real.mjs "$RUNNER_TEMP/spindle-browser-store" --scripted
+          node -e '
+            const build = require(process.argv[1]);
+            if (build.version !== process.env.VERSION || build.edition !== "store") throw new Error(`build.json says ${build.version} ${build.edition}`);
+          ' "$RUNNER_TEMP/spindle-browser-store/build.json"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ runner.temp }}/${{ env.ASSET }}
+          subject-path: |
+            ${{ runner.temp }}/${{ env.ASSET }}
+            ${{ runner.temp }}/${{ env.STORE_ASSET }}
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -110,12 +135,14 @@ jobs:
 
           This build runs commands in the browser Linux on v86. The faster wasm Linux is in builds made from source with \`SPINDLE_WASM_LINUX\` ([how](https://github.com/$GITHUB_REPOSITORY/blob/main/docs/browser-linux.md#building-the-images)).
 
+          \`$STORE_ASSET\` is the Chrome Web Store's build of this tag: the same extension, with ChatGPT signing in only through OpenAI's Sign in with ChatGPT (builds from source also offer ChatGPT through the Codex CLI's sign-in).
+
           The zip's THIRD-PARTY.md lists the other software it carries, with licenses and sources.
           EOF
           cd "$RUNNER_TEMP"
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" -R "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" "$STORE_ASSET" "$STORE_ASSET.sha256" -R "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$TAG" "$ASSET" "$ASSET.sha256" -R "$GITHUB_REPOSITORY" --verify-tag \
+            gh release create "$TAG" "$ASSET" "$ASSET.sha256" "$STORE_ASSET" "$STORE_ASSET.sha256" -R "$GITHUB_REPOSITORY" --verify-tag \
               --title "Spindle for Browser $VERSION" --notes-file notes.md
           fi
