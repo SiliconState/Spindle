@@ -15,10 +15,10 @@ names, which Edge shares. In Edge, Brave or Opera, the panel and the messages it
 browser's name where they would say Chrome (`BROWSER` in
 [`page-tools.mjs`](../spindle/chrome/page-tools.mjs)). The manifest's current version is **0.1.8**
 ([`manifest.json`](../spindle/chrome/manifest.json)); its release assets are
-`spindle-browser-0.1.8.zip` and `spindle-browser-store-0.1.8.zip`. A release is
-available once the matching `browser-v0.1.8` tag's workflow finishes and attaches
-its checked zips. The product page keeps its download on the last published release
-until then. Historical additions in 0.1.7 remain marked below.
+`spindle-browser-0.1.8.zip` and `spindle-browser-store-0.1.8.zip`, published by the
+matching `browser-v0.1.8` tag's workflow after checking the unpacked zips. The
+standard zip retains ChatGPT (Codex); the store edition omits its client.
+Historical additions in 0.1.7 remain marked below.
 
 ## Contents
 
@@ -1110,9 +1110,9 @@ zip. The zip also holds the `LICENSE` and
 with licenses and sources.
 
 1. Download `spindle-browser-VERSION.zip` (and `spindle-browser-VERSION.zip.sha256` to check
-   it) and unzip it into a folder you will keep. To check version 0.1.7 first, run
-   `sha256sum -c spindle-browser-0.1.7.zip.sha256`, or
-   `gh attestation verify spindle-browser-0.1.7.zip -R SiliconState/Spindle`.
+   it) and unzip it into a folder you will keep. To check version 0.1.8 first, run
+   `sha256sum -c spindle-browser-0.1.8.zip.sha256`, or
+   `gh attestation verify spindle-browser-0.1.8.zip -R SiliconState/Spindle`.
 2. Load the folder as below (**Load unpacked**).
 3. To update, unzip the next version over the same folder and click **Reload** on the
    extension's card. The browser derives an unpacked extension's id from its folder, and its

@@ -146,16 +146,13 @@ Interrupted? `spindle --dir ../demo continue`. The web UI:
 [docs/host.md](docs/host.md#remote-access-through-a-reverse-proxy)). Full walkthrough:
 [docs/getting-started.md](docs/getting-started.md).
 
-**Current source and released zip.** The source includes OpenAI's Sign in with
-ChatGPT and keeps **ChatGPT (Codex)** in the source/GitHub edition. The store edition
-(`SPINDLE_STORE=1`) omits the legacy Codex client. Version 0.1.8 is prepared for
-release with these changes plus reviewed credential-refresh, background-task file
-delivery and restart/storage fixes. Until its release workflow publishes the zips,
-the download below remains on 0.1.7. A new release needs a new manifest version
-and matching tag.
+**Spindle for Browser 0.1.8.** The standard/GitHub zip includes OpenAI's Sign in
+with ChatGPT and keeps **ChatGPT (Codex)**. The store-edition zip omits the legacy
+Codex client. This release also includes reviewed credential-refresh,
+background-task file delivery and restart/storage fixes.
 
-**Spindle for Browser 0.1.7.** Download `spindle-browser-0.1.7.zip` from the
-[latest release](https://github.com/SiliconState/Spindle/releases/latest), unzip it, and load
+Download `spindle-browser-0.1.8.zip` from the
+[0.1.8 release](https://github.com/SiliconState/Spindle/releases/tag/browser-v0.1.8), unzip it, and load
 the folder with **Load unpacked** in `chrome://extensions`, `edge://extensions` or `brave://extensions`
 ([docs/chrome.md](docs/chrome.md#install-a-release)). Its single-box composer,
 grouped threads, compact steps and task cards share the web UI's design. Workspace
