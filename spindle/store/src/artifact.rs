@@ -244,6 +244,84 @@ pub(crate) fn unpack(stored: &[u8], size: Option<i64>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Bytes `from..to` of an object a stage of `scope` pins (clipped to its length), and
+/// that length. It is checked against its digest whole the first time on a connection
+/// (and remembered, as `validate_tree_root` remembers objects); later reads take only
+/// the range, inflating a packed object no further than `to`.
+#[cfg(feature = "workspace-tools")]
+pub(crate) fn object_range(
+    db: &Connection,
+    scope: &str,
+    digest: &str,
+    from: usize,
+    to: usize,
+) -> Result<(usize, Vec<u8>)> {
+    crate::workspace::remembered(db)?;
+    let verified: bool = db
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM temp.spindle_valid_objects WHERE digest=?1)")?
+        .query_row([digest], |row| row.get(0))?;
+    if !verified {
+        let bytes: Vec<u8> = db
+            .prepare_cached(STORED_IN_SCOPE)?
+            .query_row(params![digest, scope], |row| object_at(row, 0))
+            .optional()?
+            .ok_or(Error::Invalid)?;
+        if object_digest(&bytes) != digest {
+            return Err(Error::Incompatible);
+        }
+        db.prepare_cached("INSERT OR IGNORE INTO temp.spindle_valid_objects VALUES(?1)")?
+            .execute([digest])?;
+        let to = to.min(bytes.len());
+        return Ok((bytes.len(), bytes[from.min(to)..to].to_vec()));
+    }
+    db.prepare_cached(STORED_IN_SCOPE)?
+        .query_row(params![digest, scope], |row| {
+            let size: Option<i64> = row.get(1)?;
+            let ValueRef::Blob(stored) = row.get_ref(0)? else {
+                return Err(rusqlite::Error::InvalidQuery);
+            };
+            prefix(stored, size, to)
+                .map(|(length, bytes)| {
+                    let to = to.min(bytes.len());
+                    (length, bytes[from.min(to)..to].to_vec())
+                })
+                .map_err(|_| rusqlite::Error::InvalidQuery)
+        })
+        .optional()?
+        .ok_or(Error::Invalid)
+}
+
+/// An object's length and its first `want` bytes (fewer when it is shorter), from its
+/// row's `stored` bytes and `size`: a packed one inflated only that far.
+#[cfg(feature = "workspace-tools")]
+fn prefix(stored: &[u8], size: Option<i64>, want: usize) -> Result<(usize, Cow<'_, [u8]>)> {
+    let Some(size) = size else {
+        return Ok((
+            stored.len(),
+            Cow::Borrowed(&stored[..want.min(stored.len())]),
+        ));
+    };
+    let size = usize::try_from(size)
+        .ok()
+        .filter(|size| *size > stored.len() && *size <= MAX_OBJECT)
+        .ok_or(Error::Incompatible)?;
+    let mut out = vec![0; want.min(size)];
+    let mut state = Box::<DecompressorOxide>::default();
+    let (status, _, written) = decompress(
+        &mut state,
+        stored,
+        &mut out,
+        0,
+        TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+    );
+    let whole = status == TINFLStatus::Done && written == size;
+    let cut = status == TINFLStatus::HasMoreOutput && written == out.len();
+    if !(whole || cut) {
+        return Err(Error::Incompatible);
+    }
+    Ok((size, Cow::Owned(out)))
+}
+
 /// The object a row holds in columns `at` (stored bytes) and `at + 1` (`size`); a
 /// malformed one reads as an invalid query, as other bounded columns do.
 pub(crate) fn object_at(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Vec<u8>> {
@@ -270,26 +348,52 @@ pub(crate) fn checked_at(
     }
 }
 
-/// Schema 20's objects: the `size` column, then (`pack_rows`) every row kept as `pack`
-/// keeps it. Rows left as they are stay valid (NULL `size`), so checking an older image
-/// only adds the column.
-pub(crate) fn upgrade(tx: &Connection, pack_rows: bool) -> Result<()> {
+/// Schema 20's objects: the `size` column. Rows kept as they are stay valid (NULL
+/// `size`); `pack_unpacked` packs them after the migration has committed.
+pub(crate) fn upgrade(tx: &Connection) -> Result<()> {
     tx.execute_batch("ALTER TABLE objects ADD COLUMN size INTEGER CHECK(size>0)")?;
-    if !pack_rows {
-        return Ok(());
-    }
+    Ok(())
+}
+
+/// Most bytes of objects one `pack_unpacked` transaction reads.
+const PACK_BATCH: usize = 8 * 1024 * 1024;
+
+/// Packs every object a migrated store kept as it was, as `pack` keeps it, a batch at a
+/// time: each its own transaction reading at most `PACK_BATCH` bytes (or one object), so
+/// no journal ever holds the whole object store. Best effort: a row left as it is stays
+/// valid, so a full disk or quota stops the packing, never the store.
+pub(crate) fn pack_unpacked(db: &Connection) -> Result<()> {
     // Row ids first (8 bytes each, however many objects), then one object at a time.
-    let rows = tx
-        .prepare("SELECT rowid FROM objects WHERE length(bytes)>=?1")?
+    let rows = db
+        .prepare("SELECT rowid FROM objects WHERE size IS NULL AND length(bytes)>=?1")?
         .query_map([PACK_FROM as i64], |row| row.get::<_, i64>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut read = tx.prepare("SELECT bytes FROM objects WHERE rowid=?1")?;
-    let mut write = tx.prepare("UPDATE objects SET bytes=?1,size=?2 WHERE rowid=?3")?;
-    for row in rows {
-        let bytes = read.query_row([row], |row| crate::bounded_blob(row, 0, MAX_OBJECT))?;
-        if let (Cow::Owned(packed), Some(size)) = pack(&bytes) {
-            write.execute(params![packed, size, row])?;
+    let mut rows = rows.as_slice();
+    while !rows.is_empty() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        {
+            let mut read =
+                tx.prepare_cached("SELECT bytes FROM objects WHERE rowid=?1 AND size IS NULL")?;
+            let mut write =
+                tx.prepare_cached("UPDATE objects SET bytes=?1,size=?2 WHERE rowid=?3")?;
+            let mut batch = 0;
+            while let Some((&row, rest)) = rows.split_first()
+                && batch < PACK_BATCH
+            {
+                rows = rest;
+                let Some(bytes) = read
+                    .query_row([row], |row| crate::bounded_blob(row, 0, MAX_OBJECT))
+                    .optional()?
+                else {
+                    continue;
+                };
+                batch += bytes.len();
+                if let (Cow::Owned(packed), Some(size)) = pack(&bytes) {
+                    write.execute(params![packed, size, row])?;
+                }
+            }
         }
+        tx.commit()?;
     }
     Ok(())
 }
@@ -855,7 +959,6 @@ impl Store {
             if cancelled {
                 return Err(Error::Cancelled);
             }
-            let mut pinned = crate::workspace::scope_pins(&tx, &stage.scope)?;
             let mut digests = Vec::with_capacity(paths.len());
             for path in paths {
                 let bytes = match read(path) {
@@ -864,7 +967,8 @@ impl Store {
                     Err(error) => return Ok(Err(format!("`{path}` could not be read: {error}"))),
                 };
                 let id = object_digest(&bytes);
-                if pinned.insert(id.clone()) {
+                // Pinned once in the scope (a repeat in this call is pinned by now).
+                if !crate::workspace::pinned_in_scope(&tx, &stage.scope, &id)? {
                     let stored: bool = tx
                         .prepare_cached("SELECT EXISTS(SELECT 1 FROM objects WHERE digest=?1)")?
                         .query_row([&id], |r| r.get(0))?;
@@ -934,29 +1038,41 @@ impl Store {
         if current.fits(room) && !current.crowded() {
             return Ok(true);
         }
-        let last: Option<Usage> = self
+        let last: Option<(Usage, bool)> = self
             .db
             .query_row(
-                "SELECT stages,pins,objects,bytes FROM temp.spindle_collected WHERE id=1",
+                "SELECT stages,pins,objects,bytes,journals FROM temp.spindle_collected WHERE id=1",
                 [],
                 |r| {
-                    Ok(Usage {
-                        stages: r.get(0)?,
-                        pins: r.get(1)?,
-                        objects: r.get(2)?,
-                        bytes: r.get(3)?,
-                    })
+                    Ok((
+                        Usage {
+                            stages: r.get(0)?,
+                            pins: r.get(1)?,
+                            objects: r.get(2)?,
+                            bytes: r.get(3)?,
+                        },
+                        r.get(4)?,
+                    ))
                 },
             )
             .optional()
             .unwrap_or(None);
         let due = match &last {
             None => true,
-            Some(last) if current.fits(room) => current.grown_since(last),
-            Some(last) => current != *last,
+            Some((last, _)) if current.fits(room) => current.grown_since(last),
+            // Short of room: again once usage changed, or with the journals the last
+            // collection kept.
+            Some((last, journals)) => current != *last || !journals,
         };
         if due {
             self.collect_garbage()?;
+            // Only when nothing else makes room: finished scripts' journals (what their
+            // nested calls were asked and answered), each call's spend kept.
+            let after = usage(&self.db);
+            if !self.artifact_result(after)?.fits(room) {
+                let result = self.collect_transaction(true);
+                self.artifact_result(result)?;
+            }
         }
         let after = usage(&self.db);
         Ok(self.artifact_result(after)?.fits(room))
@@ -967,26 +1083,26 @@ impl Store {
     /// names (in the root's scope); every stage that is not a resolved strict tool
     /// attempt's own (host, image, import and rewind stages, and attempts still
     /// unresolved); the retained output artifact a strict or app tool receipt names, pinned by its
-    /// attempt's stage so `read_output` keeps working; and the child journal of every
-    /// unresolved run_code attempt (journals of resolved scripts, kept for inspection,
-    /// are collected too once the store is half full). Objects whose last pin went
-    /// are deleted. One transaction; space is reused by later writes, not returned to
-    /// the filesystem.
+    /// attempt's stage so `read_output` keeps working; and every code-mode script's
+    /// child journal (a finished script's is collected only when a write would not fit
+    /// otherwise: `make_room`). Objects whose last pin went are deleted. One
+    /// transaction; space is reused by later writes, not returned to the filesystem.
     pub fn collect_garbage(&mut self) -> Result<Collected> {
         if self.paused {
             return Err(Error::Paused);
         }
-        let result = self.collect_transaction();
+        let result = self.collect_transaction(false);
         self.artifact_result(result)
     }
 
     #[cfg(not(feature = "workspace-tools"))]
-    fn collect_transaction(&mut self) -> Result<Collected> {
+    fn collect_transaction(&mut self, _journals: bool) -> Result<Collected> {
         Ok(Collected::default())
     }
 
+    /// `journals`: finished scripts' child journals go too (their spend kept).
     #[cfg(feature = "workspace-tools")]
-    fn collect_transaction(&mut self) -> Result<Collected> {
+    fn collect_transaction(&mut self, journals: bool) -> Result<Collected> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1061,11 +1177,7 @@ impl Store {
                 collectable.push((stage, scope, artifact));
             }
         }
-        let crowded = before.stages * 2 > MAX_STAGES
-            || before.pins * 2 > MAX_PINS
-            || before.objects * 2 > MAX_OBJECTS
-            || before.bytes * 2 > MAX_OBJECT_BYTES;
-        if crowded {
+        if journals {
             let journals = resolved_journals(&tx)?;
             keep_spend(&tx, epoch, &journals)?;
             collectable.extend(journals);
@@ -1089,13 +1201,19 @@ impl Store {
             "CREATE TEMP TABLE gc_pinned AS SELECT DISTINCT digest FROM staging_pins;
              DELETE FROM objects WHERE digest IN (SELECT digest FROM temp.gc_freed EXCEPT SELECT digest FROM temp.gc_pinned);
              DROP TABLE temp.gc_live; DROP TABLE temp.gc_freed; DROP TABLE temp.gc_pinned;
-             CREATE TEMP TABLE IF NOT EXISTS spindle_collected(id INTEGER PRIMARY KEY CHECK(id=1), stages INTEGER NOT NULL, pins INTEGER NOT NULL, objects INTEGER NOT NULL, bytes INTEGER NOT NULL);",
+             CREATE TEMP TABLE IF NOT EXISTS spindle_collected(id INTEGER PRIMARY KEY CHECK(id=1), stages INTEGER NOT NULL, pins INTEGER NOT NULL, objects INTEGER NOT NULL, bytes INTEGER NOT NULL, journals INTEGER NOT NULL);",
         )?;
         crate::workspace::forget_validated_roots(&tx)?;
         let after = usage(&tx)?;
         tx.execute(
-            "INSERT OR REPLACE INTO temp.spindle_collected VALUES(1,?1,?2,?3,?4)",
-            params![after.stages, after.pins, after.objects, after.bytes],
+            "INSERT OR REPLACE INTO temp.spindle_collected VALUES(1,?1,?2,?3,?4,?5)",
+            params![
+                after.stages,
+                after.pins,
+                after.objects,
+                after.bytes,
+                journals
+            ],
         )?;
         tx.commit()?;
         Ok(Collected {
@@ -1120,6 +1238,149 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A finished script's journal (what its nested calls asked and were answered) is
+    /// kept by every collection, a crowded store's too, until a write needs its room.
+    #[cfg(feature = "workspace-tools")]
+    #[test]
+    fn finished_script_journals_are_kept_until_their_room_is_needed() {
+        let root = std::env::temp_dir().join(format!(
+            "spindle-journal-gc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut store = Store::open(&root).unwrap();
+        let stage = child_stage("parent", 0);
+        let record = serde_json::to_vec(&serde_json::json!({"kind":"reserved","parent":"parent",
+            "request":{"id":0,"method":"model"},"prepared":{"provider":"p","model":"m","contract":"c"}}))
+        .unwrap();
+        let digest = object_digest(&record);
+        // The parent's receipt (it finished), its journal, and half the stage cap held
+        // by stages nothing collects.
+        store.db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        store
+            .db
+            .execute("INSERT INTO receipts VALUES('parent',X'00',NULL)", [])
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO artifact_stages VALUES(?1,'operator',?2)",
+                params![stage, store.epoch as i64],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO objects VALUES(?1,?2,NULL)",
+                params![digest, record],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO staging_pins VALUES(?1,?2)",
+                params![stage, digest],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                 INSERT INTO artifact_stages SELECT 'host-'||i,'operator',?2 FROM n",
+                params![MAX_STAGES / 2 + 1, store.epoch as i64],
+            )
+            .unwrap();
+        store.db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        let pinned = |store: &Store, stage: &str| -> bool {
+            store
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM staging_pins WHERE stage=?1)",
+                    [stage],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        store.collect_garbage().unwrap();
+        assert!(
+            pinned(&store, &stage),
+            "a finished script's journal is kept"
+        );
+        assert!(!pinned(&store, &spend_stage("parent")));
+        #[cfg(feature = "driver")]
+        {
+            // A write that does not fit otherwise gets the journal's room; the call's
+            // spend stays.
+            let room = Room {
+                bytes: MAX_OBJECT_BYTES,
+                ..Room::default()
+            };
+            assert!(!store.make_room(room).unwrap());
+            assert!(!pinned(&store, &stage));
+            assert!(pinned(&store, &spend_stage("parent")));
+        }
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A page of a stored object: a packed one inflated only as far as the page ends,
+    /// each page the same bytes as the whole object's, and a damaged stream refused.
+    #[cfg(feature = "workspace-tools")]
+    #[test]
+    fn pages_of_an_object_match_the_whole_and_inflate_only_their_prefix() {
+        let text = "ünïcödé text ".repeat(4096).into_bytes();
+        let (stored, size) = pack(&text);
+        assert!(size.is_some());
+        for want in [0, 1, 4096, text.len() - 1, text.len(), text.len() + 10] {
+            let (length, bytes) = prefix(&stored, size, want).unwrap();
+            assert_eq!(length, text.len());
+            assert_eq!(&bytes[..], &text[..want.min(text.len())]);
+        }
+        let (length, bytes) = prefix(b"plain bytes", None, 5).unwrap();
+        assert_eq!((length, &bytes[..]), (11, &b"plain"[..]));
+        assert!(prefix(&stored[..stored.len() / 2], size, text.len()).is_err());
+        assert!(prefix(&stored, Some(text.len() as i64 + 1), text.len() + 1).is_err());
+
+        let root =
+            std::env::temp_dir().join(format!("spindle-object-range-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let digest = object_digest(&text);
+        store.db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        store
+            .db
+            .execute("INSERT INTO artifact_stages VALUES('out','operator',1)", [])
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO objects VALUES(?1,?2,?3)",
+                params![digest, stored.as_ref(), size],
+            )
+            .unwrap();
+        store
+            .db
+            .execute("INSERT INTO staging_pins VALUES('out',?1)", [&digest])
+            .unwrap();
+        store.db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        // The first read checks it whole; later ones read their range alone.
+        for (from, to) in [
+            (0, 10),
+            (100, 5000),
+            (text.len() - 3, text.len() + 3),
+            (5, 2),
+        ] {
+            let (length, bytes) = object_range(&store.db, "operator", &digest, from, to).unwrap();
+            assert_eq!(length, text.len());
+            let to = to.min(text.len());
+            assert_eq!(bytes, text[from.min(to)..to]);
+        }
+        assert!(object_range(&store.db, "other", &digest, 0, 10).is_err());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn objects_pack_where_it_pays_and_unpack_whole() {

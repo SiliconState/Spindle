@@ -24,21 +24,39 @@ const MAX_TREE = 2 * 1024 * 1024 * 1024;
  * and threads (the least recently used go first). */
 const KEPT_BYTES = 256 * 1024 * 1024;
 const KEPT_THREADS = 8;
-/** Changed files read back at once (each held twice while its digest is made). */
+/** Changed files read back at once (each held twice: the share's, and a copy). */
 const READING = 4;
 
 /** The mode a workspace file has in a fresh copy. */
 const modeOf = (executable) => S_IFREG | (executable ? 0o755 : 0o644);
 
+/** Directories commands fill with packages and caches, by name, anywhere in the tree
+ * (a virtual environment, `node_modules`, `__pycache__` under `src/`...). What the share
+ * holds under them stays for the thread's next command as any file does, but nothing
+ * there is read back into the workspace (its history, its tasks' copies and the files
+ * carried to a host would hold thousands of files that `pip install` makes again), nor
+ * placed from it; a workspace that listed such files from before (an earlier build kept
+ * them) drops them on the next command, the share keeping what is there. */
+const IGNORED_NAMES = /^(\.?venv|\.?[\w.-]*[-_.]venv|node_modules|__pycache__|\.cache|\.npm|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.tox|\.nox|\.ipynb_checkpoints)$/;
+export function ignored(path) {
+  return path.split('/').some((part) => IGNORED_NAMES.test(part));
+}
+
 /** The digest Spindle keeps `bytes` under (a workspace file's object: store/src/artifact.rs
  * `object_digest`). */
 export async function objectDigest(bytes) {
+  return (await framedDigest(bytes)).digest;
+}
+
+/** `bytes`' digest, and the copy of them it was made over (`framed`; from byte 26 on, the
+ * bytes: a copy a caller can keep, so they are not copied twice). */
+async function framedDigest(bytes) {
   const framed = new Uint8Array(26 + bytes.length);
   framed.set(new TextEncoder().encode('spindle-object-v1\0'));
   new DataView(framed.buffer).setBigUint64(18, BigInt(bytes.length));
   framed.set(bytes, 26);
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', framed));
-  return Array.from(hash, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return { digest: Array.from(hash, (byte) => byte.toString(16).padStart(2, '0')).join(''), framed };
 }
 
 export class Workspaces {
@@ -123,9 +141,10 @@ export class Workspaces {
       && inode.uid === USER_ID && inode.gid === USER_ID && inode.nlinks === 1 && inode.size === entry.size;
   }
 
-  /** Makes the command's copy from `plan` and `bytes` (object -> bytes, for its `need`):
-   * returns the run ({dir, top, placed, input}). What the share held of the thread's last
-   * copy and this one did not take goes. */
+  /** Makes the command's copy from `plan` and `bytes` (object -> bytes, for its `need`;
+   * taken, not copied: they become the files', which the guest writes in place): returns
+   * the run ({dir, top, placed, input}). What the share held of the thread's last copy
+   * and this one did not take goes. */
   async build(plan, input, bytes) {
     const fs = this.fs;
     // The commands' copies are root's, closed to others; each command's own is its user's
@@ -150,6 +169,7 @@ export class Workspaces {
     const placed = new Map();
     try {
       await this.fill(plan, input, bytes, parentOf, keptParentOf, placed);
+      this.carry(plan, parentOf, keptParentOf, placed);
     } catch (error) {
       // Half made: it goes (what was moved into it from the kept copy goes with it).
       await this.drop({ dir, placed });
@@ -159,10 +179,30 @@ export class Workspaces {
     return { session: plan.session, dir, top, placed, input };
   }
 
+  /** Moves what the kept copy holds under ignored directories (packages, caches: not
+   * in the workspace's list, `ignored`) into the command's copy, as `fill` moves a
+   * reused file, under names nothing was placed at. Whatever a command left there is
+   * kept as it is (never read, never hashed): the next command finds it. */
+  carry(plan, parentOf, keptParentOf, placed) {
+    if (!plan.kept) return;
+    const fs = this.fs;
+    for (const [path, entry] of plan.kept.files) {
+      if (!ignored(path) || placed.has(path) || !fs.inodes[entry.id]) continue;
+      // A file or a symbolic link (a package's `.bin/` entries), moved as an inode.
+      const [parent, base] = split(path);
+      fs.unlink_from_dir(keptParentOf(parent), base);
+      fs.link_under_dir(parentOf(parent), entry.id, base);
+      fs.inodes[entry.id].qid.version++;
+      placed.set(path, { id: entry.id, digest: null, executable: entry.executable, size: fs.inodes[entry.id].size });
+    }
+  }
+
   /** Puts the command's files, links and empty directories in its copy (`placed`: path ->
    * each file as placed). */
   async fill(plan, input, bytes, parentOf, keptParentOf, placed) {
     const fs = this.fs;
+    /** Objects whose bytes a file of the copy holds already. */
+    const given = new Set();
     for (const path of input.directories) parentOf(path);
     for (const file of input.files) {
       const [parent, base] = split(file.path);
@@ -180,8 +220,12 @@ export class Workspaces {
       } else {
         const content = bytes.get(file.object);
         if (!content) throw new Error(`no bytes came for ${file.path}`);
-        id = await fs.CreateBinaryFile(base, at, content);
-        fs.inodes[id].mode = modeOf(file.executable);
+        // The bytes as they came (theirs alone) become the file's, not a copy of them; the
+        // guest writes a file's bytes in place, so a second file of them gets a copy.
+        id = fs.CreateFile(base, at);
+        await fs.set_data(id, given.has(file.object) ? content.slice() : content);
+        given.add(file.object);
+        Object.assign(fs.inodes[id], { size: content.length, mode: modeOf(file.executable) });
       }
       this.watched.add(id);
       this.written.delete(id);
@@ -227,6 +271,17 @@ export class Workspaces {
     const changed = [];
     for (const [path, entry] of found) {
       const was = given.get(path);
+      // Under a package or cache directory: kept on the share for the next command, in
+      // no workspace (a file a workspace listed from before is dropped from it).
+      if (ignored(path)) {
+        // Files and symbolic links are kept (as inodes, never read); an empty directory
+        // is made again by whatever needs it.
+        if (entry.kind === 'file' || entry.kind === 'link') {
+          files.set(path, { id: entry.id, digest: null, executable: Boolean(entry.executable), size: fs.inodes[entry.id].size });
+        }
+        if (was) result.deletes.push(path);
+        continue;
+      }
       if (entry.kind === 'file') {
         const placed = run.placed.get(path);
         const inode = fs.inodes[entry.id];
@@ -242,13 +297,13 @@ export class Workspaces {
       }
     }
     // Read back a few at a time: a command that made a great deal is not held whole twice.
+    // A write is the copy its digest was made over (its buffer is handed on whole).
     const readOne = async ([path, entry, was]) => {
       const size = fs.inodes[entry.id].size;
-      const bytes = (await fs.get_data(entry.id, 0, size)) ?? new Uint8Array();
-      const digest = await objectDigest(bytes);
+      const { digest, framed } = await framedDigest((await fs.get_data(entry.id, 0, size)) ?? new Uint8Array());
       files.set(path, { id: entry.id, digest, executable: entry.executable, size });
       if (!(was?.kind === 'file' && was.object === digest && was.executable === entry.executable)) {
-        result.writes.push({ path, content: new Uint8Array(bytes), executable: entry.executable });
+        result.writes.push({ path, content: framed.subarray(26), executable: entry.executable });
       }
     };
     await Promise.all(Array.from({ length: READING }, async () => {
@@ -323,29 +378,39 @@ export class Workspaces {
 export function walk(fs, top) {
   const found = new Map();
   let bytes = 0;
+  let counted = 0;
   const stack = [[top, '']];
   while (stack.length) {
     const [id, prefix] = stack.pop();
     const names = fs.GetChildren(id);
     // A directory with nothing kept in it (sockets and pipes are not) is an empty one.
     const kept = names.filter((name) => [S_IFDIR, S_IFLNK, S_IFREG].includes(fs.inodes[fs.Search(id, name)].mode & S_IFMT));
-    if (!kept.length && prefix) found.set(prefix, { kind: 'directory' });
+    if (!kept.length && prefix) {
+      found.set(prefix, { kind: 'directory' });
+      if (!ignored(prefix) && ++counted > MAX_ENTRIES) throw new Error(`it holds over ${MAX_ENTRIES} files, links and empty directories`);
+    }
     for (const name of names) {
       const child = fs.Search(id, name);
       const inode = fs.inodes[child];
       const path = prefix ? `${prefix}/${name}` : name;
       const type = inode.mode & S_IFMT;
+      // Packages and caches count against the share's room (`KEPT_BYTES`), not a
+      // workspace's limits: they are no part of one.
+      const counts = !ignored(path);
       if (type === S_IFDIR) {
         stack.push([child, path]);
       } else if (type === S_IFLNK) {
-        found.set(path, { kind: 'link', target: inode.symlink });
+        found.set(path, { kind: 'link', target: inode.symlink, id: child });
       } else if (type === S_IFREG) {
-        if (inode.size > MAX_FILE) throw new Error(`${path} is over ${MAX_FILE / 1048576} MiB`);
-        bytes += inode.size;
-        if (bytes > MAX_TREE) throw new Error('its files come to over 2 GiB');
+        if (counts) {
+          if (inode.size > MAX_FILE) throw new Error(`${path} is over ${MAX_FILE / 1048576} MiB`);
+          bytes += inode.size;
+          if (bytes > MAX_TREE) throw new Error('its files come to over 2 GiB');
+        }
         found.set(path, { kind: 'file', id: child, executable: Boolean(inode.mode & 0o111) });
       }
-      if (found.size > MAX_ENTRIES) throw new Error(`it holds over ${MAX_ENTRIES} files, links and empty directories`);
+      if (counts && type !== S_IFDIR) counted += 1;
+      if (counted > MAX_ENTRIES) throw new Error(`it holds over ${MAX_ENTRIES} files, links and empty directories`);
     }
   }
   return found;

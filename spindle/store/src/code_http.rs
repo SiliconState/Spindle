@@ -27,8 +27,9 @@ const REPLY_ROOM: usize = crate::code_mode::MAX_REPLY - 16 * 1024;
 /// Response headers past this many (escaped) bytes are left out.
 const HEADER_ROOM: usize = 64 * 1024;
 const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
-/// Framing and routing headers the host owns.
-const RESERVED: [&str; 11] = [
+/// Framing and routing headers the host owns, and those asking for a body in parts or
+/// encoded, where the scrub could not find an echoed secret whole.
+const RESERVED: [&str; 14] = [
     "host",
     "content-length",
     "transfer-encoding",
@@ -40,6 +41,9 @@ const RESERVED: [&str; 11] = [
     "proxy-authorization",
     "proxy-connection",
     "expect",
+    "range",
+    "if-range",
+    "accept-encoding",
 ];
 /// Headers that would make a server treat a request as another method than the grant
 /// allows; a script may not send them.
@@ -422,6 +426,46 @@ fn fail(error: String, may_have_run: bool, unknown: bool) -> Value {
     value
 }
 
+/// An answer still in a content encoding to a request carrying a grant's secret is
+/// refused: the client decodes only the encodings its build turns on (and drops their
+/// header), so a body left encoded (deflate, zstd, ... though the request asked for
+/// none) could bring an echo of the secret back past the scrub.
+#[cfg(feature = "agent")]
+fn encoded_refused(grant: &Value, headers: &reqwest::header::HeaderMap) -> Option<Value> {
+    let encoding = headers
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .map(|token| String::from_utf8_lossy(token).trim().to_ascii_lowercase())
+        .find(|token| !token.is_empty() && token != "identity")?;
+    // Named only when it is a known one: the header is the server's, and could echo.
+    let encoding = match encoding.as_str() {
+        "gzip" | "x-gzip" | "br" | "deflate" | "compress" | "zstd" => encoding.as_str(),
+        _ => "another",
+    };
+    Some(fail(
+        format!(
+            "HTTP response in content encoding {encoding} is refused: grant {} adds a secret to its requests and the body is not decoded here (the request ran)",
+            grant.as_str().unwrap_or("?")
+        ),
+        true,
+        false,
+    ))
+}
+
+/// A 206 answer to a request carrying a grant's secret is refused: bodies in parts
+/// could bring an echo of the secret back split across answers, past the scrub.
+fn partial_refused(grant: &Value) -> Value {
+    fail(
+        format!(
+            "HTTP 206 partial content is refused: grant {} adds a secret to its requests (the request ran)",
+            grant.as_str().unwrap_or("?")
+        ),
+        true,
+        false,
+    )
+}
+
 /// Header values for one send, and the secret parts among them.
 #[cfg(feature = "agent")]
 type Injected = (Vec<(String, String)>, Vec<String>);
@@ -557,6 +601,60 @@ fn scrub_text(text: &str, needles: &[Vec<u8>]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// How many of the last bytes of `bytes` begin `needle` without being all of it.
+#[cfg(feature = "agent")]
+fn partial_end(bytes: &[u8], needle: &[u8]) -> usize {
+    // The needle's prefix function (KMP), then a run over as much of the end as could
+    // hold a proper prefix of it.
+    let mut border = vec![0; needle.len()];
+    for i in 1..needle.len() {
+        let mut k = border[i - 1];
+        while k > 0 && needle[i] != needle[k] {
+            k = border[k - 1];
+        }
+        if needle[i] == needle[k] {
+            k += 1;
+        }
+        border[i] = k;
+    }
+    let mut k = 0;
+    for &byte in &bytes[bytes.len().saturating_sub(needle.len().saturating_sub(1))..] {
+        while k > 0 && byte != needle[k] {
+            k = border[k - 1];
+        }
+        if byte == needle[k] {
+            k += 1;
+        }
+    }
+    k
+}
+
+/// A body as kept: every whole echo of a secret scrubbed, cut to `limit`, and, when it
+/// was cut short (`cut`: at the limit, by the timeout or a stop), without a trailing
+/// part of an echo, which the scrub cannot recognize. Says whether it was cut.
+#[cfg(feature = "agent")]
+fn kept_body(
+    mut bytes: Vec<u8>,
+    needles: &[Vec<u8>],
+    limit: usize,
+    mut cut: bool,
+) -> (Vec<u8>, bool) {
+    scrub(&mut bytes, needles);
+    if bytes.len() > limit {
+        bytes.truncate(limit);
+        cut = true;
+    }
+    if cut {
+        let partial = needles
+            .iter()
+            .map(|needle| partial_end(&bytes, needle))
+            .max()
+            .unwrap_or(0);
+        bytes.truncate(bytes.len() - partial);
+    }
+    (bytes, cut)
+}
+
 /// Bytes `ch` takes in a JSON string (serde_json's escapes).
 fn escaped_len(ch: char) -> usize {
     match ch {
@@ -662,6 +760,13 @@ pub(crate) fn answered(prepared: &Value, answer: &Value) -> Value {
     else {
         return fail("the app's answer has no response status".into(), true, true);
     };
+    if status == 206
+        && prepared["app_headers"]
+            .as_array()
+            .is_some_and(|added| !added.is_empty())
+    {
+        return partial_refused(&prepared["grant"]);
+    }
     let Some(mut bytes) = answer["body_base64"]
         .as_str()
         .map_or(Some(vec![]), crate::protocol::base64_decode)
@@ -794,8 +899,8 @@ pub(crate) fn execute(
         Err(error) => return fail(error.to_string(), false, false),
     };
     let needles = needles(&hidden);
-    // A secret is scrubbed whole before anything is cut, so a cut never leaves part of
-    // one: bodies are read this far past the limit first.
+    // A secret is scrubbed whole before anything is cut: bodies are read this far past
+    // the limit first (and lose a trailing part of one when cut, `kept_body`).
     let lookahead = needles.first().map_or(0, Vec::len);
     let deadline = Instant::now() + timeout;
     let failed = |error: String, may_have_run: bool, unknown: bool| {
@@ -899,6 +1004,14 @@ pub(crate) fn execute(
                     }
                 }
             }
+            if status == reqwest::StatusCode::PARTIAL_CONTENT && !hidden.is_empty() {
+                return partial_refused(&grant["name"]);
+            }
+            if !hidden.is_empty()
+                && let Some(refused) = encoded_refused(&grant["name"], response.headers())
+            {
+                return refused;
+            }
             let mut headers = Map::new();
             let mut header_bytes = 0;
             let mut headers_cut = false;
@@ -951,16 +1064,12 @@ pub(crate) fn execute(
                     }
                 }
             }
-            scrub(&mut bytes, &needles);
-            if bytes.len() > limit {
-                bytes.truncate(limit);
-                truncated = true;
-            }
+            let (bytes, truncated) = kept_body(bytes, &needles, limit, truncated || note.is_some());
             let mut data = json!({
                 "status":status.as_u16(),
                 "url":scrub_text(url.as_str(), &needles),
                 "headers":headers,
-                "truncated":truncated || note.is_some(),
+                "truncated":truncated,
                 "redirects":hops,
             });
             if headers_cut {
@@ -1075,6 +1184,15 @@ mod tests {
                 "{headers}"
             );
         }
+        // A body in parts or encoded would hide an echoed secret from the scrub.
+        for name in ["Range", "if-range", "Accept-Encoding"] {
+            let refused = prepare(
+                &policy,
+                &json!({"url":"https://api.example.com/v1/x","headers":{name:"bytes=0-3"}}),
+            )
+            .unwrap_err();
+            assert!(refused.contains("is set by the host"), "{name}: {refused}");
+        }
         let prepared = prepare(
             &policy,
             &json!({"url":"https://api.example.com/v1/x","method":"POST","json":{"a":1},"headers":{"X-Trace":"t"}}),
@@ -1147,6 +1265,125 @@ mod tests {
         }
         // Short secrets are not hunted in every encoding (too many false matches).
         assert!(super::needles(&["ab".into()]).is_empty());
+    }
+
+    #[test]
+    fn a_body_cut_short_keeps_no_trailing_part_of_a_secret() {
+        let secret = "s3cr3t-token-value";
+        let needles = needles(&[secret.into()]);
+        // Scrubbing shrinks the body, so the part of a secret the read stopped inside
+        // falls within the limit.
+        let body = format!("{}{}", secret.repeat(8), &secret[..9]).into_bytes();
+        let (kept, cut) = kept_body(body.clone(), &needles, 120, true);
+        let text = String::from_utf8(kept).unwrap();
+        assert!(cut);
+        assert_eq!(text, "[redacted]".repeat(8), "{text}");
+        // Stopped partway into an encoded echo (here base64).
+        let body = format!("ok {}", &base64(secret.as_bytes())[..10]).into_bytes();
+        let (kept, cut) = kept_body(body, &needles, 100, true);
+        assert!(cut);
+        assert_eq!(kept, b"ok ");
+        // A body read whole keeps its end, even one that begins like a secret.
+        let (kept, cut) = kept_body(b"all s3cr".to_vec(), &needles, 100, false);
+        assert_eq!((kept.as_slice(), cut), (&b"all s3cr"[..], false));
+        assert_eq!(partial_end(b"xxabcab", b"abcabd"), 5);
+        assert_eq!(partial_end(b"abcabd", b"abcabd"), 0);
+    }
+
+    /// A one-shot server on 127.0.0.1 answering `answer`.
+    #[cfg(unix)]
+    fn serve(answer: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![];
+            let mut buffer = [0; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream.write_all(answer.as_bytes()).unwrap();
+        });
+        format!("http://{address}/")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_content_is_refused_when_the_grant_adds_a_secret() {
+        const PARTIAL: &str = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/8\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd";
+        let run = |headers: Value| {
+            let url = serve(PARTIAL);
+            let policy =
+                json!({"http":[{"name":"echo","url":url,"risk":"read","headers":headers}]});
+            validate(&policy).unwrap();
+            let prepared = prepare(&policy, &json!({"url":url})).unwrap();
+            execute(
+                &policy,
+                &prepared,
+                &AtomicBool::new(false),
+                Duration::from_secs(10),
+            )
+        };
+        // HOME stands in for a secret the grant takes from the environment.
+        let refused = run(json!({"Authorization":{"env":"HOME","prefix":"Bearer "}}));
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert!(
+            refused["error"].as_str().unwrap().contains("HTTP 206"),
+            "{refused}"
+        );
+        assert_eq!(
+            (refused["may_have_run"].clone(), refused.get("unknown")),
+            (json!(true), None)
+        );
+        let answered = run(json!({"Accept":"text/plain"}));
+        assert_eq!(answered["data"]["status"], 206, "{answered}");
+        assert_eq!(answered["data"]["body"], "abcd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encoded_body_is_refused_when_the_grant_adds_a_secret() {
+        // An encoding the client does not decode (it decodes gzip and br where a build
+        // turns them on, and drops their header), sent though the request asked for none.
+        const ENCODED: &str = "HTTP/1.1 200 OK\r\nContent-Encoding: compress\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+        const PLAIN: &str = "HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+        let run = |answer: &'static str, headers: Value| {
+            let url = serve(answer);
+            let policy =
+                json!({"http":[{"name":"echo","url":url,"risk":"read","headers":headers}]});
+            validate(&policy).unwrap();
+            let prepared = prepare(&policy, &json!({"url":url})).unwrap();
+            execute(
+                &policy,
+                &prepared,
+                &AtomicBool::new(false),
+                Duration::from_secs(10),
+            )
+        };
+        // HOME stands in for a secret the grant takes from the environment.
+        let secret = json!({"Authorization":{"env":"HOME","prefix":"Bearer "}});
+        let refused = run(ENCODED, secret.clone());
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("content encoding compress is refused"),
+            "{refused}"
+        );
+        assert_eq!(
+            (refused["may_have_run"].clone(), refused.get("unknown")),
+            (json!(true), None)
+        );
+        // Identity is no encoding; without a secret an encoded body comes back as sent.
+        assert_eq!(run(PLAIN, secret)["data"]["body"], "hello");
+        let answered = run(ENCODED, json!({"Accept":"text/plain"}));
+        assert_eq!(answered["data"]["body"], "hello", "{answered}");
     }
 
     #[test]
@@ -1223,5 +1460,20 @@ mod app_tests {
         }
         let prepared = prepare(&policy, &json!({"url":"https://api.example.com/v1/x"})).unwrap();
         assert_eq!(prepared["headers"], json!({}));
+    }
+
+    #[test]
+    fn partial_content_is_refused_when_the_app_adds_a_header() {
+        let mut prepared = json!({"kind":"http","grant":"api","method":"GET","url":"https://api.example.com/v1/x","max_response_bytes":1024});
+        let partial = json!({"status":206,"headers":{},"body_base64":"YWJjZA=="});
+        assert_eq!(answered(&prepared, &partial)["data"]["body"], "abcd");
+        prepared["app_headers"] = json!(["Authorization"]);
+        let refused = answered(&prepared, &partial);
+        assert!(
+            refused["error"].as_str().unwrap().contains("HTTP 206"),
+            "{refused}"
+        );
+        assert_eq!(refused["may_have_run"], true);
+        assert_eq!(refused.get("unknown"), None);
     }
 }

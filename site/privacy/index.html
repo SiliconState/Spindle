@@ -25,7 +25,7 @@
 <main id="main">
   <section class="hero">
     <div class="wrap">
-      <p class="eyebrow">Privacy policy · updated 2 November 2026</p>
+      <p class="eyebrow">Privacy policy · updated 7 November 2026</p>
       <h1>Your work stays yours.</h1>
       <p class="lead">Spindle for Browser is open-source software (MIT) for <strong>Google Chrome</strong> and the
         browsers that install from its Web Store (Microsoft Edge, Brave and others). This policy covers it however
@@ -50,11 +50,15 @@
           to one.</li>
         <li><strong>Your keys and sign-ins</strong> are encrypted (AES-GCM) in your browser's storage, with an optional
           passphrase, and sent only to the provider they were saved for (and to OpenAI's sign-in service, if you sign in
-          with ChatGPT). For a ChatGPT sign-in, the account's e-mail address is kept with it, to show in Settings. A
+          with ChatGPT). OpenAI's Sign in with ChatGPT also receives a random ID for this browser installation
+          and registers an app client for the account. Spindle keeps that client ID, the account subject and e-mail
+          as readable registration metadata even after sign-out, so signing in again uses the same registration.
+          Tokens alone are sealed; resetting the vault does not remove that registration. A
           site's secret header that you save is encrypted the same way and sent only to that site.</li>
         <li><strong>Commands' network</strong>, only once you turn it on for a thread: its commands reach the websites
-          they ask for, through your browser (without your cookies) or through a relay you set up. With a relay, names
-          are looked up over DNS-over-HTTPS (Cloudflare), only while such a command runs.</li>
+          they ask for, through your browser (without your cookies) or through a relay you set up. Both routes use
+          Cloudflare DNS-over-HTTPS: the browser gateway checks public names for local addresses first, and a relay
+          resolves its command's names there. Cloudflare receives those names only while networked commands run.</li>
         <li><strong>Sites scripts may call</strong>: requests go only to the sites you list, with what the script
           sends.</li>
         <li><strong>Pages a thread makes</strong> show in a sandboxed preview that connects nowhere. If you choose
@@ -79,14 +83,16 @@
       <h2>Who else processes it</h2>
       <p>The model providers you choose (for example OpenAI, Anthropic, DeepSeek, Z.ai, Moonshot, or a model server
         you run) process what your threads send them under their own privacy policies. So do the services you set up
-        or list: a relay (and Cloudflare's DNS, for the names commands look up through it), the sites you list for
+        or list: a relay, Cloudflare's DNS for command hostnames, OpenAI's sign-in service when used, the sites you list for
         scripts, and the provider signed in on your Spindle host, for threads you run there. Websites your threads
         visit see those visits, as they would yours.</p>
       <h2>How long it is kept</h2>
       <p>On your device, until you delete the thread or remove the extension (which deletes everything it keeps; files
         you saved, <code>.spindle</code> files and threads on your Spindle host stay where they are). A key or sign-in
         stays until you remove it in Settings, and a site's secret header until you remove the site; if you forget your
-        passphrase, <strong>Forgot it</strong> deletes them all. Deleted records may linger in the browser's storage
+        passphrase, <strong>Forgot it</strong> deletes the sealed credentials. ChatGPT's readable app registration
+        and the installation ID remain until the extension's storage is removed; sign-out attempts token revocation
+        at OpenAI, but a reset of locked keys cannot revoke tokens it cannot read. Deleted records may linger in the browser's storage
         files until it compacts them. Your threads are protected by your browser profile; only keys and secrets are
         encrypted inside it.</p>
       <h2>Limited Use</h2>

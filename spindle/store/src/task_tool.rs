@@ -20,12 +20,13 @@ pub fn definition() -> AppTool {
                       that can be done apart, such as research or a separate change; calls \
                       in one step run concurrently over the same base and merge in call order; \
                       conflicts are reported, never overwritten. background returns immediately \
-                      and queues the answer; its files remain in the child workspace."
+                      and queues the answer; the answer and the task's file changes come \
+                      with its report, read at the end of a later turn."
             .into(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "background": {"type":"boolean", "description":"Queue the answer instead of waiting; file changes stay in the child."},
+                "background": {"type":"boolean", "description":"Queue the answer instead of waiting; its answer and file changes come with its report later."},
                 "prompt": {"type": "string", "description": "What the task should do, complete in itself."},
                 "model": {"type": "string", "description": "Another model of the same provider (default: this session's)."},
                 "effort": {"type": "string", "enum": ["default", "off", "low", "medium", "high", "xhigh", "max"]},

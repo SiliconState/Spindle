@@ -367,7 +367,8 @@ impl Store {
                 params![attempt, status, &detail[..end]],
             )?;
             if let Some(delay) = retry_after {
-                let millis = i64::try_from(delay.as_millis()).map_err(|_| Error::Invalid)?;
+                // Clamped, not refused: an absurd Retry-After still records the refusal.
+                let millis = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
                 crate::cached_execute(
                     &tx,
                     "INSERT INTO retry_delays VALUES(?1,?2) ON CONFLICT(attempt) DO UPDATE SET millis=excluded.millis",
@@ -554,5 +555,40 @@ impl Store {
                 Err(error.into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_absurd_retry_after_is_clamped_and_the_refusal_kept() {
+        let root = std::env::temp_dir().join(format!("spindle-retry-after-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut store = Store::open(&root).unwrap();
+        store.db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO attempts VALUES('attempt','effect',?1,'dext-provider-v1','grant')",
+                [store.epoch() as i64],
+            )
+            .unwrap();
+        store.db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        store
+            .record_rejection_with_delay(
+                "attempt",
+                429,
+                "slow down",
+                Some(std::time::Duration::MAX),
+            )
+            .unwrap();
+        assert_eq!(
+            store.retry_delay("attempt").unwrap(),
+            Some(std::time::Duration::from_millis(i64::MAX as u64))
+        );
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

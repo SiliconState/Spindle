@@ -430,13 +430,66 @@ fn describe(settings: &Settings) -> String {
     )
 }
 
+/// The fields of the model's `change` that widen what the user granted, against what
+/// the turn ends with (`current` and what is `queued`): network or the toolchain turned
+/// on, a budget raised or removed. Narrowing is the model's to do; widening only the
+/// user's.
+fn widened(
+    current: &Settings,
+    queued: &Map<String, Value>,
+    change: &Map<String, Value>,
+) -> Vec<&'static str> {
+    let on = |key: &str, now: bool| queued.get(key).and_then(Value::as_bool).unwrap_or(now);
+    let budget = match queued.get("max_usd") {
+        Some(max) => max.as_f64(),
+        None => current.max_usd,
+    };
+    let mut wider = vec![];
+    for (key, now) in [
+        ("network", current.network),
+        ("toolchain", current.toolchain),
+    ] {
+        if change.get(key) == Some(&Value::Bool(true)) && !on(key, now) {
+            wider.push(key);
+        }
+    }
+    if let (Some(max), Some(asked)) = (budget, change.get("max_usd"))
+        && asked.as_f64().is_none_or(|asked| asked > max)
+    {
+        wider.push("max_usd");
+    }
+    wider
+}
+
+/// The model's change refused for the fields it would widen (`widened`).
+fn refused_wider(wider: &[&str]) -> HostResult {
+    let said: Vec<&str> = wider
+        .iter()
+        .map(|field| match *field {
+            "network" => "turn network on",
+            "toolchain" => "turn the toolchain on",
+            _ => "raise or remove the budget (max_usd)",
+        })
+        .collect();
+    HostResult::text(
+        format!(
+            "Not changed: only the user can {} (in the thread's settings); ask them to.",
+            said.join(" or ")
+        ),
+        false,
+    )
+}
+
 /// `settings`: without fields, the current settings and what is available; with
-/// fields, the change checked and queued for the end of this turn.
+/// fields, the change checked and queued for the end of this turn. `by_model`: the
+/// model's own call (its provider's credentials are checked here, and it may not widen
+/// network, toolchain or budget); false: the user's, through the web host, which
+/// checked credentials first.
 fn settings(
     dir: &Path,
     host: Option<&dyn SessionHost>,
     input: &Value,
-    credentials: bool,
+    by_model: bool,
 ) -> HostResult {
     let current = match Settings::load(dir) {
         Ok(current) => current,
@@ -452,7 +505,9 @@ fn settings(
             Ok(available) => text.push_str(&format!(
                 "\nProviders and models (* default):{available}\nChange any of provider, model, \
                  effort, network, toolchain, compaction, max_usd and name with settings; a \
-                 change applies when this turn ends."
+                 change applies when this turn ends. Network, toolchain and budget you may \
+                 only narrow: turning them on, raising the budget or removing it is the \
+                 user's."
             )),
             Err(error) => text.push_str(&format!("\nThe model catalog is unreadable: {error}")),
         }
@@ -466,14 +521,35 @@ fn settings(
         Some(Value::Object(pending)) => pending,
         _ => Map::new(),
     };
+    let wider = if by_model {
+        widened(&current, &queued, &change)
+    } else {
+        vec![]
+    };
+    if !wider.is_empty() {
+        return refused_wider(&wider);
+    }
     let mut merged = queued.clone();
     merged.extend(change.clone());
-    if let Err(error) = checked(&current, &merged, host, credentials) {
+    if let Err(error) = checked(&current, &merged, host, by_model) {
         return HostResult::text(format!("Not changed: {error}."), false);
     }
-    let saved = pending_update(dir, |pending| pending.extend(change.clone()));
+    // Checked again against the queue as it is written (the user's picker may have
+    // queued a narrower choice meanwhile, which the model must not undo).
+    let mut late = vec![];
+    let saved = pending_update(dir, |pending| {
+        if by_model {
+            late = widened(&current, pending, &change);
+        }
+        if late.is_empty() {
+            pending.extend(change.clone());
+        }
+    });
     if let Err(error) = saved {
         return HostResult::text(format!("Not changed: {error}"), false);
+    }
+    if !late.is_empty() {
+        return refused_wider(&late);
     }
     let listed = change
         .iter()
@@ -563,6 +639,64 @@ pub(super) fn apply_pending(dir: &Path, host: Option<&dyn SessionHost>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_may_narrow_network_toolchain_and_budget_but_never_widen_them() {
+        let fields = |value: Value| value.as_object().cloned().unwrap();
+        let current = Settings::from_json(&json!({"provider": "local", "model": "fixture",
+            "network": false, "toolchain": false, "max_usd": 5.0}))
+        .unwrap();
+        let none = Map::new();
+        // The audit's change: network on and the budget removed.
+        assert_eq!(
+            widened(
+                &current,
+                &none,
+                &fields(json!({"network": true, "max_usd": null}))
+            ),
+            ["network", "max_usd"]
+        );
+        assert_eq!(
+            widened(
+                &current,
+                &none,
+                &fields(json!({"toolchain": true, "max_usd": 5.01}))
+            ),
+            ["toolchain", "max_usd"]
+        );
+        // Narrowing, or asking for what the turn already ends with, is fine.
+        for narrower in [
+            json!({"network": false, "toolchain": false, "max_usd": 2.5}),
+            json!({"max_usd": 5.0, "effort": "high"}),
+        ] {
+            assert!(
+                widened(&current, &none, &fields(narrower.clone())).is_empty(),
+                "{narrower}"
+            );
+        }
+        // Against what the user queued: on is not wider, but undoing their queued off is.
+        assert!(
+            widened(
+                &current,
+                &fields(json!({"network": true})),
+                &fields(json!({"network": true}))
+            )
+            .is_empty()
+        );
+        let open = Settings::from_json(&json!({"provider": "local", "model": "fixture",
+            "network": true, "max_usd": null}))
+        .unwrap();
+        assert_eq!(
+            widened(
+                &open,
+                &fields(json!({"network": false, "max_usd": 1.0})),
+                &fields(json!({"network": true, "max_usd": 3.0}))
+            ),
+            ["network", "max_usd"]
+        );
+        // No budget anywhere: any cap the model sets narrows.
+        assert!(widened(&open, &none, &fields(json!({"max_usd": 3.0}))).is_empty());
+    }
 
     #[test]
     fn settings_changes_must_be_known_fields_of_the_right_type() {

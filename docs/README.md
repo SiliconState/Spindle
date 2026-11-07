@@ -27,7 +27,7 @@ implement what each page describes.
 
 | Document | Component | Source |
 | --- | --- | --- |
-| [Store](store.md) | Schema 20, packed objects, revisions and workspace trees, rewind, ownership, checked compaction, bundles and migrations | [`spindle/store/src`](../spindle/store/src), [`spindle/src`](../spindle/src) |
+| [Store](store.md) | Schema 20/21, packed objects, revisions and workspace trees, rewind, ownership, checked compaction, bundles and migrations | [`spindle/store/src`](../spindle/store/src), [`spindle/src`](../spindle/src) |
 | [Driver and session](driver.md) | The decision driver, the native `Session`, model requests, recovery, steering, budgets, compaction | [`driver.rs`](../spindle/store/src/driver.rs), [`agent.rs`](../spindle/store/src/agent.rs) |
 | [Tools and execution](tools.md) | Built-in tools, sandboxed commands, background jobs, images, app tools, tasks, code mode | [`agent/`](../spindle/store/src/agent), [`code_mode.rs`](../spindle/store/src/code_mode.rs) |
 | [Web UI host](host.md) | `spindle serve`: listener, pairing and one-click connect, remote access, threads a browser brings, previews, self-edit, web UI | [`serve/`](../spindle/store/src/serve), [`ui/`](../spindle/store/ui) |

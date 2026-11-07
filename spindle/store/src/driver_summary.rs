@@ -94,9 +94,10 @@ fn summary_entries(message: &Message, prompt: bool) -> Vec<String> {
 
 /// The summary request of a compaction's dropped part, as a nested `model()` call takes
 /// it (`code_model_request`), and the source text it summarizes (whose digest names
-/// the history a recorded reply is for).
-pub(crate) fn summary_input(dropped: &[Message], prompt: Option<usize>) -> (String, Value) {
-    let source = summary_source(dropped, prompt, SUMMARY_SOURCE);
+/// the history a recorded reply is for). `dropped` was made with the current request's
+/// place (`prompt`) marked already (`Step::compact_need`).
+pub(crate) fn summary_input(dropped: &super::Dropped, _prompt: Option<usize>) -> (String, Value) {
+    let source = dropped.0.clone();
     let input = json!({
         "prompt": format!("{SUMMARY_PROMPT}\n\n{source}"),
         "system": SUMMARY_SYSTEM,

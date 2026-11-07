@@ -17,7 +17,7 @@
 // request; Spindle never sees or stores it.
 import fs from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -26,6 +26,7 @@ const clients = [join(here, '../clients'), join(here, '../../clients/js')].find(
   fs.existsSync(join(dir, 'embedded-node.mjs')),
 );
 const { nodeClient, SpindleError } = await import(join(clients, 'embedded-node.mjs'));
+const { bundleFacts } = await import(join(clients, 'embedded.mjs'));
 
 const options = { dir: './spindle-try', words: [] };
 const args = process.argv.slice(2);
@@ -83,7 +84,23 @@ try {
   for (const file of (await client.files(dir)).files) console.log(String(file.size).padStart(9), file.path);
   if (options.export) {
     const bytes = await client.exportSession(dir);
-    fs.writeFileSync(options.export, bytes);
+    // Kept on disk first (synced, and read back whole), then this copy is sealed at the
+    // bundle's head: whatever stops it between, the session is in one place or the other.
+    const fd = fs.openSync(options.export, 'w', 0o600);
+    try {
+      for (let at = 0; at < bytes.length;) at += fs.writeSync(fd, bytes, at, bytes.length - at);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    // Its directory too, so the new file's name survives a power cut (not on Windows).
+    if (process.platform !== 'win32') {
+      const parent = fs.openSync(dirname(resolve(options.export)), 'r');
+      try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+    }
+    if (!Buffer.from(bytes).equals(fs.readFileSync(options.export))) throw new Error(`${options.export} did not read back whole; ${dir} is not sealed`);
+    const { head, sourceState } = bundleFacts(bytes);
+    await client.sealSession(dir, { expectedHead: head, expectedState: sourceState });
     console.log(`moved the session into ${options.export} (${bytes.length} bytes); ${dir} is sealed`);
   }
 } catch (error) {

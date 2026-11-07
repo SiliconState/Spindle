@@ -841,6 +841,11 @@ try {
   const switchOn = await panel.until(`document.querySelector('#page-reading').getAttribute('aria-checked') === 'true' && 'true'`, { what: 'Page reading to switch on' }).catch((error) => error.message);
   await panel.click('#page-actions');
   const actionsOn = await panel.until(`document.querySelector('#page-actions').getAttribute('aria-checked') === 'true' && 'true'`, { what: 'Page actions to switch on' }).catch((error) => error.message);
+  // A new install asks before what sends or submits (Auto); the steps below act on
+  // their own, so Full is chosen, as a user may (7c tries Auto and Ask).
+  const confirmBefore = await panel.until(`document.querySelector('#act-confirm button[aria-checked="true"]')?.dataset.value`).catch((error) => error.message);
+  await panel.click('#act-confirm button[data-value="full"]');
+  await panel.until(`document.querySelector('#act-confirm button[data-value="full"]').getAttribute('aria-checked') === 'true' || null`, { what: 'Before acting: full' });
   await panel.click('#settings-dialog [data-close]');
   scripted.replies.push(call('read_page', {}), text(`The secret word is ${secret}.`));
   const first = await newThread(panel, 'Use the read_page tool to read the web page I am looking at, then reply with only the secret word written on it.');
@@ -860,6 +865,7 @@ try {
     assert.equal(switchOn, 'true', 'the Page reading switch turns it on');
     assert.equal(actionsBefore, 'false', 'page actions start off');
     assert.equal(actionsOn, 'true', 'the Page actions switch turns them on');
+    assert.equal(confirmBefore, 'auto', 'a new install asks before what sends or submits');
   });
 
   // 7a. bash in the browser Linux (its first start boots it).
@@ -910,7 +916,7 @@ try {
   await panel.screenshot(join(shots, '03c-code-through-bash.png'));
   check("a bash script makes Spindle calls: a nested model's answer and a page tool (code mode through bash)", () => {
     assert.match(guide, /spindle model/, 'the thread is told about Spindle calls');
-    assert.match(guide, /System\/Light\/Dark switch; never write em dashes/, 'the thread is told the style line');
+    assert.match(guide, /System\/Light\/Dark switch as one small icon button[^\n]*Never write em dashes\./, 'the thread is told the style line');
     assert.equal(bridged, 'idle', `state ${bridged}`);
     assert.ok(bridgeCard && !bridgeCard.failed, `the bash call: ${JSON.stringify(bridgeCard)}`);
     assert.match(bridgeCard.text, /teal/i, 'the nested model answered the script');
@@ -961,6 +967,8 @@ try {
     "curl -sS https://example.com/ | grep -o '<title>[^<]*'",
     "python3 -c \"import urllib.request as u; r = u.urlopen('https://example.com/'); print('python', r.status)\"",
     'curl -sS http://192.168.1.1/',
+    // A public name that resolves to this computer (nip.io answers 127.0.0.1).
+    'curl -sS http://127.0.0.1.nip.io/',
   ].join(' && ');
   scripted.replies.push(call('bash', { command: online }), text('Example Domain, python 200, local closed.'));
   await sendPrompt(panel, `Run exactly this command with bash, then reply with only its output: ${online}`);
@@ -968,7 +976,7 @@ try {
   const onlineState = await settled(panel, linuxThread, 300_000);
   const onlineCard = await panel.eval(`(() => { const cards = [...document.querySelectorAll('#history .tool')].filter((c) => c.querySelector('.tool-name').textContent === 'bash'); const card = cards.at(-1); return card ? { failed: card.classList.contains('failed'), text: card.querySelector('pre.result')?.textContent ?? '' } : null; })()`);
   await panel.screenshot(join(shots, '03g-network.png'));
-  check("a thread's network: off reaches nothing; on (its model menu), websites through Chrome over HTTPS; local addresses stay closed", () => {
+  check("a thread's network: off reaches nothing; on (its model menu), websites through Chrome over HTTPS; local addresses, and names leading to them, stay closed", () => {
     assert.match(offlineCard, /Could not connect|Failed to connect|exit [1-9]/, `without network: ${offlineCard}`);
     assert.match(String(networked), /web on \[globe\]$/, `the model button says (and shows) the thread reaches the web: ${networked}`);
     assert.equal(onlineState, 'idle', `state ${onlineState}`);
@@ -976,6 +984,7 @@ try {
     assert.match(onlineCard.text, /<title>Example Domain/, 'curl fetched an HTTPS page through Chrome');
     assert.match(onlineCard.text, /python 200/, "Python's urllib trusts the Linux's own authority");
     assert.match(onlineCard.text, /closed to it/, 'an address on this computer is refused');
+    assert.match(onlineCard.text, /127\.0\.0\.1\.nip\.io: that name leads to an address on this computer/, 'a public name leading here is refused too (its DNS-over-HTTPS lookup works from the extension)');
   });
 
   // 7h. (scripted) Stop a running command, then say what to do: the command is kept as
@@ -1404,11 +1413,12 @@ try {
   });
 
   // 7f2. What a thread makes shows in the conversation: a report it writes gets a card
-  // with the page in a preview that reaches nothing outside the workspace (its script
-  // runs and its fetch out is refused; what it loads from the web waits for the user's
-  // yes), Download saves it, navigate to
-  // /workspace/NAME opens it in a tab for the user; a file its command makes is in the
-  // one workspace card (marked), which sits just above the turn's final answer.
+  // whose eye shows the page (a page waits to be asked: only pictures, Markdown and
+  // documents show themselves) in a preview that reaches nothing outside the workspace
+  // (its script runs and its fetch out is refused; what it loads from the web waits for
+  // the user's yes), Download saves it, navigate to /workspace/NAME opens it in a tab for
+  // the user; a file its command makes is in the one workspace card (marked), which sits
+  // just above the turn's final answer.
   step = 'files in the conversation';
   const report = `<!doctype html><title>Report</title><style>h1{color:#3f5b2f}</style><h1>Report</h1><script src="https://cdn.example.invalid/chart.js"></script><script>console.log('spindle-test ran'); fetch('http://127.0.0.1:${port}/rendered?word=leak').then(() => console.log('spindle-test reached'), () => console.log('spindle-test closed'))</script>`;
   const notesCommand = "printf '# Notes\\n\\n- first point\\n' > notes.md";
@@ -1424,6 +1434,10 @@ try {
   await sendPrompt(panel, `Do these three steps in order. 1) Use write_file with path /workspace/report.html and exactly this content: ${report} 2) Use navigate with url /workspace/report.html to open it for me. 3) Use bash to run exactly: ${notesCommand}. Then reply with only DONE.`);
   await panel.until(`spindlePanel.threads.get(${JSON.stringify(linuxThread)})?.state === 'running' || null`, { timeout: 20_000 }).catch(() => {});
   const conversed = await settled(panel, linuxThread, Number(process.env.SPINDLE_STEP_WAIT ?? 300_000));
+  // Its card comes folded; the user opens its preview.
+  const reportFolded = await panel.until(`document.querySelector('#history .file-card[data-path="report.html"] button[aria-expanded]')?.getAttribute('aria-expanded')`, { what: 'the report card' }).catch((error) => error.message);
+  // (A card that came open fails the check below on its own, not on this click.)
+  if (reportFolded === 'false') await panel.click('#history .file-card[data-path="report.html"] button[aria-expanded="false"]');
   const reportCard = await panel.until(`document.querySelector('#history .file-card[data-path="report.html"] .file-frame') && true`, { what: 'the report card with its preview' }).catch((error) => error.message);
   const cardSaid = () => frameSaid.slice(heardBefore).filter((said) => said.page === panel.sessionId).map((said) => said.text);
   const said = async (word, wait = 20_000) => {
@@ -1448,9 +1462,10 @@ try {
   for (const tab of tabsAfter) await browser.send('Target.closeTarget', { targetId: tab.targetId }).catch(() => {});
   const saved = fs.readFileSync(await downloadBy(panel, '#history .file-card[data-path="report.html"] button[title="Download report.html"]', /^report\.html$/)).toString();
   await panel.screenshot(join(shots, '03h-files-in-conversation.png'));
-  check('what a thread makes shows in the conversation: a report (written to /workspace/report.html) as a page, its script running shut off from the network, the web on a click, Download, opened in a tab by navigate; what its commands made in the one workspace card, folded, just above the final answer', () => {
+  check('what a thread makes shows in the conversation: a report (written to /workspace/report.html) as a page on its eye, its script running shut off from the network, the web on a click, Download, opened in a tab by navigate; what its commands made in the one workspace card, folded, just above the final answer', () => {
     assert.equal(conversed, 'idle', `state ${conversed}`);
-    assert.equal(reportCard, true, `the report's card shows its page: ${reportCard}`);
+    assert.equal(reportFolded, 'false', `a page's card comes folded: ${reportFolded}`);
+    assert.equal(reportCard, true, `the report's card shows its page once asked: ${reportCard}`);
     assert.ok(ran, `the page's script ran in the card, unasked (its frames said: ${JSON.stringify(cardSaid())})`);
     assert.ok(closedOut, `its fetch to an outside address was refused (its frames said: ${JSON.stringify(cardSaid())})`);
     assert.ok(!rendered.includes('leak'), 'no preview reached this test\'s server');
@@ -1505,10 +1520,10 @@ try {
     await panel.until(`spindlePanel.threads.get(${JSON.stringify(refusedThread)})?.state === 'running' || null`, { timeout: 20_000 }).catch(() => {});
     const sentAgain = await settled(panel, refusedThread);
     const finalAsked = await panel.eval(`[...document.querySelectorAll('#history .message.user')].map((m) => m.innerText.trim())`);
-    check('the model menu: efforts to choose; a refused first turn starts over with another effort, its message sent once; a refused later turn is taken back to send again', () => {
+    check('the model menu: efforts to choose; a refused first turn goes on with another effort, its message sent once; a refused later turn is taken back to send again', () => {
       assert.equal(refusedState, 'failed', `the refused turn: ${refusedState}`);
       assert.equal(haltedButtons, true, `Take back and Retry show: ${haltedButtons}`);
-      assert.equal(haltedSheet, 'Start the turn over', `the sheet says what a change does: ${haltedSheet}`);
+      assert.equal(haltedSheet, 'Go on with this', `the sheet says what a change does: ${haltedSheet}`);
       // The levels the model takes, without "Default" (none chosen is the model's own).
       assert.ok(!efforts.includes('Default') && efforts.includes('Low') && efforts.includes('High'), `efforts offered: ${efforts}`);
       assert.equal(pickedEffort.name, 'High', `picked: ${JSON.stringify(pickedEffort)}`);
@@ -1700,7 +1715,7 @@ try {
 
   // 7c. Before acting (Settings, Pages): Ask asks before every action and the user's No
   // does nothing (a known outcome); Auto lets a plain key go and asks before Enter; the
-  // user's Yes goes ahead. Full (the default) asked nothing above.
+  // user's Yes goes ahead. Full (chosen with page actions above) asked nothing there.
   if (options.scripted) {
     step = 'before acting';
     const confirmTo = async (value) => {

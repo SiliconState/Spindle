@@ -61,6 +61,53 @@ pub(crate) fn validate(db: &Connection) -> Result<()> {
 }
 
 impl Store {
+    /// Transfer fence covering changes that do not advance the conversation head.
+    pub fn transfer_fingerprint(&self) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let mut digest = Sha256::new();
+        for sql in [
+            "SELECT identity FROM instance WHERE id=1",
+            "SELECT revision FROM head WHERE id=1",
+            "SELECT key,value FROM meta ORDER BY key",
+            "SELECT task,origin,input,base,revision,queued,state,answer,delivered,lease FROM task_runs ORDER BY task",
+        ] {
+            digest.update(sql.as_bytes());
+            let mut query = self.db.prepare(sql)?;
+            let columns = query.column_count();
+            let mut rows = query.query([])?;
+            while let Some(row) = rows.next()? {
+                digest.update([0xff]);
+                for column in 0..columns {
+                    use rusqlite::types::ValueRef;
+                    match row.get_ref(column)? {
+                        ValueRef::Null => digest.update([0]),
+                        ValueRef::Integer(value) => {
+                            digest.update([1]);
+                            digest.update(value.to_le_bytes());
+                        }
+                        ValueRef::Real(value) => {
+                            digest.update([2]);
+                            digest.update(value.to_bits().to_le_bytes());
+                        }
+                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                            digest.update([3]);
+                            digest.update((bytes.len() as u64).to_le_bytes());
+                            digest.update(bytes);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
     /// Configuration/accounting bytes, outside the revision chain (not rewound).
     pub fn metadata(&self, key: &str) -> Result<Option<Vec<u8>>> {
         if self.paused {
@@ -234,6 +281,55 @@ impl Store {
         Ok(())
     }
 
+    /// Prepends `note` to finished task `task`'s kept answer (its content), once:
+    /// what became of its file changes as its report was delivered (a conflict with the
+    /// session's own changes, the merge limit). The report's text is derived from the
+    /// answer when the report is admitted, so the note goes in the row first. A task
+    /// whose report was delivered already, or that holds the note, is left as it is.
+    #[cfg(feature = "driver")]
+    pub fn amend_task_answer(&mut self, task: &str, note: &str) -> Result<()> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let epoch: u64 = crate::cached_row(&tx, "SELECT epoch FROM realm WHERE id=1", [], |row| {
+            crate::nonnegative_id(row, 0)
+        })?;
+        if epoch != self.epoch {
+            return Err(Error::Stale);
+        }
+        let answer: Option<Option<Vec<u8>>> = crate::cached_row(
+            &tx,
+            "SELECT answer FROM task_runs WHERE task=?1 AND state='finished' AND delivered IS NULL",
+            [task],
+            |row| row.get(0),
+        )
+        .optional()?;
+        let Some(Some(answer)) = answer else {
+            return Ok(());
+        };
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&answer).map_err(|_| Error::Invalid)?;
+        let content = value["content"].as_str().unwrap_or_default().to_string();
+        if content.starts_with(note) {
+            return Ok(());
+        }
+        value["content"] = serde_json::Value::String(format!("{note}\n{content}"));
+        let bytes = value.to_string().into_bytes();
+        if bytes.len() > crate::MAX_PAYLOAD {
+            return Err(Error::Exhausted);
+        }
+        crate::cached_execute(
+            &tx,
+            "UPDATE task_runs SET answer=?1 WHERE task=?2 AND state='finished' AND delivered IS NULL",
+            params![bytes, task],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn register_task(&mut self, run: &TaskRun) -> Result<()> {
         if self.paused {
             return Err(Error::Paused);
@@ -256,14 +352,26 @@ impl Store {
         if epoch != self.epoch {
             return Err(Error::Stale);
         }
-        let kept = tasks_on(&tx)?
-            .into_iter()
-            .find(|kept| kept.task == run.task);
-        if let Some(kept) = kept {
-            return if kept.state != "abandoned"
-                && kept.input == run.input
-                && kept.queued == run.queued
-                && kept.origin == run.origin
+        // The task's own row (no answer read), and then only a count of the others.
+        let kept: Option<(String, Vec<u8>, bool, Option<String>)> = crate::cached_row(
+            &tx,
+            "SELECT state,input,queued,origin FROM task_runs WHERE task=?1",
+            [&run.task],
+            |row| {
+                Ok((
+                    crate::bounded_label(row, 0)?,
+                    crate::bounded_blob(row, 1, 128 * 1024)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            },
+        )
+        .optional()?;
+        if let Some((state, input, queued, origin)) = kept {
+            return if state != "abandoned"
+                && input == run.input
+                && queued == run.queued
+                && origin == run.origin
             {
                 Ok(())
             } else {
@@ -271,7 +379,9 @@ impl Store {
             };
         }
         crate::workspace::validate_root(&tx, "operator", &run.base)?;
-        if tasks_on(&tx)?.len() >= 4096 {
+        let count: i64 =
+            crate::cached_row(&tx, "SELECT count(*) FROM task_runs", [], |row| row.get(0))?;
+        if count >= 4096 {
             return Err(Error::Exhausted);
         }
         crate::cached_execute(
@@ -324,7 +434,9 @@ pub enum TaskEnd<'a> {
 
 /// Keeps a running task's end in its row. One stopped meanwhile (by a person, perhaps in
 /// another process) stays as they left it: its worker's own end, after, changes nothing,
-/// and the session hears what the person did.
+/// and the session hears what the person did. One a rewind abandoned while it ran
+/// keeps its answer (shown with the task, never reported to the session, which went
+/// back to before it) and stays abandoned.
 fn end_task(tx: &Connection, task: &str, input: &[u8], end: TaskEnd<'_>) -> Result<()> {
     let (state, answer) = match end {
         TaskEnd::Answered(answer) => ("finished", Some(answer)),
@@ -341,16 +453,25 @@ fn end_task(tx: &Connection, task: &str, input: &[u8], end: TaskEnd<'_>) -> Resu
     if changed == 1 {
         return Ok(());
     }
-    let stopped: bool = crate::cached_row(
+    let state: Option<String> = crate::cached_row(
         tx,
-        "SELECT EXISTS(SELECT 1 FROM task_runs WHERE task=?1 AND input=?2 AND state='stopped')",
+        "SELECT state FROM task_runs WHERE task=?1 AND input=?2",
         params![task, input],
-        |row| row.get(0),
-    )?;
-    if stopped {
-        Ok(())
-    } else {
-        Err(Error::Conflict)
+        |row| crate::bounded_label(row, 0),
+    )
+    .optional()?;
+    match (state.as_deref(), end) {
+        (Some("stopped"), _) => Ok(()),
+        (Some("abandoned"), TaskEnd::Answered(answer)) => {
+            crate::cached_execute(
+                tx,
+                "UPDATE task_runs SET answer=?1 WHERE task=?2 AND input=?3 AND state='abandoned' AND answer IS NULL",
+                params![answer, task, input],
+            )?;
+            Ok(())
+        }
+        (Some("abandoned"), TaskEnd::Stopped(_)) => Ok(()),
+        _ => Err(Error::Conflict),
     }
 }
 
@@ -464,7 +585,7 @@ pub(crate) fn connection(dir: &Path, write: bool) -> Result<Option<Connection>> 
     if [14, 15, 16, 17].contains(&schema) {
         return Ok(None);
     }
-    if ![18, 19, crate::SCHEMA].contains(&schema) {
+    if ![18, 19, crate::PREVIOUS_SCHEMA, crate::SCHEMA].contains(&schema) {
         return Err(Error::Incompatible);
     }
     if write {
@@ -535,6 +656,53 @@ pub(crate) fn seed(store: &mut Store, dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A task a rewind abandoned while it ran still keeps the answer it finished with
+    /// (it stays abandoned: nothing reports it), instead of losing it to a conflict.
+    #[test]
+    fn an_abandoned_task_keeps_the_answer_it_finishes_with() {
+        let root =
+            std::env::temp_dir().join(format!("spindle-meta-abandoned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut owner = Store::open(&root).unwrap();
+        owner.db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        for (task, state) in [("rewound", "abandoned"), ("done", "finished")] {
+            owner
+                .db
+                .execute(
+                    "INSERT INTO task_runs VALUES(?1,NULL,X'7B7D',?2,0,1,?3,NULL,NULL,NULL)",
+                    params![task, "0".repeat(64), state],
+                )
+                .unwrap();
+        }
+        owner.db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        let answer = br#"{"content":"the report","failed":false}"#;
+        owner
+            .finish_task_run("rewound", b"{}", TaskEnd::Answered(answer))
+            .unwrap();
+        let (state, kept): (String, Option<Vec<u8>>) = owner
+            .db
+            .query_row(
+                "SELECT state,answer FROM task_runs WHERE task='rewound'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), kept.as_deref()),
+            ("abandoned", Some(&answer[..]))
+        );
+        // A stop after it changes nothing; a task that already ended still conflicts.
+        owner
+            .finish_task_run("rewound", b"{}", TaskEnd::Stopped(None))
+            .unwrap();
+        assert!(matches!(
+            owner.finish_task_run("done", b"{}", TaskEnd::Answered(answer)),
+            Err(Error::Conflict)
+        ));
+        drop(owner);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn ignored_metadata_writes_are_refused_and_fence_the_owner() {
         let root = std::env::temp_dir().join(format!("spindle-meta-ignore-{}", std::process::id()));

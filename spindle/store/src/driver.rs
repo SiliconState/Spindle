@@ -45,10 +45,23 @@ const MAX_DROPPED_RETRIES: u32 = 3;
 pub const DROPPED: u16 = 0;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(300);
 const COMPACT_KEEP_SHARE: usize = 4;
+/// A model summary under this many bytes, for a dropped part over eight times as
+/// long, is too thin to stand alone (the summary asks for about 1,500 words).
+const THIN_SUMMARY: usize = 2048;
 const COMPACTED: &str = "[Earlier conversation compacted by spindle to stay within session limits]";
-const COMPACTED_TRAILER: &str =
+pub(crate) const COMPACTED_TRAILER: &str =
     "The workspace files are current; inspect them rather than relying on this summary.";
 pub(crate) const CURRENT_REQUEST: &str = "(the current request follows verbatim)";
+/// The most a background task's file changes may come to for its report to merge them
+/// into the session's workspace; over it, they stay in the task's own session.
+const MAX_TASK_MERGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TASK_MERGE_PATHS: usize = 8192;
+/// A notes file the model keeps in the workspace: carried into every compaction summary
+/// (`workspace_notes`), as much of it as `NOTES_KEPT` holds.
+const NOTES_FILES: [&str; 2] = ["NOTES.md", "notes.md"];
+const NOTES_KEPT: usize = 6 * 1024;
+/// How many top-level workspace entries a compaction summary names.
+const LISTED_ENTRIES: usize = 40;
 use crate::Error;
 use crate::broker::{DispatchOutcome, DispatchRequest};
 use crate::completion::Attempt;
@@ -242,25 +255,21 @@ impl Step<'_> {
             }
         };
         let (revision, state) = self.head()?;
-        let recorded = ModelWait::restore(&bytes).map_err(|_| "invalid recorded response")?;
-        let response = recorded
-            .response()
-            .and_then(|bytes| NativeResponse::restore(bytes).ok())
-            .ok_or("invalid recorded response")?;
-        let after = state.apply_model(&recorded, ROUTE).map_err(turn_error)?;
-        let proposal = self.proposal(
-            format!("adopt-r{revision}"),
-            Observation::Receipt(request.attempt.id.clone()),
-            revision,
-            &state,
-            &after,
-        )?;
-        self.store
+        let (proposal, response, after) = self
+            .adoption(revision, &state, &request.attempt.id, &bytes)
+            .map_err(unadoptable)?;
+        let committed = self
+            .store
             .commit_turn_receipt(
                 &proposal,
                 &receipt_binding(&request.attempt, intent_revision, &request.intent, &bytes),
             )
-            .map_err(store_error)?;
+            .map_err(|error| match error {
+                // The same reply is refused again on every continue: retry asks anew.
+                Error::Invalid | Error::TooLarge { .. } => unadoptable(store_error(error)),
+                error => store_error(error),
+            })?;
+        self.committed(committed, after);
         let text = text_of(&response.blocks);
         if sent.streamed {
             self.emit(Event::ModelText { text: "" });
@@ -279,6 +288,33 @@ impl Step<'_> {
         Ok(ModelNext::Adopted)
     }
 
+    /// The step that adopts `bytes`, the reply recorded for the head's model request
+    /// under `attempt`, and that reply; Err says why it cannot be adopted (the engine or
+    /// the store refuses it, the same way every time). Nothing is committed.
+    pub(crate) fn adoption(
+        &mut self,
+        revision: u64,
+        state: &TurnContinuation,
+        attempt: &str,
+        bytes: &[u8],
+    ) -> Result<(Proposal, NativeResponse, TurnContinuation)> {
+        let recorded = ModelWait::restore(bytes).map_err(|_| "invalid recorded response")?;
+        let response = recorded
+            .response()
+            .and_then(|bytes| NativeResponse::restore(bytes).ok())
+            .ok_or("invalid recorded response")?;
+        let after = state.apply_model(&recorded, ROUTE).map_err(turn_error)?;
+        let proposal = self.proposal(
+            format!("adopt-r{revision}"),
+            Observation::Receipt(attempt.into()),
+            revision,
+            state,
+            &after,
+        )?;
+        crate::fits(proposal.continuation.len()).map_err(store_error)?;
+        Ok((proposal, response, after))
+    }
+
     /// Whether a refused request (or one whose connection dropped) is sent again, and
     /// after how long, announced with `ProviderRetry`; otherwise the turn stops with what
     /// the provider said. A refusal is sent again when it is transient, when the history
@@ -292,7 +328,10 @@ impl Step<'_> {
             return self.backoff_drop(rejection, attempts);
         }
         let overflow = context_overflow(status, &rejection.body);
-        let transient = matches!(status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529);
+        // A ChatGPT plan's refusal (its usage limit among them, a 429) is final.
+        let plan_refused = dext_core::recovery::chatgpt_plan_refusal(&rejection.body).is_some();
+        let transient =
+            !plan_refused && matches!(status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529);
         // A refusal that states the model's output limit: remember it and ask for less.
         let lowered = (|| -> Result<bool> {
             let config = self.settings()?;
@@ -317,9 +356,9 @@ impl Step<'_> {
             String::new()
         };
         if !(overflow || transient || lowered) || *attempts >= MAX_PROVIDER_RETRIES {
+            let refused = plan_limit(&rejection.body).unwrap_or_else(|| http_error(status));
             return Err(format!(
-                "{}{said}. It was refused before any reply{tried}; `spindle retry` sends the request again.",
-                http_error(status)
+                "{refused}{said}. It was refused before any reply{tried}; `spindle retry` sends the request again.",
             ));
         }
         // The session's first request has no earlier point to send it again from.
@@ -531,7 +570,7 @@ impl Step<'_> {
                             reason: reason.clone(),
                         },
                         state,
-                        &after,
+                        after,
                     )?;
                     self.emit(Event::ToolCall {
                         id: &call.id,
@@ -546,7 +585,7 @@ impl Step<'_> {
                         format!("guard-r{revision}"),
                         &Action::Guard { effect: id },
                         state,
-                        &after,
+                        after,
                     )?;
                     self.emit(Event::ToolCall {
                         id: &call.id,
@@ -568,7 +607,7 @@ impl Step<'_> {
                             reason: reason.clone(),
                         },
                         state,
-                        &after,
+                        after,
                     )?;
                     self.emit(Event::ToolCall {
                         id: &call.id,
@@ -687,7 +726,7 @@ impl Step<'_> {
                             format!("refuse-r{revision}"),
                             &Action::Refuse { effect: id, reason },
                             &state,
-                            &after,
+                            after,
                         )?;
                         self.emit(Event::ToolRefused {
                             reason: STOPPED_BEFORE,
@@ -734,14 +773,18 @@ impl Step<'_> {
             .store
             .workspace_receipt(&request.attempt.id)
             .map_err(store_error)?;
-        self.store
+        let committed = self
+            .store
             .commit_turn_workspace_receipt(
                 &proposal,
                 &receipt_binding(&request.attempt, intent_revision, &request.intent, &bytes),
                 ran.helper,
             )
             .map_err(store_error)?;
-        if call.name == "run_code" {
+        self.committed(committed, after);
+        // A script's nested model calls (run_code's, and bash's through the runner's
+        // bridge) are counted with the call that ran it.
+        if matches!(call.name.as_str(), "run_code" | "bash") {
             self.note_cost(Counted::Script(&request.attempt.id));
         }
         Ok(())
@@ -849,6 +892,17 @@ impl Step<'_> {
                     None => "stopped while the task was running; continue resumes it".into(),
                 });
             }
+            // A failure that asking again would only repeat: the call is recorded as
+            // failed (a known outcome), so the turn goes on, and can be retried or
+            // rewound, rather than wait on a call that never settles. (A stop is not one:
+            // continue asks the app again.)
+            Err(error @ (Error::Invalid | Error::TooLarge { .. })) => {
+                let why = format!("The answer could not be kept: {}.", store_error(error));
+                match self.failed_app_call(&id, &request, &app, why)? {
+                    Some(bytes) => bytes,
+                    None => return Ok(true),
+                }
+            }
             Err(Error::Cancelled) => {
                 return Err(format!(
                     "stopped while the app was answering `{}`; continue asks it again",
@@ -921,10 +975,63 @@ impl Step<'_> {
                 app.helper,
             )
             .map_err(store_error)?;
+        self.committed(committed, after);
         if let (Some(prior), Some(next)) = (prior, &proposal.state) {
             self.emit_state(&prior, next, committed);
         }
         Ok(true)
+    }
+}
+
+impl Step<'_> {
+    /// Records app call `id` as failed with `why`: its answer when it was reserved (the
+    /// bytes to adopt), or a refusal committed now when it never was (None).
+    fn failed_app_call(
+        &mut self,
+        id: &str,
+        request: &DispatchRequest,
+        app: &AppDispatch,
+        why: String,
+    ) -> Result<Option<Vec<u8>>> {
+        if self.store.attempt_for(id).map_err(store_error)?.is_none() {
+            let (revision, state) = self.head()?;
+            let after = state.refuse_tool(id, &why).map_err(turn_error)?;
+            self.commit_action(
+                format!("refuse-r{revision}"),
+                &Action::Refuse {
+                    effect: id.into(),
+                    reason: why.clone(),
+                },
+                &state,
+                after,
+            )?;
+            self.emit(Event::ToolRefused { reason: &why });
+            return Ok(None);
+        }
+        let failed = crate::broker::AppResult {
+            content: why,
+            success: false,
+            writes: vec![],
+            deletes: vec![],
+            links: vec![],
+            directories: vec![],
+            state: None,
+            details: None,
+            max_output: app.max_output,
+        };
+        match self.store.record_app_answer(request, &app.helper, failed) {
+            Ok(DispatchOutcome::Recorded(bytes) | DispatchOutcome::Reused(bytes)) => {
+                Ok(Some(bytes))
+            }
+            Ok(DispatchOutcome::Reconcile) => {
+                Err("an app tool call's answer is missing; run `spindle continue`".into())
+            }
+            Err(error) => Err(format!(
+                "the app tool call could not be recorded as failed: {}. Run `spindle \
+                 continue` to ask again.",
+                store_error(error)
+            )),
+        }
     }
 }
 
@@ -978,12 +1085,19 @@ impl Step<'_> {
                 ));
             }
         }
+        if matches!(state.control().phase(), Phase::Ready | Phase::AfterTools)
+            && self.inbox.interrupted()
+        {
+            return Err(STOPPED_HERE.into());
+        }
+        if matches!(
+            state.control().phase(),
+            Phase::Ready | Phase::AfterTools | Phase::FinalReview | Phase::Stopped(Stop::Complete)
+        ) && self.task_files_pending()?
+        {
+            return Ok(Need::TaskWait);
+        }
         match state.control().phase() {
-            // The user's stop: the turn rests between its steps, nothing in flight. A
-            // message (`say`) or `continue` takes it on from here.
-            Phase::Ready | Phase::AfterTools if self.inbox.interrupted() => {
-                Err(STOPPED_HERE.into())
-            }
             Phase::Ready | Phase::AfterTools => self.prepare_need(revision, state),
             Phase::ModelWait => self
                 .model_need(revision, state)
@@ -997,12 +1111,7 @@ impl Step<'_> {
                     return Ok(Need::Continue);
                 }
                 let after = state.finish().map_err(turn_error)?;
-                self.commit_action(
-                    format!("finish-r{revision}"),
-                    &Action::Finish,
-                    state,
-                    &after,
-                )?;
+                self.commit_action(format!("finish-r{revision}"), &Action::Finish, state, after)?;
                 Ok(Need::Continue)
             }
             Phase::Stopped(stop) => {
@@ -1033,7 +1142,7 @@ impl Step<'_> {
             let after = state
                 .prepare(waiting.request().clone(), ROUTE)
                 .map_err(turn_error)?;
-            self.commit_action(command, &Action::Prepare { request }, state, &after)?;
+            self.commit_action(command, &Action::Prepare { request }, state, after)?;
             return Ok(Need::Continue);
         }
         // Steering first: its step is named by this revision, which a state
@@ -1043,7 +1152,7 @@ impl Step<'_> {
         }
         let config = self.settings()?;
         let route = self.session_route(&config.provider, Some(&config.model))?;
-        let budget = route.history_budget;
+        let budget = config.history_budget(route.history_budget);
         let overflowed = std::mem::take(&mut self.driver.compact_next);
         let prepared = PrepareNext {
             config,
@@ -1056,13 +1165,13 @@ impl Step<'_> {
                 revision,
                 state,
                 compact,
-                PrepareStage::BeforeRequest(prepared),
+                PrepareStage::BeforeRequest(Box::new(prepared)),
             );
         }
         self.prepare_after_compact(
             revision,
             state,
-            PrepareStage::BeforeRequest(prepared),
+            PrepareStage::BeforeRequest(Box::new(prepared)),
             false,
         )
     }
@@ -1077,7 +1186,7 @@ impl Step<'_> {
         if matches!(compact.replacement, CompactReplacement::Summary { .. }) {
             return Ok(Need::Summarize(Box::new(SummaryNeed { compact, next })));
         }
-        let changed = self.compact_done(state, compact, None)?.is_some();
+        let changed = self.compact_done(state, compact, None)?;
         self.prepare_after_compact(revision, state, next, changed)
     }
 
@@ -1092,10 +1201,8 @@ impl Step<'_> {
             return Ok(Need::Continue);
         }
         match stage {
-            PrepareStage::Start(mut pending) => {
-                if changed {
-                    pending.transcript = self.head()?.1.transcript().map_err(turn_error)?;
-                } else if pending.overflowed {
+            PrepareStage::Start(pending) => {
+                if !changed && pending.overflowed {
                     return Err(OVERFLOW_STUCK.into());
                 }
                 self.commit_start(*pending)
@@ -1106,32 +1213,47 @@ impl Step<'_> {
                 }
                 let request = self.request(state, &prepared.config)?;
                 let after = state.prepare(request.clone(), ROUTE).map_err(turn_error)?;
-                let needed =
-                    after.checkpoint().map_err(turn_error)?.len() + prepared.route.reply_reserve;
-                let stage = PrepareStage::BeforeCommit {
-                    request,
-                    after: Box::new(after),
-                    needed,
-                };
-                if needed > crate::MAX_PAYLOAD
-                    && let Some(compact) =
+                // Encoded once: measured here, committed as it is.
+                let continuation = after.checkpoint().map_err(turn_error)?;
+                let needed = continuation.len() + prepared.route.reply_reserve;
+                if needed > crate::MAX_PAYLOAD {
+                    // Nothing prepared is held while the history is compacted: the request
+                    // is prepared again from the compacted head.
+                    drop((request, after, continuation));
+                    if let Some(compact) =
                         self.compact_need(revision, state, prepared.budget, true)?
-                {
-                    return self.compact_then(revision, state, compact, stage);
+                    {
+                        return self.compact_then(
+                            revision,
+                            state,
+                            compact,
+                            PrepareStage::Overflow { needed },
+                        );
+                    }
+                    return self.prepare_after_compact(
+                        revision,
+                        state,
+                        PrepareStage::Overflow { needed },
+                        false,
+                    );
                 }
-                self.prepare_after_compact(revision, state, stage, false)
-            }
-            PrepareStage::BeforeCommit {
-                request,
-                after,
-                needed,
-            } => {
                 self.ensure_room(needed)?;
                 let action = Action::Prepare {
                     request: ModelWait::new(request).checkpoint(),
                 };
-                self.commit_action(format!("prepare-r{revision}"), &action, state, &after)?;
+                self.commit_encoded(
+                    format!("prepare-r{revision}"),
+                    &action,
+                    state,
+                    after,
+                    continuation,
+                )?;
                 Ok(Need::Continue)
+            }
+            // The history could not be compacted: the request does not fit, and says so.
+            PrepareStage::Overflow { needed } => {
+                self.ensure_room(needed)?;
+                Err(OVERFLOW_STUCK.into())
             }
         }
     }
@@ -1143,7 +1265,7 @@ impl Step<'_> {
         need: SummaryNeed,
         summary: Option<String>,
     ) -> Result<Need> {
-        let changed = self.compact_done(state, need.compact, summary)?.is_some();
+        let changed = self.compact_done(state, need.compact, summary)?;
         self.prepare_after_compact(revision, state, need.next, changed)
     }
 }
@@ -1167,6 +1289,9 @@ impl Step<'_> {
         revision: u64,
         state: &TurnContinuation,
     ) -> Result<Option<Need>> {
+        if self.task_files_pending()? {
+            return Ok(Some(Need::TaskWait));
+        }
         if self.commit_task_report(revision, state)? {
             return Ok(Some(Need::Continue));
         }
@@ -1175,6 +1300,23 @@ impl Step<'_> {
             .iter()
             .any(|run| run.queued && run.state == "running")
             .then_some(Need::TaskWait))
+    }
+
+    fn task_files_pending(&self) -> Result<bool> {
+        Ok(self
+            .store
+            .task_runs()
+            .map_err(store_error)?
+            .iter()
+            .any(|run| {
+                run.queued
+                    && run.state == "finished"
+                    && run.delivered.is_none()
+                    && serde_json::from_slice::<Value>(&run.input)
+                        .map(|input| input["files"] != "discard")
+                        .unwrap_or(true)
+                    && !self.driver.task_changes.contains_key(&run.task)
+            }))
     }
 
     pub(crate) fn commit_task_report(
@@ -1217,30 +1359,156 @@ impl Step<'_> {
                     .map_err(store_error)?,
             }
         }
-        let (run, command, text) = match chosen {
-            Some(chosen) => chosen,
+        let retained_report = chosen.is_some();
+        let (run, command, mut text) = match chosen {
+            Some((run, command, text)) => (run.clone(), command, text),
             None => {
                 let Some(run) = runs.iter().find(pending) else {
                     return Ok(false);
                 };
-                (run, self.report_command(&run.task)?, report(run)?)
+                (run.clone(), self.report_command(&run.task)?, report(run)?)
             }
         };
+        if run.state == "finished"
+            && serde_json::from_slice::<Value>(&run.input)
+                .map(|input| input["files"] != "discard")
+                .unwrap_or(true)
+            && !self.driver.task_changes.contains_key(&run.task)
+        {
+            return Ok(false);
+        }
+        // A finished task's file changes, as its host offered them (`offer_task_changes`):
+        // staged over the head's tree and committed with the report, as a foreground
+        // task's answer changes the workspace with its step. Not where the session
+        // changed what the task changed since the task began (a conflict, said in the
+        // report so the model knows; the files stay in the task's session), nor over the
+        // merge limit. A report admitted before a crash goes with the text it was
+        // admitted with: its files come along where they merge, and stay in the task
+        // (said to the host, not in the report) where they do not.
+        let offered = self.driver.task_changes.remove(&run.task);
+        let mut root = None;
+        if let Some(offered) = offered
+            && run.state == "finished"
+            && !matches!(&offered, Ok(changes) if changes.is_empty())
+        {
+            let staged = match offered {
+                Ok(changes) => self.task_files_root(&run, changes)?,
+                Err(note) => Err(note),
+            };
+            match staged {
+                Ok(staged) => root = Some(staged),
+                Err(note) => {
+                    if !retained_report {
+                        self.store
+                            .amend_task_answer(&run.task, &note)
+                            .map_err(store_error)?;
+                        if let Some(now) = self
+                            .store
+                            .task_runs()
+                            .map_err(store_error)?
+                            .into_iter()
+                            .find(|now| now.task == run.task)
+                        {
+                            text = report(&now)?;
+                        }
+                    }
+                    let label = format!("{}: {note}", self.env.task_place(&run.task));
+                    self.emit(Event::Nested { label: &label });
+                }
+            }
+        }
         let after = state.task_report(text.clone()).map_err(turn_error)?;
-        self.commit_action(
-            command,
-            &Action::TaskReport {
-                task: run.task.clone(),
-                text: text.clone(),
-            },
-            state,
-            &after,
-        )?;
+        let action = Action::TaskReport {
+            task: run.task.clone(),
+            text: text.clone(),
+        };
+        match root {
+            Some(root) => {
+                self.commit_action_with_workspace(command, &action, state, after, root)?
+            }
+            None => self.commit_action(command, &action, state, after)?,
+        };
         self.emit(Event::TaskReported {
             task: &run.task,
             text: &text,
         });
         Ok(true)
+    }
+
+    /// The root of the head's tree with a finished task's `changes` staged over it, for
+    /// its report to commit; or why they are not merged (a note for the task's answer).
+    fn task_files_root(
+        &mut self,
+        run: &crate::meta::TaskRun,
+        changes: crate::broker::Changes,
+    ) -> Result<std::result::Result<String, String>> {
+        let (bytes, count) = (changes.bytes(), changes.count());
+        if bytes > MAX_TASK_MERGE_BYTES || count > MAX_TASK_MERGE_PATHS {
+            return Ok(Err(format!(
+                "[task files not merged: {count} paths, {} MiB, over the merge limit ({} paths, {} MiB); they stay in the task's own session]",
+                bytes / (1024 * 1024),
+                MAX_TASK_MERGE_PATHS,
+                MAX_TASK_MERGE_BYTES / (1024 * 1024)
+            )));
+        }
+        let (_, head_root) = self.store.head_root().map_err(store_error)?;
+        let Some(head_root) = head_root else {
+            return Ok(Err(
+                "[task files not merged: the session has no workspace]".into()
+            ));
+        };
+        // The tree the task began from (its row's base): one no longer kept leaves the
+        // files in the task, said; the report still goes.
+        let Ok(base) = self.store.tree_map(SCOPE, &run.base) else {
+            return Ok(Err(
+                "[task files not merged: the files the task began from are no longer kept here]"
+                    .into(),
+            ));
+        };
+        let head = self
+            .store
+            .tree_map(SCOPE, &head_root)
+            .map_err(store_error)?;
+        let conflicts = task_conflicts(&base, &head, &changes);
+        if !conflicts.is_empty() {
+            return Ok(Err(format!(
+                "[task file conflict: {}; none of this task's changes were adopted]",
+                conflicts.join(", ")
+            )));
+        }
+        if !self.store.make_app_room().map_err(store_error)? {
+            return Ok(Err(format!(
+                "[task files not merged: {}]",
+                crate::broker::STORE_FULL
+            )));
+        }
+        // The stage is named by a digest of the task's key (a key is any text an app
+        // chose; a stage's label is bounded ASCII).
+        let stage = Stage {
+            id: format!(
+                "task-files-{}",
+                hex(&Sha256::digest(run.task.as_bytes())[..20])
+            ),
+            scope: SCOPE.into(),
+            owner_epoch: self.store.epoch(),
+        };
+        self.store.adopt_stage(&stage).map_err(store_error)?;
+        match self.store.begin_stage(&stage) {
+            Ok(()) => {}
+            // No room for a stage: the files stay in the task, the report goes.
+            Err(Error::Exhausted) => {
+                return Ok(Err(format!(
+                    "[task files not merged: {}]",
+                    crate::broker::STORE_FULL
+                )));
+            }
+            Err(error) => return Err(store_error(error)),
+        }
+        Ok(self
+            .store
+            .stage_task_changes(&stage, &head_root, changes)
+            .map_err(store_error)?
+            .map_err(|why| format!("[task files not merged: {why}]")))
     }
 
     /// The command a task's next report goes as: a task started again after it reported
@@ -1294,6 +1562,7 @@ impl Step<'_> {
             return Ok(true);
         }
         let command = format!("steer-r{revision}");
+        let mut queued = false;
         let text = match self.store.admitted(SCOPE, &command).map_err(store_error)? {
             Some(payload) => match Action::decode(&payload).map_err(store_error)? {
                 Action::Steer { text } => text,
@@ -1309,17 +1578,31 @@ impl Step<'_> {
                 text
             }
             None => match self.inbox.next_steer() {
-                Some(text) => text,
+                Some(text) => {
+                    queued = true;
+                    text
+                }
                 None => return Ok(false),
             },
         };
-        let after = state.steer(text.clone()).map_err(turn_error)?;
-        self.commit_action(
-            command,
-            &Action::Steer { text: text.clone() },
-            state,
-            &after,
-        )?;
+        let committed = crate::turn::steered(state, text.clone())
+            .map_err(turn_error)
+            .and_then(|after| {
+                self.commit_action(
+                    command.clone(),
+                    &Action::Steer { text: text.clone() },
+                    state,
+                    after,
+                )
+            });
+        if let Err(error) = committed {
+            // A message taken from the queue goes back unless its admission holds it
+            // (that commits it on the next try): never lost, at worst sent twice.
+            if queued && !matches!(self.store.admitted(SCOPE, &command), Ok(Some(_))) {
+                self.inbox.return_steering(vec![text]);
+            }
+            return Err(error);
+        }
         self.emit(Event::Steered { text: &text });
         Ok(true)
     }
@@ -1358,6 +1641,8 @@ impl Step<'_> {
             .store
             .commit_turn_action(&proposal)
             .map_err(store_error)?;
+        // The conversation is as it was: the same turn is the new revision's.
+        self.driver.head = Some((committed, state));
         self.emit_state(&prior, &next, committed);
         Ok(committed)
     }
@@ -1407,17 +1692,44 @@ impl Step<'_> {
 pub struct CompactCall {
     pub command: String,
     size: usize,
+    /// Forced by the history's message or block count (`crowded`), not its size.
+    crowded: bool,
     pub replacement: CompactReplacement,
 }
 
 pub enum CompactReplacement {
     Ready(TranscriptCheckpoint),
+    /// Made from the head's history when the summary (or None, for the digest) comes:
+    /// about `keep` bytes stay (`compacted`). Nothing else of the history is held
+    /// meanwhile.
     Summary {
-        dropped: Vec<Message>,
+        dropped: Dropped,
         prompt: Option<usize>,
         keep: usize,
-        transcript: TranscriptCheckpoint,
     },
+}
+
+/// The dropped part of a compaction as its summary request reads it (`summary_input`):
+/// bounded text, made only for a session whose model writes its summaries.
+#[cfg_attr(not(any(feature = "agent", feature = "embedded")), allow(dead_code))]
+pub struct Dropped(pub(crate) String);
+
+/// The most messages and blocks a compaction keeps verbatim, and past which history
+/// is compacted whatever its size: the engine refuses a history past `MAX_MESSAGES`
+/// messages or `MAX_TRANSCRIPT_BLOCKS` blocks (a reply that took it there could be
+/// saved but never adopted), so a long thread of small steps is compacted well before.
+const KEEP_MESSAGES: usize = dext_transcript::checkpoint::MAX_MESSAGES / 2;
+const KEEP_BLOCKS: usize = dext_transcript::checkpoint::MAX_TRANSCRIPT_BLOCKS / 2;
+
+/// Whether `messages` are past three quarters of either engine count limit.
+fn crowded(messages: &[Message]) -> bool {
+    use dext_transcript::checkpoint::{MAX_MESSAGES, MAX_TRANSCRIPT_BLOCKS};
+    messages.len() > MAX_MESSAGES / 4 * 3
+        || messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum::<usize>()
+            > MAX_TRANSCRIPT_BLOCKS / 4 * 3
 }
 
 impl Step<'_> {
@@ -1430,6 +1742,8 @@ impl Step<'_> {
     ) -> Result<Option<CompactCall>> {
         let transcript = state.transcript_ref().map_err(turn_error)?;
         let size = transcript_len(&transcript)?;
+        let crowded = crowded(&transcript.messages);
+        let force = force || crowded;
         let command = format!("compact-r{revision}");
         // A compaction admitted before a crash is committed exactly as admitted (its
         // summary was paid for once and is never asked for again), whatever the size.
@@ -1469,50 +1783,144 @@ impl Step<'_> {
                     .filter(|(index, _)| Some(*index) != prompt)
                     .map(|(_, message)| message_size(message))
                     .sum();
-                if dropped < size / 4 + SUMMARY_BYTES {
+                if dropped < size / 4 + SUMMARY_BYTES && !crowded {
                     return Ok(None);
                 }
                 CompactReplacement::Summary {
-                    dropped: transcript.messages[..cut].to_vec(),
+                    dropped: self.dropped(&transcript.messages[..cut], prompt)?,
                     prompt,
                     keep,
-                    transcript: transcript.into_owned(),
                 }
             }
         };
         Ok(Some(CompactCall {
             command,
             size,
+            crowded,
             replacement,
         }))
     }
 
+    /// What a compaction summary carries of the workspace, so the model goes on knowing
+    /// what it has whatever the summary says: how many files, the top-level entries
+    /// (files, and directories with their counts), and the model's own notes file
+    /// (`NOTES_FILES`, its first `NOTES_KEPT` bytes) when it keeps one. None for an
+    /// empty workspace.
+    fn workspace_notes(&mut self) -> Result<Option<String>> {
+        let Some(root) = self.store.head_root().map_err(store_error)?.1 else {
+            return Ok(None);
+        };
+        let tree = self.store.tree_map(SCOPE, &root).map_err(store_error)?;
+        if tree.files.is_empty() && tree.links.is_empty() && tree.directories.is_empty() {
+            return Ok(None);
+        }
+        let mut top: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let paths = tree
+            .files
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .chain(tree.links.iter().map(|link| link.path.as_str()))
+            .chain(tree.directories.iter().map(String::as_str));
+        for path in paths {
+            match path.split_once('/') {
+                Some((dir, _)) => *top.entry(format!("{dir}/")).or_default() += 1,
+                None => {
+                    top.entry(path.to_string()).or_default();
+                }
+            }
+        }
+        let mut listed: Vec<String> = top
+            .iter()
+            .take(LISTED_ENTRIES)
+            .map(|(name, count)| match count {
+                0 => name.clone(),
+                1 => format!("{name} (1 file)"),
+                _ => format!("{name} ({count} files)"),
+            })
+            .collect();
+        if top.len() > LISTED_ENTRIES {
+            listed.push(format!("and {} more", top.len() - LISTED_ENTRIES));
+        }
+        let mut text = format!(
+            "Workspace now: {} file(s). Top level: {}.",
+            tree.files.len(),
+            listed.join(", ")
+        );
+        if let Some(entry) = tree
+            .files
+            .iter()
+            .find(|entry| NOTES_FILES.contains(&entry.path.as_str()))
+        {
+            let bytes = self
+                .store
+                .read_object(SCOPE, &entry.object)
+                .map_err(store_error)?;
+            let mut notes = String::from_utf8_lossy(&bytes).into_owned();
+            let cut = notes.len() > NOTES_KEPT;
+            if cut {
+                let mut end = NOTES_KEPT;
+                while !notes.is_char_boundary(end) {
+                    end -= 1;
+                }
+                notes.truncate(end);
+            }
+            text.push_str(&format!(
+                "\nYour notes file, {} (kept across compactions{}):\n{}",
+                entry.path,
+                if cut {
+                    "; its start, read it whole for the rest"
+                } else {
+                    ""
+                },
+                notes.trim_end()
+            ));
+        }
+        Ok(Some(text))
+    }
+
+    /// What a compaction's summary request reads of its dropped part: nothing for a
+    /// session that compacts by digest, or a host that asks no model.
+    fn dropped(&self, dropped: &[Message], prompt: Option<usize>) -> Result<Dropped> {
+        #[cfg(any(feature = "agent", feature = "embedded"))]
+        if self.settings()?.compaction == Compaction::Model {
+            return Ok(Dropped(summary_source(dropped, prompt, SUMMARY_SOURCE)));
+        }
+        let _ = (dropped, prompt);
+        Ok(Dropped(String::new()))
+    }
+
+    /// Commits `need`'s compaction of the head `state` (a summary's is made from it now:
+    /// the head it was asked for). Whether it committed.
     pub fn compact_done(
         &mut self,
         state: &TurnContinuation,
         need: CompactCall,
         summary: Option<String>,
-    ) -> Result<Option<TurnContinuation>> {
+    ) -> Result<bool> {
         let CompactCall {
             command,
             size,
+            crowded: by_count,
             replacement,
         } = need;
         let replacement = match replacement {
             CompactReplacement::Ready(transcript) => transcript,
-            CompactReplacement::Summary {
-                transcript, keep, ..
-            } => {
-                let Some(replacement) = compacted(&transcript, keep, summary.as_deref()) else {
-                    return Ok(None);
+            CompactReplacement::Summary { keep, .. } => {
+                let notes = self.workspace_notes()?;
+                let transcript = state.transcript_ref().map_err(turn_error)?;
+                let Some(replacement) =
+                    compacted(&transcript, keep, summary.as_deref(), notes.as_deref())
+                else {
+                    return Ok(false);
                 };
                 replacement
             }
         };
         let bytes = transcript_bytes(&replacement)?;
-        // Each compaction must shrink history by a quarter, so repeats are bounded.
-        if bytes.len() > size / 4 * 3 {
-            return Ok(None);
+        // Each compaction must shrink history by a quarter, so repeats are bounded; one
+        // forced by the counts must bring them back under (it may keep the bytes).
+        if bytes.len() > size / 4 * 3 && (!by_count || crowded(&replacement.messages)) {
+            return Ok(false);
         }
         let after = state.compact(replacement).map_err(turn_error)?;
         let compacted_size = bytes.len();
@@ -1520,13 +1928,13 @@ impl Step<'_> {
             command,
             &Action::Compact { transcript: bytes },
             state,
-            &after,
+            after,
         )?;
         self.emit(Event::Compacted {
             before: size,
             after: compacted_size,
         });
-        Ok(Some(after))
+        Ok(true)
     }
 }
 
@@ -1544,21 +1952,22 @@ struct PrepareNext {
 
 enum PrepareStage {
     Start(Box<StartPending>),
-    BeforeRequest(PrepareNext),
-    BeforeCommit {
-        request: PreparedRequest<Vec<u8>>,
-        after: Box<TurnContinuation>,
+    BeforeRequest(Box<PrepareNext>),
+    /// The prepared request (and room for its reply) is `needed` bytes, more than a
+    /// step holds: it goes only if a compaction makes it fit (prepared again then).
+    Overflow {
         needed: usize,
     },
 }
 
+/// A turn start waiting on a compaction: its history is read from the head when it
+/// commits (compacted or not), never held meanwhile.
 struct StartPending {
     prompt: String,
     start: Start,
     start_state: Option<StartState>,
     config: Settings,
     live: Route,
-    transcript: TranscriptCheckpoint,
     overflowed: bool,
 }
 
@@ -1573,25 +1982,23 @@ impl Step<'_> {
         live: Route,
         budget: usize,
     ) -> Result<Need> {
-        let snapshot = self.store.snapshot().map_err(store_error)?;
-        if snapshot.revision == 0 {
+        let revision = self.store.head_revision().map_err(store_error)?;
+        if revision == 0 {
+            // A store of its own (a first turn, or one that replaced a store whose first
+            // request is retried): nothing read before is its.
+            self.driver.head = None;
             return self.commit_start(StartPending {
                 prompt,
                 start,
                 start_state,
                 config,
                 live,
-                transcript: TranscriptCheckpoint {
-                    route_binding: ROUTE.into(),
-                    messages: vec![],
-                },
                 overflowed: false,
             });
         }
         self.ensure_idle()?;
-        let prior = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
-        let transcript = prior.transcript().map_err(turn_error)?;
-        let command = self.turn_command(snapshot.revision, &prompt)?;
+        let (revision, prior) = self.head()?;
+        let command = self.turn_command(revision, &prompt)?;
         if self
             .store
             .admitted(SCOPE, &command)
@@ -1604,11 +2011,10 @@ impl Step<'_> {
                 start_state,
                 config,
                 live,
-                transcript,
                 overflowed: false,
             });
         }
-        let history = transcript_len(&transcript)?;
+        let history = transcript_len(&*prior.transcript_ref().map_err(turn_error)?)?;
         let overflowed = std::mem::take(&mut self.driver.compact_next);
         let force = overflowed || 2 * history + live.reply_reserve > crate::MAX_PAYLOAD;
         let pending = StartPending {
@@ -1617,19 +2023,18 @@ impl Step<'_> {
             start_state,
             config,
             live,
-            transcript,
             overflowed,
         };
-        if let Some(compact) = self.compact_need(snapshot.revision, &prior, budget, force)? {
+        if let Some(compact) = self.compact_need(revision, &prior, budget, force)? {
             return self.compact_then(
-                snapshot.revision,
+                revision,
                 &prior,
                 compact,
                 PrepareStage::Start(Box::new(pending)),
             );
         }
         self.prepare_after_compact(
-            snapshot.revision,
+            revision,
             &prior,
             PrepareStage::Start(Box::new(pending)),
             false,
@@ -1643,16 +2048,9 @@ impl Step<'_> {
             start_state,
             config,
             live,
-            mut transcript,
             ..
         } = pending;
-        let revision = self.store.snapshot().map_err(store_error)?.revision;
-        transcript.messages.push(Message {
-            role: "user".into(),
-            content: vec![Block::Text {
-                text: prompt.clone(),
-            }],
-        });
+        let revision = self.store.head_revision().map_err(store_error)?;
         let command = self.turn_command(revision, &prompt)?;
         let (initial, request) = match self.store.admitted(SCOPE, &command).map_err(store_error)? {
             Some(payload) => {
@@ -1669,6 +2067,20 @@ impl Step<'_> {
                 (initial, request.request().clone())
             }
             None => {
+                // The history the turn goes on from, as the head holds it now.
+                let mut transcript = match revision {
+                    0 => TranscriptCheckpoint {
+                        route_binding: ROUTE.into(),
+                        messages: vec![],
+                    },
+                    _ => self.head()?.1.transcript().map_err(turn_error)?,
+                };
+                transcript.messages.push(Message {
+                    role: "user".into(),
+                    content: vec![Block::Text {
+                        text: prompt.clone(),
+                    }],
+                });
                 let initial = TurnContinuation::new(
                     SCOPE.into(),
                     execution_id(SCOPE, &command).map_err(store_error)?,
@@ -1684,7 +2096,8 @@ impl Step<'_> {
         let next = initial
             .prepare(request.clone(), ROUTE)
             .map_err(turn_error)?;
-        self.ensure_room(next.checkpoint().map_err(turn_error)?.len() + live.reply_reserve)?;
+        let continuation = next.checkpoint().map_err(turn_error)?;
+        self.ensure_room(continuation.len() + live.reply_reserve)?;
         // Files that cannot form a workspace are refused before the turn is admitted
         // (a queued admission that never commits would block every later prompt).
         let planned = match &start {
@@ -1698,7 +2111,7 @@ impl Step<'_> {
                 files,
             )),
             Start::Add(files) => {
-                let tree = match self.store.snapshot().map_err(store_error)?.workspace {
+                let tree = match self.store.head_root().map_err(store_error)?.1 {
                     Some(root) => self.store.tree_map(SCOPE, &root).map_err(store_error)?,
                     None => Tree::default(),
                 };
@@ -1723,13 +2136,16 @@ impl Step<'_> {
             request: ModelWait::new(request).checkpoint(),
         };
         let sequence = self.admit(&command, &action)?;
-        let mut proposal = self.proposal(
+        drop(action);
+        let mut proposal = self.proposal_encoded(
             format!("commit-{command}"),
             Observation::Admission(sequence),
             revision,
             &initial,
             &next,
+            continuation,
         )?;
+        drop(initial);
         proposal.state = start_state;
         // Per owner epoch: a stage an earlier process began cannot be continued.
         let stage = format!(
@@ -1754,7 +2170,7 @@ impl Step<'_> {
                 files,
             )?),
             Start::Add(files) => {
-                let tree = match self.store.snapshot().map_err(store_error)?.workspace {
+                let tree = match self.store.head_root().map_err(store_error)?.1 {
                     Some(root) => self.store.tree_map(SCOPE, &root).map_err(store_error)?,
                     None => Tree::default(),
                 };
@@ -1771,6 +2187,7 @@ impl Step<'_> {
                 .commit_turn_action(&proposal)
                 .map_err(store_error)?
         };
+        self.committed(committed, next);
         self.emit(Event::Prompt { text: &prompt });
         if let Some(next) = &proposal.state {
             self.emit_state(&prior_state, next, committed);
@@ -1856,7 +2273,7 @@ impl Step<'_> {
     fn retry_to(&mut self, target: crate::rewind::RewindTarget, cut: bool) -> Result<Need> {
         let (revision, state) = self.head()?;
         let prompt = state
-            .transcript()
+            .transcript_ref()
             .map_err(turn_error)?
             .messages
             .iter()
@@ -1871,14 +2288,14 @@ impl Step<'_> {
         }
         // A turn's first request re-sends its prompt from the end of the turn before; the
         // files it brought (attachments) are in the workspace the request saw.
-        let started = self.store.snapshot().map_err(store_error)?.workspace;
+        let started = self.store.head_root().map_err(store_error)?.1;
         // The app state the interrupted turn had (its prompt's, and any change made
         // before its request) comes back with the restarted turn.
         let carried = self.store.app_state(SCOPE, revision).map_err(store_error)?;
         self.rewind_to(target.revision, true)?;
         if target.kind == RewindTargetKind::Settled {
             let mut prompt = prompt.ok_or("the interrupted prompt could not be found")?;
-            let current = self.store.snapshot().map_err(store_error)?.workspace;
+            let current = self.store.head_root().map_err(store_error)?.1;
             let start = match started {
                 Some(root) if Some(&root) != current.as_ref() => Start::Root(root),
                 _ => Start::Same,
@@ -1920,7 +2337,7 @@ impl Step<'_> {
         let (revision, state) = self.head()?;
         match state.control().phase() {
             Phase::Ready | Phase::AfterTools | Phase::FinalReview => {
-                self.commit_steer(revision, &state, text)?;
+                self.commit_steer(revision, state, text)?;
                 Ok(Need::Continue)
             }
             Phase::ModelWait => {
@@ -1933,12 +2350,10 @@ impl Step<'_> {
                     return Err("no pending model request".into());
                 };
                 let attempt = self.store.attempt_for(&id).map_err(store_error)?;
+                // A saved reply the turn cannot adopt is gone back past, as retry does.
                 if let Some(attempt) = &attempt
-                    && self
-                        .store
-                        .receipt(&attempt.id)
-                        .map_err(store_error)?
-                        .is_some()
+                    && let Some(bytes) = self.store.receipt(&attempt.id).map_err(store_error)?
+                    && self.adoption(revision, &state, &attempt.id, &bytes).is_ok()
                 {
                     return Err("the reply to this turn's last request is saved: continue \
                                 reads it in, then send the message"
@@ -1963,7 +2378,7 @@ impl Step<'_> {
                 }
                 self.retry_to(target, true)?;
                 let (revision, state) = self.head()?;
-                self.commit_steer(revision, &state, text)?;
+                self.commit_steer(revision, state, text)?;
                 Ok(Need::Continue)
             }
             Phase::ToolsWait => Err("a tool call of this turn has no recorded result yet: \
@@ -1985,10 +2400,9 @@ impl Step<'_> {
     fn commit_steer(
         &mut self,
         mut revision: u64,
-        state: &TurnContinuation,
+        mut state: std::sync::Arc<TurnContinuation>,
         text: String,
     ) -> Result<()> {
-        let mut state = state.clone();
         loop {
             let command = format!("steer-r{revision}");
             let admitted = match self.store.admitted(SCOPE, &command).map_err(store_error)? {
@@ -2003,12 +2417,12 @@ impl Step<'_> {
                 None => None,
             };
             let next = admitted.clone().unwrap_or_else(|| text.clone());
-            let after = state.steer(next.clone()).map_err(turn_error)?;
+            let after = crate::turn::steered(&state, next.clone()).map_err(turn_error)?;
             self.commit_action(
                 command,
                 &Action::Steer { text: next.clone() },
                 &state,
-                &after,
+                after,
             )?;
             self.emit(Event::Steered { text: &next });
             if admitted.is_none_or(|earlier| earlier == text) {
@@ -2112,18 +2526,35 @@ fn message_size(message: &Message) -> usize {
 /// Deterministic, host-produced compaction: older messages become one digest of the
 /// prompts, replies and tool calls they held; about `keep` bytes of recent history stay
 /// verbatim. The kept part starts at an assistant message, so tool results always
-/// follow their calls. None if nothing can be dropped.
+/// follow their calls. `notes` (the workspace as it stands, and the model's notes file:
+/// `Step::workspace_notes`) go after the summary, so what the model goes on from names
+/// the files it has. None if nothing can be dropped.
 pub(crate) fn compacted(
     transcript: &TranscriptCheckpoint,
     keep: usize,
     summary: Option<&str>,
+    notes: Option<&str>,
 ) -> Option<TranscriptCheckpoint> {
     let messages = &transcript.messages;
     let (cut, prompt) = compaction_cut(messages, keep)?;
-    let digest = match summary {
-        Some(summary) => summary.trim().to_string(),
+    let mut digest = match summary.map(str::trim) {
+        // A summary far shorter than what it replaces (a model that answered with a
+        // fragment) keeps the plain record of that part beside it.
+        Some(summary)
+            if summary.len() < THIN_SUMMARY
+                && messages[..cut].iter().map(message_size).sum::<usize>() > 8 * THIN_SUMMARY =>
+        {
+            format!(
+                "{summary}\n\nThat part step by step, as recorded:\n{}",
+                digest(&messages[..cut], prompt)
+            )
+        }
+        Some(summary) => summary.to_string(),
         None => digest(&messages[..cut], prompt),
     };
+    if let Some(notes) = notes.map(str::trim).filter(|notes| !notes.is_empty()) {
+        digest = format!("{digest}\n\n{notes}");
+    }
     let mut replacement = vec![Message {
         role: "user".into(),
         content: vec![Block::Text {
@@ -2141,19 +2572,173 @@ pub(crate) fn compacted(
     })
 }
 
+/// Paths a finished task's `changes` touch that the session changed too since the
+/// task began (`base`, its tree then; `head`, the tree now): each as a file, link or
+/// directory, in either, differs. A path under a changed directory, or over one,
+/// conflicts too.
+fn task_conflicts(base: &Tree, head: &Tree, changes: &crate::broker::Changes) -> Vec<String> {
+    #[derive(PartialEq)]
+    enum Node<'a> {
+        File(&'a str, bool),
+        Link(&'a str),
+        Directory,
+    }
+    fn nodes(tree: &Tree) -> std::collections::BTreeMap<&str, Node<'_>> {
+        tree.files
+            .iter()
+            .map(|entry| {
+                (
+                    entry.path.as_str(),
+                    Node::File(&entry.object, entry.executable),
+                )
+            })
+            .chain(
+                tree.links
+                    .iter()
+                    .map(|link| (link.path.as_str(), Node::Link(&link.target))),
+            )
+            .chain(
+                tree.directories
+                    .iter()
+                    .map(|path| (path.as_str(), Node::Directory)),
+            )
+            .collect()
+    }
+    let prior = nodes(base);
+    let now = nodes(head);
+    let changed: Vec<&str> = prior
+        .keys()
+        .chain(now.keys())
+        .filter(|path| prior.get(**path) != now.get(**path))
+        .copied()
+        .collect();
+    let overlap = |a: &str, b: &str| {
+        a == b
+            || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+            || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+    };
+    let mut conflicts: Vec<String> = changes
+        .writes
+        .iter()
+        .map(|(path, _, _)| path.as_str())
+        .chain(changes.deletes.iter().map(String::as_str))
+        .chain(changes.links.iter().map(|link| link.path.as_str()))
+        .chain(changes.directories.iter().map(String::as_str))
+        .filter(|path| changed.iter().any(|changed| overlap(path, changed)))
+        .map(String::from)
+        .collect();
+    conflicts.sort();
+    conflicts.dedup();
+    conflicts
+}
+
+/// The changes that make `now` of `base` (a finished task's tree of its own session,
+/// against the tree it began from): files written (their bytes through `read`, by
+/// object), paths removed, links and empty directories added. What both hosts offer a
+/// task's report (`Driver::offer_task_changes`). Over the merge limit (paths counted
+/// first, bytes as they are read, so no more than the limit is ever held) nothing is
+/// read further: `Err` names the limit, for the report to say.
+#[cfg_attr(not(any(feature = "embedded", feature = "agent")), allow(dead_code))]
+pub(crate) fn tree_changes(
+    base: &Tree,
+    now: &Tree,
+    mut read: impl FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<std::result::Result<crate::broker::Changes, String>> {
+    let before: std::collections::HashMap<&str, (&str, bool)> = base
+        .files
+        .iter()
+        .map(|entry| {
+            (
+                entry.path.as_str(),
+                (entry.object.as_str(), entry.executable),
+            )
+        })
+        .collect();
+    let kept: std::collections::HashSet<&str> =
+        now.files.iter().map(|entry| entry.path.as_str()).collect();
+    let changed: Vec<&Entry> = now
+        .files
+        .iter()
+        .filter(|entry| {
+            before.get(entry.path.as_str()) != Some(&(entry.object.as_str(), entry.executable))
+        })
+        .collect();
+    let mut deletes: Vec<String> = base
+        .files
+        .iter()
+        .filter(|entry| !kept.contains(entry.path.as_str()))
+        .map(|entry| entry.path.clone())
+        .collect();
+    let links: Vec<crate::workspace::Link> = now
+        .links
+        .iter()
+        .filter(|link| !base.links.contains(link))
+        .cloned()
+        .collect();
+    let directories: Vec<String> = now
+        .directories
+        .iter()
+        .filter(|path| !base.directories.contains(path))
+        .cloned()
+        .collect();
+    deletes.extend(
+        base.links
+            .iter()
+            .filter(|link| !now.links.iter().any(|kept| kept.path == link.path))
+            .map(|link| link.path.clone()),
+    );
+    deletes.extend(
+        base.directories
+            .iter()
+            .filter(|path| !now.directories.contains(path))
+            .cloned(),
+    );
+    let count = changed.len() + deletes.len() + links.len() + directories.len();
+    let over = |count: usize, bytes: usize| {
+        format!(
+            "[task files not merged: {count} paths, {} MiB, over the merge limit ({} paths, {} MiB); they stay in the task's own session]",
+            bytes / (1024 * 1024),
+            MAX_TASK_MERGE_PATHS,
+            MAX_TASK_MERGE_BYTES / (1024 * 1024)
+        )
+    };
+    if count > MAX_TASK_MERGE_PATHS {
+        return Ok(Err(over(count, 0)));
+    }
+    let mut writes = Vec::with_capacity(changed.len());
+    let mut bytes = 0usize;
+    for entry in changed {
+        let content = read(&entry.object)?;
+        bytes += content.len();
+        if bytes > MAX_TASK_MERGE_BYTES {
+            return Ok(Err(over(count, bytes)));
+        }
+        writes.push((entry.path.clone(), content, entry.executable));
+    }
+    Ok(Ok(crate::broker::Changes {
+        writes,
+        deletes,
+        links,
+        directories,
+    }))
+}
+
 /// Where a compaction cuts: about `keep` bytes of recent history stay, starting at an
 /// assistant message. Also the current prompt's index when it falls in the dropped
 /// part; it stays verbatim (retry re-sends it), placed after the summary.
 fn compaction_cut(messages: &[Message], keep: usize) -> Option<(usize, Option<usize>)> {
-    let mut kept = 0usize;
+    let (mut kept, mut blocks) = (0usize, 0usize);
     let mut cut = None;
     for index in (1..messages.len()).rev() {
         kept += message_size(&messages[index]);
+        blocks += messages[index].content.len();
+        // At most `keep` bytes, and well under the engine's counts (`crowded`).
+        let fits = kept <= keep && messages.len() - index <= KEEP_MESSAGES && blocks <= KEEP_BLOCKS;
         if messages[index].role == "assistant" {
-            if kept <= keep || cut.is_none() {
+            if fits || cut.is_none() {
                 cut = Some(index);
             }
-            if kept > keep {
+            if !fits {
                 break;
             }
         }
@@ -2236,6 +2821,16 @@ fn state_after(prior: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Whether a turn waits for its next model request with nothing in flight: its
+/// settings may change there, since that request is prepared from them when it goes.
+#[cfg(any(feature = "agent", feature = "embedded"))]
+pub(crate) fn before_model(state: &TurnContinuation) -> bool {
+    matches!(state.control().phase(), Phase::Ready | Phase::AfterTools)
+        && state
+            .pending_effects()
+            .is_ok_and(|effects| effects.is_empty())
 }
 
 /// A user's request: an all-text user message that is neither a compaction digest nor
@@ -2434,6 +3029,15 @@ fn transcript_len(transcript: &TranscriptCheckpoint) -> Result<usize> {
         .map_err(|error| format!("history rejected ({error:?})"))
 }
 
+/// Why a saved reply cannot be read into the turn, pointing at the way on: `retry`
+/// treats it as an unknown outcome and asks again (`Driver::retry`).
+fn unadoptable(why: String) -> String {
+    format!(
+        "the reply saved for this request cannot be used ({why}); `spindle retry` asks for \
+         it again (it may be billed again)"
+    )
+}
+
 fn turn_error(error: dext_transcript::continuation::Error) -> String {
     format!("turn state rejected the step ({error:?})")
 }
@@ -2530,13 +3134,27 @@ pub fn describe_call(name: &str, input: &Value) -> String {
 }
 
 impl Step<'_> {
-    pub(crate) fn head(&mut self) -> Result<(u64, TurnContinuation)> {
-        let snapshot = self.store.snapshot().map_err(store_error)?;
-        if snapshot.revision == 0 {
+    /// The head revision and its turn: the one this driver last committed or read
+    /// (a revision's turn never changes), else restored from the store.
+    pub(crate) fn head(&mut self) -> Result<(u64, std::sync::Arc<TurnContinuation>)> {
+        let revision = self.store.head_revision().map_err(store_error)?;
+        if revision == 0 {
             return Err("this session has no turns yet".into());
         }
-        let state = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
+        if let Some((kept, state)) = &self.driver.head
+            && *kept == revision
+        {
+            return Ok((revision, state.clone()));
+        }
+        let snapshot = self.store.snapshot().map_err(store_error)?;
+        let state =
+            std::sync::Arc::new(crate::turn::restored(&snapshot.continuation).map_err(turn_error)?);
+        self.driver.head = Some((snapshot.revision, state.clone()));
         Ok((snapshot.revision, state))
+    }
+    /// Keeps `state` as the turn of `revision`, just committed.
+    pub(crate) fn committed(&mut self, revision: u64, state: TurnContinuation) {
+        self.driver.head = Some((revision, std::sync::Arc::new(state)));
     }
     pub(crate) fn proposal(
         &mut self,
@@ -2546,6 +3164,26 @@ impl Step<'_> {
         before: &TurnContinuation,
         after: &TurnContinuation,
     ) -> Result<Proposal> {
+        let continuation = after.checkpoint().map_err(turn_error)?;
+        self.proposal_encoded(
+            id,
+            observation,
+            expected_revision,
+            before,
+            after,
+            continuation,
+        )
+    }
+    /// `proposal`, with `after` encoded already (`continuation`).
+    pub(crate) fn proposal_encoded(
+        &mut self,
+        id: String,
+        observation: Observation,
+        expected_revision: u64,
+        before: &TurnContinuation,
+        after: &TurnContinuation,
+        continuation: Vec<u8>,
+    ) -> Result<Proposal> {
         Ok(Proposal {
             id,
             scope: SCOPE.into(),
@@ -2553,7 +3191,7 @@ impl Step<'_> {
             expected_revision,
             owner_epoch: self.store.epoch(),
             engine: ENGINE.into(),
-            continuation: after.checkpoint().map_err(turn_error)?,
+            continuation,
             workspace: None,
             effects: new_intents(Some(before), after).map_err(store_error)?,
             state: None,
@@ -2599,20 +3237,65 @@ impl Step<'_> {
         id: String,
         action: &Action,
         before: &TurnContinuation,
-        after: &TurnContinuation,
+        after: TurnContinuation,
+    ) -> Result<u64> {
+        let continuation = after.checkpoint().map_err(turn_error)?;
+        self.commit_encoded(id, action, before, after, continuation)
+    }
+    /// `commit_action`, with `after` encoded already (`continuation`).
+    pub(crate) fn commit_encoded(
+        &mut self,
+        id: String,
+        action: &Action,
+        before: &TurnContinuation,
+        after: TurnContinuation,
+        continuation: Vec<u8>,
     ) -> Result<u64> {
         let sequence = self.admit(&id, action)?;
-        let revision = self.store.snapshot().map_err(store_error)?.revision;
-        let proposal = self.proposal(
+        let revision = self.store.head_revision().map_err(store_error)?;
+        let proposal = self.proposal_encoded(
             format!("commit-{id}"),
             Observation::Admission(sequence),
             revision,
             before,
-            after,
+            &after,
+            continuation,
         )?;
-        self.store
+        let committed = self
+            .store
             .commit_turn_action(&proposal)
-            .map_err(store_error)
+            .map_err(store_error)?;
+        self.committed(committed, after);
+        Ok(committed)
+    }
+    /// `commit_action` with a workspace root for the revision it makes: a task's
+    /// report with the files it brings (`Store::commit_turn_task_report`).
+    pub(crate) fn commit_action_with_workspace(
+        &mut self,
+        id: String,
+        action: &Action,
+        before: &TurnContinuation,
+        after: TurnContinuation,
+        root: String,
+    ) -> Result<u64> {
+        let continuation = after.checkpoint().map_err(turn_error)?;
+        let sequence = self.admit(&id, action)?;
+        let revision = self.store.head_revision().map_err(store_error)?;
+        let mut proposal = self.proposal_encoded(
+            format!("commit-{id}"),
+            Observation::Admission(sequence),
+            revision,
+            before,
+            &after,
+            continuation,
+        )?;
+        proposal.workspace = Some(root);
+        let committed = self
+            .store
+            .commit_turn_task_report(&proposal)
+            .map_err(store_error)?;
+        self.committed(committed, after);
+        Ok(committed)
     }
     pub(crate) fn intent(&mut self, effect: &str) -> Result<(u64, EffectIntent)> {
         let revision = self
@@ -2650,11 +3333,10 @@ impl Step<'_> {
             .map_err(|_| BAD_FILES.into())
     }
     pub(crate) fn ensure_idle(&mut self) -> Result<()> {
-        let snapshot = self.store.snapshot().map_err(store_error)?;
-        if snapshot.revision == 0 {
+        if self.store.head_revision().map_err(store_error)? == 0 {
             return Ok(());
         }
-        let prior = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
+        let (_, prior) = self.head()?;
         match prior.control().phase() {
             Phase::Stopped(Stop::Complete) => Ok(()),
             Phase::Stopped(stop) => Err(format!(
@@ -2711,7 +3393,7 @@ impl Step<'_> {
             ));
         };
         let kind = chosen.kind;
-        let head = self.store.snapshot().map_err(store_error)?.revision;
+        let head = self.store.head_revision().map_err(store_error)?;
         let lineage = self.store.lineage().map_err(store_error)?;
         let cut = self
             .store
@@ -2732,7 +3414,7 @@ impl Step<'_> {
             .resume_rewind(SCOPE, &command)
             .map_err(store_error)?;
         let report = self.store.reconciliation().map_err(store_error)?;
-        let revision = self.store.snapshot().map_err(store_error)?.revision;
+        let revision = self.store.head_revision().map_err(store_error)?;
         self.emit(Event::Rewound {
             target,
             revision,
@@ -2836,6 +3518,20 @@ fn display_of(content: &str) -> Option<Value> {
         .all(|item| item["path"].is_string() && item["kind"].is_string())
         .then_some(value)
 }
+/// What a refusal says when it is a ChatGPT plan's usage limit (the plan's, or the one
+/// the user set for this app in ChatGPT's settings).
+fn plan_limit(body: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    (lower.contains("subscription_sharing_") && lower.contains("usage_limit_exceeded")).then(|| {
+        format!(
+            "your ChatGPT plan's usage limit is reached (the plan's, or the one set for this app): review it at {CHATGPT_USAGE}"
+        )
+    })
+}
+
+/// Where a ChatGPT user reviews and limits what apps use of their plan.
+pub(crate) const CHATGPT_USAGE: &str = "https://chatgpt.com/settings/usage";
+
 fn http_error(status: u16) -> String {
     match status {
         401 | 403 => "the provider rejected the credentials".into(),
@@ -2868,3 +3564,194 @@ pub fn stop_text(stop: Stop) -> &'static str {
 }
 
 pub use crate::protocol::base64_decode;
+
+#[cfg(test)]
+mod merge_tests {
+    use super::{task_conflicts, tree_changes};
+    use crate::broker::Changes;
+    use crate::workspace::{Entry, Link, Tree};
+
+    fn file(path: &str, object: &str) -> Entry {
+        Entry {
+            path: path.into(),
+            object: object.into(),
+            executable: false,
+        }
+    }
+
+    fn tree(files: &[(&str, &str)], links: &[(&str, &str)], directories: &[&str]) -> Tree {
+        Tree {
+            files: files
+                .iter()
+                .map(|(path, object)| file(path, object))
+                .collect(),
+            links: links
+                .iter()
+                .map(|(path, target)| Link {
+                    path: (*path).into(),
+                    target: (*target).into(),
+                })
+                .collect(),
+            directories: directories.iter().map(|path| (*path).into()).collect(),
+        }
+    }
+
+    fn writes(paths: &[&str]) -> Changes {
+        Changes {
+            writes: paths
+                .iter()
+                .map(|path| ((*path).into(), b"new".to_vec(), false))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_task_conflicts_only_where_the_session_changed_since_it_began() {
+        let base = tree(
+            &[("a.txt", "a1"), ("src/b.txt", "b1"), ("c.txt", "c1")],
+            &[],
+            &[],
+        );
+        // The session rewrote a.txt, removed c.txt and added src/d.txt since.
+        let head = tree(
+            &[("a.txt", "a2"), ("src/b.txt", "b1"), ("src/d.txt", "d1")],
+            &[],
+            &[],
+        );
+        assert!(task_conflicts(&base, &head, &writes(&["src/b.txt", "e.txt"])).is_empty());
+        assert_eq!(
+            task_conflicts(&base, &head, &writes(&["a.txt", "e.txt"])),
+            ["a.txt"]
+        );
+        assert_eq!(task_conflicts(&base, &head, &writes(&["c.txt"])), ["c.txt"]);
+        // A delete of what the session changed, and a write over or under a changed path.
+        let deletes = Changes {
+            deletes: vec!["src/d.txt".into()],
+            ..Default::default()
+        };
+        assert_eq!(task_conflicts(&base, &head, &deletes), ["src/d.txt"]);
+        assert_eq!(
+            task_conflicts(&base, &head, &writes(&["src/d.txt/x"])),
+            ["src/d.txt/x"]
+        );
+        // Unchanged between base and head: nothing conflicts, whatever the task touched.
+        assert!(task_conflicts(&base, &base, &writes(&["a.txt", "c.txt"])).is_empty());
+        // A link or directory that changed counts like a file.
+        let linked = tree(&[], &[("l", "a.txt")], &["empty"]);
+        let relinked = tree(&[], &[("l", "b.txt")], &[]);
+        let touching = Changes {
+            links: vec![Link {
+                path: "l".into(),
+                target: "c.txt".into(),
+            }],
+            directories: vec!["empty".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            task_conflicts(&linked, &relinked, &touching),
+            ["empty", "l"]
+        );
+    }
+
+    #[test]
+    fn a_tasks_tree_against_its_base_names_what_it_changed() {
+        let base = tree(
+            &[("keep.txt", "k1"), ("edit.txt", "e1"), ("gone.txt", "g1")],
+            &[("old-link", "keep.txt")],
+            &["was-empty"],
+        );
+        let mut now = tree(
+            &[("keep.txt", "k1"), ("edit.txt", "e2"), ("new.txt", "n1")],
+            &[("new-link", "new.txt")],
+            &["now-empty"],
+        );
+        now.files[0].executable = true;
+        let changes = tree_changes(&base, &now, |object| {
+            Ok(format!("bytes of {object}").into_bytes())
+        })
+        .unwrap()
+        .unwrap();
+        let written: Vec<(&str, &str, bool)> = changes
+            .writes
+            .iter()
+            .map(|(path, bytes, executable)| {
+                (
+                    path.as_str(),
+                    std::str::from_utf8(bytes).unwrap(),
+                    *executable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            written,
+            [
+                ("keep.txt", "bytes of k1", true),
+                ("edit.txt", "bytes of e2", false),
+                ("new.txt", "bytes of n1", false)
+            ]
+        );
+        let mut deletes = changes.deletes.clone();
+        deletes.sort();
+        assert_eq!(deletes, ["gone.txt", "old-link", "was-empty"]);
+        assert_eq!(changes.links.len(), 1);
+        assert_eq!(changes.links[0].path, "new-link");
+        assert_eq!(changes.directories, ["now-empty"]);
+        assert_eq!(changes.count(), 8);
+        // Nothing changed: nothing to offer.
+        assert!(
+            tree_changes(&base, &base, |_| unreachable!())
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        // A read that fails fails the whole.
+        assert!(tree_changes(&base, &now, |_| Err("object missing".into())).is_err());
+        // Over the merge limit, reading stops where the limit is passed (no more than
+        // the limit is ever held), and the note says so.
+        let mut reads = 0;
+        let big = tree_changes(&base, &now, |_| {
+            reads += 1;
+            Ok(vec![0u8; super::MAX_TASK_MERGE_BYTES / 2 + 1])
+        })
+        .unwrap();
+        assert!(
+            big.as_ref()
+                .is_err_and(|note| note.contains("over the merge limit")),
+            "{big:?}"
+        );
+        assert_eq!(reads, 2, "the third file was never read");
+        let many = Tree {
+            files: (0..=super::MAX_TASK_MERGE_PATHS)
+                .map(|n| file(&format!("f{n}"), "x"))
+                .collect(),
+            ..Default::default()
+        };
+        let counted =
+            tree_changes(&base, &many, |_| unreachable!("counted before any read")).unwrap();
+        assert!(counted.is_err(), "{counted:?}");
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::{CHATGPT_USAGE, http_error, plan_limit};
+
+    #[test]
+    fn a_chatgpt_plan_usage_limit_says_where_to_review_it() {
+        let limit = r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded"}}"#;
+        let said = plan_limit(limit).unwrap();
+        assert!(said.contains("usage limit is reached"), "{said}");
+        assert!(said.contains(CHATGPT_USAGE), "{said}");
+        // Any other 429 is the rate limit it always was.
+        assert_eq!(
+            plan_limit(r#"{"error":{"code":"rate_limit_exceeded"}}"#),
+            None
+        );
+        assert!(http_error(429).contains("rate-limited"));
+        assert!(
+            dext_core::recovery::chatgpt_plan_refusal(limit).is_some(),
+            "and backoff gives up on it at once"
+        );
+    }
+}

@@ -195,8 +195,9 @@
           <p>If something covers the target, such as a banner or a dialog, nothing is clicked or typed, and the
             agent is told what is in the way. Two threads never type into one tab at once.</p></div>
         <div class="card"><span class="tag">Before acting</span><h3>You choose when it asks.</h3>
-          <p>Full, the default, works start to end without asking. Auto asks before anything that sends: Enter or
-            Return, a submit, accepting a page's dialog, a button that posts, pays or deletes. Ask asks before every
+          <p>Auto is the current source's new-install default; older installs keep Full, which works without asking.
+            Auto asks before Enter or Return, uploads, a submit, accepting a dialog, or a button that posts, pays or
+            deletes. Its English labels are a heuristic, not a guarantee. Ask asks before every
             click, key, choice, dialog answer, page it opens and tab it closes. A No means it is not done.</p></div>
         <div class="card"><span class="tag">Steer</span><h3>Stop, then say what to do.</h3>
           <p>Stop ends a running command. It is kept as stopped, with what it printed, and never runs again. Your
@@ -219,8 +220,8 @@
             read what the agent proposes before it acts on anything that matters.</li>
           <li>A click, a submitted form or a sent request cannot be taken back. Spindle tells you when one may
             have happened; it cannot undo it.</li>
-          <li>Through the browser, local addresses are refused by name and number, but the browser resolves
-            names, so a public name that points into your own network is not caught. A relay you set up
+          <li>The browser gateway checks public names over Cloudflare DNS-over-HTTPS first, but failed or slow
+            checks pass and Chrome resolves names again, so DNS rebinding is not caught. A relay you set up
             reaches whatever it can reach.</li>
           <li>Without a passphrase, the key that seals your keys lives in the same browser profile.</li>
           <li>A site's sealed token is kept from scripts, not from use: any script may make the requests that
@@ -248,7 +249,9 @@
         <li>Local llama.cpp <small>no key</small></li>
         <li>Your own <small>providers.json</small></li>
       </ul>
-      <p class="note" style="margin-top:16px">Sign in with ChatGPT uses your ChatGPT plan. Anthropic models take an
+      <p class="note" style="margin-top:16px">Current source offers OpenAI's Sign in with ChatGPT and, in the
+        source/GitHub edition, ChatGPT (Codex). The store edition omits the Codex client. Both use your plan;
+        live issued-client sign-in still needs an interactive account check. Anthropic models take an
         API key; a Claude subscription sign-in is not offered. Any OpenAI-compatible endpoint can be added with a
         <code>providers.json</code>.</p>
     </div>
@@ -260,7 +263,9 @@
         <span class="num">07 &mdash; INSTALL</span>
         <h2 id="install-h">Download, load, sign in.</h2>
         <p>Spindle for Browser is not in the Chrome Web Store yet. Each release is a zip built and
-          checked by the repository's own workflow; you load it as an unpacked extension.</p>
+          checked by the repository's own workflow; you load it as an unpacked extension. The download here is
+          0.1.7; current-source features can be newer, including OpenAI's issued-client ChatGPT sign-in and the
+          Auto default. Build from source for those until the next release.</p>
       </div>
       <ol class="steps">
         <li><div><h3>Download the zip.</h3>

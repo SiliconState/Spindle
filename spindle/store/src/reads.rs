@@ -34,15 +34,33 @@ fn at(
     view: &mut ReadView<'_>,
     revision: Option<u64>,
 ) -> crate::Result<(u64, u64, Vec<u8>, Option<String>)> {
-    let (head, continuation, root) = view.head()?;
+    // One continuation read, the one asked for: the head's is not read for another.
+    let head = view.head_revision()?;
     match revision {
-        None => Ok((head, head, continuation, root)),
-        Some(revision) if revision == head => Ok((head, head, continuation, root)),
-        Some(0) => Ok((head, 0, vec![], None)),
-        Some(revision) => {
+        Some(0) if head != 0 => Ok((head, 0, vec![], None)),
+        Some(revision) if revision != head => {
             let (continuation, root) = view.at(revision)?.ok_or(crate::Error::Invalid)?;
             Ok((head, revision, continuation, root))
         }
+        _ => {
+            let (head, continuation, root) = view.head()?;
+            Ok((head, head, continuation, root))
+        }
+    }
+}
+/// `at` without the continuation (never read): the head, the revision read and its
+/// workspace root.
+fn root_at(
+    view: &mut ReadView<'_>,
+    revision: Option<u64>,
+) -> crate::Result<(u64, u64, Option<String>)> {
+    let (head, root) = view.head_root()?;
+    match revision {
+        Some(revision) if revision != head => {
+            let root = view.root_at(revision)?.ok_or(crate::Error::Invalid)?;
+            Ok((head, revision, root))
+        }
+        _ => Ok((head, head, root)),
     }
 }
 /// Where a session's committed head stands: `head`,
@@ -206,7 +224,7 @@ fn window(messages: &[Message], from: usize) -> Vec<Value> {
 pub fn state_on(view: &mut ReadView<'_>, revision: Option<u64>) -> Result<Value> {
     let (head, revision, state) = view
         .read(|view| {
-            let (head, revision, _, _) = at(view, revision)?;
+            let (head, revision, _) = root_at(view, revision)?;
             Ok((
                 head,
                 revision,
@@ -229,7 +247,7 @@ fn no_revision(revision: Option<u64>) -> String {
 /// empty directories.
 pub fn files_on(view: &mut ReadView<'_>, revision: Option<u64>) -> Result<Value> {
     view.read(|view| {
-        let (head, revision, _, root) = at(view, revision)?;
+        let (head, revision, root) = root_at(view, revision)?;
         let Some(root) = root else {
             return Ok(json!({"head": head, "revision": revision, "files": [], "links": [], "directories": []}));
         };
@@ -253,7 +271,7 @@ pub fn files_on(view: &mut ReadView<'_>, revision: Option<u64>) -> Result<Value>
 /// The bytes of one workspace file committed at `revision` (the head when None).
 pub fn read_on(view: &mut ReadView<'_>, revision: Option<u64>, path: &str) -> Result<Vec<u8>> {
     view.read(|view| {
-        let (_, _, _, root) = at(view, revision)?;
+        let (_, _, root) = root_at(view, revision)?;
         let root = root.ok_or(crate::Error::Invalid)?;
         // Found in the manifest: one file's read never looks at the others.
         let entry = view.entry(&root, path)?.ok_or(crate::Error::Invalid)?;
@@ -268,20 +286,57 @@ pub fn targets_on(view: &mut ReadView<'_>) -> Result<Vec<Value>> {
 }
 /// Rewind targets among the newest `listed` steps (at most 8192), newest first.
 pub fn targets_among(view: &mut ReadView<'_>, listed: usize) -> Result<Vec<Value>> {
-    let steps = view
-        .read(|view| view.recent_steps(8192))
+    let candidates = view
+        .read(|view| view.newest_revisions(listed))
         .map_err(view_error)?;
-    let candidates: Vec<u64> = steps
-        .iter()
-        .rev()
-        .take(listed)
-        .map(|step| step.revision)
-        .collect();
     Ok(view
         .targets(&candidates)
         .into_iter()
         .map(|(revision, kind)| json!({"revision": revision, "kind": rewind_kind(kind)}))
         .collect())
+}
+
+/// Where a stopped turn can go on from (`targets` with `until: "settled"`): its rewind
+/// targets newest first, up to and including the newest completed turn; `completed`,
+/// false only when the whole history holds no completed turn (its first turn); and
+/// `prompt`, the turn's own message: the newest user request, never a compaction
+/// summary, a message sent while it ran or a task's report (each turn's request stays
+/// verbatim through compaction).
+pub fn turn_on(view: &mut ReadView<'_>) -> Result<Value> {
+    let (targets, completed, continuation) = view
+        .read(|view| {
+            let (targets, completed) = view.targets_to_settled()?;
+            let (_, continuation, _) = view.head()?;
+            Ok((targets, completed, continuation))
+        })
+        .map_err(view_error)?;
+    let prompt = if continuation.is_empty() {
+        None
+    } else {
+        restore(&continuation)?
+            .transcript_ref()
+            .map_err(|_| "unreadable transcript".to_string())?
+            .messages
+            .iter()
+            .rev()
+            .find(|message| is_prompt(message))
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        dext_transcript::Block::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+    };
+    let targets: Vec<Value> = targets
+        .into_iter()
+        .map(|(revision, kind)| json!({"revision": revision, "kind": rewind_kind(kind)}))
+        .collect();
+    Ok(json!({"targets": targets, "completed": completed, "prompt": prompt}))
 }
 
 /// A task's short name, from its key (a call's id, or `app:` and an app's own id): as a

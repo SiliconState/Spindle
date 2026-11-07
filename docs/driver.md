@@ -99,7 +99,11 @@ The driver may read the store, commit steps, and call three host traits:
 | `begin_run()` | Resets the retry policy for a new host-driven run. |
 | `set_state(store, patch)` | Commits an app-state merge patch as a step of its own, at a safe boundary. |
 | `reserve_app(store, need)` / `record_app(store, need, answer)` | Reserve an app call before asking the app; retain its answer before delivering it. |
+| `pending_task_reports(store)`, `offer_task_changes(task, changes)`, `clear_task_changes()` | Enumerate finished/stopped queued reports and supply bounded file changes, an explicit empty offer, or a reason files stay in the task. A finished keep-files report waits for its offer. |
 | `set_inbox(inbox)` | Rebinds the host's queues after the host replaced the store. |
+
+The driver also caches the current head and holds the host's transient task-file
+offers; neither is authoritative beyond the committed store.
 
 ### Needs and answers
 
@@ -115,7 +119,7 @@ The driver may read the store, commit steps, and call three host traits:
 | `Tool(ToolNeed::Ask / Task / Tasks)` | Reserve and ask the app, or run task sessions. | `App { need, outcome, waiting }` |
 | `Summarize(SummaryNeed)` | Ask the model for a compaction summary, or decline. | `Summary { need, summary }` (`None`: the deterministic digest is used) |
 | `Start(StartCall)` | Start a turn again with this prompt, workspace start and state (a retry that restarts a turn). | call `start` |
-| `TaskWait` | Background tasks are still running; wait. | call `next` |
+| `TaskWait` | Wait for running background tasks, or read pending finished tasks and offer their files (even an empty set or an error) before the report commits. | call `next` |
 | `PackIdle` / `FollowUp` | A session pack's idle hook, and its delayed follow-up prompt. | `Pack { idle, end }` / `FollowUp { idle, follow, waited }` |
 | `Stopped(Stop)` | The turn stopped: report it. | `Stopped(stop)` |
 
@@ -403,12 +407,21 @@ The session's first request has no earlier point to rewind to. For it `retry` re
 opens a fresh store with the same settings, files and app state, and starts the same
 prompt (`RetryingFirst`).
 
+A finished task's report also commits mergeable file changes from its original base.
+A missing host offer is not an empty change set: the driver returns `TaskWait` until
+it receives an explicit empty offer, bounded changes, or a reason the files stay in
+the child. `a_finished_task_waits_for_its_files_before_its_report_is_committed` checks
+that the report cannot advance the head first. File-merge failure notes lead the
+answer so they survive the report's 64 KiB clipping. Stop between tool steps takes
+precedence over collecting pending task files; the report remains available on resume.
+
 ## Refusals, drops and backoff
 
 When a send does not produce a reply, `deliver` classifies it:
 
 | Failure | Classified as | Policy |
 | --- | --- | --- |
+| `chatgpt-plan` usage limit, ineligible account, unsupported route or permission refusal | Final plan refusal | No automatic retry; review usage at chatgpt.com/settings/usage. A genuinely unavailable 503 remains transient. |
 | HTTP 408, 409, 425, 429, 500, 502, 503, 504, 529 | Transient refusal (recorded) | Sent again after `Retry-After`, or `2 << attempt` seconds (4, 8, 16, 32, 64, 64), at most 300 seconds, up to 6 automatic retries. |
 | HTTP 400, 413 or 422 whose body says the input is too long | Context overflow (recorded) | Sent again at once after compacting (`compacting: true`). |
 | HTTP 400 or 422 that states a lower output-token limit | Output limit (recorded) | The limit is remembered per provider and model in the `output_limits` metadata and the request is sent again at once asking for less. |
@@ -539,7 +552,9 @@ own spend is reserved against the parent's budget.
 **Embedded task tree.** Child settings inherit the parent's budget and may narrow
 it. While hosts in one task tree are open, every member checks the shared spend
 and worst case of in-flight requests, including nested script calls and compaction
-summaries. After a restart, a child that ran earlier counts in its own store only.
+summaries. After a restart, retained child stores are recursively counted before a
+budgeted send; unreadable child spend refuses instead of counting as zero. Freed
+task spend stays in the parent's ledger once.
 Embedded `usage` reports the session's own spend, not its tasks'.
 
 Both hosts check a compaction summary request the same way: when the budget
@@ -551,6 +566,9 @@ History is compacted when it outgrows the route's *history budget*: 80 percent o
 the model's context window leaves beside the largest reply, at three bytes per token,
 clamped to 16 KiB to 8 MiB (`shape::history_budget`, which both hosts' `Env::route`
 uses; models the catalog does not describe are assumed to have a 200,000-token window).
+`compact_tokens`, when set, can lower that threshold. The browser defaults new threads
+to 256,000 tokens. A summary retains the workspace file count, top-level names and
+start of top-level NOTES.md/notes.md alongside what the model wrote.
 
 | Trigger | Recent history kept verbatim |
 | --- | --- |

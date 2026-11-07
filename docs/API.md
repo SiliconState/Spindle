@@ -731,7 +731,9 @@ Points the session can rewind to.
 
 Result: `{targets: [{revision, kind, last}]}` ([rewind target](#rewind-target)).
 Refused with `busy` while a turn runs, and fails (`failed`) while a step is
-unresolved (`continue` first).
+unresolved (`continue` first). The embedded `targets` also accepts `limit`
+(default 48, 1–8192) and `until: "settled"`, which searches back to a completed turn
+instead of assuming one is within a fixed recent window.
 
 ### `usage`
 
@@ -745,8 +747,9 @@ Result: the [usage form](#usage-form). Both hosts use
 [`spend.rs`](../spindle/store/src/spend.rs) for retained pricing and worst-case
 budget checks. The embedded package counts during a turn only with `max_usd`
 (and emits `cost`); without a cap, this method counts when asked. Embedded calls
-are undated and the report excludes child tasks; its open task tree still shares
-spend for budget checks. See [embedded.md](embedded.md#settings-and-limits).
+are undated and the report excludes child tasks; budget checks share open-tree
+spend and recursively count retained child stores after reopen. Freed tasks retain
+counted spend in the parent ledger. See [embedded.md](embedded.md#settings-and-limits).
 
 ### `recover`
 
@@ -818,8 +821,10 @@ closes it; it continues only where the bundle is imported.
 Result: `{target, size, head, identity, files, moved, warnings}`. A running
 background task refuses the export. Moves are checked record by record before
 sealing; copies (`keep`) are checked as far as bundle facts require, and import
-always checks every record. Schema 20 packs workspace objects; schema 19 bundles
-are accepted and migrated in place. A native host never writes metadata into the
+always checks every record. Schema 20 and 21 are accepted; more than eight intents
+in a step widens a store atomically to 21 (at most 256). A schema-19 store image
+can migrate, but a bundle manifest naming schema 19 is refused (manifests must name
+20 or 21). A native host never writes metadata into the
 sealed source or into a store owned by the package. See [store.md](store.md).
 
 Embedded storage additionally offers `compact {dir}` (`compactSession(dir)`):
@@ -827,8 +832,14 @@ Embedded storage additionally offers `compact {dir}` (`compactSession(dir)`):
 free pages of the session and its tasks. A synced, fully checked compacted copy
 replaces each closed store; running turns or background tasks refuse it. Memory
 storage returns zeros. `checkBundle(bytes)` checks a bundle whole without writing,
-returning `{head, identity, files}`; `exportSession(..., {keep: true, whole: true})`
-requests full checking for a backup copy too. These are embedded methods, not
+returning `{head, identity, files, sourceState}`; `exportSession(..., {keep: true, whole: true})`
+requests full checking for a backup copy too. Embedded exports copy by default;
+native and HTTP exports still move by default. A two-step embedded move first keeps
+the bytes durably, then calls `sealSession(dir, {expectedHead, expectedState})`,
+using `bundleFacts(bytes).head` and `.sourceState`. The fingerprint covers settings,
+usage and task records/stores as well as the head; changes refuse the seal.
+`exportTask` and `task_drop` (`dropTask` in JS) additionally export then free a
+finished task's store, retaining its spend. These require feature `task_storage`. These are embedded methods, not
 native stdio or HTTP routes; see [embedded.md](embedded.md#giving-space-back).
 
 ### `import_session`
@@ -1591,7 +1602,8 @@ Spindle for Browser does this with a browser token (see
   `[]` (the host mounts its directories only for threads it made) and `self_edit`
   becomes false. On the thread only, `provider` and `model` change as the query asks,
   and an `effort` the model does not take becomes `default`.
-- The same key again with the same bytes (compared by SHA-256): `200 {session, fit,
+- A committed key is checked against the upload's SHA-256 before unpacking; replay
+  does not reopen or revalidate all the uploaded stores. The same key with the same bytes: `200 {session, fit,
   replayed: true}`, the same session as it is now and the same `fit`; nothing is
   imported again. The same key with other bytes: `409 conflict`. A key whose import is
   still running: `409 busy`; send it again when that ends.
@@ -1611,8 +1623,9 @@ Spindle for Browser does this with a browser token (see
 - A client that disconnects during the upload leaves nothing behind: no session, no
   record, no file.
 
-No stop of the host, a crash or power cut included, loses a thread brought in this way
-or leaves it registered twice. The upload is synced before anything else, and the key
+Import/restart tests exercise the staged filesystem and registry protocol, retaining
+one registered thread or a retryable pending import. This is not physical power-loss
+certification across every filesystem and registry boundary. The upload is synced before anything else, and the key
 is recorded as pending. The session is staged in a private directory, synced, and
 renamed into place, and only then registered: its registry row, its owner and the key's
 record commit in one transaction, and the session is live from that moment. A host that
@@ -1687,9 +1700,10 @@ without any token passing through a URL (PKCE, RFC 7636, `S256` only). Source:
 A code is 256 random bits, kept by the host only as its hash and only in memory (a
 host restart forgets it: connect again), good for one trade within 120 seconds, and
 bound to the NAME and challenge it was issued for. At most 16 codes are outstanding;
-another one retires the oldest. After 10 failed trades within a minute, across the
-host, every trade is `429 rate_limited` until fewer than 10 fall within the last
-minute.
+another one retires the oldest. Ten failed trades or pairing guesses from one
+source within a minute make that source's further attempts `429 rate_limited`
+for the remaining window, without locking out other sources. The source is
+Cloudflare's connecting address where present, otherwise local.
 
 ## Errors
 

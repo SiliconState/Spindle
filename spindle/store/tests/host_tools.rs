@@ -881,9 +881,12 @@ fn settings_queue_for_the_end_of_the_turn_and_models_are_listed() {
                 0 => Step::Call("settings", json!({})),
                 1 => Step::Call("settings", json!({"model": "no-such-model"})),
                 2 => Step::Call("settings", json!({"effort": "loud"})),
-                3 => Step::Call(
+                // The model may not widen what the user granted: network on is refused.
+                // (with a field nothing later queues: refused, it is not queued either)
+                3 => Step::Call("settings", json!({"network": true, "compaction": "digest"})),
+                4 => Step::Call(
                     "settings",
-                    json!({"network": true, "effort": "low", "max_usd": 5, "name": "Renamed"}),
+                    json!({"effort": "low", "max_usd": 5, "name": "Renamed"}),
                 ),
                 _ => {
                     // Mid-turn the change is pending, not applied: this request still
@@ -892,14 +895,15 @@ fn settings_queue_for_the_end_of_the_turn_and_models_are_listed() {
                     let list = exchange(port, &cookie, "GET", "/api/sessions", None).2;
                     let list: Value = serde_json::from_slice(&list).unwrap();
                     let id = list["sessions"][0]["id"].as_str().unwrap().to_string();
-                    // The phone's picker during a run: queued like the tool's change.
+                    // The phone's picker during a run: queued like the tool's change, and
+                    // the user may widen (network and toolchain on).
                     let (status, _, body) = exchange(
                         port,
                         &cookie,
                         "POST",
                         "/api/commands",
                         Some(&json!({"request_id": "mid-settings", "session": id,
-                            "kind": "settings", "toolchain": true})),
+                            "kind": "settings", "toolchain": true, "network": true})),
                     );
                     let posted = json!({"status": status,
                         "body": String::from_utf8_lossy(&body)});
@@ -996,8 +1000,13 @@ fn settings_queue_for_the_end_of_the_turn_and_models_are_listed() {
         results[2]["is_error"] == true && effort.contains("choose one of: default, off, low"),
         "{effort}"
     );
+    let widened = results[3]["content"].as_str().unwrap();
     assert!(
-        results[3]["content"]
+        results[3]["is_error"] == true && widened.contains("only the user can turn network on"),
+        "{widened}"
+    );
+    assert!(
+        results[4]["content"]
             .as_str()
             .unwrap()
             .starts_with("Queued:")

@@ -11,10 +11,31 @@ pub trait Storage {
     /// Opens the session's store: a new one (`create`, refused where history exists)
     /// or the existing one (refused where there is none).
     fn open(&self, create: bool) -> crate::Result<Store>;
+    /// Opens the existing store to read it, closed again at once. Where the place has
+    /// no lighter way, this is a full owner's open (checked, brought to this schema,
+    /// counted as an open) and costs as much as one.
+    fn read(&self) -> crate::Result<Store> {
+        self.open(false)
+    }
     /// Closes `store`, keeps its files aside (a first request retried in a fresh
     /// store: the old one keeps its unknown request on record) and opens a new empty
     /// store in its place. Returns the new store and where the old one was kept.
     fn set_aside(&self, store: Store) -> crate::Result<(Store, String)>;
+    /// `set_aside`, the new store first given to `prepare` with where the old one will
+    /// be kept (a retried first request's settings, its spend with the old store's
+    /// requests of unknown outcome, and the restarted turn go in): where the place can,
+    /// the new store is made whole so before the old one moves, and no other owner
+    /// opens either store meanwhile, so a crash leaves the session with one store or the
+    /// other, never none or one without what `prepare` wrote.
+    fn replace_store(
+        &self,
+        store: Store,
+        prepare: &mut dyn FnMut(&mut Store, &str) -> crate::Result<()>,
+    ) -> crate::Result<(Store, String)> {
+        let (mut fresh, aside) = self.set_aside(store)?;
+        prepare(&mut fresh, &aside)?;
+        Ok((fresh, aside))
+    }
     /// The storage of the task session `key` (a store of its own beside this one).
     fn child(&self, key: &str) -> Box<dyn Storage>;
     /// The sidecar file `name` beside the store (`session.json`, a task's `task.json`),
@@ -36,12 +57,22 @@ pub trait Storage {
     fn tasks(&self) -> Vec<String> {
         vec![]
     }
+    /// Holds the destination's exclusion while all files of an import are published.
+    fn begin_import(&self) -> crate::Result<Option<Box<dyn OwnerExclusion>>> {
+        Ok(None)
+    }
     /// Writes `image` (a checked store image) as this place's store, with the files a
     /// native store directory has; refused where a store is already.
     fn import_store(&self, image: &[u8]) -> crate::Result<()>;
-    /// Seals this place's session as moved elsewhere (`spindle-moved: <note>`), in
-    /// effect once its store closes: no host opens this copy as the session again.
-    /// Places that keep nothing once closed (memory) need no seal.
+    /// Removes everything kept in this place: an import's files, when it failed in a
+    /// place that was empty before it (so it can be tried again there).
+    fn discard(&self) -> crate::Result<()> {
+        Ok(())
+    }
+    /// Seals this place's session as moved elsewhere (`spindle-moved: <note>`), its
+    /// store open here: the seal is kept (durably) before this returns, or this fails
+    /// and nothing is sealed. No host opens a sealed copy as the session again. Places
+    /// that keep nothing once closed (memory) need no seal.
     fn seal(&self, _note: &str) -> crate::Result<()> {
         Ok(())
     }
@@ -56,6 +87,24 @@ pub trait Storage {
     /// on disk (memory).
     fn compact(&self) -> crate::Result<Option<(u64, u64)>> {
         Ok(None)
+    }
+    /// The bytes this place keeps: its store with its log, its sidecars and the stores
+    /// of its tasks (nested ones too). 0 where nothing is kept on disk (memory); a file
+    /// that cannot be read counts none.
+    fn size(&self) -> u64 {
+        0
+    }
+    /// Removes the place of task `key` (its store, sidecars and its own tasks) for good,
+    /// once the session has kept its spend: moved out of `tasks/` in one step first, so
+    /// no reader of either host finds part of it, then removed, with whatever an earlier
+    /// removal cut short left (`sweep`).
+    fn remove_task(&self, _key: &str) -> crate::Result<()> {
+        Ok(())
+    }
+    /// Removes what a `remove_task` cut short left (nothing reads it); cheap when there
+    /// is none, as when a session opens.
+    fn sweep(&self) -> crate::Result<()> {
+        Ok(())
     }
 }
 
@@ -105,6 +154,12 @@ impl Storage for MemoryStorage {
         }
         memory_store()
     }
+    /// A copy: opening hands the image over.
+    fn read(&self) -> crate::Result<Store> {
+        let images = self.images.borrow();
+        let image = images.get(&self.label).ok_or(crate::Error::Incompatible)?;
+        Store::from_image(image, NoGuard)
+    }
     fn set_aside(&self, store: Store) -> crate::Result<(Store, String)> {
         drop(store);
         Ok((
@@ -135,6 +190,30 @@ impl Storage for MemoryStorage {
             .filter(|key| !key.contains('#'))
             .map(String::from)
             .collect()
+    }
+    fn discard(&self) -> crate::Result<()> {
+        let prefix = format!("{}#", self.label);
+        self.images
+            .borrow_mut()
+            .retain(|label, _| *label != self.label && !label.starts_with(&prefix));
+        Ok(())
+    }
+    fn size(&self) -> u64 {
+        let prefix = format!("{}#", self.label);
+        self.images
+            .borrow()
+            .iter()
+            .filter(|(label, _)| **label == self.label || label.starts_with(&prefix))
+            .map(|(_, image)| image.len() as u64)
+            .sum()
+    }
+    fn remove_task(&self, key: &str) -> crate::Result<()> {
+        let task = format!("{}#{key}", self.label);
+        let nested = format!("{task}#");
+        self.images
+            .borrow_mut()
+            .retain(|label, _| *label != task && !label.starts_with(&nested));
+        Ok(())
     }
     fn import_store(&self, image: &[u8]) -> crate::Result<()> {
         match self.images.borrow_mut().entry(self.label.clone()) {

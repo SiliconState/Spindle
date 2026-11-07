@@ -746,9 +746,8 @@ fn check_backup(
     }
     let migrated = user_version(&copy.join("authority.sqlite"));
     let _ = std::fs::remove_dir_all(&copy);
-    if migrated? == i64::from(spindle_store::CAPABILITIES.schema)
-        && state_of(&backup).as_ref() != Ok(expected)
-    {
+    // Committed: a migration lands at schema 20 (a store moves on only with a wider step).
+    if migrated? == 20 && state_of(&backup).as_ref() != Ok(expected) {
         return Err("the migration committed but its backup is missing or differs".into());
     }
     check()?;
@@ -2000,6 +1999,174 @@ mod session {
         }
         eprintln!("{}", outcomes.join("\n"));
         let _ = std::fs::remove_dir_all(&root);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// One `spindle` CLI run over a copy of the session `dir` on a filesystem that is
+    /// full but for `headroom` bytes: a tmpfs sized to the copy plus `headroom`, mounted
+    /// in a user, mount and PID namespace of the run's own (no root needed), so the kernel
+    /// refuses writes past it with ENOSPC, as a real full disk does. What the run left
+    /// there is copied back over `dir`, as if room were made, so the next run continues
+    /// it. None where this host cannot make such a namespace.
+    #[cfg(all(feature = "cli", target_os = "linux"))]
+    fn cli_on_full_disk(dir: &Path, args: &[&str], headroom: u64) -> Option<(Option<i32>, String)> {
+        const SCRIPT: &str = r#"set -u
+src=$1; mnt=$2; bin=$3; headroom=$4; shift 4
+mkdir -p "$mnt/probe" "$mnt/full" || exit 90
+mount -t tmpfs -o size=1g tmpfs "$mnt/probe" || exit 91
+cp -a "$src" "$mnt/probe/s" || exit 92
+used=$(df -B1 --output=used "$mnt/probe" | tail -1)
+umount "$mnt/probe" || exit 93
+mount -t tmpfs -o size=$((used + headroom)) tmpfs "$mnt/full" || exit 94
+cp -a "$src" "$mnt/full/s" || exit 95
+"$bin" --dir "$mnt/full/s" "$@"
+code=$?
+rm -rf "$src" && cp -a "$mnt/full/s" "$src" || exit 96
+exit $code
+"#;
+        let usable = std::process::Command::new("unshare")
+            .args(["-Urmpf", "--kill-child", "true"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !usable {
+            return None;
+        }
+        let mnt = dir.with_extension("mnt");
+        std::fs::create_dir_all(&mnt).unwrap();
+        // A PID namespace of its own too: the script is its init, so ending `unshare` on a
+        // timeout (--kill-child) ends spindle with it, and the pipe closes.
+        let mut child = std::process::Command::new("unshare")
+            .args(["-Urmpf", "--kill-child", "sh", "-c", SCRIPT, "sh"])
+            .arg(dir)
+            .arg(&mnt)
+            .arg(env!("CARGO_BIN_EXE_spindle"))
+            .arg(headroom.to_string())
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Drained as it runs, so a long error never fills the pipe and stalls the run.
+        let mut pipe = child.stderr.take().unwrap();
+        let drained = std::thread::spawn(move || {
+            let mut stderr = String::new();
+            let _ = pipe.read_to_string(&mut stderr);
+            stderr
+        });
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(120) {
+                let _ = child.kill();
+                break child.wait().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let stderr = drained.join().unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&mnt);
+        assert!(
+            !matches!(status.code(), Some(90..=96)),
+            "the full-disk harness itself failed (exit {:?}): {stderr}",
+            status.code()
+        );
+        Some((status.code(), stderr))
+    }
+
+    /// A real `spindle` process on a full disk (ENOSPC, not a file size limit) at a
+    /// range of room left during a turn: it must end with a message, not a panic, signal
+    /// or hang; and once room is made, `continue` (or `retry`), a prompt and `doctor`
+    /// must succeed on what it left.
+    #[cfg(all(feature = "cli", target_os = "linux"))]
+    #[test]
+    fn a_cli_run_on_a_full_disk_ends_cleanly_and_the_session_continues() {
+        assert!(provider());
+        let root = scratch("enospc");
+        let mut outcomes = vec![];
+        let mut failures = vec![];
+        for (index, headroom) in [
+            0u64,
+            4 << 10,
+            16 << 10,
+            48 << 10,
+            128 << 10,
+            320 << 10,
+            1 << 20,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = root.join(format!("s{index}"));
+            let new = cli(
+                &dir,
+                &[
+                    "new",
+                    "--provider",
+                    "fake",
+                    "--model",
+                    "fake-model",
+                    "--isolation",
+                    "off",
+                    "TURN-1: write a note and count it",
+                ],
+                None,
+            );
+            assert_eq!(new.0, Some(0), "{}", new.1);
+            let Some((code, stderr)) = cli_on_full_disk(
+                &dir,
+                &["say", "TURN-2: write a note and count it"],
+                headroom,
+            ) else {
+                eprintln!(
+                    "skipped: this host cannot make user, mount and PID namespaces (unshare -Urmpf)"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            };
+            let last = stderr.lines().last().unwrap_or_default().to_string();
+            outcomes.push(format!("room {headroom}: exit {code:?}: {last}"));
+            if code.is_none()
+                || stderr.contains("panicked")
+                || (code != Some(0) && !last.starts_with("spindle: "))
+            {
+                failures.push(format!("room {headroom}: exit {code:?}, stderr:\n{stderr}"));
+            }
+            if code != Some(0)
+                && (last.contains("(Sql(") || last.contains("(Io(") || last.contains("(Paused)"))
+            {
+                failures.push(format!(
+                    "room {headroom}: an internal error reached the user: {last}"
+                ));
+            }
+            let resume = if last.contains("run `spindle retry`") {
+                "retry"
+            } else {
+                "continue"
+            };
+            for args in [
+                &[resume][..],
+                &["say", "TURN-3: write a note and count it"][..],
+                &["doctor"][..],
+            ] {
+                let (code, stderr) = cli(&dir, args, None);
+                if code != Some(0) {
+                    failures.push(format!(
+                        "room {headroom}, then {args:?}: exit {code:?}\n{stderr}"
+                    ));
+                    break;
+                }
+            }
+        }
+        eprintln!("{}", outcomes.join("\n"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| !outcome.contains("exit Some(0)")),
+            "no room left made no run fail, so nothing was tested: {outcomes:?}"
+        );
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 

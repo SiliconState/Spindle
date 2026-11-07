@@ -112,7 +112,8 @@ pub(crate) struct Facts {
     pub member: Mutex<String>,
 }
 
-/// Spend of a task tree's sessions while their hosts are open, by session label.
+/// Spend of a task tree's sessions by session label: as their open hosts count it,
+/// and (under a budget) as the stores of those not open kept it.
 pub(crate) type Pool = Arc<Mutex<BTreeMap<String, f64>>>;
 
 impl Facts {
@@ -134,6 +135,37 @@ impl Facts {
         lock(&lock(&self.pool)).insert(member, usd);
     }
 
+    /// Counts the task session `label` at what its store kept spent (`read` opens it),
+    /// unless the tree counts it already: a host of it opened since keeps its own count
+    /// (a request it sent included).
+    pub(crate) fn count_kept(
+        &self,
+        label: &str,
+        read: impl FnOnce() -> Result<Store>,
+    ) -> Result<()> {
+        let pool = lock(&self.pool).clone();
+        if lock(&pool).contains_key(label) {
+            return Ok(());
+        }
+        let store = read()?;
+        let report = crate::spend::HeldLedger::default().report(
+            &mut ReadView::from_store(&store),
+            Some(&self.catalog.0),
+            None,
+            false,
+        )?;
+        lock(&pool)
+            .entry(label.to_string())
+            .or_insert(report.budget_spent());
+        Ok(())
+    }
+
+    /// Empties the task tree's pool, to be counted again from what each session spent.
+    pub(crate) fn forget_spent(&self) {
+        let pool = lock(&self.pool).clone();
+        lock(&pool).clear();
+    }
+
     /// What the other sessions of this task tree spent, as they last counted it.
     pub(crate) fn others_spent(&self) -> f64 {
         let member = lock(&self.member).clone();
@@ -152,17 +184,44 @@ impl Facts {
     }
 
     /// Keeps `calls` (a set-aside store's requests of unknown outcome, `aside` naming
-    /// it) counted in `store`'s ledger.
+    /// it) counted in `store`'s ledger, the held one (that store's, before it was set
+    /// aside) written into `store` whole, even with no calls to add.
     pub(crate) fn keep_aside(
         &self,
         store: &Store,
         aside: &str,
         calls: Vec<crate::spend::Call>,
     ) -> Result<()> {
-        if calls.is_empty() {
-            return Ok(());
+        lock(&self.spend).aside(&mut ReadView::from_store(store), aside, calls, None)
+    }
+
+    /// Keeps the spend of a task whose store goes (`calls`, `aside` naming it) and the
+    /// record of it (`dropped`) in `store`'s ledger, in one write: from then on it is this
+    /// session's own spend, so the task tree's pool forgets the task (`label`) and its
+    /// own tasks.
+    pub(crate) fn keep_dropped(
+        &self,
+        store: &Store,
+        aside: &str,
+        calls: Vec<crate::spend::Call>,
+        dropped: Value,
+        label: &str,
+    ) -> Result<()> {
+        lock(&self.spend).aside(
+            &mut ReadView::from_store(store),
+            aside,
+            calls,
+            Some(dropped),
+        )?;
+        let nested = format!("{label}#");
+        let pool = lock(&self.pool).clone();
+        lock(&pool).retain(|member, _| member != label && !member.starts_with(&nested));
+        drop(pool);
+        // Counted as this session's now, where a budget counts the tree.
+        if lock(&self.budget).is_some() {
+            self.spent(store, false)?;
         }
-        lock(&self.spend).aside(&mut ReadView::from_store(store), aside, calls)
+        Ok(())
     }
 
     /// Keeps what was counted and not kept yet (at a turn's end).

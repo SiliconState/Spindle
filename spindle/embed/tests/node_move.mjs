@@ -149,7 +149,8 @@ async function aKilledNativeOwner(dir) {
   await app.close();
 }
 
-/** Moving by session bundle (Step 4): the package seals its copy and a native host
+/** Moving by session bundle (Step 4): the package keeps the bundle, then seals its copy
+ * at the bundle's head, and a native host
  * continues the bundle (its task found, not run again); the native host moves it back
  * into the package; a kept copy stays usable. */
 async function bundlesBothWays() {
@@ -161,12 +162,16 @@ async function bundlesBothWays() {
   replies.push(call('write_file', { path: 't.txt', content: 'from the task\n' }), text('task done'));
   await app.taskStart(dir, 't1', 'write t.txt');
   const head = (await app.status(dir)).head;
+  // A move in two steps: the bundle kept where it goes on first, then this copy sealed
+  // at its head.
   const bytes = await app.exportSession(dir);
+  assert.equal((await app.status(dir)).head, head, 'exported, it stays here until sealed');
+  const file = join(root, 'bundled.spindle');
+  fs.writeFileSync(file, bytes);
+  assert.equal((await app.sealSession(dir, { expectedHead: app.checkBundle(bytes).head, expectedState: app.checkBundle(bytes).sourceState })).head, head);
   await assert.rejects(app.status(dir), /moved elsewhere/, 'its old place is sealed');
   await app.close();
   assert.match(fs.readFileSync(join(dir, 'store', 'authority.sqlite.lock'), 'utf8'), /^spindle-moved: /);
-  const file = join(root, 'bundled.spindle');
-  fs.writeFileSync(file, bytes);
   const host = native();
   await assert.rejects(host.prompt(dir, 'not here'), /moved elsewhere/, 'natively too');
   const moved = join(root, 'bundled-native');

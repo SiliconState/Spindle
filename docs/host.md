@@ -65,9 +65,12 @@ What the host does at start, in order (`run` and `Host::open` in
 5. Prunes old command receipts, restores a registered thread whose directory was left
    in `HOST/trash`, migrates any thread store that an older schema wrote (the
    pre-migration copy is kept as `store/authority.vNN.sqlite`), and removes
-   unregistered leftovers from the trash in the background. Schema 20 packs workspace
+   unregistered trash older than 24 hours in the background (or sooner with less
+   than 1 GiB free). Schema 20 packs workspace
    objects; older stores, including schema 19, migrate in place.
-6. With `--access-team`, loads the team's signing keys; then binds the listener.
+6. With `--access-team`, loads cached signing keys; without any cached keys, makes
+   one bounded initial fetch. It binds the listener, then refreshes cached keys off
+   the startup path.
 
 ## Request path
 
@@ -111,7 +114,7 @@ is caught, so it never takes the host down.
 | Concurrent connections | 48; the next gets `429 {"error":"connection limit","code":"rate_limited"}` | `run` in [`mod.rs`](../spindle/store/src/serve/mod.rs) |
 | Request line | `GET` or `POST`, `HTTP/1.1`, absolute path | [`http.rs`](../spindle/store/src/serve/http.rs) |
 | Request head | 16 KiB; a `Host` header is required; duplicate headers, duplicate query keys, `Transfer-Encoding` and `Expect` are refused | `http.rs` |
-| Request body | 64 KiB; 8 MiB for attachment uploads and `/v1` app data; 64 MiB plus 64 KiB for `/v1/run`; none on `GET` | `http.rs` |
+| Request body | 64 KiB; 8 MiB for attachments and `/v1` app data; 64 MiB plus 64 KiB for `/v1/run`; `/v1/threads` streams to disk with a separate 2 GiB route cap; none on `GET` | `http.rs` |
 | Timeouts | 10 s overall for the request head; after authorization, 10 s overall for the body, or 2 minutes for uploads and `/v1/run`; each read and write at most 10 s | `http.rs` |
 
 A request body is read only after the request has been authorized, so an unpaired
@@ -220,9 +223,11 @@ is listed under Settings, Screens, where Revoke ends it. The exchange is specifi
 
 The listener never leaves loopback. Remote access needs a reverse proxy that terminates
 HTTPS, authenticates the user, and forwards to `127.0.0.1:PORT`, with `--origin` set to
-the proxy's public origin. The host recognizes public requests by the `Host` header, so
-the proxy must forward the public host name unchanged: a request that arrives with
-`Host: localhost` or `127.0.0.1` is treated as local and is not checked against Access.
+the proxy's public origin. The host recognizes tunneled requests by the public
+`Host` or Cloudflare's `Cf-Ray` / `Cf-Connecting-Ip` headers. Changing Host to
+localhost cannot bypass Access while those headers remain. Ordinary loopback requests
+without tunnel markers still skip Access (device pairing remains required). The
+proxy must preserve the public host name for origin/cookie checks.
 Through `--origin`, the cookie is marked `Secure` and commands must come from that
 origin. Device pairing still applies to every request either way.
 
@@ -245,7 +250,9 @@ served.
 
 The team's keys come from `https://TEAM/cdn-cgi/access/certs`, are kept in
 `HOST/access-keys.json` so that a restart does not depend on reaching Cloudflare, and are
-refreshed hourly and whenever a token names an unknown key (at most once a minute).
+refreshed hourly in the background and whenever a token names an unknown key
+(at most once a minute, that request waiting at most five seconds). With cached
+keys the listener starts before its refresh, not after a network timeout.
 A successful refresh replaces the set immediately, so a key the team dropped is
 refused on that lookup too; a failed refresh retains the known keys. If
 no keys can be loaded at start, the host still starts and logs it; public requests are
@@ -293,7 +300,11 @@ starts or ends, and a heartbeat comment every 10 seconds. Event ids are `BOOT:SE
 `BOOT` changes on every host start; a client that reconnects with `Last-Event-ID` (or
 `?after=`) from the same boot gets only what it missed, and otherwise a fresh snapshot.
 A client that connects during a run receives the run's retained events again. A stream
-lasts at most 300 seconds and ends when the thread is deleted; clients reconnect.
+lasts at most 300 seconds and ends when the thread is deleted, the device is
+revoked, or its opening Access token stops verifying (checked each ten-second
+heartbeat, including the 300-second clock leeway); clients reconnect. Cloudflare-side
+revocation is not queried per heartbeat, so an already-open stream may last until
+its token expires.
 Command output chunks travel base64-encoded.
 
 **Resuming after a restart.** Commands that were running when the host stopped are

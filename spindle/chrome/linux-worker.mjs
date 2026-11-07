@@ -28,10 +28,19 @@ const MACHINE = 'net1';
 const MTU = 65520;
 /** Most output a command returns (the package keeps far less in the transcript). */
 const MAX_OUTPUT = 4 * 1024 * 1024;
-/** How long past its own timeout a command may go before the Linux counts as stuck. */
+/** How long past its own timeout a command may go before the agent is asked to stop it,
+ * and how long after a Stop its end may take before the command is let go of alone (the
+ * machine is judged by its heartbeat, not by one command). */
 const GRACE_MS = 20_000;
+/** While commands run, the agent is asked every PING_MS whether it is there; a machine
+ * whose agent says nothing for SILENT_MS of them (it waits up to 30 s for a command's
+ * namespaces, and syncs the share as one ends) is stuck, and restarts. */
+const PING_MS = 5_000;
+const SILENT_MS = 60_000;
 /** The longest a first boot may take before it counts as failed. */
 const BOOT_MS = 180_000;
+/** The longest a saved state may take to load before it counts as failed. */
+const RESUME_MS = 60_000;
 /** Commands running at once (one CPU: more mostly wait their turn on it). */
 const MOST_RUNNING = 4;
 
@@ -95,7 +104,9 @@ async function stateFile(identity, create) {
   return dir.getFileHandle(`state-${identity}-${MACHINE}`, { create });
 }
 
-/** The machine: resumed from its saved state, or booted (and saved) the first time. */
+/** The machine: resumed from its saved state, or booted (and saved) the first time; a
+ * saved state that does not load, or whose agent does not answer, goes and the machine
+ * boots afresh. */
 function start() {
   starting ??= (async () => {
     const wired = relay;
@@ -104,32 +115,24 @@ function start() {
     try {
       saved = await (await (await stateFile(identity, false)).getFile()).arrayBuffer();
     } catch {}
-    if (saved) {
+    let vm = null;
+    let listeners;
+    if (saved?.byteLength) {
       status('resuming');
-      const vm = new V86(options(saved, wired));
-      await new Promise((done) => vm.add_listener('emulator-ready', done));
-      const listeners = listen(vm);
-      // The agent answers a ping once the resumed machine takes input (pings count from
-      // 1: READY 0 is the agent starting).
-      for (let attempt = 0; ; attempt++) {
-        frame(vm, 'PING', attempt + 1);
-        try {
-          await waitFor(listeners, (kind) => kind === 'READY', 2000);
-          break;
-        } catch {
-          if (attempt >= 15) {
-            vm.destroy();
-            await (await navigator.storage.getDirectory()).getDirectoryHandle('linux').then((dir) => dir.removeEntry(`state-${identity}-${MACHINE}`)).catch(() => {});
-            throw new Error('the saved Linux did not answer; it boots afresh next time');
-          }
-        }
+      vm = new V86(options(saved, wired));
+      saved = null;
+      listeners = listen(vm);
+      if (!(await resumed(vm, listeners))) {
+        vm = null;
+        await forgetState(identity);
+        console.warn('the saved browser Linux did not resume; it boots afresh');
       }
-      machine = { vm, listeners, relay: wired, net: wire(vm, wired), workspaces: new Workspaces(vm.fs9p), ...lifetime() };
-      watchAgent(machine);
-    } else {
+    }
+    let unsaved = null;
+    if (!vm) {
       status('booting', 'once, under a minute');
-      const vm = new V86(options(null, wired));
-      const listeners = listen(vm);
+      vm = new V86(options(null, wired));
+      listeners = listen(vm);
       try {
         await waitFor(listeners, (kind) => kind === 'READY', BOOT_MS);
       } catch {
@@ -137,19 +140,63 @@ function start() {
         throw new Error('the Linux did not start');
       }
       status('saving');
-      const state = await vm.save_state();
-      const writable = await (await stateFile(identity, true)).createWritable();
-      await writable.write(state);
-      await writable.close();
-      machine = { vm, listeners, relay: wired, net: wire(vm, wired), workspaces: new Workspaces(vm.fs9p), ...lifetime() };
-      watchAgent(machine);
+      // Not saved (no room left for it, say): this machine runs all the same, and the
+      // next start boots again (what was begun of the file goes).
+      unsaved = await save(vm, identity).then(() => null, async (error) => {
+        await forgetState(identity);
+        return error;
+      });
     }
-    status('ready');
+    machine = { vm, listeners, relay: wired, net: wire(vm, wired), workspaces: new Workspaces(vm.fs9p), ...lifetime() };
+    watchAgent(machine);
+    heartbeat(machine);
+    status('ready', unsaved && `not saved (${unsaved.message}): the next start boots afresh`);
   })().catch((error) => {
     starting = null;
     throw error;
   });
   return starting;
+}
+
+/** Whether a machine resuming from a saved state loaded it within RESUME_MS and its
+ * agent answers a ping (pings count from 1: READY 0 is the agent starting); one that does
+ * not is let go of (one that loads later, then). */
+async function resumed(vm, listeners) {
+  const ready = new Promise((done) => vm.add_listener('emulator-ready', done));
+  let timer;
+  const loaded = await Promise.race([ready.then(() => true), new Promise((done) => { timer = setTimeout(done, RESUME_MS, false); })]);
+  clearTimeout(timer);
+  for (let attempt = 0; loaded && attempt <= 15; attempt++) {
+    frame(vm, 'PING', attempt + 1);
+    try {
+      await waitFor(listeners, (kind) => kind === 'READY', 2000);
+      return true;
+    } catch {}
+  }
+  if (loaded) vm.destroy();
+  // One that loads late goes then (until it loads there is nothing to destroy).
+  else ready.then(() => vm.destroy()).catch(() => {});
+  return false;
+}
+
+/** Removes the saved state (one that did not resume, or was not saved whole). */
+async function forgetState(identity) {
+  try {
+    await (await (await navigator.storage.getDirectory()).getDirectoryHandle('linux')).removeEntry(`state-${identity}-${MACHINE}`);
+  } catch {}
+}
+
+/** Saves a freshly booted machine's state, for later starts to resume. */
+async function save(vm, identity) {
+  const state = await vm.save_state();
+  const writable = await (await stateFile(identity, true)).createWritable();
+  try {
+    await writable.write(state);
+    await writable.close();
+  } catch (error) {
+    await writable.abort().catch(() => {});
+    throw error;
+  }
 }
 
 /** The machine's network (a VM it cannot be wired to is let go of). */
@@ -228,9 +275,7 @@ async function run(job) {
     size += data.length;
   };
   listeners.add(collect);
-  const ended = waitFor(listeners, (kind, fid) => kind === 'END' && fid === String(job.id), job.timeoutS * 1000 + GRACE_MS);
-  // Waited on below unless the RUN frame never went (its machine is then restarted).
-  ended.catch(() => {});
+  const ended = endOf(mine, job);
   let end;
   try {
     await frame(vm, 'RUN', job.id, JSON.stringify({
@@ -239,16 +284,25 @@ async function run(job) {
     }));
     // A long command goes as a file first: a Stop meanwhile goes once it is there.
     job.sent = true;
-    if (job.stopped) frame(vm, 'STOP', job.id);
+    if (job.stopped) job.stopping();
     end = JSON.parse(new TextDecoder().decode(await Promise.race([ended, mine.gone])));
-  } catch {
+  } catch (error) {
+    ended.cancel();
     listeners.delete(collect);
-    // Stuck (or restarted for another command that was): every command on it ends.
-    if (machine === mine) restart();
-    return { output: '', success: false, failure: 'the browser Linux stopped answering; it was restarted' };
+    const output = outputOf(chunks, size);
+    // Its machine stopped answering (or its agent started again): every command on it
+    // ended, the share with them.
+    if (machine !== mine) return { output, success: false, failure: 'the browser Linux stopped answering; it was restarted' };
+    // This command alone (never sent, or not ended when asked): the others run on.
+    await workspaces.drop(copy);
+    return {
+      output, success: false,
+      failure: !job.sent ? `the command did not reach the browser Linux: ${error.message}`
+        : job.stopped ? 'the command was stopped' : `the command did not finish within ${job.timeoutS} s`,
+    };
   }
   listeners.delete(collect);
-  const output = new TextDecoder().decode(concat(chunks).subarray(0, MAX_OUTPUT)) + (size > MAX_OUTPUT ? '\n[output cut at 4 MiB]' : '');
+  const output = outputOf(chunks, size);
   if (end.timed_out || end.stopped) {
     await workspaces.drop(copy);
     return { output, success: false, failure: end.timed_out ? `the command did not finish within ${job.timeoutS} s` : 'the command was stopped' };
@@ -259,6 +313,68 @@ async function run(job) {
   } catch (error) {
     return { output, success: false, failure: `the workspace it left was not kept: ${error.message}` };
   }
+}
+
+/** The agent's END for `job` (its bytes), with `cancel()`. A command GRACE_MS past its
+ * time is asked to stop (the agent ends it at its time itself), as the user's Stop asks
+ * (`job.stopping`); one not ended GRACE_MS after is let go of alone (a machine that
+ * stopped answering is its heartbeat's to restart). */
+function endOf(mine, job) {
+  let cancel;
+  const ended = new Promise((resolve, reject) => {
+    let timer = 0;
+    let asked = false;
+    const listener = (kind, id, data) => {
+      if (kind !== 'END' || id !== String(job.id)) return;
+      cancel();
+      resolve(data);
+    };
+    cancel = () => {
+      clearTimeout(timer);
+      mine.listeners.delete(listener);
+      job.stopping = null;
+    };
+    job.stopping = () => {
+      if (asked) return;
+      asked = true;
+      frame(mine.vm, 'STOP', job.id).catch(() => {});
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        cancel();
+        reject(new Error('it did not end when asked to stop'));
+      }, GRACE_MS);
+    };
+    timer = setTimeout(job.stopping, job.timeoutS * 1000 + GRACE_MS);
+    mine.listeners.add(listener);
+  });
+  ended.catch(() => {});
+  return Object.assign(ended, { cancel });
+}
+
+/** While commands run, asks the agent every PING_MS whether it is there, and restarts
+ * the machine once it has said nothing for SILENT_MS. Silence is counted in pings: a
+ * worker too busy to run the machine (it runs here) does not count against it. */
+function heartbeat(mine) {
+  let silent = 0;
+  let heard = false;
+  let pings = 0;
+  mine.listeners.add(() => {
+    heard = true;
+  });
+  const timer = setInterval(() => {
+    silent = heard || !running.size ? 0 : silent + 1;
+    heard = false;
+    if (silent * PING_MS < SILENT_MS) {
+      if (running.size) frame(mine.vm, 'PING', ++pings).catch(() => {});
+    } else if (machine === mine) {
+      restart();
+    }
+  }, PING_MS);
+  mine.gone.catch(() => clearInterval(timer));
+}
+
+function outputOf(chunks, size) {
+  return new TextDecoder().decode(concat(chunks).subarray(0, MAX_OUTPUT)) + (size > MAX_OUTPUT ? '\n[output cut at 4 MiB]' : '');
 }
 
 /** The bytes of `objects` (files of the job's workspace the share lacks), from the engine. */
@@ -331,7 +447,7 @@ self.onmessage = ({ data }) => {
     const job = running.get(data.id);
     if (!job) return;
     job.stopped = true;
-    if (job.sent && machine) frame(machine.vm, 'STOP', data.id);
+    if (job.sent) job.stopping?.();
   } else if (data.type === 'code_reply') {
     if (machine?.vm) {
       frame(machine.vm, 'REPLY', data.id, JSON.stringify({ seq: data.seq, reply: data.reply }))

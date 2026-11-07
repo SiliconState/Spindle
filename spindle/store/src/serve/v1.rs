@@ -93,6 +93,11 @@ const RUN_KEPT: Duration = Duration::from_secs(600);
 const EARLY_STOP: Duration = Duration::from_secs(60);
 const MAX_RUNS: usize = 256;
 const MAX_ENDED: usize = 1024;
+/// Runs at once, named or not: each holds its workspace (up to 64 MiB as base64, then
+/// its files decoded) until it ends.
+const LIVE_RUNS: usize = 4;
+/// The longest a task wait holds its connection; the client waits again after.
+const MAX_TASK_WAIT: u64 = 300;
 pub(super) const MAX_TOKENS: i64 = 16;
 /// Bounds of the stable event ring (the UI's has the same).
 const MAX_EVENTS: usize = 1024;
@@ -291,6 +296,28 @@ impl Runs {
 }
 
 /// Marks a named run ended when its request ends, however it ends.
+/// One of the `LIVE_RUNS` places, given back when dropped.
+struct RunSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+impl<'a> RunSlot<'a> {
+    fn take(running: &'a std::sync::atomic::AtomicUsize) -> std::result::Result<Self, Failure> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if running.fetch_add(1, SeqCst) >= LIVE_RUNS {
+            running.fetch_sub(1, SeqCst);
+            return Err(Failure::new(
+                503,
+                "busy",
+                "four runs are already running on this host; try again when one ends",
+            ));
+        }
+        Ok(Self(running))
+    }
+}
+impl Drop for RunSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 struct RunEnd(Option<((String, String), Arc<std::sync::atomic::AtomicBool>)>);
 impl Drop for RunEnd {
     fn drop(&mut self) {
@@ -381,7 +408,8 @@ pub(super) fn route(
         // A connect code is its own credential (connect.rs).
         if request.method == "POST" && request.path == "/v1/connect/token" {
             http::read_body(stream, &mut request).map_err(bad)?;
-            let token = super::connect::trade(host, &request.body)?;
+            let source = super::auth::source(&request.headers);
+            let token = super::connect::trade(host, &request.body, &source)?;
             return send(stream, 200, &token, extra);
         }
         let device = authenticate(host, &request, extra, public, origin)?;
@@ -416,10 +444,16 @@ pub(super) fn route(
                 extra,
             );
         }
+        // Refused before its body is read, when the host has no room for another run.
+        let _run = if request.method == "POST" && request.path == "/v1/run" {
+            Some(RunSlot::take(&host.runs)?)
+        } else {
+            None
+        };
         if request.method == "POST" {
             http::read_body(stream, &mut request).map_err(bad)?;
         }
-        dispatch(host, stream, &request, extra, &device)
+        dispatch(host, stream, &mut request, extra, &device)
     })();
     if let Err(failure) = answer {
         let mut body = failure.extra;
@@ -455,7 +489,7 @@ fn authenticate(
             return Err(unauthorized("unknown or revoked token"));
         }
         return host
-            .authenticate(token, None, public, &mut String::new())
+            .authenticate(token, public, &mut String::new())
             .map_err(internal)?
             .ok_or_else(|| unauthorized("unknown or revoked token"));
     }
@@ -466,12 +500,7 @@ fn authenticate(
         return Err(unauthorized("Pair this device first"));
     }
     let device = host
-        .authenticate(
-            token,
-            request.headers.get("user-agent").map(String::as_str),
-            public,
-            extra,
-        )
+        .authenticate(token, public, extra)
         .map_err(internal)?
         .ok_or_else(|| unauthorized("Pair this device first"))?;
     if request.method == "POST"
@@ -494,7 +523,7 @@ fn send(stream: &mut TcpStream, status: u16, body: &Value, extra: &str) -> Answe
 fn dispatch(
     host: &Arc<Host>,
     stream: &mut TcpStream,
-    request: &http::Request,
+    request: &mut http::Request,
     extra: &str,
     device: &str,
 ) -> Answer {
@@ -547,8 +576,9 @@ fn dispatch(
         }
         ("POST", ["run"]) => {
             let runner = runner().map_err(|why| Failure::new(503, "unavailable", &why))?;
-            let body: Value =
-                serde_json::from_slice(&request.body).map_err(|_| bad("the body is not JSON"))?;
+            // The raw body goes once parsed: the run holds only the parsed one.
+            let body: Value = serde_json::from_slice(&std::mem::take(&mut request.body))
+                .map_err(|_| bad("the body is not JSON"))?;
             // A named run can be asked about and stopped while it runs (below).
             let named = run_id(&body["run"])?.map(|id| (device.to_string(), id));
             let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -693,9 +723,9 @@ fn dispatch(
                             .filter(|value| *value <= 86400)
                             .ok_or_else(|| bad("timeout_s must be 0-86400"))?,
                     };
+                    let wait = Duration::from_secs(seconds.min(MAX_TASK_WAIT));
                     let mut result =
-                        agent::tasks::wait(&dir, &key, Duration::from_secs(seconds), &false.into())
-                            .map_err(internal)?;
+                        agent::tasks::wait(&dir, &key, wait, &false.into()).map_err(internal)?;
                     result["task"] = json!(task);
                     send(stream, 200, &result, extra)
                 }
@@ -777,12 +807,35 @@ fn dispatch(
                 (true, ["targets"]) => {
                     // A running command's thread cannot be rewound: no targets meanwhile.
                     let busy = host.live(id).map_err(missing)?.lock().busy;
-                    let targets = if busy {
-                        vec![]
-                    } else {
-                        api::recent_targets(&dir).map_err(internal)?
+                    // `until=settled`: back to the newest completed turn, however far,
+                    // with whether there is one and the turn's own message.
+                    let turn = match request.query.get("until").map(String::as_str) {
+                        None => false,
+                        Some("settled") => true,
+                        Some(_) => return Err(bad("until is settled")),
                     };
-                    send(stream, 200, &json!({ "targets": targets }), extra)
+                    if turn && busy {
+                        send(
+                            stream,
+                            200,
+                            &json!({"targets": [], "completed": null, "prompt": null, "busy": true}),
+                            extra,
+                        )
+                    } else if turn {
+                        send(
+                            stream,
+                            200,
+                            &api::turn_targets(&dir).map_err(internal)?,
+                            extra,
+                        )
+                    } else {
+                        let targets = if busy {
+                            vec![]
+                        } else {
+                            api::recent_targets(&dir).map_err(internal)?
+                        };
+                        send(stream, 200, &json!({ "targets": targets }), extra)
+                    }
                 }
                 (true, ["events"]) => events(
                     host,
@@ -1030,6 +1083,7 @@ fn fields(kind: &str) -> &'static [&'static str] {
             "toolchain",
             "effort",
             "compaction",
+            "compact_tokens",
             "max_usd",
             "tools",
             "builtin_tools",
@@ -1064,6 +1118,7 @@ fn fields(kind: &str) -> &'static [&'static str] {
             "toolchain",
             "effort",
             "compaction",
+            "compact_tokens",
             "max_usd",
             "tools",
             "builtin_tools",
@@ -1364,8 +1419,12 @@ fn events(
         }
         if heartbeat.elapsed() >= super::HEARTBEAT {
             // A revoked device or token (or one replaced under its name) loses its
-            // open stream too.
-            if !host.paired(device) || credential.is_some_and(|hash| !current(host, device, hash)) {
+            // open stream too, and so does one whose Access token stopped verifying
+            // (the reconnect meets Access again).
+            if !host.paired(device)
+                || credential.is_some_and(|hash| !current(host, device, hash))
+                || request.access_lapsed()
+            {
                 return Ok(());
             }
             out.push_str(": heartbeat\n\n");
@@ -1625,6 +1684,32 @@ mod tests {
             ),
         );
         (status, serde_json::from_str(&reply).unwrap_or(Value::Null))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runs_past_four_are_refused_before_their_body_is_read() {
+        let (root, host) = temp_host_for_tests("v1-run-slots");
+        let (_, device) = host.pair("Linux · Firefox").unwrap();
+        let held: Vec<_> = (0..LIVE_RUNS)
+            .map(|_| RunSlot::take(&host.runs).ok().unwrap())
+            .collect();
+        // A 64 MiB body declared and none sent: the answer comes at once.
+        let (status, _, body) = call(
+            &host,
+            &format!(
+                "POST /v1/run HTTP/1.1\r\nHost: HOST\r\nAuthorization: Bearer {device}\r\nContent-Length: {}\r\n\r\n",
+                64 * 1024 * 1024
+            ),
+        );
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("\"busy\""), "{body}");
+        drop(held);
+        // Each run gives its place back however it ends.
+        post(&host, "/v1/run", &device, &json!({"command": ""}));
+        post(&host, "/v1/run", &device, &json!("not a run"));
+        assert_eq!(host.runs.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -2165,6 +2250,43 @@ mod tests {
             .done(&json!({"type": "done", "request_id": "r", "state": "completed"}));
         let done = read(&format!("Last-Event-ID: {}:3\r\n", host.boot));
         assert!(done.contains("command_done"), "{done}");
+        drop(host);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Through the tunnel, an event stream does not outlast the Access token it was
+    /// opened with: it ends at the first heartbeat after the token stops verifying.
+    #[test]
+    #[cfg(unix)]
+    fn an_event_stream_through_the_tunnel_ends_when_its_access_token_does() {
+        let (root, host) = temp_host_for_tests("v1-access-stream");
+        let (_, device) = host.pair("t").unwrap();
+        let _watch = thread(&host);
+        // Verifies for one more second (its expiry plus the clock leeway).
+        let until = super::super::access::now() + 1;
+        let (access, token) =
+            super::super::access::tests::signed(until - super::super::access::LEEWAY);
+        assert!(host.access.set(access).is_ok());
+        let started = Instant::now();
+        let (status, _, body) = call(
+            &host,
+            &format!(
+                "GET /v1/sessions/s/events HTTP/1.1\r\nHost: HOST\r\nCf-Ray: test\r\nCf-Access-Jwt-Assertion: {token}\r\nAuthorization: Bearer {device}\r\n\r\n"
+            ),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("event: snapshot"), "{body}");
+        let took = started.elapsed();
+        assert!(
+            took < super::super::HEARTBEAT * 2,
+            "ended at the first heartbeat after expiry: {took:?}"
+        );
+        // Without its token the stream is refused at the door.
+        let (refused, _, _) = call(
+            &host,
+            "GET /v1/sessions/s/events HTTP/1.1\r\nHost: HOST\r\nCf-Ray: test\r\n\r\n",
+        );
+        assert_eq!(refused, 403);
         drop(host);
         let _ = std::fs::remove_dir_all(root);
     }

@@ -89,7 +89,7 @@ export class Waiting extends Error {
  *   browser token (else it throws, saying why);
  * - `local`: `copy(id)` (the thread's bundle, kept here, set up for the host),
  *   `facts(bytes)` ({head, identity}, the bundle checked whole), `sealed(id)`,
- *   `seal(id)`, `dropSealed(id)`, `clear(id)` (everything of the thread's place, fence
+ *   `seal(id, head)` (sealed at the head the host took), `dropSealed(id)`, `clear(id)` (everything of the thread's place, fence
  *   too), `restore(id, bytes)` (a bundle imported in its place with the browser's fit:
  *   resolves with the thread's new fields and what changed, `said`);
  * - `changed(thread)`: a thread's record changed (panels are told);
@@ -129,8 +129,8 @@ export function hostMoves(deps) {
    */
   async function toHost(id, { url, name, provider, model }) {
     const bytes = await local.copy(id);
-    const { head, identity } = local.facts(bytes);
-    const move = { id, way: 'to', step: 'upload', url, key: moveKey(identity, head), name, provider: provider ?? null, model: model ?? null, head, identity, size: bytes.byteLength, at: Date.now() };
+    const { head, identity, sourceState } = local.facts(bytes);
+    const move = { id, way: 'to', step: 'upload', url, key: moveKey(identity, head), name, provider: provider ?? null, model: model ?? null, head, identity, sourceState, size: bytes.byteLength, at: Date.now() };
     await commit(id, pending('to', 'upload'), move, { bytes, size: bytes.byteLength });
     await cut('to:recorded');
     return { done: proceed(id) };
@@ -205,7 +205,7 @@ export function hostMoves(deps) {
       return null;
     }
     if (move.step === 'seal') {
-      if (!(await local.sealed(id))) await local.seal(id);
+      if (!(await local.sealed(id))) await local.seal(id, move.head, move.sourceState);
       await cut('to:sealed');
       const settings = move.settings ?? {};
       await commit(id, {

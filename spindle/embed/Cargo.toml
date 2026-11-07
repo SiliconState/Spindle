@@ -9,6 +9,13 @@ description = "Spindle inside a JS/TS app: the embedded host built for wasm, wit
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# The ChatGPT sign-in through the Codex CLI client and the Codex backend; the browser's
+# store build leaves it out (`chrome/build.sh` with SPINDLE_STORE=1) and offers only
+# Sign in with ChatGPT.
+default = ["codex-signin"]
+codex-signin = ["spindle-store/codex-signin"]
+
 [dependencies]
 spindle-store = { path = "../store", default-features = false, features = ["embedded"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }

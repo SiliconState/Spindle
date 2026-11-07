@@ -185,7 +185,7 @@ pub fn files_param(
     Ok(files)
 }
 
-pub const SETTINGS: [&str; 14] = [
+pub const SETTINGS: [&str; 15] = [
     "provider",
     "model",
     "network",
@@ -194,6 +194,7 @@ pub const SETTINGS: [&str; 14] = [
     "isolation",
     "effort",
     "compaction",
+    "compact_tokens",
     "max_usd",
     "tools",
     "builtin_tools",
@@ -624,6 +625,7 @@ pub fn settings_json(settings: &Settings) -> Value {
         isolation,
         effort,
         compaction,
+        compact_tokens,
         max_usd,
         self_edit,
         tools,
@@ -643,6 +645,7 @@ pub fn settings_json(settings: &Settings) -> Value {
         "isolation": isolation.as_str(),
         "effort": effort.as_str(),
         "compaction": compaction.as_str(),
+        "compact_tokens": compact_tokens,
         "max_usd": max_usd,
         "self_edit": self_edit,
         "tools": tools.iter().map(crate::driver::app_tools::AppTool::to_json).collect::<Vec<_>>(),

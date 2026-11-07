@@ -273,8 +273,9 @@ enum Found {
     Missing,
 }
 
-fn find(host: &Host, session: &str, revision: u64, path: &str) -> super::Result<Found> {
-    let mut view = View::open(&host.dir(session).join("store")).map_err(err)?;
+/// What `path` names at `revision`, read through `view` (one per request: a page and
+/// every file it inlines share it).
+fn find(view: &mut View, revision: u64, path: &str) -> super::Result<Found> {
     view.read(|view| {
         let Some((_, Some(root))) = view.at(revision)? else {
             return Ok(Found::Missing);
@@ -395,12 +396,16 @@ pub(super) fn serve(
     if !spindle_store::workspace::valid_path(&wanted) {
         return missing(stream);
     }
-    match find(host, &session, revision, &wanted).map_err(|e| Refused(500, e))? {
+    let view = std::cell::RefCell::new(
+        View::open(&host.dir(&session).join("store")).map_err(|e| Refused(500, err(e)))?,
+    );
+    let found = find(&mut view.borrow_mut(), revision, &wanted).map_err(|e| Refused(500, e))?;
+    match found {
         // A page arrives whole (its own stylesheets, scripts and images inlined) with
         // a storage shim: see `bundle`.
         Found::File(bytes) if mime(&wanted).starts_with("text/html") => {
             let html = String::from_utf8_lossy(&bytes);
-            let read = |path: &str| match find(host, &session, revision, path) {
+            let read = |path: &str| match find(&mut view.borrow_mut(), revision, path) {
                 Ok(Found::File(bytes)) => Some(bytes),
                 _ => None,
             };
@@ -512,17 +517,48 @@ pub(super) fn bundle(
             }
         }
     };
-    // The shim goes right after <head> (or <html>) of the page proper, else after its
-    // doctype, else first of all.
+    // The shim goes first in the page proper: right after its <head> (or its <html>,
+    // and then after a <head> that comes next) when that is the first element past the
+    // doctype; else before whatever element comes first (whose scripts must not run
+    // before it), past the doctype and any comments ahead of the page.
     let from = doctype.unwrap_or(lead);
-    let at = ["<head", "<html"]
-        .iter()
-        .find_map(|tag| {
-            let start = from + lower[from..].find(tag)?;
-            Some(start + lower[start..].find('>')? + 1)
-        })
-        .or(doctype)
-        .unwrap_or(0);
+    // The next start tag at or after `at`, space and comments passed over: its name and
+    // where it ends.
+    let next = |mut at: usize| -> Option<(String, usize)> {
+        loop {
+            at = lower.len()
+                - lower[at..]
+                    .trim_start_matches([' ', '\t', '\r', '\n', '\x0c'])
+                    .len();
+            let rest = &lower[at..];
+            if rest.starts_with("<!--") {
+                at += [
+                    rest.find("-->").map(|end| end + 3),
+                    rest.find("--!>").map(|end| end + 4),
+                ]
+                .into_iter()
+                .flatten()
+                .min()?;
+                continue;
+            }
+            if !rest.starts_with('<') || !rest[1..].starts_with(|c: char| c.is_ascii_alphabetic()) {
+                return None;
+            }
+            let name: String = rest[1..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            return Some((name, tag_close(html, at)?));
+        }
+    };
+    let at = match next(from) {
+        Some((name, end)) if name == "head" => end,
+        Some((name, end)) if name == "html" => match next(end) {
+            Some((name, after)) if name == "head" => after,
+            _ => end,
+        },
+        _ => from,
+    };
     let mut i = 0;
     // The guard goes before anything that could run: right after a doctype (only space,
     // comments and `<?…>` come before one), else first of all.
@@ -1022,8 +1058,48 @@ mod tests {
         }
         // A page without a head still gets the shim first, after any doctype.
         assert!(bundle("<p>hi</p>", "a.html", "/p/", |_| None, true, false).starts_with(SHIM));
+        // `<header>` is not `<head>`: a page whose first element is a header gets the
+        // shim before it (its scripts must not run first), whatever comes after; with no
+        // head, the shim goes after `<html>`; `<html>` then `<head>`, inside the head.
+        let headed = bundle(
+            "<!doctype html><header><script>x()</script></header><head><title>t</title></head>",
+            "a.html",
+            "/p/",
+            |_| None,
+            true,
+            false,
+        );
+        assert!(
+            headed.starts_with(&format!("<!doctype html>{SHIM}<header>")),
+            "{headed}"
+        );
+        let both = bundle(
+            "<!DOCTYPE html>\n<HTML lang=en>\n<!-- c -->\n<Head data-x=\">\">",
+            "a.html",
+            "/p/",
+            |_| None,
+            true,
+            false,
+        );
+        assert!(
+            both.ends_with(&format!("<Head data-x=\">\">{SHIM}")),
+            "{both}"
+        );
+        let headless = bundle(
+            "<html lang=en><header>x</header>",
+            "a.html",
+            "/p/",
+            |_| None,
+            true,
+            false,
+        );
+        assert!(
+            headless.starts_with(&format!("<html lang=en>{SHIM}<header>")),
+            "{headless}"
+        );
         // A contained grant's page: the guard before anything that could run (after a
-        // doctype), the shim after it; none where nothing runs anyway.
+        // doctype), the shim after it and still before the page's first script (which
+        // here comes ahead of its <head>); none where nothing runs anyway.
         let guarded = bundle(
             "<!doctype html><script>early()</script><html><head><title>t</title>",
             "a.html",
@@ -1033,13 +1109,12 @@ mod tests {
             true,
         );
         assert!(
-            guarded.starts_with(&format!("<!doctype html>{GUARD}<script>early()</script>")),
+            guarded.starts_with(&format!(
+                "<!doctype html>{GUARD}{SHIM}<script>early()</script>"
+            )),
             "{guarded}"
         );
-        assert!(
-            guarded.contains(&format!("<head>{SHIM}<title>")),
-            "{guarded}"
-        );
+        assert!(guarded.contains("<head><title>"), "{guarded}");
         assert!(GUARD.contains(held!()) && CHECK_PAGE.contains(held!()));
         // Comments and `<?…>` before the doctype are passed over to it (else the guard
         // first would put the page in quirks mode); anything else is not.

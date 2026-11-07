@@ -973,9 +973,16 @@ impl Server {
                     self.queue_idle(&entry, id, move |actor| {
                         let mut settings = Settings::load(&actor.entry.dir).map_err(failed)?;
                         apply_settings(&mut settings, &params, true)?;
+                        let named: Vec<&str> = SETTINGS
+                            .iter()
+                            .copied()
+                            .filter(|key| params.0.contains_key(*key))
+                            .collect();
                         actor
                             .session()
-                            .and_then(|session| session.set_settings(settings.clone()))
+                            .and_then(|session| {
+                                session.set_chosen_settings(settings.clone(), &named)
+                            })
                             .map_err(conflict)?;
                         Ok(settings_json(&settings))
                     })

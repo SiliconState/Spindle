@@ -45,12 +45,13 @@ impl std::ops::Deref for ViewConnection<'_> {
 }
 
 /// How the store keeps its records: (whether its values are uncompressed (schema 14),
-/// whether its objects have their `size` column (schema 20)); refuses anything else.
+/// whether its objects have their `size` column (schema 20 on)); refuses anything else.
 fn encoding(db: &Connection) -> Result<(bool, bool)> {
     let app: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let schema: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match (app == crate::APP_ID, schema) {
-        (true, crate::SCHEMA) => Ok((false, true)),
+        // 21 is 20 with wider steps.
+        (true, crate::PREVIOUS_SCHEMA | crate::SCHEMA) => Ok((false, true)),
         // Schema 15 values decode as schema 16 ones (no chunks yet); 14 kept them raw.
         // 16 differs from 17 only by tables it lacks (no app state, read as empty).
         // Before 20 every object is kept as it is.
@@ -415,6 +416,62 @@ impl<'a> ReadView<'a> {
         )?)
     }
 
+    /// The head revision alone (its continuation is never read). 0: no turn yet.
+    pub fn head_revision(&mut self) -> Result<u64> {
+        Ok(crate::cached_row(
+            &self.db,
+            "SELECT revision FROM head WHERE id=1",
+            [],
+            |row| crate::nonnegative_id(row, 0),
+        )?)
+    }
+
+    /// The head revision and its workspace root (its continuation never read).
+    pub fn head_root(&mut self) -> Result<(u64, Option<String>)> {
+        Ok(crate::cached_row(
+            &self.db,
+            "SELECT r.revision,r.workspace FROM head h JOIN revisions r ON r.revision=h.revision WHERE h.id=1",
+            [],
+            |row| {
+                Ok((
+                    crate::nonnegative_id(row, 0)?,
+                    crate::optional_digest(row, 1)?,
+                ))
+            },
+        )?)
+    }
+
+    /// The workspace root of a committed revision of the session (as `at` gives it,
+    /// its continuation never read): None when it is not one, Some(None) for one
+    /// without a workspace (revision 0 has none).
+    pub fn root_at(&mut self, revision: u64) -> Result<Option<Option<String>>> {
+        if revision == 0 {
+            return Ok(Some(None));
+        }
+        if revision > i64::MAX as u64 {
+            return Ok(None);
+        }
+        Ok(crate::cached_row(
+            &self.db,
+            "SELECT workspace FROM revisions WHERE revision=?1 AND scope=?2",
+            params![revision as i64, SCOPE],
+            |row| crate::optional_digest(row, 0),
+        )
+        .optional()?)
+    }
+
+    /// The session's newest `limit` revisions, newest first.
+    pub fn newest_revisions(&mut self, limit: usize) -> Result<Vec<u64>> {
+        let mut statement = self.db.prepare_cached(
+            "SELECT revision FROM revisions WHERE scope=?1 AND revision>0 ORDER BY revision DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![SCOPE, limit.min(MAX_STEPS as usize) as i64],
+            |row| crate::nonnegative_id(row, 0),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The continuation and workspace root of any committed revision of the session,
     /// including revisions a rewind left behind.
     pub fn at(&mut self, revision: u64) -> Result<Option<(Vec<u8>, Option<String>)>> {
@@ -463,7 +520,7 @@ impl<'a> ReadView<'a> {
 
     /// The newest `limit` committed revisions, oldest first.
     pub fn recent_steps(&mut self, limit: u64) -> Result<Vec<Step>> {
-        let (head, _, _) = self.head()?;
+        let head = self.head_revision()?;
         self.steps(head.saturating_sub(limit.min(MAX_STEPS as u64)))
     }
 
@@ -476,28 +533,78 @@ impl<'a> ReadView<'a> {
         if self.legacy {
             return vec![];
         }
-        let Ok((head, _, _)) = self.head() else {
+        let Ok(head) = self.head_revision() else {
             return vec![];
         };
         crate::rewind::listed_targets(&self.db, SCOPE, head, revisions)
     }
 
-    /// Recorded model replies stored after receipt row `after`, oldest first, at most
-    /// `limit`: (row, result). Includes replies a rewind later abandoned; each was
-    /// billed once.
-    pub fn model_receipts_after(
+    /// Rewind targets newest first, up to and including the newest completed turn, and
+    /// whether the session has one. Read back from the head along its line (`line`: a
+    /// finished rewind's revision continues from its target, so a turn it left behind
+    /// is not the one to go back to), a page at a time over the whole history if need
+    /// be; the walk ends at that turn, so it costs the current turn's length. An
+    /// unmigrated store answers none, and a completed turn assumed.
+    pub fn targets_to_settled(&mut self) -> Result<(Vec<(u64, RewindTargetKind)>, bool)> {
+        if self.legacy {
+            return Ok((vec![], true));
+        }
+        let head = self.head_revision()?;
+        let forks: std::collections::BTreeMap<u64, u64> = self
+            .forks()?
+            .into_iter()
+            .map(|fork| (fork.revision, fork.target))
+            .collect();
+        let mut found = vec![];
+        let mut below = head.saturating_add(1);
+        loop {
+            let page: Vec<u64> = {
+                let mut statement = self.db.prepare_cached(
+                    "SELECT revision FROM revisions WHERE scope=?1 AND revision<?2 ORDER BY revision DESC LIMIT 256",
+                )?;
+                let rows = statement
+                    .query_map(params![SCOPE, below.min(i64::MAX as u64) as i64], |row| {
+                        crate::nonnegative_id(row, 0)
+                    })?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            // The page's line ends at its newest rewind's revision; the next page starts
+            // at what that revision continues from.
+            let end = page
+                .iter()
+                .position(|revision| forks.contains_key(revision))
+                .map_or(page.len(), |at| at + 1);
+            let Some(&oldest) = page[..end].last() else {
+                return Ok((found, false));
+            };
+            let (mut more, settled) =
+                crate::rewind::targets_to_settled(&self.db, SCOPE, head, &page[..end])?;
+            found.append(&mut more);
+            if settled {
+                return Ok((found, true));
+            }
+            below = predecessor(oldest, &forks).saturating_add(1);
+        }
+    }
+
+    /// Each recorded model reply stored after receipt row `after`, oldest first, handed
+    /// to `visit` as (row, result) one at a time: only one reply (with the request it
+    /// embeds) is held at once, however many there are. Includes replies a rewind
+    /// later abandoned; each was billed once.
+    pub fn each_model_receipt(
         &mut self,
         after: i64,
-        limit: usize,
-    ) -> Result<Vec<(i64, Vec<u8>)>> {
+        mut visit: impl FnMut(i64, Vec<u8>),
+    ) -> Result<()> {
         let legacy = self.legacy;
         let mut statement = self.db.prepare(
-            "SELECT q.rowid,q.result FROM receipts q JOIN attempts a ON a.id=q.attempt WHERE a.implementation='dext-provider-v1' AND q.rowid>?1 ORDER BY q.rowid LIMIT ?2",
+            "SELECT q.rowid,q.result FROM receipts q JOIN attempts a ON a.id=q.attempt WHERE a.implementation='dext-provider-v1' AND q.rowid>?1 ORDER BY q.rowid",
         )?;
-        let rows = statement.query_map(params![after, limit.min(4096) as i64], |row| {
-            Ok((row.get(0)?, stored(&self.db, legacy, row, 1)?))
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut rows = statement.query([after])?;
+        while let Some(row) = rows.next()? {
+            visit(row.get(0)?, stored(&self.db, legacy, row, 1)?);
+        }
+        Ok(())
     }
 
     /// How many model replies are stored at or before receipt row `through`.
@@ -536,7 +643,9 @@ impl<'a> ReadView<'a> {
         if schema < 19 {
             return Ok(vec![]);
         }
-        let mut query = self.db.prepare("SELECT p.revision,a.effect,d.value FROM app_details d JOIN attempts a ON a.id=d.attempt JOIN applied_receipts p ON p.attempt=a.id JOIN revisions r ON r.revision=p.revision WHERE r.scope=?1 AND p.revision<=?2 ORDER BY p.revision")?;
+        // Where each detail was applied first (no value read), then only the details on
+        // the line to `revision` decoded: never those a rewind left behind.
+        let mut query = self.db.prepare("SELECT p.revision,a.effect FROM app_details d JOIN attempts a ON a.id=d.attempt JOIN applied_receipts p ON p.attempt=a.id JOIN revisions r ON r.revision=p.revision WHERE r.scope=?1 AND p.revision<=?2 ORDER BY p.revision")?;
         let rows = query
             .query_map(
                 params![SCOPE, revision.min(i64::MAX as u64) as i64],
@@ -544,25 +653,33 @@ impl<'a> ReadView<'a> {
                     Ok((
                         crate::nonnegative_id(row, 0)?,
                         crate::bounded_label(row, 1)?,
-                        crate::packed_blob(&self.db, row, 2, crate::transition::MAX_STATE)?,
                     ))
                 },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(query);
-        if rows.is_empty() {
+        let Some(&(oldest, _)) = rows.first() else {
             return Ok(vec![]);
-        }
-        let oldest = rows[0].0;
+        };
         let mut line = std::collections::BTreeSet::new();
         self.line(revision, |at, _| {
             line.insert(at);
             at <= oldest
         })?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(at, effect, details)| line.contains(&at).then_some((effect, details)))
-            .collect())
+        let mut details = Vec::new();
+        for (at, effect) in rows {
+            if !line.contains(&at) {
+                continue;
+            }
+            let value = crate::cached_row(
+                &self.db,
+                "SELECT d.value FROM app_details d JOIN attempts a ON a.id=d.attempt JOIN applied_receipts p ON p.attempt=a.id WHERE a.effect=?1 AND p.revision=?2",
+                params![effect, at as i64],
+                |row| crate::packed_blob(&self.db, row, 0, crate::transition::MAX_STATE),
+            )?;
+            details.push((effect, value));
+        }
+        Ok(details)
     }
 
     pub fn call_id(&self, effect: &str) -> Result<String> {
@@ -749,8 +866,8 @@ impl<'a> ReadView<'a> {
         if self.legacy {
             return false;
         }
-        match self.head() {
-            Ok((head, _, _)) => crate::rewind::has_target(&self.db, SCOPE, head),
+        match self.head_revision() {
+            Ok(head) => crate::rewind::has_target(&self.db, SCOPE, head),
             Err(_) => false,
         }
     }
@@ -760,7 +877,7 @@ impl<'a> ReadView<'a> {
             return None;
         }
         crate::rewind::ensure_open(&self.db).ok()?;
-        let (head, _, _) = self.head().ok()?;
+        let head = self.head_revision().ok()?;
         crate::rewind::eligible_head(&self.db, SCOPE, head).ok()?;
         crate::rewind::eligible_target(&self.db, SCOPE, revision).ok()
     }
@@ -803,15 +920,17 @@ impl ReadView<'_> {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// `run_code` attempts and whether each is settled (its child journal is then
-    /// final): its receipt is recorded, or a finished rewind abandoned it (nothing
-    /// resumes an abandoned attempt). Oldest first.
+    /// Attempts whose scripts can make nested calls through the code-mode bridge
+    /// (`run_code`, and `bash`: a runner's `spindle` command and `import spindle`), and
+    /// whether each is settled (its child journal is then final): its receipt is
+    /// recorded, or a finished rewind abandoned it (nothing resumes an abandoned
+    /// attempt). Oldest first.
     pub fn code_attempts(&mut self) -> Result<Vec<(String, bool)>> {
         let mut statement = self.db.prepare(
             "SELECT a.id,EXISTS(SELECT 1 FROM receipts q WHERE q.attempt=a.id)
              OR EXISTS(SELECT 1 FROM rewinds w JOIN revisions r ON r.revision=i.revision WHERE w.scope=r.scope
              AND w.state IN (1,2) AND i.revision>w.target AND i.revision<=w.old_revision)
-             FROM attempts a JOIN intents i ON i.id=a.effect WHERE i.adapter='run_code' ORDER BY a.rowid",
+             FROM attempts a JOIN intents i ON i.id=a.effect WHERE i.adapter IN ('run_code','bash') ORDER BY a.rowid",
         )?;
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -933,6 +1052,56 @@ mod tests {
         drop(owner);
         assert!(crate::Store::open(&store).is_ok(), "the owner can reopen");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "dext-turn")]
+    fn a_broken_turn_header_never_reads_as_a_first_turn() {
+        let dir =
+            std::env::temp_dir().join(format!("spindle-broken-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::Store::open(&dir).unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO revisions VALUES(1,'operator',?1,X'01',NULL)",
+                [crate::turn::ENGINE],
+            )
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE head SET revision=1 WHERE id=1", [])
+            .unwrap();
+        let mut view = ReadView::from_store(&store);
+        assert!(view.targets_to_settled().is_err());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "dext-turn")]
+    fn a_held_rewind_offers_no_target_and_never_reads_as_a_first_turn() {
+        let dir = std::env::temp_dir().join(format!("spindle-held-rewind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::Store::open(&dir).unwrap();
+        // A rewind begun (pending) and not finished: the store holds new work until it is.
+        store
+            .db
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys=OFF;
+                 INSERT INTO revisions VALUES(1,'operator','{}',X'01',NULL);
+                 UPDATE head SET revision=1 WHERE id=1;
+                 INSERT INTO rewinds VALUES('operator','held',1,1,1,0,1,0,NULL);
+                 PRAGMA foreign_keys=ON;",
+                crate::turn::ENGINE
+            ))
+            .unwrap();
+        let mut view = ReadView::from_store(&store);
+        assert_eq!(view.targets_to_settled().unwrap(), (vec![], true));
+        assert!(view.targets(&[1]).is_empty(), "as the listing answers");
+        drop(view);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

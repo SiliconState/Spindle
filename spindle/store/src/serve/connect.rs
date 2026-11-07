@@ -16,7 +16,7 @@ use super::{Host, Refused, auth, err, hash, http, lock, now_ms, random};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
@@ -24,16 +24,14 @@ use std::time::{Duration, Instant};
 const CODE_LIFE: Duration = Duration::from_secs(120);
 /// Codes outstanding at once (minting another retires the oldest).
 const MAX_CODES: usize = 16;
-/// Failed trades allowed per minute, host-wide, before `429 rate_limited`.
-const MAX_FAILURES: usize = 10;
 /// A browser token's device id: `api:browser:NAME`.
 pub(super) const BROWSER_PREFIX: &str = "api:browser:";
 
-/// Outstanding codes by their SHA-256, and recent failed trades.
+/// Outstanding codes by their SHA-256 (failed trades are counted by source in
+/// `Host::failures`).
 #[derive(Default)]
 pub(super) struct Codes {
     codes: HashMap<String, Code>,
-    failures: VecDeque<Instant>,
 }
 struct Code {
     client: String,
@@ -44,13 +42,6 @@ struct Code {
 impl Codes {
     fn prune(&mut self) {
         self.codes.retain(|_, code| code.at.elapsed() < CODE_LIFE);
-        while self
-            .failures
-            .front()
-            .is_some_and(|at| at.elapsed() >= Duration::from_secs(60))
-        {
-            self.failures.pop_front();
-        }
     }
     /// Ages every code by `by` (tests: expiry without waiting). Only the host tests use
     /// it, and they run on Unix: a Windows test build would see it unused.
@@ -152,12 +143,7 @@ pub(super) fn page(
     let mut extra = String::new();
     let paired = match auth::cookie(request.headers.get("cookie")) {
         Some(token) => host
-            .authenticate(
-                token,
-                request.headers.get("user-agent").map(String::as_str),
-                public,
-                &mut extra,
-            )?
+            .authenticate(token, public, &mut extra)?
             .is_some_and(|device| !super::v1::scoped(&device)),
         None => false,
     };
@@ -200,7 +186,8 @@ pub(super) fn done(
 }
 
 /// `POST /api/connect` (a paired screen): Allow mints a code for the client, Deny
-/// says so; either way the answer is where the tab goes next.
+/// says so; either way the answer is where the tab goes next. Allow for a name that is
+/// connected already is refused (409) until it comes with `replace`.
 pub(super) fn answer(host: &Host, data: &Value) -> std::result::Result<Value, Refused> {
     let text = |key: &str| data[key].as_str().unwrap_or_default();
     let (client, challenge, state) = (text("client"), text("challenge"), text("state"));
@@ -209,6 +196,35 @@ pub(super) fn answer(host: &Host, data: &Value) -> std::result::Result<Value, Re
     }
     if data["allow"] != true {
         return Ok(json!({"redirect": format!("/connect/done?error=denied&state={state}")}));
+    }
+    // The name is all that tells clients apart: allowing one already connected hands
+    // the asker that connection's threads. Said first; Allow again (`replace`) confirms.
+    if data["replace"] != true {
+        let db = lock(&host.db);
+        let id = format!("{BROWSER_PREFIX}{client}");
+        let connected: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1)",
+                [&id],
+                |row| row.get(0),
+            )
+            .map_err(err)?;
+        if connected {
+            let threads: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM owners WHERE client=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .map_err(err)?;
+            return Err(Refused(
+                409,
+                format!(
+                    "{client} is already connected. Allowing replaces that connection: the app asking now gets its {threads} thread{} here, and the one connected now loses access. Press Replace only if both are the same app.",
+                    if threads == 1 { "" } else { "s" }
+                ),
+            ));
+        }
     }
     let code = random()?;
     let mut codes = lock(&host.connect);
@@ -236,8 +252,9 @@ pub(super) fn answer(host: &Host, data: &Value) -> std::result::Result<Value, Re
 }
 
 /// `POST /v1/connect/token` (no credential): a code and its verifier for the client's
-/// browser token, minted (or replaced) now.
-pub(super) fn trade(host: &Host, body: &[u8]) -> std::result::Result<Value, Failure> {
+/// browser token, minted (or replaced) now. `source` (auth.rs) is who asks: ten failed
+/// trades a minute from one source, and it waits.
+pub(super) fn trade(host: &Host, body: &[u8], source: &str) -> std::result::Result<Value, Failure> {
     let data: Value = serde_json::from_slice(body)
         .map_err(|_| Failure::new(400, "bad_request", "the body is JSON: {code, verifier}"))?;
     let (Some(code), Some(verifier)) = (data["code"].as_str(), data["verifier"].as_str()) else {
@@ -255,15 +272,15 @@ pub(super) fn trade(host: &Host, body: &[u8]) -> std::result::Result<Value, Fail
         )
     };
     let found = {
-        let mut codes = lock(&host.connect);
-        codes.prune();
-        if codes.failures.len() >= MAX_FAILURES {
+        if host.failures.blocked(source) {
             return Err(Failure::new(
                 429,
                 "rate_limited",
                 "too many failed connects; wait a minute",
             ));
         }
+        let mut codes = lock(&host.connect);
+        codes.prune();
         // Single use: taken out before anything is checked.
         let found = codes.codes.remove(&hash(code.as_bytes()));
         let good = found.as_ref().is_some_and(|found| {
@@ -274,7 +291,8 @@ pub(super) fn trade(host: &Host, body: &[u8]) -> std::result::Result<Value, Fail
                 )
         });
         if !good {
-            codes.failures.push_back(Instant::now());
+            drop(codes);
+            host.failures.failed(source);
             return Err(refused());
         }
         found.expect("checked above")

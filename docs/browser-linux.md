@@ -337,8 +337,13 @@ flowchart LR
 5. **Refused addresses.** `local(hostname)` refuses, with `403`, names without a dot; names that are, or end in a dot and,
    `localhost`, `local`, `internal`, `lan`, `localdomain` or `home.arpa`; IPv4 `0/8`, `10/8`,
    `127/8`, `169.254/16`, `172.16/12`, `192.168/16`, `100.64/10` and `224/4` and above; and IPv6
-   `::`-prefixed, `fc00::/7`, `fe80::/10` and `ff00::/8` addresses. Chrome resolves names, so a
-   public name that resolves into a private network is not caught. A request to the browser's
+   `::`-prefixed, `fc00::/7`, `fe80::/10` and `ff00::/8` addresses, NAT64 encodings of
+   local IPv4 addresses, and benchmark range `198.18.0.0/15`. Before fetching a public
+   name, `resolvesLocal` checks A and AAAA answers over Cloudflare DNS-over-HTTPS
+   (Cloudflare sees the name); any returned local address is refused. Verdicts cache
+   for 30 seconds to five minutes. Failed or slow lookups pass; a transport failure
+   pauses checks for a minute. Chrome resolves the name again, so rebinding is still
+   possible. This is a best-effort check, not a private-network firewall. A request to the browser's
    own extension store (Chrome's or Edge's) also gets a `403`, which says the browser never
    lets an extension reach it.
 6. **Redirects** are never followed by the gateway. If Chrome hides a redirect's target

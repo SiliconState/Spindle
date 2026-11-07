@@ -3,7 +3,7 @@
 // over OPFS. Panels ask over the channel and see every event; turns go on while no
 // panel is open. The thread index (titles, times, states) is the engine's to keep.
 import init, * as firstGlue from './web/spindle_embed.js';
-import { EmbeddedClient, remoteRunner } from './clients/embedded.mjs';
+import { EmbeddedClient, bundleFacts, remoteRunner } from './clients/embedded.mjs';
 import { refusedAnswer } from './clients/common.mjs';
 import { RemoteClient, requestId, worthRepeating } from './clients/remote.mjs';
 import { BUNDLE_MOST, MOVE, STEP_TEXT, Waiting, hostMoves, said as sentence } from './host-moves.mjs';
@@ -11,18 +11,37 @@ import { linuxRunner } from './linux-runner.mjs';
 import { storeRefusal } from './linux-net.mjs';
 import { openOpfsPool } from './clients/opfs.mjs';
 import { titleFrom } from './text.js';
-import { ASKING_NAMES, BROWSER, PAGE_TOOLS, actionText, confirmMode, sends, uncertain } from './page-tools.mjs';
-import { CHANNEL, keysOf, read, remove, removeDurably, update, valuesOf, write, writeDurably, writeTogether } from './shared.mjs';
-import { endedText, exchange, flowOf, refreshed } from './signin.mjs';
+import { ASKING_NAMES, BROWSER, PAGE_TOOLS, UPLOAD, actionText, confirmMode, numbersIn, sends, uncertain } from './page-tools.mjs';
+import { typeOf } from './page.mjs';
+import { CHANNEL, keysOf, read, remove, removeDurably, merge, update, valuesOf, write, writeDurably, writeTogether, REQUESTS, answersFor, has, keysWith } from './shared.mjs';
+import { endedText, exchange, flowOf, planSignIn, refreshed, revoke } from './signin.mjs';
 import * as vault from './vault.mjs';
 
-/** Free pool slots kept before work that may add files (a thread holds a few). */
-const HEADROOM = 16;
+/** Free pool slots kept before work that may add files (a thread holds a few, and each
+ * background task it starts a few more; the pool also grows on its own as slots run
+ * low, clients/js/opfs.mjs). */
+const HEADROOM = 48;
 /** How long a page tool call may wait for Chrome (the package gives up at 30 s). */
 const PAGE_TOOL_WAIT = 35_000;
 
 const channel = new BroadcastChannel(CHANNEL);
 const send = (message) => channel.postMessage(message);
+const requests = new BroadcastChannel(REQUESTS);
+/** Each asking page's own answer channel (the newest few kept open). */
+const answerChannels = new Map();
+function answerTo(page) {
+  let found = answerChannels.get(page);
+  if (!found) {
+    found = new BroadcastChannel(answersFor(page));
+    answerChannels.set(page, found);
+    if (answerChannels.size > 32) {
+      const [oldest, gone] = answerChannels.entries().next().value;
+      gone.close();
+      answerChannels.delete(oldest);
+    }
+  }
+  return found;
+}
 const failure = (kind, message) => Object.assign(new Error(message), { kind });
 
 let pool = null;
@@ -120,7 +139,9 @@ let changingCatalog = false;
 let maintenance = null;
 
 async function operate(op, args) {
-  while (maintenance) await maintenance;
+  // A panel's `hello` and `ping` answer while space is freed (up to ten minutes): a
+  // page that hears nothing would offer to restart the engine.
+  if (op !== 'hello' && op !== 'ping') while (maintenance) await maintenance;
   if (changingCatalog) throw failure('busy', 'the provider catalog is changing; try again in a moment');
   const threadIds = [args.id, ...(op === 'create' ? [args.from] : [])].filter((id) => id != null);
   for (const id of threadIds) {
@@ -129,17 +150,25 @@ async function operate(op, args) {
   if (op === 'catalog') {
     if (pendingOps || running.size) throw failure('busy', 'wait for threads and pending operations before changing providers');
     changingCatalog = true;
+    // A new provider list starts a new client, which ends the old one's background tasks
+    // mid-request: they are waited for, as freeing space waits for them.
+    const { sessions = [] } = await client?.call('list').catch(() => null) ?? {};
+    if (sessions.some((session) => session.busy || session.background)) {
+      changingCatalog = false;
+      throw failure('busy', 'wait for background tasks to finish (or stop them) before changing providers');
+    }
   }
   pendingOps += 1;
   // Stopping a turn or a task waits behind no slow read of its thread.
   const stopping = op === 'stop' || op === 'taskStop';
   const keys = stopping ? [] : [...new Set(threadIds)];
-  // A sign-in waits on the provider's token endpoint: in a lane of its own, so `hello`
-  // and other settings are not held up behind it.
+  // A sign-in waits on the provider's token endpoint (a sign-out of Sign in with ChatGPT
+  // on its revocation endpoint): in a lane of its own, so `hello` and other settings are
+  // not held up behind it.
   // An answer to a waiting page action waits behind nothing slow either.
   // So does a connect to the user's host (it waits on the host).
   // A panel's `hello` (and `ping`) waits behind nothing slow (a host connect, an unlock).
-  if (!keys.length && !stopping) keys.push(op === 'signIn' ? 'signin' : op === 'approve' ? 'approve' : op === 'hostConnect' ? 'connect' : op === 'hello' || op === 'ping' ? 'hello' : 'settings');
+  if (!keys.length && !stopping) keys.push(['signIn', 'signInStart', 'signInDeclined', 'forget'].includes(op) ? 'signin' : op === 'approve' ? 'approve' : op === 'hostConnect' ? 'connect' : op === 'hello' || op === 'ping' ? 'hello' : 'settings');
   const work = Promise.all(keys.map((key) => lanes.get(key))).then(() => ops[op](args));
   const settled = work.catch(() => {});
   for (const key of keys) lanes.set(key, settled);
@@ -177,10 +206,38 @@ const PAGE_NAMES = new Set(PAGE_TOOLS.map((tool) => tool.name));
 
 /** What a thread whose commands run in the browser Linux is told (app instructions):
  * the Linux, and Spindle's calls for its scripts (code mode, through bash). */
-const GUIDE_START = [
+/** The guide as it read before packages left the workspace and NOTES.md was named (threads
+ * made before hold it; `freshen` gives them the current one). */
+const GUIDE_START_BEFORE_NOTES = [
   "Your commands run in a small Linux inside the user's browser (Alpine: bash, coreutils, Python 3 with pip, Node with",
   'npm, git, curl, jq, ripgrep). Each command starts afresh but for the workspace, so install packages into it',
   '(`npm install`, `python3 -m venv .venv`). With network on (the bash tool says whether), commands reach websites over',
+  'HTTP and HTTPS, which Chrome fetches through the proxy their environment names (without the user\'s cookies; the',
+  "user's computer and local network addresses and names are refused); if the user set a relay, they reach any address through it. Without",
+  "network, connections are refused: ask the user to turn the thread's network on (its model menu) rather than",
+  'working around it. The Linux is emulated and slow: give a command that runs long, or makes Spindle calls, a',
+  'timeout of a few minutes.',
+  'Scripts there can ask Spindle for calls, each journaled so a call that was cut off is never sent twice:',
+  "from bash, `spindle model PROMPT` prints a model's answer, `spindle tool NAME '{\"json\": \"args\"}'` calls a tool",
+  '(such as read_page or list_tabs), `spindle search` lists the tools, `spindle http URL` calls a site the user',
+  'allowed (any other is refused, naming those allowed; a site the user saved with a secret header, such as a token,',
+  'gets it from Spindle: never set that header or ask for its value); in Python, `import spindle` gives',
+  "spindle.model(prompt)['text'], spindle.models([prompts]) (run together), spindle.tool(name, args), spindle.http(url)",
+  "and spindle.batch(calls); in Node, require('spindle') or `import ... from 'spindle'` gives the same, synchronously,",
+  'and `node file.ts` runs TypeScript (types are stripped, not checked).',
+  'Prefer one script that loops, filters and aggregates (asking models or tools as it goes) and prints only what you',
+  'need over many separate tool calls.',
+  'What you make for the user (pages, apps, reports, pictures) goes in the workspace as files: each shows in the',
+];
+const GUIDE_START = [
+  "Your commands run in a small Linux inside the user's browser (Alpine: bash, coreutils, Python 3 with pip, Node with",
+  'npm, git, curl, jq, ripgrep). Each command starts afresh but for the workspace, so install packages into it',
+  '(`npm install`, `python3 -m venv .venv`). Package and cache directories (.venv, node_modules, __pycache__, .cache)',
+  'stay on the Linux between commands but are not workspace files (not in its history, not in tasks\' copies): after',
+  'a long pause they may be gone, so check before using them, and keep what you make outside them.',
+  'Keep NOTES.md in the workspace: what the user wants, decisions, where things are and what is left; its start is',
+  'carried into the summary when the history is compacted, so you go on knowing it.',
+  'With network on (the bash tool says whether), commands reach websites over',
   'HTTP and HTTPS, which Chrome fetches through the proxy their environment names (without the user\'s cookies; the',
   "user's computer and local network addresses and names are refused); if the user set a relay, they reach any address through it. Without",
   "network, connections are refused: ask the user to turn the thread's network on (its model menu) rather than",
@@ -206,7 +263,11 @@ const LINUX_GUIDE = [
 
 /** Earlier wordings of the guide, which threads made before may hold. */
 const EARLIER_GUIDES = [[
-  ...GUIDE_START,
+  ...GUIDE_START_BEFORE_NOTES,
+  'conversation, where the user reads, opens and downloads it; with page tools on, navigate to /workspace/NAME opens',
+  'one in a tab for them.',
+].join(' '), [
+  ...GUIDE_START_BEFORE_NOTES,
   'conversation, where the user reads, opens and downloads it; navigate to /workspace/NAME opens one in a tab for them.',
 ].join(' '), [
   "Your commands run in a small Linux inside the user's browser (Alpine: bash, coreutils, Python 3 with pip, Node with",
@@ -281,20 +342,60 @@ const STANDING_START = "[The user's standing instructions]";
 const STANDING_END = "[End of the user's standing instructions]";
 const STANDING = /\[The user's standing instructions\]\n([\s\S]*?)\n\[End of the user's standing instructions\]/;
 
+/** What a thread is told of its own setup (`setupOf`), between these lines. */
+const SETUP_START = "[This thread's setup]";
+const SETUP_END = "[End of this thread's setup]";
+const SETUP = /\[This thread's setup\]\n([\s\S]*?)\n\[End of this thread's setup\]/;
+
 /** What every thread is told about what it writes, before the user's standing
- * instructions (which win). A later wording must still take this one out. */
-const STYLE = "Pages you make follow the system's light or dark theme and offer a System/Light/Dark switch; never write em dashes.";
+ * instructions (which win). A later wording must still take this one out (`EARLIER_STYLES`). */
+const STYLE = "Pages you make follow the system's light or dark theme and offer a System/Light/Dark switch as one small "
+  + 'icon button in a corner that cycles them (no visible label, no menu); they print in light colours with everything '
+  + "shown, and have no print button (Spindle's file tab has one). Never write em dashes.";
+/** Earlier wordings of the style line, which threads made before hold. */
+const EARLIER_STYLES = ["Pages you make follow the system's light or dark theme and offer a System/Light/Dark switch; never write em dashes."];
 
 /** A thread's instructions as they are, with the style line, the Linux guide in (`on`)
- * or out and the user's standing instructions as `standing` says (undefined: as they
- * are). */
-function guided(instructions, on, standing) {
+ * or out, the user's standing instructions as `standing` says (undefined: as they are)
+ * and the thread's `setup` (`setupOf`; undefined: none, as a thread leaving this browser
+ * takes them). */
+function guided(instructions, on, standing, setup) {
   let rest = String(instructions ?? '');
   for (const guide of [LINUX_GUIDE, ...EARLIER_GUIDES]) rest = rest.replace(guide, '');
   const kept = STANDING.exec(rest)?.[1] ?? '';
-  rest = rest.replace(STANDING, '').replace(STYLE, '').trim();
+  rest = rest.replace(STANDING, '').replace(SETUP, '');
+  for (const style of [STYLE, ...EARLIER_STYLES]) rest = rest.replace(style, '');
+  rest = rest.trim();
   const user = (standing ?? kept).trim();
-  return [rest, STYLE, user && `${STANDING_START}\n${user}\n${STANDING_END}`, on && LINUX_GUIDE].filter(Boolean).join('\n\n');
+  return [rest, STYLE, user && `${STANDING_START}\n${user}\n${STANDING_END}`, setup && `${SETUP_START}\n${setup}\n${SETUP_END}`, on && LINUX_GUIDE]
+    .filter(Boolean).join('\n\n');
+}
+
+/** What a thread is told of its own setup before each turn, which the user changes in
+ * the panel and the thread cannot (it asks them): its model, where its commands run and
+ * their network, its spending limit, the page switches and the sites its scripts may
+ * call. Kept in its instructions, so they (and a provider's prompt cache) change only
+ * when the user changes one of these. */
+async function setupOf(id, settings) {
+  const [thread, pages, sites] = await Promise.all([read('threads', id), read('kv', 'pages'), read('kv', 'sites')]);
+  const runner = thread?.runner ?? 'app';
+  const reading = pages?.reading === true;
+  const acting = reading && pages?.acting === true;
+  const before = {
+    full: 'they act without asking the user',
+    auto: 'the user is asked before what reads as sending or submitting (judged by its words: no guarantee) and before files are put in a field',
+    ask: 'the user is asked before each one',
+  }[confirmMode(pages)];
+  return [
+    `Model: ${settings.provider}/${settings.model}, effort ${settings.effort ?? 'default'}.`,
+    runner === 'none' ? 'Commands: none.'
+      : `Commands: ${runner === 'remote' ? "on the user's Spindle host" : "in this browser's Linux"}, network ${settings.network ? 'on' : 'off'}.`,
+    `Spending limit: ${settings.max_usd != null ? `US$${settings.max_usd}` : 'none'}.`,
+    `Page reading ${reading ? 'on' : 'off'}; page actions ${acting ? `on (${before})` : 'off'}.`,
+    // Where its scripts run (none: no sites to name to its provider).
+    runner !== 'none' && `Sites scripts may call with spindle http: ${(sites ?? []).map((grant) => grant.url).join(', ') || 'none'}.`,
+    'The user changes these in the Spindle panel (the model menu, and Settings); you cannot, so ask them to.',
+  ].filter(Boolean).join('\n');
 }
 
 /** Before a turn, a thread gets what is current, if it differs (if it cannot, the turn
@@ -311,7 +412,9 @@ async function freshen(dir) {
     const tools = settings.tools ?? [];
     const changes = {};
     const guide = instructions.includes(LINUX_GUIDE) || EARLIER_GUIDES.some((earlier) => instructions.includes(earlier));
-    const wanted = guided(instructions, guide, (await read('kv', 'standing')) ?? '');
+    // Unreadable now, the setup it was told stays (nothing else held back for it).
+    const setup = await setupOf(id, settings).catch(() => SETUP.exec(instructions)?.[1]);
+    const wanted = guided(instructions, guide, (await read('kv', 'standing')) ?? '', setup);
     if (wanted !== instructions.trim()) changes.instructions = wanted;
     const offered = tools.filter((tool) => PAGE_NAMES.has(tool.name));
     const now = client.tools.definitions();
@@ -351,15 +454,18 @@ function attachedNote(files) {
   return `\n\n[Attached, in the workspace: ${files.map((file) => `${file.path} (${file.bytes.length} bytes)`).join(', ')}]`;
 }
 
+function base64Of(bytes) {
+  let binary = '';
+  for (let at = 0; at < bytes.length; at += 0x8000) binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
+  return btoa(binary);
+}
+
 function attachments(files) {
   if (!files?.length) return { files: null, note: '' };
-  const encode = (bytes) => {
-    let binary = '';
-    for (let at = 0; at < bytes.length; at += 0x8000) binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
-    return btoa(binary);
-  };
   return {
-    files: files.map((file) => ({ path: String(file.path), base64: encode(file.bytes) })),
+    // As bytes: the package passes them beside the request, never as base64 inside it
+    // (a thread started with another's files carries up to MAX_CARRIED).
+    files: files.map((file) => ({ path: String(file.path), bytes: file.bytes instanceof Uint8Array ? file.bytes : new Uint8Array(file.bytes) })),
     note: attachedNote(files),
   };
 }
@@ -396,6 +502,38 @@ async function changeSettings(id, changes) {
   return settings;
 }
 
+/** Most characters of a page read kept in the conversation: every later request sends
+ * it again, so more goes into a workspace file the thread's file tools read and search
+ * (as much as was asked for, nothing lost). */
+const INLINE_PAGE = 32_000;
+const SPILLED = new Set(['read_page', 'page_elements', 'page_html']);
+/** A script's tool call (code mode): its call id. */
+const SCRIPT_CALL = /(^|\/)code-[0-9a-f]+$/;
+
+/** A long page read, its first INLINE_PAGE characters kept in the answer and the whole in
+ * the workspace (`.pages/`), for a thread that has file tools; any other answer as it is. */
+async function spilled(name, answer, call) {
+  const content = answer?.content;
+  if (!SPILLED.has(name) || typeof content !== 'string' || content.length <= INLINE_PAGE || answer.error != null || answer.unknown) return answer;
+  // A script's call keeps its whole answer: the package keeps no files a script's tool
+  // call writes, so the file would never be there (the script reads its answer itself).
+  if (SCRIPT_CALL.test(String(call?.call ?? ''))) return answer;
+  try {
+    const settings = await client.settings(String(call?.session ?? '').split('#')[0]);
+    if ((settings.builtin_tools ?? 'all') === 'none') return answer;
+  } catch {
+    return answer;
+  }
+  // Its time and a random part: calls made together never share a name.
+  const path = `.pages/${name.replace('_', '-')}-${new Date().toISOString().replace(/[:.]/g, '-')}-${newId().slice(0, 6)}.${name === 'page_html' ? 'html' : 'txt'}`;
+  const more = content.length - INLINE_PAGE;
+  return {
+    ...answer,
+    content: `${content.slice(0, INLINE_PAGE)}\n[${more} more characters: all that was read is in the workspace at ${path}; read or search it there (read_file, or grep in bash) instead of asking for the page again]`,
+    files: { write: { [path]: content } },
+  };
+}
+
 function newId() {
   return [...crypto.getRandomValues(new Uint8Array(8))].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
@@ -410,7 +548,17 @@ function makeClient(saved) {
     // the package waits longer than all of that, so the engine always answers first (no
     // action the package gave up on, said unknown, happens after).
     const timeoutS = ASKING_NAMES.has(tool.name) ? 100 + APPROVAL_WAIT / 1000 : 30;
-    made.tool({ ...tool, timeoutS, run: (input, call) => actOnPage(tool.name, opened(tool.name, input, call?.session), call?.session, call?.signal, ownedByTask(call)) });
+    made.tool({
+      ...tool, timeoutS,
+      run: async (input, call) => {
+        // The turn's page tool generation before the files are read (a host thread's may
+        // take a while): a Stop meanwhile is seen.
+        const epoch = pageEpoch(call?.session, ownedByTask(call));
+        const given = await prepared(tool.name, numbersIn(tool, input), call);
+        if (given.error != null) return { error: given.error };
+        return spilled(tool.name, await actOnPage(tool.name, given.input, call?.session, call?.signal, ownedByTask(call), epoch), call);
+      },
+    });
   }
   made.on('event', (event, dir) => {
     const id = idOf(dir);
@@ -645,6 +793,36 @@ async function credentials(facts) {
   throw new Error(`Spindle has no credential for ${profile?.display_name ?? facts.provider}: ${missing} in Settings, Providers`);
 }
 
+/** This installation's ID for Sign in with ChatGPT (`ext_agent_host_id`): a random
+ * UUID made once and kept, the same for every sign-in from this browser profile; never
+ * the user's identifier, and no credential. */
+let agentHostMaking = null;
+function agentHost() {
+  agentHostMaking ??= (async () => {
+    const kept = await read('kv', 'agent-host');
+    if (typeof kept === 'string' && /^urn:uuid:[0-9a-f-]{36}$/.test(kept)) return kept;
+    const made = `urn:uuid:${crypto.randomUUID()}`;
+    await writeDurably('kv', 'agent-host', made);
+    return made;
+  })().finally(() => {
+    agentHostMaking = null;
+  });
+  return agentHostMaking;
+}
+
+/** The Sign in with ChatGPT registration kept for `provider` (`{clientId, subject,
+ * account, declined?}`), or null: it outlives a sign-out, so signing in again is the same
+ * client; a sign-in with another account replaces it. */
+async function registrationOf(provider) {
+  const kept = await read('kv', 'signin-registrations');
+  const registration = kept?.[provider];
+  return registration && typeof registration.clientId === 'string' ? registration : null;
+}
+
+function keepRegistration(provider, registration) {
+  return merge('kv', 'signin-registrations', { [provider]: registration }, (value, old) => ({ ...(old ?? {}), ...value }));
+}
+
 /** A URL's origin, or null. */
 function originOf(url) {
   try {
@@ -835,6 +1013,57 @@ function opened(name, input, session) {
   return { ...input, url: view.href, new_tab: true };
 }
 
+/** A page tool's input as Chrome's side gets it (`{input}`), or why it may not go
+ * (`{error}`): a workspace file to open named by this thread (`opened`; a file viewer
+ * address naming another thread's is refused), and for `select` with `files`, the files
+ * themselves (`uploadOf`; an `upload` the model wrote itself never passes). */
+async function prepared(name, input, call) {
+  const id = idOf(String(call?.session ?? '').split('#')[0]);
+  const given = opened(name, input, call?.session);
+  if (name === 'navigate' && typeof given?.url === 'string' && given.url.startsWith(new URL('view.html?', self.location.href).href)) {
+    if (new URL(given.url).searchParams.get('thread') !== id) return { error: "that address opens another thread's file: open a file of this thread's workspace with /workspace/NAME" };
+  }
+  if (name !== 'select' || !given || typeof given !== 'object') return { input: given };
+  const { upload: _, ...rest } = given;
+  if (rest.files == null) return { input: rest };
+  const found = await uploadOf(rest.files, id, call).catch((error) => ({ error: `the files could not be read: ${error?.message ?? error}` }));
+  return found.error != null ? found : { input: { ...rest, upload: found.upload } };
+}
+
+/** The files `select` puts in a field (`paths` in thread `id`'s workspace, here or on the
+ * host), read when the model asks so the bytes the user is asked about are the bytes
+ * that go: `{upload: [{path, name, type, size, base64}]}` or `{error}`. Not from a script
+ * (a command writes its files back only when it ends, so its call would find older ones)
+ * nor a task (its workspace comes back to the thread when it ends); within `UPLOAD`. */
+async function uploadOf(paths, id, call) {
+  const mb = (bytes) => `${Math.ceil(bytes / 104857.6) / 10} MB`;
+  if (SCRIPT_CALL.test(String(call?.call ?? ''))) return { error: 'a script cannot put files in a page (its command writes its files back only when it ends): call select with files yourself, after the command' };
+  if (ownedByTask(call)) return { error: 'a task cannot put files in a page: its thread can, once the task has ended and its files are back' };
+  if (!id) return { error: 'files go in a page only from a thread' };
+  if (!Array.isArray(paths) || !paths.length || paths.length > UPLOAD.count) return { error: `give 1 to ${UPLOAD.count} files` };
+  const wanted = paths.map((path) => String(path).trim().replace(/^\/workspace\//, '').replace(/^\.\//, ''));
+  const bad = wanted.find((path) => !path || path.startsWith('/') || path.split('/').some((part) => !part || part === '.' || part === '..'));
+  if (bad != null) return { error: `${JSON.stringify(bad)} is no file of the workspace: give its path there, such as resume.pdf` };
+  const sizes = new Map(((await ops.files({ id }))?.files ?? []).map((file) => [file.path, file.size]));
+  const missing = wanted.find((path) => !sizes.has(path));
+  if (missing != null) return { error: `the workspace has no file ${missing}` };
+  const big = wanted.find((path) => sizes.get(path) > UPLOAD.file);
+  if (big != null) return { error: `${big} is ${mb(sizes.get(big))}: at most ${mb(UPLOAD.file)} a file` };
+  if (wanted.reduce((sum, path) => sum + sizes.get(path), 0) > UPLOAD.total) return { error: `the files come to more than ${mb(UPLOAD.total)}, the most one select takes` };
+  const upload = [];
+  let total = 0;
+  for (const path of wanted) {
+    // Checked again as read (a file may have grown since it was listed).
+    const { bytes } = await ops.read({ id, path });
+    total += bytes.length;
+    if (bytes.length > UPLOAD.file || total > UPLOAD.total) return { error: `${bytes.length > UPLOAD.file ? `${path} is ${mb(bytes.length)}: at most ${mb(UPLOAD.file)} a file` : `the files come to more than ${mb(UPLOAD.total)}, the most one select takes`}` };
+    // A type Spindle does not know goes as none, as Chrome gives one picked in its dialog.
+    const type = typeOf(path);
+    upload.push({ path, name: path.split('/').pop(), type: type === 'application/octet-stream' ? '' : type, size: bytes.length, base64: base64Of(bytes) });
+  }
+  return { upload };
+}
+
 /** Whether an app call is a task's: its call named under its task (`tasks/KEY/...`, as a
  * task's calls come from the package), or asked in a task's session (`dir#KEY`, a script's).
  * A thread's own turn ending or stopped leaves its background tasks' page tools be: the
@@ -871,6 +1100,7 @@ function pageTool(name, input, session, allowed = null, signal = null, task = fa
   if (pageStopped(session, task)) return Promise.resolve({ error: 'the turn was stopped' });
   if (signal?.aborted) return Promise.resolve({ error: `${endedWhy(signal)} first, so it was not done` });
   const call = crypto.randomUUID();
+  if (task && OPENS_TABS.has(name)) tasksOpening.add(idOf(session?.split('#')[0] ?? ''));
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       self.postMessage({ type: 'page_tool_cancel', call });
@@ -886,8 +1116,39 @@ function pageTool(name, input, session, allowed = null, signal = null, task = fa
       resolve(answer);
     }, { session, tool: name, task }));
     signal?.addEventListener('abort', stop, { once: true });
-    self.postMessage({ type: 'page_tool', call, name, input, ...(allowed && { allowed }) });
+    // Its thread: tabs the call opens are that thread's, closed when it is done (`tabsDone`).
+    self.postMessage({ type: 'page_tool', call, name, input, thread: idOf(session?.split('#')[0] ?? ''), task: Boolean(task), ...(allowed && { allowed }) });
   });
+}
+
+/** The page tools whose call may open a tab (navigate's new_tab, or a page opening one). */
+const OPENS_TABS = new Set(['navigate', 'click', 'press', 'type', 'select', 'dialog']);
+/** Threads whose background tasks may have opened tabs not yet closed. */
+const tasksOpening = new Set();
+
+/** Thread `id`'s turn is done (or the thread deleted): the tabs Spindle opened for its
+ * turns close (`tasks`: its background tasks' too). */
+function tabsDone(id, { tasks = false } = {}) {
+  self.postMessage({ type: 'tabs_done', thread: id, tasks });
+}
+
+/** Whether a background task is still at work, as its row says: here `pending`; a
+ * native host's rows say where the task's session stands (finished or stopped: done). */
+const atWork = (task) => task.pending ?? !(task.status?.complete === true || task.status?.stop != null);
+
+/** A turn of thread `id` completed (`tasksOf`: its task rows, here or on the host): the
+ * tabs its turns opened close, and its tasks' once none of them is still at work (a
+ * task's tab may still be in use; a list that cannot be read keeps them). */
+async function turnTabsDone(id, tasksOf = () => client.tasks(dirOf(id))) {
+  let tasks = false;
+  // Taken out while the rows are read: a task's call meanwhile puts it back.
+  if (tasksOpening.delete(id)) {
+    try {
+      tasks = !((await tasksOf()).tasks ?? []).some(atWork);
+    } catch {}
+    if (!tasks) tasksOpening.add(id);
+  }
+  tabsDone(id, { tasks });
 }
 
 /** How long a page action the user is asked about waits for their answer. */
@@ -906,11 +1167,10 @@ function announceApprovals() {
   send({ type: 'approvals', approvals: approvalsShown() });
 }
 
-/** A page tool for a thread: at once under Full (the default); under Auto or Ask once the
+/** A page tool for a thread: at once under Full; under Auto (the default) or Ask once the
  * user allows it when it is one they asked to be asked about. A refusal is a known
  * outcome: nothing was done. */
-async function actOnPage(name, input, session, signal, task = false) {
-  const epoch = pageEpoch(session, task);
+async function actOnPage(name, input, session, signal, task = false, epoch = pageEpoch(session, task)) {
   const asked = { task };
   const refusal = await beforeActing(name, input, session, signal, asked);
   if (epoch !== pageEpoch(session, task) || pageStopped(session, task)) return { error: 'the turn ended or was stopped before the page tool started' };
@@ -947,7 +1207,7 @@ async function beforeActing(name, input, session, signal, asked = {}) {
     const found = await pageTool('target', { ref: input.ref, ...(input.tab != null && { tab: input.tab }) }, session, null, signal, task);
     target = found?.details ?? null;
   } else if (name === 'press' || name === 'dialog' || name === 'close_tab' || (name === 'navigate' && !input?.new_tab)) {
-    const found = await pageTool('tab_of', { ...(input?.tab != null && { tab: input.tab }) }, session, null, signal, task).catch(() => null);
+    const found = await pageTool('tab_of', { ...(input?.tab != null && { tab: input.tab }), ...(name === 'press' && { focus: true }) }, session, null, signal, task).catch(() => null);
     target = found?.details ?? null;
     // Which tab it would land on could not be told: asked about no tab, it would go to
     // whatever tab is shown when it runs. Not done; it can be asked about again.
@@ -980,8 +1240,12 @@ async function beforeActing(name, input, session, signal, asked = {}) {
     asked.allowed = {
       tab: target.tab ?? null, host: target.host ?? null,
       ...(target.document && { document: target.document }), ...(target.url != null && { url: target.url }),
-      ...(input?.ref && target.what && { what: target.what }),
+      // The part as shown: its description, words and where it leads (a link's address,
+      // the address a submit button sends its form to).
+      ...(input?.ref && target.what && { what: target.what, words: target.words ?? '', dest: target.dest ?? null }),
       ...(name === 'dialog' && { dialog: target.dialog?.id ?? 0 }),
+      // A key goes where the focus is: to the part the user was shown having it, or none.
+      ...(name === 'press' && 'focus' in target && { focus: target.focus?.ref ?? null }),
     };
   }
   return answer;
@@ -1146,6 +1410,7 @@ function turn(id, work) {
   entry.done = (async () => {
     let unsent = [];
     let failed = false;
+    let completed = false;
     const before = await read('threads', id).catch(() => null);
     try {
       const thread = await touch(id, { state: 'running', note: null });
@@ -1163,6 +1428,7 @@ function turn(id, work) {
         ? result.stopped.reason
         : unsent.length ? `${unsent.length} message(s) came after the turn's last step and were not read` : null;
       await touch(id, { state: cut ? 'stopped' : 'idle', note });
+      completed = !cut;
     } catch (error) {
       if (error.beforeStart) {
         // Stopped before the message went: the thread is as it was (the message comes
@@ -1179,7 +1445,7 @@ function turn(id, work) {
       cancelPageTools(id, { tasks: false });
       const took = carrying.get(id);
       carrying.delete(id);
-      await afterTurn(id, unsent, took, { sending: entry.sending, failed }).catch((error) => console.warn('Spindle: after a turn:', error));
+      await afterTurn(id, unsent, took, { sending: entry.sending, failed, completed }).catch((error) => console.warn('Spindle: after a turn:', error));
     }
   })();
 }
@@ -1187,8 +1453,10 @@ function turn(id, work) {
 /** What follows a turn of a thread here. The waiting message it took (`took`) leaves the
  * disk once the thread holds it; a turn that ended without taking it (stopped before it
  * started, say) puts it back, held, saying why. Messages the turn did not read go with a
- * message waiting for its end, before it; then that message goes. */
-async function afterTurn(id, unsent, took, { sending, failed }) {
+ * message waiting for its end, before it; then that message goes. A `completed` turn
+ * after which the thread rests (no message goes on at once, none it did not read is
+ * held) closes the tabs it opened (`turnTabsDone`); otherwise they stay, to go on in. */
+async function afterTurn(id, unsent, took, { sending, failed, completed = false }) {
   if (took) {
     // Not handed over: not taken. Handed over to a turn that went on: taken (the package
     // commits the message first). Handed over to one that failed: its history tells.
@@ -1200,7 +1468,10 @@ async function afterTurn(id, unsent, took, { sending, failed }) {
   send({ type: 'turn_end', thread: id, unsent: [] });
   const waiting = queued.get(id);
   if (waiting && !waiting.held) sendQueued(id);
-  else rest(id);
+  else {
+    if (completed && !unsent?.length) turnTabsDone(id).catch(() => {});
+    rest(id);
+  }
 }
 
 /** Messages a turn ended before reading: with a message waiting for that end, they go
@@ -1364,7 +1635,7 @@ async function firstStepStopped(id) {
     const dir = dirOf(id);
     const status = await client.status(dir);
     if (status.accepts_prompt || !status.accepts_message || status.phase === 'model_wait') return false;
-    if ((await client.targets(dir)).some((target) => target.kind === 'settled')) return false;
+    if ((await client.turn(dir)).completed) return false;
     const messages = (await client.history(dir)).messages ?? [];
     const replies = messages.filter((message) => message.role === 'assistant');
     const calling = replies.filter((message) => message.content?.some((block) => block.type === 'tool_use'));
@@ -1372,8 +1643,18 @@ async function firstStepStopped(id) {
   });
 }
 
+/** Why a stopped turn can neither go on nor start over now (its earlier turns cannot be
+ * gone back to): a background task still at work holds every point of a thread that
+ * has tasks. Nothing is changed. */
+async function heldBack(dir) {
+  const working = ((await client.tasks(dir).catch(() => null))?.tasks ?? []).filter((task) => task.pending).length;
+  return failure('busy', working
+    ? `${working === 1 ? 'a background task of this thread is' : `${working} background tasks of this thread are`} still at work, and meanwhile its earlier turns cannot be gone back to: wait for ${working === 1 ? 'it' : 'them'} or stop ${working === 1 ? 'it' : 'them'}, then try again. Nothing was changed`
+    : "this thread's earlier turns cannot be gone back to now: Retry or Continue it instead. Nothing was changed");
+}
+
 function notRunning(id, doing) {
-  if (running.has(id)) throw failure('busy', `stop this thread before ${doing} it`);
+  if (running.has(id)) throw failure('busy', `stop this thread before ${doing}`);
 }
 
 /** A thread that can take work: it exists and has not moved out. */
@@ -1476,6 +1757,10 @@ async function snapshot() {
   const standing = (await read('kv', 'standing')) ?? '';
   const relay = (await read('kv', 'relay')) ?? null;
   const vault = await vaultState();
+  // Sign in with ChatGPT registrations kept (outliving a sign-out), by provider: the
+  // account each is for (a client ID is no secret, but the panel needs only that).
+  const registrations = Object.fromEntries(Object.entries((await read('kv', 'signin-registrations')) ?? {})
+    .map(([provider, registration]) => [provider, typeof registration?.account === 'string' ? registration.account : null]));
   // The thread list is read last, and nothing is awaited after it: a panel replaces its
   // whole list with this one, so a thread that changed (and was announced) while the
   // reads above waited must be in it. A change committed after this read is announced
@@ -1496,6 +1781,7 @@ async function snapshot() {
     standing,
     relay,
     vault,
+    registrations,
   };
 }
 
@@ -1514,14 +1800,20 @@ function announceVault() {
 /** The last turnFiles answer, by thread and revision (asked again at every turn's end). */
 let turnFilesKept = { key: null, value: null };
 
+/** Said when the messages before a summary are asked for while the thread works: a
+ * store lists no points to go back to meanwhile. */
+const NOT_WHILE_WORKING = 'The messages before the summary can be shown once this thread stops working';
+
 /** The rewind target whose history is `shown`'s first `at` messages: the point just
  * before message `at`. Newest first, among the last 8192 steps (each read only to its
  * count first; the whole history of one with the right count). */
 async function pointBefore(dir, shown, at) {
   const before = JSON.stringify(shown.slice(0, at));
   for (const target of await client.targets(dir, { limit: 8192 })) {
-    const { messages = [] } = await client.history(dir, target.revision, { from: at - 1 });
-    if (messages.length !== 1) continue;
+    // Its length first (asked from the end: no messages come back), the whole compared
+    // only for a point of that length.
+    const { total } = await client.history(dir, target.revision, { from: at });
+    if (total !== at) continue;
     if (JSON.stringify((await client.history(dir, target.revision)).messages ?? []) === before) return target.revision;
   }
   return null;
@@ -1544,7 +1836,8 @@ function creationSettings(settings) {
 }
 
 async function checkCreation(provider, settings) {
-  const probe = newId();
+  // Named apart from threads: one a stop left behind is cleared at start, never listed.
+  const probe = `probe-${newId()}`;
   await headroom();
   try {
     await client.create(dirOf(probe), provider, settings);
@@ -1561,11 +1854,16 @@ async function replaceFirst(id, provider, settings) {
   const backup = `prior:${id}:${String(Date.now()).padStart(15, '0')}:${crypto.randomUUID()}`;
   // Checked whole: if the reset fails, this is what the thread comes back from. On disk
   // (with the record naming it) before the thread's store is discarded.
-  await writeDurably('bundles', backup, { bytes: await client.exportSession(dirOf(id), { keep: true, whole: true }) });
+  // (Its size kept, not the bytes: they go once written.)
+  const size = await client.exportSession(dirOf(id), { keep: true, whole: true })
+    .then(async (bytes) => (await writeDurably('bundles', backup, { bytes, size: bytes.byteLength }), bytes.byteLength));
   await writeDurably('kv', `reset:${id}`, { type: 'reset', id, backup });
   try {
     await discard(id);
     await client.create(dirOf(id), provider, settings);
+    // The thread as it was stays, as an earlier version (Settings > Storage), named on
+    // disk before the reset is done: a crash in between brings the old thread back.
+    await keepEarlier(id, backup, Date.now(), size);
     // Gone from disk before the thread takes any work: found again after a crash, it
     // would bring the old thread back over what the new one did.
     await removeDurably('kv', `reset:${id}`);
@@ -1573,13 +1871,56 @@ async function replaceFirst(id, provider, settings) {
     await restoreFirst({ id, backup });
     throw error;
   }
-  // Only a reset cut short comes back from its backup: this one is done, so it goes
-  // (tidying only: one left behind goes when the engine next starts).
-  await dropPriors(id).catch(() => {});
 }
 
-/** A thread's reset backups go (none is in use: the thread's reset, if any, is done). */
+/** An earlier version's record: kv `earlier:<id>:<backup>` naming its bundle. */
+const EARLIER = 'earlier:';
+/** How long an earlier version is kept whatever happens, and how many turns the thread
+ * must finish after it, before it may be freed (deleting the thread deletes it too). */
+const EARLIER_DAYS = 7;
+const EARLIER_TURNS = 3;
+
+/** Keeps the bundle `backup` (a whole copy of thread `id` as it was) as an earlier
+ * version of it. */
+async function keepEarlier(id, backup, made = Date.now(), known = null) {
+  // Its size as the export gave it (an earlier build's backup is read once for it).
+  const size = known ?? (await read('bundles', backup))?.bytes?.byteLength ?? 0;
+  await writeDurably('kv', `${EARLIER}${id}:${backup}`, { type: 'earlier', id, backup, made, size });
+}
+
+/** Every earlier version's record. */
+async function earlierVersions() {
+  const keys = await keysWith('kv', EARLIER);
+  return (await Promise.all(keys.map((key) => read('kv', key)))).filter((record) => record?.type === 'earlier');
+}
+
+/** Whether an earlier version may be freed: a week after it was kept and three turns
+ * the thread finished since (`{free, until}`, `until` saying what is still to come). */
+async function freeable(record) {
+  const due = record.made + EARLIER_DAYS * 24 * 3600 * 1000;
+  let since = 0;
+  // A thread whose history is not here (on the user's host, or moved into a file) has no
+  // turns to count: its earlier versions wait out the week alone.
+  const thread = await read('threads', record.id);
+  if (thread?.home || thread?.state === 'moved') since = EARLIER_TURNS;
+  else try {
+    // Turns since: each request it holds but the one sent again (compaction can only
+    // lower this, which keeps the version longer).
+    // (Through `within`: the session closes again once it has rested.)
+    const status = await within(record.id, () => client.status(dirOf(record.id)));
+    since = Math.max(0, (status.prompts ?? 0) - 1 - (status.complete ? 0 : 1));
+  } catch {}
+  // What is still to come: the day it may go, and the turns the thread must finish first
+  // (`until` says both in words, for a refusal).
+  const date = Date.now() < due ? due : null;
+  const turns = Math.max(0, EARLIER_TURNS - since);
+  const waits = [date && new Date(date).toLocaleDateString([], { month: 'short', day: 'numeric' }), turns && `the thread finishes ${turns} more ${turns === 1 ? 'turn' : 'turns'}`].filter(Boolean);
+  return { free: waits.length === 0, until: waits.join(' and ') || null, due: date, turns };
+}
+
+/** A thread's earlier versions and their bundles go (it is being deleted). */
 async function dropPriors(id) {
+  for (const key of await keysWith('kv', `${EARLIER}${id}:`)) await remove('kv', key);
   for (const key of await keysOf('bundles')) if (key.startsWith(`prior:${id}:`)) await remove('bundles', key);
 }
 
@@ -1589,8 +1930,11 @@ async function restoreFirst({ id, backup }) {
   await discard(id);
   await client.importSession(dirOf(id), kept.bytes);
   await client.closeSession(dirOf(id));
+  // The thread is that copy again: not an earlier version of itself.
+  await remove('kv', `${EARLIER}${id}:${backup}`).catch(() => {});
   // As a finished reset's: gone from disk before the thread takes any work.
   await removeDurably('kv', `reset:${id}`);
+  await remove('bundles', backup).catch(() => {});
 }
 
 /** A thread's workspace as prompt files take them ({path, base64, executable}), and its
@@ -1646,7 +1990,7 @@ const ops = {
   /** That the engine answers (a file's tab times its start apart from what it reads). */
   ping: () => true,
 
-  async create({ provider, model, effort, text, runner = 'app', network = false, tasks = false, max_usd: limit = null, files: given, from }) {
+  async create({ provider, model, effort, text, runner = 'app', network = false, tasks = false, max_usd: limit = null, compact_tokens: compactAt, files: given, from }) {
     await headroom();
     // Started with another thread's files (its workspace now; no history).
     const carried = from ? await workspaceOf(from) : null;
@@ -1662,6 +2006,9 @@ const ops = {
         ...(instructions && { instructions }), ...(tasks && { tasks: true }),
         // A spending limit set for new threads (dollars, tasks included).
         ...(Number.isFinite(limit) && limit >= 0 && { max_usd: limit }),
+        // Where history compacts, when the user set one for new threads (else the
+        // engine's own default).
+        ...(compactAt !== undefined && { compact_tokens: compactAt }),
       });
       status = await client.status(dir);
     } catch (error) {
@@ -1674,13 +2021,21 @@ const ops = {
       runner: status.settings?.runner ?? 'app', network: Boolean(status.settings?.network), tasks: Boolean(status.settings?.tasks),
       created: now, updated: now, state: 'idle', note: null, summaries: true,
     };
-    await write('threads', id, thread);
+    // On disk before anything else is told of it: an index entry lost to a power cut
+    // would leave the thread's files unlisted (found again at the next start).
+    await writeDurably('threads', id, thread);
     send({ type: 'thread', thread });
     const { files, note } = attachments(given);
     const sent = [...(carried?.files ?? []), ...(files ?? [])];
     // Before the attachments' line, which ends a message.
     const started = carried ? `\n\n[Started with the files of “${carried.title}”: ${carried.files.length} in the workspace]` : '';
-    turn(id, () => client.prompt(dir, text + started + note, sent.length ? { files: sent } : {}));
+    // Its setup in its instructions from its first turn on (`setupOf`), inside the turn
+    // as `send` does, so nothing else starts one meanwhile. Unlike a later message, the
+    // first has no box to go back to, so a Stop does not hold it back here (as before).
+    turn(id, async () => {
+      await freshen(dir);
+      return client.prompt(dir, text + started + note, sent.length ? { files: sent } : {});
+    });
     warmFor(thread);
     return { id };
   },
@@ -1761,7 +2116,7 @@ const ops = {
     const thread = await read('threads', id);
     if (!thread) throw failure('not_found', 'there is no such thread');
     if (thread.state === 'moved') {
-      return { thread, status: null, history: null, running: false, bundle: Boolean(await read('bundles', id)) };
+      return { thread, status: null, history: null, running: false, bundle: await has('bundles', id) };
     }
     // Its commands run in the browser Linux: started (or resumed) while the user reads
     // and writes, not when the first command waits for it.
@@ -1831,7 +2186,10 @@ const ops = {
     return within(id, async () => {
       const shown = (await client.history(dir, revision ?? undefined)).messages ?? [];
       const summary = JSON.stringify(shown[0] ?? null);
-      for (const target of await client.targets(dir, { limit: 8192 })) {
+      const targets = await client.targets(dir, { limit: 8192 }).catch((error) => {
+        throw error?.kind === 'busy' ? failure('busy', NOT_WHILE_WORKING) : error;
+      });
+      for (const target of targets) {
         if (revision != null && target.revision >= revision) continue;
         const history = await client.history(dir, target.revision);
         if (JSON.stringify(history.messages?.[0] ?? null) !== summary) return { revision: target.revision, history };
@@ -1851,7 +2209,7 @@ const ops = {
     const dir = dirOf(id);
     const [settings, usage] = await Promise.all([client.settings(dir), client.usage(dir)]);
     return {
-      max_usd: settings.max_usd ?? null, usd: usage.usd, calls: usage.calls,
+      max_usd: settings.max_usd ?? null, compact_tokens: settings.compact_tokens ?? null, usd: usage.usd, calls: usage.calls,
       subscription: usage.subscription, unpriced: usage.unpriced, unknown: usage.unknown,
     };
   }),
@@ -1859,28 +2217,49 @@ const ops = {
   /** The efforts a provider's model takes, each with what it then asks for. */
   efforts: ({ provider, model }) => client.efforts(provider, model),
 
-  /** Starts over a turn that stopped before it finished: takes it back (to the end of
-   * the turn before, or to a fresh start for a thread's first turn), applies `changes`
-   * (provider, model, effort, where commands run, network) and sends its message again
-   * with the files attached to it; or, `resend` false, gives it back ({text, files}). */
+  /** Goes on with a turn that stopped before it finished, `changes` (provider, model,
+   * effort, where commands run, network, tasks, budget) applied: from just before its
+   * newest model request when it has one (what the turn did stays; only the request that
+   * failed goes again, with the new model); else from the end of the turn before (the
+   * turn starts over, its message and the files attached to it sent again; what it did
+   * stays in the history behind); a thread's first turn starts afresh, its earlier version
+   * kept (Settings > Storage). Never anything else: a thread whose earlier turns cannot be
+   * gone back to now says so and is left as it is. `resend` false takes the turn back to
+   * the end of the turn before and gives its message back ({text, files}). */
   async restart({ id, changes = {}, resend = true }) {
     await workable(id);
     notRunning(id, 'starting it over');
     const dir = dirOf(id);
-    const { text, files, fresh, carried = [] } = await within(id, async () => {
+    const changing = Object.keys(changes).length > 0;
+    const { text, files, fresh, carried = [], goOn = false } = await within(id, async () => {
       const status = await client.status(dir);
       if (status.accepts_prompt) throw failure('invalid', 'this thread has no unfinished turn to start over');
-      const settled = (await client.targets(dir)).find((target) => target.kind === 'settled');
+      // Back to the newest completed turn, however far (a long turn has many steps).
+      const point = await client.turn(dir);
+      if (changing) {
+        const settings = await client.settings(dir);
+        await checkCreation(changes.provider ?? settings.provider, { ...creationSettings(settings), ...changes });
+      }
+      const before = resend && point.targets[0]?.kind === 'before_model' ? point.targets[0] : null;
+      if (before) {
+        if (before.revision !== status.head) {
+          await client.rewind(dir, before.revision);
+          await forgetUnlisted(id);
+        }
+        if (changing) await changeSettings(id, changes);
+        return { goOn: true };
+      }
+      const settled = point.targets.find((target) => target.kind === 'settled');
+      // Earlier turns that cannot be gone back to now are never wiped for a fresh start.
+      if (!settled && point.completed !== false) throw await heldBack(dir);
       if (!settled && status.unresolved) {
         throw failure('conflict', 'its first request may have reached the provider with no reply saved: Retry it, or delete the thread');
       }
-      // Its message: the first the user wrote after the turn before (the files attached to
-      // it are read now: taking the turn back takes them out of the workspace).
-      const kept = settled ? ((await client.history(dir, settled.revision)).messages ?? []).length : 0;
-      const prompt = ((await client.history(dir)).messages ?? []).slice(kept)
-        .find((message) => message.role === 'user' && message.content?.some((block) => block.type === 'text' && block.text.trim()));
-      if (!prompt) throw failure('invalid', "this turn's message was not found");
-      const { text, paths } = unattached(prompt.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n'));
+      // Its own message (never a summary of earlier ones, a message sent while it ran or
+      // a task's report); the files attached to it are read now: taking the turn back
+      // takes them out of the workspace.
+      if (!point.prompt) throw failure('invalid', "this turn's message was not found");
+      const { text, paths } = unattached(point.prompt);
       const files = [];
       for (const path of paths) {
         try {
@@ -1890,13 +2269,9 @@ const ops = {
         }
       }
       if (settled) {
-        if (Object.keys(changes).length) {
-          const settings = await client.settings(dir);
-          await checkCreation(changes.provider ?? settings.provider, { ...creationSettings(settings), ...changes });
-        }
         await client.rewind(dir, settled.revision);
         await forgetUnlisted(id);
-        if (Object.keys(changes).length) await changeSettings(id, changes);
+        if (changing) await changeSettings(id, changes);
         return { text, files, fresh: null };
       }
       // A first turn that started the thread with another thread's files: started over,
@@ -1913,6 +2288,15 @@ const ops = {
       }
       return { text, files, fresh: await client.settings(dir), carried };
     });
+    if (goOn) {
+      await touch(id, { state: 'idle', note: null });
+      turn(id, async (check) => {
+        await freshen(dir);
+        check();
+        return client.resume(dir);
+      });
+      return { started: true, from: 'request' };
+    }
     if (fresh) {
       // A first turn has nothing before it to go back to: the thread starts afresh with
       // the same settings, as changed.
@@ -1944,13 +2328,16 @@ const ops = {
       check();
       return client.prompt(dir, text + note, all.length ? { files: all } : {});
     });
-    return { started: true };
+    // Taken out of the history already: should the turn end without it (stopped before it
+    // began, or its start failing), the message comes back, with its files.
+    carrying.set(id, waitingMessage(id, text, files));
+    return { started: true, from: fresh ? 'start' : 'turn' };
   },
 
   rename: ({ id, title }) => touch(id, { title: String(title).trim().slice(0, 80) || 'Untitled' }),
 
   async remove({ id }) {
-    notRunning(id, 'deleting');
+    notRunning(id, 'deleting it');
     // Its background tasks' page actions (and their questions) end with it.
     cancelPageTools(id);
     if (using.has(id)) throw failure('busy', 'this thread is busy; try again in a moment');
@@ -1967,13 +2354,16 @@ const ops = {
     queued.delete(id);
     carrying.delete(id);
     linux.forget(dirOf(id));
+    // The tabs Spindle opened for it close too.
+    tasksOpening.delete(id);
+    tabsDone(id, { tasks: true });
     send({ type: 'removed', id });
     return { removed: true };
   },
 
   async export({ id, keep }) {
     await workable(id);
-    notRunning(id, 'exporting');
+    notRunning(id, 'exporting it');
     moving.add(id);
     try {
       return await within(id, async () => {
@@ -1995,14 +2385,22 @@ const ops = {
         let thread = await read('threads', id);
         const name = `${slug(thread?.title)}.spindle`;
         if (keep) return { bytes: await client.exportSession(dir, { keep: true, settings: native }), name };
-        // The file is kept (on disk: a strict commit) before this copy is sealed, so
-        // whatever stops the engine, the thread is in one or the other; and again once
-        // sealed, before the sealed store goes. Kept, it can be saved again (a closed
-        // panel or a cancelled save loses nothing).
-        const copy = await client.exportSession(dir, { keep: true, settings: native });
-        await writeDurably('bundles', id, { bytes: copy, name, size: copy.byteLength });
-        const bytes = await client.exportSession(dir, { keep: false, settings: native });
+        // The file is kept (on disk: a strict commit) before this copy is sealed at the
+        // file's own head (refused if the thread went on since), so whatever stops the
+        // engine, the thread is in one or the other. Kept, it can be saved again (a closed
+        // panel or a cancelled save loses nothing). One export: the bundle is built once.
+        // A background task at work would refuse the seal: said before a copy is made.
+        if ((await client.status(dir)).background) throw failure('busy', 'a task of this thread works in the background: wait for it (or stop it), then move the thread');
+        const bytes = await client.exportSession(dir, { keep: true, settings: native });
         await writeDurably('bundles', id, { bytes, name, size: bytes.byteLength });
+        const facts = bundleFacts(bytes);
+        try {
+          await client.sealSession(dir, { expectedHead: facts.head, expectedState: facts.sourceState });
+        } catch (error) {
+          // Not moved: the thread stays live here, and the copy just kept is not its file.
+          await remove('bundles', id).catch(() => {});
+          throw error;
+        }
         bundleSizes.delete(id);
         thread = await touch(id, { state: 'moved', note: null });
         // The file is now the thread's one copy: once it reads back as written, the
@@ -2055,8 +2453,42 @@ const ops = {
       if (!known.has(move.id)) continue;
       Object.assign(entry(move.id), { held: move.size, move: { way: move.way, step: move.step, error: move.error } });
     }
+    // Earlier versions (a thread as it was before a fresh start), kept in IndexedDB.
+    for (const record of await earlierVersions()) {
+      if (!known.has(record.id)) continue;
+      const kept = entry(record.id);
+      kept.earlier = (kept.earlier ?? 0) + record.size;
+      kept.bytes += record.size;
+      (kept.versions ??= []).push({ backup: record.backup, made: record.made, size: record.size, ...(await freeable(record)) });
+    }
     // Bytes no file name leads to: slots whose header was found damaged (opfs.mjs `lost`).
     return { threads: [...usage.values()], lost: { files: fs.lost, bytes: fs.lostBytes } };
+  },
+
+  /** An earlier version of a thread, brought back as a thread of its own (the version
+   * stays, and so does the thread as it is now). */
+  async earlierOpen({ id, backup }) {
+    const record = await read('kv', `${EARLIER}${id}:${backup}`);
+    const kept = record && await read('bundles', backup);
+    if (!kept?.bytes) throw failure('not_found', 'that earlier version is gone');
+    const title = (await read('threads', id))?.title ?? 'Thread';
+    const opened = await ops.import({ bytes: kept.bytes, name: `${title}.spindle` });
+    // Named apart from the thread it was (an import names a thread by its first message).
+    await touch(opened.id, { title: `${title} (as it was on ${new Date(record.made).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })})`.slice(0, 80) });
+    return opened;
+  },
+
+  /** An earlier version goes, once the thread has gone on past it (`freeable`). */
+  async earlierFree({ id, backup }) {
+    const record = await read('kv', `${EARLIER}${id}:${backup}`);
+    if (!record) return { freed: 0 };
+    const why = await freeable(record);
+    if (!why.free) throw failure('invalid', `this earlier version is kept until ${why.until}`);
+    // The copy first, then its record: a crash between leaves a record whose copy is
+    // gone (cleared at start), never a copy no record names (kept as a version again).
+    await removeDurably('bundles', backup);
+    await removeDurably('kv', `${EARLIER}${id}:${backup}`);
+    return { freed: record.size };
   },
 
   /** Lets go of the bytes `storage` says no file name leads to (`lost`): `{freed}`. */
@@ -2069,7 +2501,7 @@ const ops = {
    * be running. */
   compact: ({ id }) => within(id, async () => {
     await workable(id);
-    notRunning(id, 'freeing space in');
+    notRunning(id, 'freeing space in it');
     await headroom();
     // Nothing may be at work anywhere in the engine: no turn and no background task (of
     // any thread); new work waits for the compaction (`maintenance`), and so does
@@ -2120,6 +2552,47 @@ const ops = {
     return { freed: dropSealed(await openPool(), id) };
   }),
 
+  /** A moved thread's file goes from this browser once it is saved whole on the user's
+   * disk (`filename`, as Chrome's downloads confirmed it): the thread is then in that
+   * file alone, and importing it brings it back. Its sealed copy goes too. */
+  dropBundle: ({ id, filename }) => within(id, async () => {
+    const thread = await read('threads', id);
+    if (thread?.state !== 'moved') throw failure('invalid', 'only a thread moved into a file keeps one here');
+    if (!filename) throw failure('invalid', 'the saved file is not named');
+    const size = await bundleSize(id);
+    let freed = 0;
+    if (await has('bundles', id)) {
+      await removeDurably('bundles', id);
+      freed += size;
+    }
+    bundleSizes.delete(id);
+    freed += dropSealed(await openPool(), id);
+    await touch(id, { note: `In your file ${filename} alone (saved ${new Date().toLocaleString()}): import it to bring the thread back.`, file: { name: filename, size, at: Date.now() } });
+    return { freed };
+  }),
+
+  /** A thread's finished tasks whose working copies are still here (`{task, name,
+   * bytes}`): what Storage offers to save to a file and free. */
+  finishedTasks: ({ id }) => within(id, async () => {
+    const { tasks = [] } = await client.tasks(dirOf(id));
+    return tasks.filter((task) => task.store && !task.dropped && !task.pending && task.state !== 'running')
+      .map((task) => ({ task: task.task, name: task.name ?? String(task.task).split('#').pop(), prompt: task.prompt ?? null, bytes: task.bytes ?? 0, remains: Boolean(task.remains) }));
+  }),
+
+  /** A finished task's working copy as a session bundle (it imports as a thread). */
+  taskExport: ({ id, task }) => within(id, async () => {
+    notRunning(id, 'saving its tasks');
+    return { bytes: await client.exportTask(dirOf(id), task) };
+  }),
+
+  /** A finished task's working copy goes, once saved (its spend stays counted in the
+   * thread, its answer and the files it gave stay in it). */
+  taskDrop: ({ id, task, expectedState }) => within(id, async () => {
+    notRunning(id, 'freeing its tasks');
+    if (typeof expectedState !== 'string') throw failure('invalid', 'the saved task version is missing: save it again before freeing it');
+    return client.dropTask(dirOf(id), task, { expectedState });
+  }),
+
   /** The file a moved thread went into, to save again. */
   async bundle({ id }) {
     const kept = await read('bundles', id);
@@ -2154,7 +2627,9 @@ const ops = {
       provider: status.provider, model: status.model, effort: effortOf(status), runner, network, tasks, created: now, updated: now,
       state: 'idle', note, summaries: true,
     };
-    await write('threads', id, thread);
+    // On disk before anything else is told of it: an index entry lost to a power cut
+    // would leave the thread's files unlisted (found again at the next start).
+    await writeDurably('threads', id, thread);
     send({ type: 'thread', thread });
     // What changed for it to run here: the panel asks before the user goes on with it.
     return { id, said };
@@ -2203,6 +2678,9 @@ const ops = {
     const at = shown.findLastIndex((message) => message.role === 'user' && (message.content ?? []).some((block) =>
       block.type === 'text' && typeof block.steer !== 'string' && block.text.trim() && !block.text.startsWith('[Earlier conversation compacted')));
     let before = null;
+    // Kept for this revision unless the store could not look back yet: it lists no
+    // earlier points while the thread works (a turn, a task), so it is asked again then.
+    let lasting = true;
     if (at === 0) {
       before = [];
     } else if (at > 0) {
@@ -2210,11 +2688,12 @@ const ops = {
         const revision = await pointBefore(dir, shown, at);
         if (revision != null) before = (await client.files(dir, revision)).files.map((file) => [file.path, file.digest]);
       } catch (error) {
-        console.warn('Spindle: the previous workspace is unavailable:', error);
+        if (error?.kind === 'busy') lasting = false;
+        else console.warn('Spindle: the previous workspace is unavailable:', error);
       }
     }
     const value = { ...now, before };
-    turnFilesKept = { key, value };
+    if (lasting) turnFilesKept = { key, value };
     return value;
   }),
 
@@ -2302,11 +2781,42 @@ const ops = {
     return snapshot();
   },
 
-  /** Forgets a provider's key or sign-in. */
+  /** Forgets a provider's key or sign-in. A Sign in with ChatGPT session is ended at
+   * OpenAI first (its refresh token revoked); its registration stays, so signing in again
+   * is the same client (`unconfirmed`: OpenAI did not confirm the end). */
   async forget({ provider }) {
+    const profile = catalog.providers.find((p) => p.id === provider);
+    let unconfirmed = false;
+    if (planSignIn(profile)) {
+      // One that cannot be read (the keys locked) cannot be ended there either: said.
+      const held = await vault.secret(String(provider)).then((secret) => ({ secret }), () => null);
+      unconfirmed = !held || !(await revoke(profile, held.secret, reach).catch(() => false));
+    }
     await vault.forget(String(provider));
     announceVault();
-    return snapshot();
+    return { ...(await snapshot()), ...(unconfirmed && { unconfirmed }) };
+  },
+
+  /** The user declined Sign in with ChatGPT on OpenAI's page: the registration kept
+   * asks for the plan permission again on the next sign-in (`prompt=consent`). */
+  async signInDeclined({ provider }) {
+    const kept = await registrationOf(String(provider));
+    if (kept) await keepRegistration(String(provider), { ...kept, declined: true });
+    return {};
+  },
+
+  /** What a sign-in starts with: for Sign in with ChatGPT this browser's installation ID
+   * and the registration it signs in again with (none when `fresh`: another account
+   * registers anew). No secret: a client ID and the account's email. */
+  async signInStart({ provider, fresh = false }) {
+    const profile = catalog.providers.find((p) => p.id === provider);
+    if (!flowOf(profile)) throw failure('invalid', `${profile?.display_name ?? provider} does not sign in through a browser here`);
+    if (!planSignIn(profile)) return {};
+    const registration = fresh ? null : await registrationOf(String(provider));
+    return {
+      hostId: await agentHost(),
+      registration: registration && { clientId: registration.clientId, account: registration.account ?? null, declined: Boolean(registration.declined) },
+    };
   },
 
   /** A forgotten passphrase: every saved key and sign-in goes (the host's token and
@@ -2319,17 +2829,44 @@ const ops = {
     return snapshot();
   },
 
-  /** Exchanges a sign-in the panel caught (`code`, `verifier`, `redirect`) for tokens
-   * and keeps them sealed. */
-  async signIn({ provider, code, verifier, redirect }) {
+  /** Exchanges a sign-in the panel caught (`code`, `verifier`, `redirect`; for Sign in
+   * with ChatGPT also `nonce` and `clientId`) for tokens and keeps them sealed. A Sign in
+   * with ChatGPT one keeps its registration (client, account) for the next, checks a
+   * sign-in again with it is that account, and says when it is the first here
+   * (`planWelcome`: the panel says what using the plan means, once). */
+  async signIn({ provider, code, verifier, redirect, nonce = null, clientId = null }) {
     const profile = catalog.providers.find((p) => p.id === provider);
     if (!flowOf(profile)) throw failure('invalid', `${profile?.display_name ?? provider} does not sign in through a browser here`);
     // A code is good for one exchange: none while its tokens could not be kept.
     if (!(await vault.usableNow())) throw failure('locked', "Spindle's keys are locked: unlock them, then sign in");
-    const tokens = await exchange(profile, { code, verifier, redirect }, reach);
-    await vault.keep(provider, { ...tokens, origin: originOf(profile.base_url), tokenOrigin: originOf(flowOf(profile).token_url) });
+    const plan = planSignIn(profile);
+    // Signed in again as the client kept: the token must be that account's.
+    const kept = plan ? await registrationOf(String(provider)) : null;
+    const against = kept && kept.clientId === clientId ? kept : null;
+    let made;
+    try {
+      made = await exchange(profile, { code, verifier, redirect, nonce, clientId }, reach, against);
+    } catch (error) {
+      // Registered, but the plan permission was declined: the next sign-in asks again as
+      // that client.
+      if (plan && error?.kind === 'declined' && error.registration) await keepRegistration(String(provider), error.registration);
+      // A code refused (`invalid_grant`) as a client just issued (a first sign-in, or
+      // another account's): that client is kept, so the next sign-in is it again, not
+      // another registration.
+      if (plan && error?.code === 'invalid_grant' && kept?.clientId !== clientId && typeof clientId === 'string' && clientId !== flowOf(profile).client_id) {
+        await keepRegistration(String(provider), { clientId, subject: null, account: null });
+      }
+      throw error?.kind === 'declined' ? failure('declined', error.message) : error;
+    }
+    await vault.keep(provider, { ...made.secret, origin: originOf(profile.base_url), tokenOrigin: originOf(flowOf(profile).token_url) });
+    let planWelcome = false;
+    if (plan) {
+      await keepRegistration(String(provider), made.registration);
+      planWelcome = !(await read('kv', 'plan-welcomed'));
+      if (planWelcome) await write('kv', 'plan-welcomed', true);
+    }
     announceVault();
-    return snapshot();
+    return { ...(await snapshot()), ...(planWelcome && { planWelcome }) };
   },
 
   async unlock({ passphrase }) {
@@ -2452,8 +2989,18 @@ const moves = hostMoves({
       const fence = `${dirOf(id)}/store/authority.sqlite.lock`;
       return fs.existsSync(fence) && String(fs.readFileSync(fence)).startsWith('spindle-moved: ');
     },
-    seal: (id) => within(id, async () => {
-      await client.exportSession(dirOf(id), { keep: false });
+    // Sealed at the head of the copy the host took (refused if the thread went on since):
+    // no second bundle is built.
+    seal: (id, head, sourceState) => within(id, async () => {
+      let state = sourceState;
+      // A move an earlier version recorded has no source state: it is read from a copy made
+      // now, at the same head (the thread takes no work while it moves).
+      if (!state) {
+        const facts = bundleFacts(await client.exportSession(dirOf(id), { keep: true }));
+        if (facts.head !== head) throw failure('head_moved', 'this thread went on after its copy went to your host');
+        state = facts.sourceState;
+      }
+      return client.sealSession(dirOf(id), { expectedHead: head, expectedState: state });
     }),
     dropSealed: async (id) => {
       await client.closeSession(dirOf(id)).catch(() => {});
@@ -2523,8 +3070,12 @@ function sendHostedStop(id) {
 async function forgetHostedCommand(id, request) {
   if ((await read('kv', hostedCommandKey(id)))?.request === request) {
     await removeDurably('kv', hostedCommandKey(id));
+    await remove('bundles', hostedFilesKey(id)).catch(() => {});
   }
 }
+
+/** A message's files kept here until the host has taken it (`onHost.send`). */
+const hostedFilesKey = (id) => `host-files:${id}`;
 
 function admitHosted(id, command) {
   if (admittingHosted.has(id)) return admittingHosted.get(id);
@@ -2733,7 +3284,7 @@ async function answerHostedCall(id, home, entry, event, key) {
 }
 
 async function clearHostedTools(id) {
-  const changes = (await keysOf('kv')).filter((key) => String(key).startsWith(`host-tool:${id}:`))
+  const changes = (await keysWith('kv', `host-tool:${id}:`))
     .map((key) => ['kv', key, undefined]);
   if (changes.length) await writeTogether(changes, 'strict');
 }
@@ -2792,6 +3343,9 @@ async function endHostedCall(id, done) {
   send({ type: 'turn_end', thread: id, unsent: [] });
   const waiting = queued.get(id);
   if (state !== 'running' && waiting && !waiting.held) sendQueuedHosted(id);
+  // Done, and resting (as for a turn here, `afterTurn`): the tabs it opened close, its
+  // tasks' once the host says none is at work.
+  else if (complete && state === 'idle' && !done?.unsent?.length) turnTabsDone(id, () => hostedClient(thread.home.url).tasks(thread.home.session)).catch(() => {});
 }
 
 /** The message (with files) that waited for a hosted thread's turn to end goes now; one
@@ -2826,7 +3380,7 @@ async function sendQueuedHosted(id) {
 /** Starts a turn of hosted thread `id` (`kind` say, continue or retry) on the host: its
  * event stream is open first, so no event of the turn is missed, and the command goes
  * with a request ID of its own (sent again, if need be, with the same one). */
-async function startHosted(id, kind, fields = {}) {
+async function startHosted(id, kind, fields = {}, keep = null) {
   const epoch = pageEpoch(dirOf(id));
   await endingHosted.get(id);
   const thread = await workable(id);
@@ -2851,7 +3405,7 @@ async function startHosted(id, kind, fields = {}) {
   let next;
   try {
     entry.saved = update('threads', id, (current) => ({ ...current, state: 'running', note: null, updated: Date.now() }), {
-      changes: [['kv', hostedCommandKey(id), command]], durability: 'strict',
+      changes: [['kv', hostedCommandKey(id), command], ['bundles', hostedFilesKey(id), keep ? { request, ...keep } : undefined]], durability: 'strict',
     });
     next = await entry.saved;
     if (!next) throw failure('not_found', 'there is no such thread');
@@ -2886,10 +3440,13 @@ async function settledCommand(remote, kind, fields, options) {
 }
 
 /** The rewind target whose history is `shown`'s first `at` messages, among the targets
- * the host offers (its newest 48 steps), newest first. */
+ * the host offers (its newest 48 steps), newest first; null when none is, undefined when
+ * the host offers none (it lists none while a command runs there). */
 async function hostedPointBefore(remote, session, shown, at) {
   const before = JSON.stringify(shown.slice(0, at));
-  for (const target of await remote.targets(session)) {
+  const targets = await remote.targets(session);
+  if (!targets.length) return undefined;
+  for (const target of targets) {
     const { messages = [] } = await remote.messages(session, target.revision);
     if (messages.length === at && JSON.stringify(messages) === before) return target.revision;
   }
@@ -2947,7 +3504,7 @@ const onHost = {
       }
     }
     // Attachments go up first (each kept by the host a day), then the message names them.
-    const { note } = attachments(given);
+    const note = given?.length ? attachedNote(given) : '';
     const sent = [];
     for (const file of given ?? []) {
       try {
@@ -2958,7 +3515,9 @@ const onHost = {
       }
     }
     if (epoch !== pageEpoch(dirOf(id))) throw failure('stopped', 'the turn was stopped before it started');
-    return startHosted(id, 'say', { text: text + note, ...(sent.length && { attachments: sent }) });
+    // The files stay here too until the host takes the message (saved with its command,
+    // under its request ID): refused later, it waits again with them, not as text alone.
+    return startHosted(id, 'say', { text: text + note, ...(sent.length && { attachments: sent }) }, given?.length ? { text, files: given } : null);
   },
 
   async stop({ id }) {
@@ -3049,7 +3608,10 @@ const onHost = {
     const session = thread.home.session;
     const shown = (await remote.messages(session, revision ?? undefined)).messages ?? [];
     const summary = JSON.stringify(shown[0] ?? null);
-    for (const target of await remote.targets(session)) {
+    const targets = await remote.targets(session);
+    // None listed: a command runs there (a thread with a summary has steps to go back to).
+    if (!targets.length) throw failure('busy', NOT_WHILE_WORKING);
+    for (const target of targets) {
       if (revision != null && target.revision >= revision) continue;
       const history = await remote.messages(session, target.revision);
       if (JSON.stringify(history.messages?.[0] ?? null) !== summary) return { revision: target.revision, history: { ...history, total: (history.messages ?? []).length } };
@@ -3063,7 +3625,7 @@ const onHost = {
     const session = thread.home.session;
     // Its commands run in the host's sandbox while it is there: where they run is not
     // this thread's to choose until it is back.
-    const asked = Object.fromEntries(Object.entries(changes).filter(([key]) => ['provider', 'model', 'network', 'effort', 'compaction', 'max_usd', 'tasks'].includes(key)));
+    const asked = Object.fromEntries(Object.entries(changes).filter(([key]) => ['provider', 'model', 'network', 'effort', 'compaction', 'compact_tokens', 'max_usd', 'tasks'].includes(key)));
     try {
       if (Object.keys(asked).length) await settledCommand(remote, 'settings', { session, ...asked });
       const settings = (await remote.session(session)).settings ?? {};
@@ -3079,13 +3641,14 @@ const onHost = {
     const object = await hostedClient(thread.home.url).session(thread.home.session);
     const usage = object.usage ?? {};
     return {
-      max_usd: object.settings?.max_usd ?? null, usd: usage.usd ?? 0, calls: usage.calls ?? 0,
+      max_usd: object.settings?.max_usd ?? null, compact_tokens: object.settings?.compact_tokens ?? null, usd: usage.usd ?? 0, calls: usage.calls ?? 0,
       subscription: usage.subscription ?? 0, unpriced: usage.unpriced ?? 0, unknown: usage.unknown ?? 0,
     };
   },
 
-  /** Takes back (or starts over, `resend`) a turn that stopped before it finished, on
-   * the host: back to the end of the turn before, its message (and files) returned. */
+  /** Goes on with (or takes back, `resend` false) a turn that stopped before it
+   * finished, on the host, as a thread here does (`ops.restart`): from just before its
+   * newest model request, else from the end of the turn before; never wiped. */
   async restart({ id, changes = {}, resend = true }) {
     const thread = await workable(id);
     if (thread.state === 'running' || hostedTurns.has(id)) throw failure('busy', 'stop this thread before starting it over');
@@ -3094,13 +3657,32 @@ const onHost = {
     try {
       const object = await remote.session(session);
       if (object.accepts_prompt) throw failure('invalid', 'this thread has no unfinished turn to start over');
-      const settled = (await remote.targets(session)).find((target) => target.kind === 'settled');
-      if (!settled) throw failure('invalid', 'On your host a first turn cannot be taken back or started over: bring the thread back to this browser for that, or delete it');
-      const kept = ((await remote.messages(session, settled.revision)).messages ?? []).length;
-      const prompt = ((await remote.messages(session)).messages ?? []).slice(kept)
-        .find((message) => message.role === 'user' && message.content?.some((block) => block.type === 'text' && block.text.trim()));
-      if (!prompt) throw failure('invalid', "this turn's message was not found");
-      const { text, paths } = unattached(prompt.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n'));
+      // Back to the newest completed turn, however far (an older host lists the newest
+      // steps only, and says nothing of the turn's message).
+      const point = await remote.turn(session);
+      const targets = point.targets ?? [];
+      const before = resend && point.prompt !== undefined && targets[0]?.kind === 'before_model' ? targets[0] : null;
+      if (before) {
+        if (before.revision !== object.head) await settledCommand(remote, 'rewind', { session, revision: before.revision, expected_head: object.head });
+        if (Object.keys(changes).length) await onHost.settings({ id, changes });
+        await touch(id, { state: 'idle', note: null });
+        return { ...(await startHosted(id, 'continue')), from: 'request' };
+      }
+      const settled = targets.find((target) => target.kind === 'settled');
+      if (!settled) {
+        throw failure('invalid', point.completed === false
+          ? 'On your host a first turn cannot be taken back or started over: bring the thread back to this browser for that, or delete it'
+          : "On your host this thread's earlier turns cannot be gone back to now (a background task may still be at work): wait for it, or Retry or Continue the turn. Nothing was changed");
+      }
+      let found = point.prompt;
+      if (found === undefined) {
+        const kept = ((await remote.messages(session, settled.revision)).messages ?? []).length;
+        const prompt = ((await remote.messages(session)).messages ?? []).slice(kept)
+          .find((message) => message.role === 'user' && message.content?.some((block) => block.type === 'text' && block.text.trim()));
+        found = prompt && prompt.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n');
+      }
+      if (!found) throw failure('invalid', "this turn's message was not found");
+      const { text, paths } = unattached(found);
       const files = [];
       for (const path of paths) {
         try {
@@ -3110,10 +3692,17 @@ const onHost = {
         }
       }
       await settledCommand(remote, 'rewind', { session, revision: settled.revision, expected_head: object.head });
-      if (Object.keys(changes).length) await onHost.settings({ id, changes });
-      await touch(id, { state: 'idle', note: null });
-      if (!resend) return { text, files };
-      return onHost.send({ id, text, files });
+      // Taken out of the host's history now: whatever fails before its turn takes it, the
+      // message waits here, held, with its files.
+      try {
+        if (Object.keys(changes).length) await onHost.settings({ id, changes });
+        await touch(id, { state: 'idle', note: null });
+        if (!resend) return { text, files };
+        return { ...(await onHost.send({ id, text, files })), from: 'turn' };
+      } catch (error) {
+        if (resend) await requeue(id, waitingMessage(id, text, files), sentence(error)).catch(() => {});
+        throw error;
+      }
     } catch (error) {
       throw hostFailure(error);
     }
@@ -3162,14 +3751,17 @@ const onHost = {
     const at = shown.findLastIndex((message) => message.role === 'user' && (message.content ?? []).some((block) =>
       block.type === 'text' && typeof block.steer !== 'string' && block.text.trim() && !block.text.startsWith('[Earlier conversation compacted')));
     let before = null;
+    // As turnFiles above: not kept while the host cannot look back yet.
+    let lasting = true;
     if (at === 0) {
       before = [];
     } else if (at > 0) {
       const revision = await hostedPointBefore(remote, session, shown, at).catch(() => null);
-      if (revision != null) before = (await remote.files(session, revision)).files.map((file) => [file.path, file.digest]);
+      if (revision === undefined) lasting = false;
+      else if (revision != null) before = (await remote.files(session, revision)).files.map((file) => [file.path, file.digest]);
     }
     const value = { ...now, before };
-    hostedFilesKept = { key, value };
+    if (lasting) hostedFilesKept = { key, value };
     return value;
   },
 
@@ -3183,6 +3775,9 @@ const onHost = {
   export: hereOnly('move it to a file'),
   compact: hereOnly('free space in it'),
   dropAside: hereOnly('remove its first attempts'),
+  finishedTasks: async () => [],
+  taskExport: hereOnly('save its tasks'),
+  taskDrop: hereOnly('free its tasks'),
   freeSealed: hereOnly('free its sealed copy'),
   bundle: hereOnly('save it as a file'),
 };
@@ -3230,7 +3825,7 @@ for (const [name, hosted] of Object.entries(onHost)) {
     }
     const done = await here(args);
     await clearHostedTools(args.id);
-    await writeTogether([['kv', hostedCommandKey(args.id), undefined], ['kv', hostedStopKey(args.id), undefined], ['kv', MOVE(args.id), undefined], ['bundles', MOVE(args.id), undefined]], 'strict');
+    await writeTogether([['kv', hostedCommandKey(args.id), undefined], ['kv', hostedStopKey(args.id), undefined], ['kv', MOVE(args.id), undefined], ['bundles', MOVE(args.id), undefined], ['bundles', hostedFilesKey(args.id), undefined]], 'strict');
     return done;
   };
 }
@@ -3268,12 +3863,16 @@ async function pollHosted() {
         if (worthRepeating(error) || error?.status === 401 || error?.kind === 'host') {
           await away(thread.id, `a saved request waits for your host (${sentence(error)})`);
         } else {
-          await forgetHostedCommand(thread.id, command.request);
           hostedTurns.delete(thread.id);
           await touch(thread.id, { state: 'failed', note: sentence(error) });
           // The refused message waits, held, for the user (whether or not a panel shows
-          // this thread now).
-          await holdUnsent(thread.id, command.kind === 'say' ? [command.fields.text] : []);
+          // this thread now), with the files it was sent with; then its record goes.
+          const found = command.kind === 'say' ? await read('bundles', hostedFilesKey(thread.id)).catch(() => null) : null;
+          // Only this command's own files (a record of another request is never its).
+          const kept = found?.request === command.request ? found : null;
+          if (kept?.files?.length) await requeue(thread.id, waitingMessage(thread.id, kept.text, kept.files), sentence(error)).catch((failed) => console.warn('Spindle: a refused message could not be kept:', failed));
+          else await holdUnsent(thread.id, command.kind === 'say' ? [command.fields.text] : []);
+          await forgetHostedCommand(thread.id, command.request);
           send({ type: 'turn_end', thread: thread.id, unsent: [] });
         }
       }
@@ -3443,7 +4042,7 @@ Object.assign(ops, {
    * thread says how it goes. */
   async toHost({ id, provider, model }) {
     const thread = await workable(id);
-    notRunning(id, 'moving');
+    notRunning(id, 'moving it');
     if (thread.home) throw failure('invalid', 'this thread is on your host already');
     if (thread.moving) throw failure('busy', 'the previous move is still finishing: wait for its host cleanup before moving it again');
     if (queued.has(id)) throw failure('busy', 'a message waits for this thread: send it or take it back first');
@@ -3482,6 +4081,20 @@ Object.assign(ops, {
   },
 });
 
+/** A thread found in storage with no index entry, listed again from its own store. */
+async function relist(id) {
+  const status = await within(id, () => client.status(dirOf(id))).catch(() => null);
+  const now = Date.now();
+  await writeDurably('threads', id, {
+    id, title: 'Found again', created: now, updated: now,
+    provider: status?.provider ?? null, model: status?.model ?? null, effort: status ? effortOf(status) : 'default',
+    runner: status?.settings?.runner ?? 'none', network: Boolean(status?.settings?.network), tasks: Boolean(status?.settings?.tasks),
+    state: status?.accepts_prompt === false ? 'interrupted' : 'idle',
+    note: 'This thread was in storage without its entry in the list, so it is listed again (rename it from its menu).',
+    summaries: true,
+  });
+}
+
 const starting = (async () => {
   try {
     // Compiled once: a renewal instantiates it again.
@@ -3490,11 +4103,22 @@ const starting = (async () => {
     await start();
     // Keys saved by a build that kept them as text are sealed now.
     await vault.sealPlain().catch((error) => console.error('Spindle: keys could not be sealed:', error));
-    for (const record of await valuesOf('kv')) if (record?.type === 'reset') await restoreFirst(record);
-    // Reset backups no reset is using (kept by earlier versions, or a reset finished just
-    // before Chrome stopped): every reset cut short was restored above. Tidying only: a
-    // backup that cannot go now stays for the next start.
-    for (const key of await keysOf('bundles')) if (key.startsWith('prior:')) await remove('bundles', key).catch(() => {});
+    // (By key: not every waiting message's files read to find them.)
+    for (const key of await keysWith('kv', 'reset:')) {
+      const record = await read('kv', key);
+      if (record?.type === 'reset') await restoreFirst(record);
+    }
+    // A reset backup no record names (an earlier build's, which deleted them) is a whole
+    // copy of its thread as it was: kept as an earlier version, never deleted here.
+    // An earlier version whose copy is gone (its removal cut short) goes from the list.
+    for (const key of await keysWith('kv', EARLIER)) {
+      if (!(await has('bundles', key.slice(key.indexOf(':prior:') + 1)))) await remove('kv', key).catch(() => {});
+    }
+    const named = new Set((await keysWith('kv', EARLIER)).map((key) => key.slice(key.indexOf(':prior:') + 1)));
+    for (const key of await keysOf('bundles')) {
+      const [, id, time] = key.split(':');
+      if (key.startsWith('prior:') && !named.has(key)) await keepEarlier(id, key, Number(time) || Date.now()).catch(() => {});
+    }
     // A thread the index still calls running was cut off when Chrome or the engine stopped.
     const known = new Set();
     const files = new Set(await keysOf('bundles'));
@@ -3517,10 +4141,19 @@ const starting = (async () => {
       // thread is still here, whole, so the file is a stale copy (tidying only).
       if (!moved && files.has(thread.id)) await remove('bundles', thread.id).catch(() => {});
     }
-    // Files no thread owns (an engine stopped between writing a thread and indexing it).
+    // Files no thread owns (an engine stopped between writing a thread and indexing it,
+    // or an index lost or damaged): a store there is a thread, listed again, never
+    // deleted; a directory holding no store was a thread's start that never took.
     const fs = await openPool();
     for (const name of fs.readdirSync('/threads')) {
-      if (!known.has(name)) fs.rmSync(`/threads/${name}`, { recursive: true, force: true });
+      // A settings check cut short (`checkCreation`): never a thread.
+      if (name.startsWith('probe-')) {
+        fs.rmSync(`/threads/${name}`, { recursive: true, force: true });
+        continue;
+      }
+      if (known.has(name) || !/^[0-9a-f]{16}$/.test(name)) continue;
+      if (fs.existsSync(`/threads/${name}/store/authority.sqlite`)) await relist(name).catch((error) => console.error('Spindle: an unlisted thread was not listed again:', error));
+      else if (!fs.files().some(({ path }) => path.startsWith(`/threads/${name}/`))) fs.rmSync(`/threads/${name}`, { recursive: true, force: true });
     }
     // Messages that waited for a turn's end when the engine stopped.
     await restoreQueued().catch((error) => console.warn('Spindle: waiting messages:', error));
@@ -3533,9 +4166,12 @@ const starting = (async () => {
   }
 })();
 
-channel.onmessage = async ({ data }) => {
+/** Answers a request: on the asker's own channel when it asked on REQUESTS, else on the
+ * shared one (the background's way). */
+async function answerRequest(data, privately) {
   if (data?.to !== 'engine') return;
   const { from, id, op, args } = data;
+  const reply = privately ? (message) => answerTo(from).postMessage(message) : send;
   try {
     await starting;
     while (renewing) await renewing.catch(() => {});
@@ -3543,14 +4179,16 @@ channel.onmessage = async ({ data }) => {
     if (!Object.hasOwn(ops, op)) throw failure('invalid', `there is no operation ${op}`);
     answering += 1;
     try {
-      send({ to: from, id, ok: true, result: await operate(op, args ?? {}) });
+      reply({ to: from, id, ok: true, result: await operate(op, args ?? {}) });
     } finally {
       answering -= 1;
     }
   } catch (error) {
-    send({ to: from, id, ok: false, error: { kind: error.kind ?? 'failed', message: String(error.message ?? error) } });
+    reply({ to: from, id, ok: false, error: { kind: error.kind ?? 'failed', message: String(error.message ?? error) } });
   }
-};
+}
+channel.onmessage = ({ data }) => answerRequest(data, false);
+requests.onmessage = ({ data }) => answerRequest(data, true);
 
 await starting;
 send({ type: 'ready', broken });

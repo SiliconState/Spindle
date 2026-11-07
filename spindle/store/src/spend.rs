@@ -203,6 +203,9 @@ pub(crate) struct Ledger {
     /// Worst cases of parent requests with an unknown outcome, by effect (their
     /// request is read once).
     pub(crate) estimates: BTreeMap<String, f64>,
+    /// Task sessions whose own stores were removed, as the host that removed them
+    /// records each: their spend stays here (`aside:tasks/<key>:` calls), kept with it.
+    pub(crate) dropped: Vec<Value>,
 }
 
 impl Ledger {
@@ -275,6 +278,7 @@ impl Ledger {
             turns_through: value["turns_through"].as_u64().unwrap_or(0),
             store: value["store"].as_str().map(String::from),
             forks_through: value["forks_through"].as_u64().unwrap_or(0),
+            dropped: value["dropped"].as_array().cloned().unwrap_or_default(),
             ..Self::default()
         };
         if let Some(aliases) = value["aliases"].as_object() {
@@ -322,12 +326,15 @@ impl Ledger {
     }
 
     pub(crate) fn encoded(&self) -> Result<Vec<u8>> {
-        let value = json!({"version": LEDGER, "through": self.through, "counted": self.counted,
+        let mut value = json!({"version": LEDGER, "through": self.through, "counted": self.counted,
             "turns_through": self.turns_through,
             "turns": self.turns.iter().map(|t| json!({"turn": t.turn, "revision": t.revision, "prompt": t.prompt})).collect::<Vec<_>>(),
             "done": self.done, "calls": self.calls.iter().map(Call::to_json).collect::<Vec<_>>(),
             "store": self.store, "forks_through": self.forks_through, "aliases": self.aliases,
             "estimates": self.estimates});
+        if !self.dropped.is_empty() {
+            value["dropped"] = json!(self.dropped);
+        }
         serde_json::to_vec(&value).map_err(|error| error.to_string())
     }
 
@@ -392,57 +399,53 @@ impl Ledger {
             self.counted = 0;
             changed = true;
         }
-        loop {
-            let batch = view.model_receipts_after(self.through, 256)?;
-            if batch.is_empty() {
-                break;
+        // One reply at a time (each embeds its whole request).
+        view.each_model_receipt(self.through, |row, bytes| {
+            self.through = row;
+            self.counted += 1;
+            changed = true;
+            let Ok(recorded) = ModelWait::restore(&bytes) else {
+                return;
+            };
+            drop(bytes);
+            let request = recorded.request();
+            let identity = request.identity();
+            if self.keys.contains(&identity.effect) {
+                return;
             }
-            for (row, bytes) in batch {
-                self.through = row;
-                self.counted += 1;
-                changed = true;
-                let Ok(recorded) = ModelWait::restore(&bytes) else {
-                    continue;
-                };
-                let request = recorded.request();
-                let identity = request.identity();
-                if self.keys.contains(&identity.effect) {
-                    continue;
-                }
-                let Some(response) = recorded
-                    .response()
-                    .and_then(|bytes| NativeResponse::restore(bytes).ok())
-                else {
-                    continue;
-                };
-                let subscription = subscription_request(&identity.contract, request.body());
-                let (billing, usd) = price(
-                    catalog,
-                    &identity.provider,
-                    &identity.model,
-                    &identity.contract,
-                    subscription,
-                    &response.usage,
-                );
-                let at = self.at(now);
-                self.push(Call {
-                    key: identity.effect.clone(),
-                    kind: CallKind::Parent,
-                    turn: Some(turn_of(&identity.effect)),
-                    after: None,
-                    provider: identity.provider.clone(),
-                    model: identity.model.clone(),
-                    billing,
-                    usage: tokens(&response.usage),
-                    usd,
-                    at,
-                    count: 1,
-                    worst: 0.0,
-                });
-            }
-        }
-        // Turns, with the prompt that started each.
-        let (head, _, _) = view.head()?;
+            let Some(response) = recorded
+                .response()
+                .and_then(|bytes| NativeResponse::restore(bytes).ok())
+            else {
+                return;
+            };
+            let subscription = subscription_request(&identity.contract, request.body());
+            let (billing, usd) = price(
+                catalog,
+                &identity.provider,
+                &identity.model,
+                &identity.contract,
+                subscription,
+                &response.usage,
+            );
+            let at = self.at(now);
+            self.push(Call {
+                key: identity.effect.clone(),
+                kind: CallKind::Parent,
+                turn: Some(turn_of(&identity.effect)),
+                after: None,
+                provider: identity.provider.clone(),
+                model: identity.model.clone(),
+                billing,
+                usage: tokens(&response.usage),
+                usd,
+                at,
+                count: 1,
+                worst: 0.0,
+            });
+        })?;
+        // Turns, with the prompt that started each (the head's revision alone).
+        let head = view.head_revision()?;
         if head < self.turns_through {
             self.turns_through = 0;
         }
@@ -494,8 +497,9 @@ impl Ledger {
                 self.aliases.insert(forked, turn);
             }
         }
-        // Nested model calls of run_code scripts, from their journals (or the spend
-        // records garbage collection keeps once a journal is collected).
+        // Nested model calls of scripts (run_code's, and bash's through the runner's
+        // bridge), from their journals (or the spend records garbage collection keeps
+        // once a journal is collected).
         for (attempt, settled) in view.code_attempts()? {
             if self.done.contains(&attempt) {
                 continue;
@@ -885,7 +889,7 @@ pub(crate) fn outcome(
             Some(subscription) => subscription,
             // Journals written before the flag: the login the route has now.
             None => {
-                contract == RequestContract::ChatGptResponses.as_str()
+                plan_paid(contract)
                     || (contract == RequestContract::AnthropicMessages.as_str()
                         && route_subscription(&outcome.provider, &outcome.model))
             }
@@ -952,7 +956,7 @@ pub(crate) fn dollars(usd: f64) -> String {
 /// block first in its system text (`claude_subscription::transform_body`).
 pub(crate) fn subscription_request(contract: &str, body: &[u8]) -> bool {
     const MARKER: &[u8] = b"\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: ";
-    contract == RequestContract::ChatGptResponses.as_str()
+    plan_paid(contract)
         || (contract == RequestContract::AnthropicMessages.as_str()
             && body.windows(MARKER.len()).any(|window| window == MARKER))
 }
@@ -1230,7 +1234,7 @@ pub(crate) fn journal_worst(catalog: Option<&ProviderCatalog>, prepared: &Value)
     let provider = prepared["provider"].as_str().unwrap_or_default();
     let model = prepared["model"].as_str().unwrap_or_default();
     let contract = prepared["contract"].as_str().unwrap_or_default();
-    let subscription = contract == RequestContract::ChatGptResponses.as_str()
+    let subscription = plan_paid(contract)
         || (contract == RequestContract::AnthropicMessages.as_str()
             && route_subscription(provider, model));
     if subscription {
@@ -1248,6 +1252,18 @@ pub(crate) fn journal_worst(catalog: Option<&ProviderCatalog>, prepared: &Value)
     .unwrap_or(0.0)
 }
 
+/// Whether requests on `contract` (its name, as journals keep it) are paid by the user's
+/// ChatGPT plan, not per token: the Codex backend, or the OpenAI API under Sign in with
+/// ChatGPT.
+pub(crate) fn plan_paid(contract: &str) -> bool {
+    [
+        RequestContract::ChatGptResponses,
+        RequestContract::ChatGptPlan,
+    ]
+    .iter()
+    .any(|plan| contract == plan.as_str())
+}
+
 /// The worst case a summary's reservation recorded, or (journals before it did) one
 /// for the largest summary request: its whole source, none of it ASCII.
 pub(crate) fn summary_worst(catalog: Option<&ProviderCatalog>, reserved: &Value) -> f64 {
@@ -1256,7 +1272,7 @@ pub(crate) fn summary_worst(catalog: Option<&ProviderCatalog>, reserved: &Value)
     }
     let route = |key: &str| reserved[key].as_str().unwrap_or_default().to_string();
     let (provider, model, contract) = (route("provider"), route("model"), route("contract"));
-    if contract == RequestContract::ChatGptResponses.as_str()
+    if plan_paid(&contract)
         || (contract == RequestContract::AnthropicMessages.as_str()
             && route_subscription(&provider, &model))
     {
@@ -1332,20 +1348,22 @@ pub(crate) fn worst_tokens(
 
 impl Tally {
     pub(crate) fn add_call(&mut self, call: &Call) {
+        // Counts a provider reported: summed saturating, so absurd ones cannot panic.
+        let add = |total: &mut u64, more: u64| *total = total.saturating_add(more);
         match call.billing {
-            Billing::Refused => self.refused += call.count,
-            Billing::Unknown => self.unknown += call.count,
+            Billing::Refused => add(&mut self.refused, call.count),
+            Billing::Unknown => add(&mut self.unknown, call.count),
             billing => {
-                self.calls += call.count;
-                self.input += call.usage.input;
-                self.output += call.usage.output;
-                self.cache_read += call.usage.cache_read;
-                self.cache_create += call.usage.cache_create;
+                add(&mut self.calls, call.count);
+                add(&mut self.input, call.usage.input);
+                add(&mut self.output, call.usage.output);
+                add(&mut self.cache_read, call.usage.cache_read);
+                add(&mut self.cache_create, call.usage.cache_create);
                 self.usd += call.usd;
                 match billing {
-                    Billing::Priced => self.priced += call.count,
-                    Billing::Subscription => self.subscription += call.count,
-                    _ => self.unpriced += call.count,
+                    Billing::Priced => add(&mut self.priced, call.count),
+                    Billing::Subscription => add(&mut self.subscription, call.count),
+                    _ => add(&mut self.unpriced, call.count),
                 }
             }
         }
@@ -1533,17 +1551,17 @@ impl Tally {
     #[cfg(feature = "agent")]
     pub(crate) fn plus(&self, other: &Tally) -> Tally {
         Tally {
-            calls: self.calls + other.calls,
-            input: self.input + other.input,
-            output: self.output + other.output,
-            cache_read: self.cache_read + other.cache_read,
-            cache_create: self.cache_create + other.cache_create,
+            calls: self.calls.saturating_add(other.calls),
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+            cache_create: self.cache_create.saturating_add(other.cache_create),
             usd: self.usd + other.usd,
-            priced: self.priced + other.priced,
-            subscription: self.subscription + other.subscription,
-            unpriced: self.unpriced + other.unpriced,
-            refused: self.refused + other.refused,
-            unknown: self.unknown + other.unknown,
+            priced: self.priced.saturating_add(other.priced),
+            subscription: self.subscription.saturating_add(other.subscription),
+            unpriced: self.unpriced.saturating_add(other.unpriced),
+            refused: self.refused.saturating_add(other.refused),
+            unknown: self.unknown.saturating_add(other.unknown),
         }
     }
 }
@@ -1634,13 +1652,15 @@ impl HeldLedger {
         Ok(report)
     }
 
-    /// Keeps `calls` of a store set aside (`aside` naming it) in this ledger, and the
-    /// ledger in `view`'s store now.
+    /// Keeps `calls` of a store set aside (`aside` naming it) in this ledger, with the
+    /// record of a task store removed (`dropped`), and the ledger in `view`'s store now:
+    /// one write.
     pub(crate) fn aside(
         &mut self,
         view: &mut ReadView<'_>,
         aside: &str,
         calls: Vec<Call>,
+        dropped: Option<Value>,
     ) -> Result<()> {
         let (mut ledger, _) = match self.0.take() {
             Some(held) => held,
@@ -1660,6 +1680,7 @@ impl HeldLedger {
             call.key = format!("{ASIDE}{aside}:{}", call.key);
             ledger.push(call);
         }
+        ledger.dropped.extend(dropped);
         view.retain_metadata("usage", &ledger.encoded()?)
             .map_err(|error| format!("{error:?}"))?;
         self.0 = Some((ledger, 0));
@@ -1753,7 +1774,7 @@ pub(crate) fn journal_request_worst(
     let provider = prepared["provider"].as_str().unwrap_or_default();
     let model = prepared["model"].as_str().unwrap_or_default();
     let contract = prepared["contract"].as_str().unwrap_or_default();
-    let subscription = contract == RequestContract::ChatGptResponses.as_str()
+    let subscription = plan_paid(contract)
         || (contract == RequestContract::AnthropicMessages.as_str()
             && route_subscription(provider, model));
     if subscription {
@@ -1870,4 +1891,105 @@ pub(crate) fn unpriced_text(provider: &str, model: &str, max: f64) -> String {
         "this thread has a {} budget, but Dext's catalog has no price for {provider}/{model}, so its spend could not be counted; nothing was sent. Add the model's pricing to the provider catalog, choose a priced model, or clear the budget, then Continue",
         dollars(max)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A model call a bash command's script made through the runner's bridge (the
+    /// guest `spindle` command, `import spindle`) is counted as run_code's are.
+    #[test]
+    fn nested_calls_of_bash_scripts_are_counted() {
+        let root = std::env::temp_dir().join(format!("spindle-bash-spend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = crate::Store::open(&root).unwrap();
+        let db = &store.db;
+        db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        db.execute(
+            "INSERT INTO intents VALUES('turn/m/1/t/0',1,0,'bash',X'7B7D')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO attempts VALUES('a:turn/m/1/t/0','turn/m/1/t/0',1,'runner','grant')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO receipts VALUES('a:turn/m/1/t/0',X'00',NULL)",
+            [],
+        )
+        .unwrap();
+        let stage = crate::artifact::child_stage("a:turn/m/1/t/0", 0);
+        db.execute(
+            "INSERT INTO artifact_stages VALUES(?1,?2,1)",
+            rusqlite::params![stage, crate::view::SCOPE],
+        )
+        .unwrap();
+        for record in [
+            json!({"kind":"reserved","parent":"a:turn/m/1/t/0","request":{"id":0,"method":"model"},
+                "prepared":{"provider":"p","model":"m","contract":"openai-chat-completions"}}),
+            json!({"kind":"result","parent":"a:turn/m/1/t/0","id":0,
+                "response":{"ok":true,"data":{"usage":{"input":7,"output":3,"cache_create":0,"cache_read":0}}}}),
+        ] {
+            let bytes = serde_json::to_vec(&record).unwrap();
+            let digest = crate::artifact::object_digest(&bytes);
+            db.execute(
+                "INSERT INTO objects VALUES(?1,?2,NULL)",
+                rusqlite::params![digest, bytes],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO staging_pins VALUES(?1,?2)",
+                rusqlite::params![stage, digest],
+            )
+            .unwrap();
+        }
+        db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        let mut ledger = Ledger::default();
+        let mut live = Live::default();
+        let mut view = ReadView::from_store(&store);
+        view.read(|view| ledger.update(view, None, 0, &mut live))
+            .unwrap();
+        let nested: Vec<&Call> = ledger
+            .calls
+            .iter()
+            .filter(|call| call.kind == CallKind::Nested)
+            .collect();
+        assert_eq!(nested.len(), 1, "the bash script's model call is counted");
+        assert_eq!((nested[0].usage.input, nested[0].usage.output), (7, 3));
+        drop(view);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absurd_reported_token_counts_saturate_instead_of_overflowing() {
+        let call = Call {
+            key: "effect".into(),
+            kind: CallKind::Parent,
+            turn: None,
+            after: None,
+            provider: "p".into(),
+            model: "m".into(),
+            billing: Billing::Unpriced,
+            usage: Usage {
+                input: u64::MAX,
+                output: u64::MAX,
+                ..Usage::default()
+            },
+            usd: 0.0,
+            at: None,
+            count: 1,
+            worst: 0.0,
+        };
+        let mut tally = Tally::default();
+        tally.add_call(&call);
+        tally.add_call(&call);
+        assert_eq!(
+            (tally.input, tally.output, tally.calls),
+            (u64::MAX, u64::MAX, 2)
+        );
+    }
 }

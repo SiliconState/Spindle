@@ -15,7 +15,9 @@ names, which Edge shares. In Edge, Brave or Opera, the panel and the messages it
 browser's name where they would say Chrome (`BROWSER` in
 [`page-tools.mjs`](../spindle/chrome/page-tools.mjs)). The manifest's current version is **0.1.7**
 ([`manifest.json`](../spindle/chrome/manifest.json)); the release asset is
-`spindle-browser-0.1.7.zip`. What 0.1.7 added is marked "(since 0.1.7)".
+`spindle-browser-0.1.7.zip`. This reference follows the current source; the linked
+0.1.7 release predates some source changes described below. Build from source for
+those changes. A new release needs a new manifest version and matching tag.
 
 ## Contents
 
@@ -216,8 +218,10 @@ otherwise is kept apart (`lost`), never read or reused, until Settings, Storage 
 
 A session is open only while something uses it. `within` counts users of a thread;
 `rest` closes it once no turn, task or operation is using it, releasing its in-memory
-state. Before work that may add files, `headroom` adds 32
-slots to the pool when fewer than 16 are free. After idle sessions close, a
+state after two idle seconds. The pool starts with 96 slots and schedules 64 more
+when fewer than 32 remain; before operations, `headroom` adds 96 when fewer than
+48 are free. Opening and growth serialize, and closing during growth releases its
+new handles. A synchronous allocation can still fail before growth finishes. After idle sessions close, a
 30-second rest allows an engine instance grown past 64 MiB to renew: the client closes,
 a fresh copy of the wasm glue instantiates the already compiled module, and the old
 glue drops its references so that memory can return to the browser. No turn, task,
@@ -248,17 +252,17 @@ catalog (or the built-ins if that catalog is refused), reconnects a saved host i
 loads the site grants and relay, seals any key an earlier build kept as text, and then repairs
 what an earlier stop left behind:
 
-- a `reset:ID` marker means a first-turn reset was interrupted, so the saved backup bundle is
-  imported back, then the marker and backup are removed (markers are written and removed with
-  strict commits, so one cannot return after a crash and undo later work); finished resets keep no
-  backup, and startup removes unused reset backups and stale bundles from moves
-  into a file that never sealed;
+- a `reset:ID` marker restores an interrupted first-turn reset from its checked bundle.
+  A completed reset keeps the previous thread as an earlier version, not disposable
+  scratch; a backup without an index record is recovered as one. Stale move bundles
+  whose source never sealed may be removed;
 - a thread the index still calls `running` becomes `interrupted` ("Chrome stopped while it ran"),
   unless it lives on the host, where it may still run (the host says how it stands once it
   answers);
 - a thread whose store lock file starts with `spindle-moved: ` is marked `moved` (a move sealed
   before the index was updated);
-- directories under `/threads` that no index entry names are removed;
+- a live store under `/threads` that no index entry names is listed again as a
+  recovered thread, never deleted; incomplete directories remain for diagnosis;
 - a message that waited for a turn's end, or was held, comes back held ("Not sent (...)")
   with Take back, unless the turn that took it had already committed it (then it is not
   offered again); one whose thread is gone is removed;
@@ -306,10 +310,11 @@ saved before origins were recorded is bound to the origin in use the first time 
 Credentials are not part of any session, so an exported `.spindle` file carries none;
 `extension_real.mjs` checks that no bundle contains the key.
 
-**Browser sign-in.** A provider whose catalog entry has a standard OAuth flow (authorization code
-with PKCE, `protocol` `generic`, a plain `http://localhost` or `http://127.0.0.1` redirect) shows a
-**Sign in to NAME** button instead of a key field; ChatGPT is the built-in one
-([`signin.mjs`](../spindle/chrome/signin.mjs)).
+**Browser sign-in.** Supported flows use authorization code + PKCE and a plain
+loopback redirect (`generic`, or `chatgpt-plan` with a secure issuer). The current
+built-in **ChatGPT** entry uses OpenAI's Sign in with ChatGPT; **ChatGPT (Codex)**
+is the legacy Codex-client route, included in source/GitHub builds but omitted in
+the store edition ([`signin.mjs`](../spindle/chrome/signin.mjs)).
 
 ```mermaid
 sequenceDiagram
@@ -336,8 +341,10 @@ sequenceDiagram
    be kept).
 2. It opens a blank tab, starts watching it, and only then sends it to the provider's
    authorize URL with a fresh PKCE challenge (S256) and `state`, so a provider that redirects
-   at once cannot get there before the watch. For ChatGPT it also sends the sign-in page's own options for coding agents
-   (`codex_cli_simplified_flow`, `id_token_add_organizations`, `originator=spindle`).
+   at once cannot get there before the watch. Provider `authorize_params` supply extra
+   options without overriding the request's state, client or PKCE fields. Only the legacy
+   Codex route supplies `codex_cli_simplified_flow`, `id_token_add_organizations` and
+   `originator=spindle`.
 3. When that tab navigates to the registered redirect, the panel checks `state`, takes the
    `code` and closes the tab. A closed tab, an `error` answer or ten minutes without one ends
    the attempt.
@@ -346,18 +353,51 @@ sequenceDiagram
    token for the panel to show). The panel never holds a token.
 5. Before each request, a sign-in with five minutes or less left is refreshed first (the
    refresh token may rotate; both are sealed again). Refreshes run one at a time per provider,
-   outside the vault's queue, and one that finds the record changed meanwhile (signed out or
-   in again) keeps nothing. While the token is still good, a token endpoint that is down or
+   outside the vault's queue. Before returning, a refresh reopens the current record:
+   sign-out or reset returns no credential; replacement returns the replacement;
+   a locked vault refuses. The superseded token is neither saved nor handed to the
+   waiting request, even when the refresh returned no update or failed. A save after
+   sign-out is a replacement even when its values are identical. While the token is
+   still good, a token endpoint that is down or
    rate-limited fails nothing: the request uses the token it has. When the endpoint refuses
    the refresh token (HTTP 400, 401 or 403), or the token expires with none, the sign-in is
    marked ended: the request fails with a message to sign in again, the row says **sign-in
    ended**, and nothing more is sent until the user signs in again.
 
-The ChatGPT backend also needs the account the token belongs to (`chatgpt-account-id`). The
+The legacy ChatGPT Codex backend also needs the account the token belongs to (`chatgpt-account-id`). The
 package marks that header's place with a second slot, `{account}`, and names the token claim it
 comes from (`claims` in the `authorize` work); the client reads the claim from the token itself.
 Signing in again replaces the record; **Sign out of NAME** removes it. Anthropic's built-in entry takes an
 API key here; its subscription sign-in is not offered.
+
+### Sign in with ChatGPT
+
+`chatgpt-plan` uses OpenAI's `/v1/responses` with a bearer token, not Codex headers.
+The first sign-in registers an issued client through `dynamic_agent_client`, with
+`agent_name_hint`, `resource`, a nonce and this profile's random installation UUID
+(`ext_agent_host_id`). The callback must name the issued client. The engine checks
+an RS256 ID token against discovery/JWKS on the issuer's origin, issuer, audience,
+expiry, nonce and account subject, and requires `chatgpt.tokens.use.direct`.
+
+The registration (client ID, subject, account e-mail) stays in `kv/signin-registrations`
+after sign-out, and `kv/agent-host` keeps the installation UUID. These are readable
+metadata, not tokens. Signing in again uses that client and account; **Use another
+ChatGPT account**, offered while signed out, registers anew. A declined plan scope
+asks for consent next time; an `invalid_grant` keeps the issued client for retry.
+
+Refresh uses the issued client and resource without a scope override. Sign-out tries
+to revoke the refresh token through discovery's same-origin revocation endpoint;
+when confirmation fails, the panel says so and still forgets the local token. A
+session whose verified exchange is rejected is also offered for revocation. Resetting
+locked keys cannot revoke tokens it cannot read. Only a scripted issuer has been
+exercised here: live OpenAI sign-in and the account's model list need an interactive
+account check. The built-in model list is not evidence of plan eligibility.
+
+The first successful plan sign-in explains that requests use the ChatGPT plan.
+**Manage usage** links to `https://chatgpt.com/settings/usage`. A plan usage limit
+stops rather than retrying. Plan tools are sent under the `spindle` namespace;
+requests carry no `max_output_tokens` or separate system items. A checkpoint using
+this route has contract tag 4 and cannot be read by builds predating the route.
 
 ### Keys at rest
 
@@ -472,8 +512,8 @@ then. A new install starts with both switches off.
 | Tool | Needs | Does |
 | --- | --- | --- |
 | `list_tabs` | reading | Lists tabs (id, title, address) and marks the one the user is looking at. |
-| `read_page` | reading (`scroll` also needs actions) | Address, title, selected text and visible text of a tab (default 20,000 characters, at most 100,000). With `scroll: N` (1 to 30) it scrolls down and collects each new line once, for feeds that load as they scroll. |
-| `page_elements` | reading | An indented outline of headings, links, buttons, fields, lists, tables and text, each actionable part with a ref such as `kqm12`. |
+| `read_page` | reading (`scroll` also needs actions) | Visible page text (default 20,000, max 100,000 characters); `find` returns matching lines with neighbours. Reads over 32,000 characters keep full text under `.pages/` in the workspace. `scroll` 1–30 collects new lines as it scrolls. Spindle's own file tabs read as their workspace text. |
+| `page_elements` | reading | An indented outline with refs such as `kqm12`; `find` filters matching parts with neighbours. |
 | `page_html` | reading | The page's or one part's HTML, without `<script>` unless asked and without password values (default 50,000 characters, at most 200,000). |
 | `screenshot` | reading, plus the `<all_urls>` grant (visible tab) or actions (any tab) | A JPEG of a tab saved to `screenshots/` in the workspace. |
 | `navigate` | actions (reading for `/workspace/NAME`) | Go to an http(s) address, back, forward or reload, in a tab or a new tab; or open a workspace file in a tab for the user. |
@@ -537,8 +577,8 @@ Settings, Pages, **Before acting** decides whether a thread asks the user before
 
 | Mode | Asks before |
 | --- | --- |
-| **Full** (the default) | Nothing: it acts without asking, the whole task start to end. |
-| **Auto** | An action that sends or submits: `press` of Enter or Return (with or without modifiers), `type` with `submit` (Enter after typing), `dialog` accepting a page's dialog, and a `click` on a submit control or on one whose label or accessible name holds a word such as Send, Submit, Post, Reply, Share, Buy, Pay, Order, Confirm, Delete, Remove or Transfer (`SENDING_WORDS`; a click whose target cannot be told counts as one that sends). |
+| Full | Nothing: it acts without asking. Older installs retain this mode on update. |
+| Auto (new-install default) | An action that sends or submits, including selecting workspace files for upload:  `press` of Enter or Return (with or without modifiers), `type` with `submit` (Enter after typing), `dialog` accepting a page's dialog, and a `click` on a submit control or on one whose label or accessible name holds a word such as Send, Submit, Post, Reply, Share, Buy, Pay, Order, Confirm, Delete, Remove or Transfer (`SENDING_WORDS`; a click whose target cannot be told counts as one that sends). |
 | **Ask** | Every `click`, `type`, `press`, `select`, `navigate` (going back, forward or reloading too), `dialog` (accepting or dismissing) and `close_tab`. |
 
 Reading tools, `scroll`, `wait_for`, `screenshot` and `network` never ask, and neither does
@@ -570,11 +610,14 @@ and the service worker checks that just before acting, after any wait for the ta
   name the document (when asked or now), the same address but its `#` part. A key is
   checked again once the debugger is attached, just before it goes;
 - a `click`, `type` or `select` goes ahead only while its part is still what the question
-  named: its role and words, numbers and punctuation aside (so a count or a time on it may
-  change);
+  named: full words, including numbers and punctuation, and its destination (a link's
+  href or a submit control's form target). A pressed key also binds the focused part
+  when the page reported it, including an explicitly empty focus;
 - a dialog's answer goes only to the dialog the question showed.
 
 Otherwise nothing is done, and the thread is told why and that it can ask again.
+Auto's sending-word heuristic is English and can miss actions labelled otherwise;
+it is not a proof that an action is harmless. Use Ask for broader confirmation.
 
 While an action waits, the panel shows it above that thread's message box as "Spindle asks
 before it acts: ..." with **Deny** and **Allow**, and the thread's row in the list says "Asks
@@ -825,11 +868,13 @@ defaults for new threads are kept in the panel's `localStorage` (`spindle-new`).
 | Provider, Model, Effort | from the catalog | The efforts listed are those the model accepts (`efforts`). |
 | Commands run in | Browser (`runner: 'app'`), Host (`'remote'`), None (`'none'`) | `app` threads get the browser Linux guide in their instructions. A thread that lives on the host runs its commands in the host's sandbox until it is brought back. Host can be chosen only while a Spindle host is connected. |
 | Network for commands | on or off | Off by default, and unavailable when commands run nowhere. For commands in this browser with no relay set, saving it on asks Chrome for site access; if Chrome declines, a thread's network stays off (for new threads, Chrome asks again at send). |
+| Compact history past | Tokens, default 256,000 for new threads | `compact_tokens` can lower the model-window history threshold; a summary also retains workspace context and the start of NOTES.md. |
 | Tasks | on or off | Child sessions, including background work and queued reports. |
 | Spend limit | US dollars, or empty for none | Per thread, tasks included. `max_usd` is enforced in the package; spend and the limit are also reachable from the header. |
 
-For a stopped, failed or interrupted thread, saving this page starts the unfinished
-turn over (`restart`), taking it back and sending its message again. Otherwise it
+For a stopped, failed or interrupted thread, saving this page restarts from its
+newest safe before-model or settled target, keeping earlier history; only a true
+first turn starts afresh, with its old copy retained. Otherwise it
 uses `settings`, which the package refuses while a turn runs; a spend limit alone may also
 change between the steps of an unfinished turn. Background
 tasks must end or be stopped before a restart.
@@ -855,6 +900,20 @@ The Linux snapshot row counts OPFS `linux/`: **Remove** deletes those saved file
 so a future v86 start boots afresh instead of resuming them; it does not stop an
 already running Linux. These are separate actions, not part of Free all. Source:
 [`panel.mjs`](../spindle/chrome/panel.mjs).
+
+**Earlier versions and cold storage.** Restarting a stopped turn after a model change
+first finds its newest before-model target, or the newest settled turn (`until:
+'settled'`, not just 48 recent steps). Only a true first turn replaces the whole
+thread; that prior thread is kept as an earlier version. Unreadable history refuses,
+never counts as first-turn evidence. Earlier versions can open as threads; ordinary
+removal needs a week and three later completed turns plus confirmation.
+
+Storage can **Move to file** or **Save and free** a moved thread, and **Free finished
+tasks** exports each task into a zip before freeing its store. Removal waits for
+Chrome to report the complete download, with its size checked. Task deletion passes
+the saved bundle's source fingerprint and retains spend. Unreadable bytes have their
+own explicit removal. A restored or imported copy is not synchronization and can
+create another session with the same identity.
 
 **Unreadable** (since 0.1.7) is a row shown only when the OPFS pool found file slots whose
 header is damaged (`lost` in [`opfs.mjs`](../spindle/clients/js/opfs.mjs)). A crash leaves
@@ -1090,6 +1149,7 @@ each Linux image's identity, which Settings, About shows. Environment variables:
 | --- | --- | --- |
 | `SPINDLE_LINUX` | `chrome/linux/dist` | The v86 Linux to carry (must contain `identity`). |
 | `SPINDLE_WASM_LINUX` | unset | The wasm Linux to carry (`build-image.sh` output). Without it, every command runs on v86. |
+| `SPINDLE_STORE` | unset | A nonempty value builds without `codex-signin`, checks the output contains no legacy Codex client/options, and sets `build.json.edition` to `store`; otherwise `source`. |
 
 To load it:
 
@@ -1124,7 +1184,7 @@ whole.
 | [`panel_tree.mjs`](../spindle/chrome/tests/panel_tree.mjs) | a build, `SPINDLE_BROWSER` | Large workspace trees: closed folders draw no descendants, single-child folder chains, counts and change marks, open state across redraws, filtering and next/previous navigation; draw timing and Light/Dim screenshots. |
 | [`engine_renew.mjs`](../spindle/chrome/tests/engine_renew.mjs) | build's `web/`, Node `--expose-gc` | Fresh wasm instance from one compiled module; old glue drops references, resident memory falls, fresh sessions work. |
 | [`linux_warm.mjs`](../spindle/chrome/tests/linux_warm.mjs) | Node only | Stand-in workers: wasm-only warming leaves v86 unstarted, commands start the Linux they need, and `onRan` identifies it. |
-| [`vault_host.mjs`](../spindle/chrome/tests/vault_host.mjs) | Node only | Host token sealed apart from provider keys, passphrase lock/unlock and re-sealing, reset removes it. |
+| [`vault_host.mjs`](../spindle/chrome/tests/vault_host.mjs) | Node only | Host token sealed apart, lock/unlock and reset, strict refresh writes, and a pending refresh racing sign-out, replacement (even with the same refresh token), lock or reset. |
 
 **Scripted or real provider.** `extension_real.mjs --scripted` serves a scripted provider from
 the test itself, needs no account and costs nothing. With `--provider ID` (and `SPINDLE_KEY`,

@@ -22,7 +22,10 @@ dext-image-continuation = ["dext-image", "dep:dext-transcript", "dep:serde_json"
 shape = ["workspace-tools", "dep:dext-provider-catalog"]
 # The embedded host: sessions an app drives, with all I/O its own.
 embedded = ["shape", "dext-native/wire", "dep:url"]
-agent = ["driver", "shape", "dext-provider", "dext-strict-workspace", "dext-provider-catalog/native", "dep:tokio", "dep:reqwest", "dep:url"]
+agent = ["driver", "shape", "dext-provider", "dext-strict-workspace", "dext-provider-catalog/native", "codex-signin", "dep:tokio", "dep:reqwest", "dep:url"]
+# The ChatGPT sign-in through the Codex CLI client and the Codex backend (`chatgpt`),
+# beside Sign in with ChatGPT (`chatgpt-plan`): every build but the browser's store build.
+codex-signin = ["dext-provider-catalog?/codex-signin"]
 cli = ["agent", "dep:ring"]
 
 [dependencies]

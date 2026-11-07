@@ -3515,10 +3515,37 @@ fn background_jobs_run_beside_the_turn_and_never_change_the_workspace() {
                 "read_job",
                 serde_json::json!({"job": "job-nope"}),
             ),
+            // After a restart (here: the process forgets its jobs), what it printed last.
+            call("after", "read_job", serde_json::json!({"job": job})),
+            call(
+                "outside",
+                "read_job",
+                serde_json::json!({"job": "../../session"}),
+            ),
         ],
     );
     let mut results = vec![];
     for (index, intent) in tools.effects.iter().enumerate() {
+        if index == 5 {
+            // The job's last output is kept once it ends (its watcher writes it).
+            let kept = realm.0.join(format!("job-output/{job}.json"));
+            let started = std::time::Instant::now();
+            while !std::fs::read_to_string(&kept)
+                .is_ok_and(|text| text.contains("\"running\":false"))
+                && started.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(store.stop_jobs(), 0, "nothing still running to forget");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&kept).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "kept output is private");
+                let folder = std::fs::metadata(kept.parent().unwrap()).unwrap();
+                assert_eq!(folder.permissions().mode() & 0o777, 0o700, "and its folder");
+            }
+        }
         let mut request = strict_dispatch_request(&store, &tools, &executor);
         request.expected_revision = store.snapshot().unwrap().revision;
         request.intent = intent.clone();
@@ -3590,6 +3617,19 @@ fn background_jobs_run_beside_the_turn_and_never_change_the_workspace() {
     assert!(
         missing.contains("no background job `job-nope`"),
         "{missing}"
+    );
+    let (after, error) = &results[5];
+    assert_eq!(*error, Some(false), "{after}");
+    assert!(after.starts_with("old\nhello from job\n"), "{after}");
+    assert!(
+        after.contains("is no longer running in this session: it ended: stopped"),
+        "{after}"
+    );
+    let (outside, error) = &results[6];
+    assert_eq!(
+        *error,
+        Some(true),
+        "only a job's own name is a file name: {outside}"
     );
     assert_eq!(store.running_jobs(), 0);
     assert_eq!(store.stop_jobs(), 0);
@@ -3997,6 +4037,82 @@ fn repeated_rewinds_and_cancelled_plans_keep_contiguous_lineage_after_reopen() {
         assert_eq!(store.snapshot().unwrap().revision, current);
         assert!(store.receipt("second-bash").unwrap().is_some());
     }
+}
+
+/// A runner reads a reserved call's files one by one: the call is checked whole once,
+/// and each later file still refuses a call cancelled, fenced or no longer at the head.
+#[cfg(feature = "dext-strict-workspace")]
+#[test]
+fn a_runners_file_reads_stop_once_its_call_is_cancelled_or_fenced() {
+    use spindle_store::broker::RunnerReservation;
+    use std::sync::atomic::AtomicBool;
+    let realm = Realm::new();
+    let mut store = Store::open(&realm.0).unwrap();
+    let (tools, _) = prepared_workspace_tool(&mut store, "cat input.txt");
+    let helper = [7u8; 32];
+    let mut request = dispatch_request(&store, &tools);
+    let hex: String = helper.iter().map(|byte| format!("{byte:02x}")).collect();
+    request.attempt.implementation = format!("dext-strict-bash-v1-{hex}");
+    assert!(matches!(
+        store
+            .reserve_runner_call(&request, &AtomicBool::new(false), &helper)
+            .unwrap(),
+        RunnerReservation::Reserved(_)
+    ));
+    let object = store.runner_tree(&request).unwrap().files[0].object.clone();
+    for _ in 0..3 {
+        assert_eq!(store.runner_file(&request, &object).unwrap(), b"old");
+    }
+    assert!(matches!(
+        store.runner_file(&request, &"0".repeat(64)),
+        Err(Error::Invalid)
+    ));
+    let mut fenced = dispatch_request(&store, &tools);
+    fenced.attempt.implementation = request.attempt.implementation.clone();
+    fenced.owner_epoch += 1;
+    fenced.attempt.owner_epoch += 1;
+    assert!(matches!(
+        store.runner_file(&fenced, &object),
+        Err(Error::Stale)
+    ));
+    assert_eq!(store.runner_file(&request, &object).unwrap(), b"old");
+    store.cancel_scope("operator", "stop").unwrap();
+    assert!(matches!(
+        store.runner_file(&request, &object),
+        Err(Error::Cancelled)
+    ));
+}
+
+#[cfg(feature = "dext-strict-workspace")]
+#[test]
+#[cfg(target_os = "linux")]
+fn a_validated_rewind_is_not_rebuilt_by_later_opens() {
+    let realm = Realm::new();
+    let mut store = Store::open(&realm.0).unwrap();
+    let (target, current) = rewind_history(&mut store);
+    store
+        .begin_rewind("operator", "rewind", target, current, 0)
+        .unwrap();
+    let rewound = store
+        .finish_rewind("operator", "rewind")
+        .unwrap()
+        .revision
+        .unwrap();
+    store.resume_rewind("operator", "rewind").unwrap();
+    drop(store);
+    // This open rebuilds the rewind once and records it as validated.
+    drop(Store::open(&realm.0).unwrap());
+    // As an engine whose fork output changed would see it: a rebuild no longer matches.
+    let db = rusqlite::Connection::open(realm.0.join("authority.sqlite")).unwrap();
+    db.execute(
+        "UPDATE revisions SET continuation=(SELECT continuation FROM revisions WHERE revision=?1) WHERE revision=?2",
+        [target as i64, rewound as i64],
+    )
+    .unwrap();
+    drop(db);
+    let mut store = Store::open(&realm.0).unwrap();
+    // A full check still compares every record.
+    assert!(matches!(store.check_integrity(), Err(Error::Incompatible)));
 }
 
 #[cfg(feature = "dext-strict-workspace")]
@@ -7626,8 +7742,18 @@ fn managed_steering_commits_cli_update_text_and_survives_reopen() {
     let empty = Action::Steer { text: " ".into() };
     let refused = action_proposal(&mut store, "steer-empty", &empty, &before, &before);
     assert!(store.commit_turn_action(&refused).is_err());
-    let steered = before.steer("check the second file too".into()).unwrap();
-    let mismatched = before.steer("different text".into()).unwrap();
+    let steered =
+        spindle_store::turn::steered(&before, "check the second file too".into()).unwrap();
+    let mismatched = spindle_store::turn::steered(&before, "different text".into()).unwrap();
+    // Spindle's own wrapper, not the engine's (Dext's) longer one.
+    assert!(
+        before
+            .steer("check the second file too".into())
+            .unwrap()
+            .checkpoint()
+            .unwrap()
+            != steered.checkpoint().unwrap()
+    );
     let forged = action_proposal(&mut store, "steer-forged", &action, &before, &mismatched);
     assert!(
         store.commit_turn_action(&forged).is_err(),

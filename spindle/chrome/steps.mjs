@@ -33,6 +33,7 @@ const VERBS = {
   click: ['Click', 'Clicking', 'Clicked'],
   type: ['Type into', 'Typing into', 'Typed into'],
   choose: ['Choose in', 'Choosing in', 'Chose in'],
+  upload: ['Upload', 'Uploading', 'Uploaded'],
   press: ['Press', 'Pressing', 'Pressed'],
   scroll: ['Scroll', 'Scrolling', 'Scrolled'],
   wait: ['Wait for', 'Waiting for', 'Waited for'],
@@ -107,6 +108,9 @@ export function domainOf(url) {
 }
 
 const base = (path) => String(path ?? '').split('/').filter(Boolean).pop() ?? String(path ?? '');
+/** The files a `select` puts in a file field (its input as the model wrote it: a list,
+ * or anything else, which names none). */
+const uploading = (input) => (Array.isArray(input?.files) ? input.files : []);
 const quote = (text, most = 32) => {
   const short = String(text).replace(/\s+/g, ' ').trim();
   return `“${short.length > most ? `${short.slice(0, most - 1)}…` : short}”`;
@@ -233,7 +237,9 @@ export function describe(name, input = {}, state = 'done', tabs = new Map(), par
     screenshot: () => say('picture', 'the tab'),
     click: () => say('click', partShort(input?.ref, parts, 'on the page')),
     type: () => say('type', partShort(input?.ref, parts, 'a field')),
-    select: () => say('choose', partShort(input?.ref, parts, 'a list')),
+    select: () => (uploading(input).length
+      ? say('upload', `${base(uploading(input)[0])}${uploading(input).length > 1 ? ` and ${uploading(input).length - 1} more` : ''}`)
+      : say('choose', partShort(input?.ref, parts, 'a list'))),
     press: () => say('press', input?.key ?? 'a key'),
     scroll: () => say('scroll', 'the page'),
     wait_for: () => say('wait', input?.text ? quote(input.text, 20) : 'the page'),
@@ -290,7 +296,12 @@ function describeLong(name, input = {}, state = 'done', tabs = new Map(), parts 
     }
     case 'click': { const p = page(); const part = partWords(input?.ref, parts, null); return { label: say('click', `${part ? `${part} ` : ''}on ${p.where}`), ...p }; }
     case 'type': { const p = page(); return { label: say('type', `${partWords(input?.ref, parts, 'a field')} on ${p.where}`), ...p }; }
-    case 'select': { const p = page(); return { label: say('choose', `${partWords(input?.ref, parts, 'a list')} on ${p.where}`), ...p }; }
+    case 'select': {
+      const p = page();
+      // Files put in a file field: named, as they go out.
+      if (uploading(input).length) return { label: say('upload', `${uploading(input).map((file) => base(file)).join(', ')} to ${p.where}`), ...p };
+      return { label: say('choose', `${partWords(input?.ref, parts, 'a list')} on ${p.where}`), ...p };
+    }
     case 'press': { const p = page(); return { label: say('press', `${input?.key ?? 'a key'} on ${p.where}`), ...p }; }
     case 'scroll': { const p = page(); return { label: say('scroll', p.where), ...p }; }
     case 'wait_for': { const p = page(); return { label: say('wait', input?.text ? quote(input.text, 20) : p.where), ...p }; }
@@ -378,6 +389,13 @@ export function elapsed(steps) {
 /** Files a command run in a sandbox is not meant to leave (kept out of sight by default). */
 export function isScratch(path) {
   return /\.(txt|py|pyc|log|tmp)$/i.test(path) || /(^|\/)(tests?|__pycache__|\.cache)\//.test(path);
+}
+
+/** The notes file a thread keeps for itself at the top of its workspace (the guide asks for
+ * NOTES.md; the engine carries its start into compaction summaries under either name):
+ * the thread's own memory, not something made for the user. */
+export function isNotes(path) {
+  return path === 'NOTES.md' || path === 'notes.md';
 }
 
 /** A file's name as the panel shows it. A picture Spindle named for the moment it was taken

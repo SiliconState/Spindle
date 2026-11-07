@@ -95,6 +95,7 @@ check them.
     authority.sqlite.lock    the fence file (present while owned, or once sealed)
     authority.vN.sqlite      copy kept from before a schema migration from schema N
   store.abandoned-N/         a store set aside when a first request is retried fresh
+  store/job-output/         newest 64 KiB per background job, bounded to 64, never bundled
   tasks/<key>/               a task session: the same layout plus task.json
 ```
 
@@ -192,7 +193,8 @@ flowchart TD
 2. **Checks paths** as described in [Session directory](#session-directory), then takes the
    owner lock and holds the fence.
 3. **Identifies the database.** `PRAGMA application_id` must be `0x53504e44` (ASCII `SPND`)
-   and `PRAGMA user_version` the schema, `20` in this build. An empty database is refused
+   and `PRAGMA user_version` the schema, `20` or `21` in this build. New stores remain
+   at 20 until a step publishes more than eight intents. An empty database is refused
    unless this open just created it. Schemas 14 to 19 are migrated (see
    [Schema migration](#schema-migration-and-binary-upgrade)); any other value is
    `Incompatible`, and the file is left untouched.
@@ -412,7 +414,7 @@ it in one transaction.
 | `engine` | The engine label, `dext-turn-v1` for turns. |
 | `continuation` | The engine's checkpoint bytes, at most 32 MiB. |
 | `workspace` | A new workspace root, or `None` to keep the scope's prior root. |
-| `effects` | Up to 8 `EffectIntent { id, adapter, input }`; ids must be new to the store. |
+| `effects` | Up to 256 `EffectIntent { id, adapter, input }`; more than eight atomically widens the store to schema 21; ids must be new to the store. |
 | `state` | New app state, or `None` to keep the prior one. Set only by turn paths, adopted app-tool answers and rewinds; `commit_proposal` refuses it. |
 
 ### What a commit checks and writes
@@ -506,7 +508,7 @@ stateDiagram-v2
 
 | Record | Method | Enforced |
 | --- | --- | --- |
-| Intent | committed by `commit_proposal` | At most 8 per revision; ids unique in the store. |
+| Intent | committed by `commit_proposal` | At most 256 per revision; more than eight requires schema 21; ids unique in the store. |
 | Attempt | `Store::reserve_attempt` | One attempt per intent; current epoch; refused for a cancelled, suspended or unconfirmed scope and for an intent a finished rewind abandoned. Repeating the same reservation is a no-op. |
 | Receipt | `ingest_receipt`, `ingest_workspace_receipt` | The attempt exists and has no recorded refusal; a workspace root must be complete in the intent's scope. Recording the same result again is a no-op; a different one is `Conflict`. Receipts are accepted for cancelled scopes and for attempts an earlier owner reserved: late results are kept as history. |
 | Refusal | `record_rejection`, `record_rejection_with_delay` | Only for a reserved attempt without a receipt; status 100 to 599; detail cut to 4096 bytes. |
@@ -728,7 +730,7 @@ the session.
 - `View::open(store_dir)` opens `authority.sqlite` read-only with `query_only`, no owner
   lock and a 500 ms busy timeout. `ReadView::read` runs several reads inside one transaction,
   so they see one consistent snapshot, and reads the schema version inside it, so a migration
-  by the owner is seen before or after, never half-way. Views read schemas 14 to 20; tables a
+  by the owner is seen before or after, never half-way. Views read schemas 14 to 21; tables a
   schema lacks read as empty.
 - `ReadView::from_store(&store)` borrows the owner's connection without changing its pragmas
   or transactions (the embedded host reads this way).
@@ -821,6 +823,7 @@ flushes (the negative control shows such loss is detected, not that it cannot ha
 | 18 | `meta`. |
 | 19 | `instance`, `app_details`, `retry_delays`, `task_runs`. |
 | 20 | Packed `objects.bytes` and logical `objects.size`; object ids and workspace roots stay the same. |
+| 21 | The same tables as 20, permitting up to 256 intents in a step. A store moves from 20 in the transaction that first publishes more than eight, or when reopening finds a previously written wider step. |
 
 ### Migration on open
 
@@ -874,7 +877,8 @@ opens it counts no crash for the exporting owner. `image_with(metadata)` replace
 in the copy only. It is refused inside a transaction.
 
 `check_image(bytes)` accepts an image only if it is an unencrypted rollback-journal SQLite file
-with this build's application id and current or immediately previous schema, exact
+with this build's application id and schema 20 or 21 (or 19, checked as its in-place
+migration would read it), exact
 table definitions, every page valid, every
 record valid under the full check, and a non-zero identity. It returns `ImageFacts { head,
 identity, settings }`. `Store::from_image` opens a checked image as a memory store; written as
@@ -926,6 +930,9 @@ directory's portable files, so a session can move where no directory is shared.
 | Files | Their bytes, in manifest order |
 | Checksum | SHA-256 of everything before it |
 
+- A store's file header may be schema 19, 20 or 21 and is checked accordingly;
+  the bundle manifest itself must name 20 or 21. A schema-19 manifest is refused,
+  even though an individual schema-19 store can migrate in place.
 - **Paths**: `(tasks/<20 hex>/)*` (at most 16 levels) followed by `store/authority.sqlite`,
   `session.json`, `pack-session-id` (a native host's session pack id, so a pack keeps
   its session across moves), or, inside a task, `task.json`. At most 4096 files. A
@@ -1035,7 +1042,7 @@ and revision roots never change once recorded; and replay traces against tampere
 | --- | --- | --- |
 | One stored value (payload, continuation, intent input, result, metadata) | 32 MiB | `MAX_PAYLOAD` |
 | Revisions, admissions | 2^20 each | `MAX_ADMISSIONS` |
-| Intents per revision | 8 | `transition::MAX_EFFECTS` |
+| Intents per revision | 256 (8 before a store widens to schema 21) | `transition::MAX_EFFECTS` |
 | App state | 1 MiB JSON object | `transition::MAX_STATE` |
 | One object | 64 MiB | `artifact::MAX_OBJECT` |
 | Object bytes in all (stored, after packing) | 16 GiB | `artifact::MAX_OBJECT_BYTES` |

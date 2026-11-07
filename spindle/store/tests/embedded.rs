@@ -357,6 +357,45 @@ impl Storage for DirStorage {
         std::fs::write(self.0.join("owner.lock"), b"")?;
         Ok(())
     }
+    fn size(&self) -> u64 {
+        fn walk(path: &Path) -> u64 {
+            match std::fs::read_dir(path) {
+                Ok(entries) => entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| walk(&entry.path()))
+                    .sum(),
+                Err(_) => std::fs::metadata(path).map_or(0, |meta| meta.len()),
+            }
+        }
+        walk(self.0.parent().unwrap())
+    }
+    /// As the package's places remove one: renamed out of `tasks/`, then removed. A
+    /// `fail-removal` file in the session's directory stops it `before` the rename or
+    /// `after` it (a crash there).
+    fn remove_task(&self, key: &str) -> spindle_store::Result<()> {
+        let dir = self.0.parent().unwrap();
+        let task = dir.join("tasks").join(key);
+        let fail = std::fs::read_to_string(dir.join("fail-removal")).unwrap_or_default();
+        let crash = || Err(std::io::Error::other("the removal stopped here").into());
+        if task.exists() {
+            if fail == "before" {
+                return crash();
+            }
+            std::fs::create_dir_all(dir.join("tasks.removing"))?;
+            std::fs::rename(&task, dir.join("tasks.removing").join(key))?;
+            if fail == "after" {
+                return crash();
+            }
+        }
+        self.sweep()
+    }
+    fn sweep(&self) -> spindle_store::Result<()> {
+        let removing = self.0.parent().unwrap().join("tasks.removing");
+        if removing.exists() {
+            std::fs::remove_dir_all(removing)?;
+        }
+        Ok(())
+    }
 }
 
 /// A runner: the work, and a reader of the call's files, give the answer.
@@ -479,8 +518,9 @@ impl<'a> App<'a> {
         match work["kind"].as_str().unwrap() {
             "authorize" => deliver(json!({"kind": "authorized"})),
             "fetch" => {
-                let body =
-                    spindle_store::protocol::base64_decode(work["body"].as_str().unwrap()).unwrap();
+                // The body is read apart, as bytes; the frame carries none.
+                assert!(work.get("body").is_none(), "{work}");
+                let body = self.embedded.request_body(session, id).unwrap();
                 self.run.requests.push(String::from_utf8(body).unwrap());
                 let index = self.run.requests.len();
                 if self.hold > 0 && index >= self.hold {
@@ -2199,6 +2239,355 @@ fn a_tasks_own_task_finishes_into_it_and_files_merge_through_both() {
     assert_eq!(read["result"]["content"], "from the grandchild", "{read}");
 }
 
+/// The dollars a budget refusal names after `after` ("has spent ", "could cost up to ").
+fn dollars_after(message: &str, after: &str) -> f64 {
+    let rest = &message[message.find(after).unwrap_or_else(|| panic!("{message}")) + after.len()..];
+    let rest = rest.trim_start_matches('$');
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    rest[..end].trim_end_matches('.').parse().unwrap()
+}
+
+#[test]
+fn a_task_trees_spend_still_counts_against_its_budget_after_the_session_reopens() {
+    let fake = fake();
+    let mut catalog = catalog_json(&fake.base);
+    // Every reply costs $1.10; the parent's next request could cost up to $5.23.
+    catalog["providers"][0]["model_specs"]["fake-model"]["pricing"] = json!({
+        "input_usd_per_mtok": 1000, "output_usd_per_mtok": 1000,
+        "cache_read_usd_per_mtok": 1000, "cache_create_usd_per_mtok": 1000});
+    let root = temp_root("budget-reopen");
+    let host = Embedded::new(
+        Box::new(DirPlaces(root.clone())),
+        Catalog::from_json(&catalog).unwrap(),
+    );
+    let mut app = App::new(&host)
+        .script("bt", vec![Reply::Text("ready")])
+        .script(
+            "#",
+            vec![
+                Reply::Call("task", json!({"prompt": "delegate deeper"})),
+                Reply::Text("grandchild done"),
+                Reply::Text("child done"),
+            ],
+        );
+    // $9 fits the parent's $1.10, the task's $2.20 and a request, not its own task's
+    // $1.10 too.
+    app.call(
+        "create",
+        json!({"dir": "bt", "provider": "fake", "tasks": true, "max_usd": 9}),
+    );
+    app.call("prompt", json!({"dir": "bt", "text": "[t:bt] hello"}));
+    let started = app.call(
+        "task_start",
+        json!({"dir": "bt", "task": "t", "prompt": "[t:bt-task] go"}),
+    );
+    assert_eq!(started["result"]["state"], "finished", "{started}");
+    assert_eq!(app.run.requests.len(), 4, "parent, task, its task, task");
+    let refused = |reply: &Value| {
+        reply["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("spending limit:"))
+    };
+    let before = app.call("prompt", json!({"dir": "bt", "text": "[t:bt] more"}));
+    assert!(refused(&before), "{before}");
+    // Only the nested task's $1.10 tips it (else this proves nothing about counting it).
+    let said = before["error"]["message"].as_str().unwrap();
+    assert!(
+        dollars_after(said, "has spent ") + 2.20 + dollars_after(said, "could cost up to ") <= 9.0,
+        "{said}"
+    );
+    // Closed and opened again, the ended tasks' spend still counts.
+    app.call("close", json!({"dir": "bt"}));
+    let after = app.call("continue", json!({"dir": "bt"}));
+    assert!(refused(&after), "{after}");
+    assert_eq!(app.run.requests.len(), 4, "nothing was sent");
+    // A task whose spend cannot be read fails the turn under any budget, and costs
+    // nothing without one.
+    app.call("close", json!({"dir": "bt"}));
+    let tasks = std::fs::read_dir(root.join("bt/tasks")).unwrap();
+    let task = tasks.map(|task| task.unwrap().path()).next().unwrap();
+    let nested = std::fs::read_dir(task.join("tasks")).unwrap();
+    let nested = nested.map(|task| task.unwrap().path()).next().unwrap();
+    std::fs::write(nested.join("store/authority.sqlite"), b"not a database").unwrap();
+    app.call("settings", json!({"dir": "bt", "max_usd": 1000}));
+    let unread = app.call("continue", json!({"dir": "bt"}));
+    assert!(
+        unread["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot be read for the budget")),
+        "{unread}"
+    );
+    app.call("settings", json!({"dir": "bt", "max_usd": null}));
+    let unbudgeted = app.call("continue", json!({"dir": "bt"}));
+    assert!(unbudgeted["error"].is_null(), "{unbudgeted}");
+    assert_eq!(app.run.requests.len(), 5);
+}
+
+#[test]
+fn a_budget_set_again_counts_what_tasks_spent_without_one() {
+    let fake = fake();
+    let mut catalog = catalog_json(&fake.base);
+    // Every reply costs $1.10, as above.
+    catalog["providers"][0]["model_specs"]["fake-model"]["pricing"] = json!({
+        "input_usd_per_mtok": 1000, "output_usd_per_mtok": 1000,
+        "cache_read_usd_per_mtok": 1000, "cache_create_usd_per_mtok": 1000});
+    let root = temp_root("budget-again");
+    let host = Embedded::new(
+        Box::new(DirPlaces(root.clone())),
+        Catalog::from_json(&catalog).unwrap(),
+    );
+    let mut app = App::new(&host)
+        .script("ba", vec![Reply::Text("ready")])
+        .script(
+            "#",
+            vec![
+                Reply::Call("task", json!({"prompt": "delegate deeper"})),
+                Reply::Text("grandchild done"),
+                Reply::Text("child done"),
+            ],
+        );
+    app.call(
+        "create",
+        json!({"dir": "ba", "provider": "fake", "tasks": true, "max_usd": 9}),
+    );
+    app.call("prompt", json!({"dir": "ba", "text": "[t:ba] hello"}));
+    // No budget while the tasks run (they count nothing), then the same budget again,
+    // in one open: what they spent counts.
+    app.call("settings", json!({"dir": "ba", "max_usd": null}));
+    let started = app.call(
+        "task_start",
+        json!({"dir": "ba", "task": "t", "prompt": "[t:ba-task] go"}),
+    );
+    assert_eq!(started["result"]["state"], "finished", "{started}");
+    app.call("settings", json!({"dir": "ba", "max_usd": 9}));
+    let sent = app.run.requests.len();
+    let again = app.call("prompt", json!({"dir": "ba", "text": "[t:ba] more"}));
+    let said = again["error"]["message"].as_str().unwrap_or_default();
+    assert!(said.starts_with("spending limit:"), "{again}");
+    // Only the nested task's $1.10 tips it (else this proves nothing about counting it).
+    assert!(
+        dollars_after(said, "has spent ") + 2.20 + dollars_after(said, "could cost up to ") <= 9.0,
+        "{said}"
+    );
+    assert_eq!(app.run.requests.len(), sent, "nothing was sent");
+}
+
+#[test]
+fn a_budget_set_while_a_background_task_runs_counts_what_it_spent() {
+    let fake = fake();
+    let mut catalog = catalog_json(&fake.base);
+    catalog["providers"][0]["model_specs"]["fake-model"]["pricing"] = json!({
+        "input_usd_per_mtok": 1000, "output_usd_per_mtok": 1000,
+        "cache_read_usd_per_mtok": 1000, "cache_create_usd_per_mtok": 1000});
+    let root = temp_root("budget-running");
+    let host = Embedded::new(
+        Box::new(DirPlaces(root.clone())),
+        Catalog::from_json(&catalog).unwrap(),
+    );
+    let mut app = App::new(&host)
+        .script("bb", vec![Reply::Text("ready"), Reply::Text("more")])
+        .script(
+            "#",
+            vec![
+                Reply::Call("bash", json!({"command": "true"})),
+                Reply::Text("task done"),
+            ],
+        );
+    // The task's command never answers: it keeps running in the background.
+    app.runner = Box::new(|work, _| {
+        if work["session"].as_str().unwrap().contains('#') {
+            Value::Null
+        } else {
+            json!({"kind": "ran", "output": "", "success": true})
+        }
+    });
+    app.call(
+        "create",
+        json!({"dir": "bb", "provider": "fake", "tasks": true, "runner": "app"}),
+    );
+    app.call("prompt", json!({"dir": "bb", "text": "[t:bb] hello"}));
+    let queued = app.call(
+        "task_start",
+        json!({"dir": "bb", "task": "bg", "prompt": "[t:bb-task] go", "report": "queue"}),
+    );
+    assert_eq!(queued["result"]["queued"], true, "{queued}");
+    assert_eq!(
+        app.run.requests.len(),
+        2,
+        "the session's request and the task's"
+    );
+    // A budget set while it runs (none before): a tiny one says what the session spent
+    // and what its next request could cost.
+    app.call("settings", json!({"dir": "bb", "max_usd": 0.01}));
+    let probe = app.call("prompt", json!({"dir": "bb", "text": "[t:bb] more"}));
+    let message = probe["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("spending limit:"), "{probe}");
+    // Room for the session's own spend and its request, not for the task's $1.10 too.
+    let budget =
+        dollars_after(message, "has spent ") + dollars_after(message, "could cost up to ") + 0.05;
+    app.call("settings", json!({"dir": "bb", "max_usd": budget}));
+    let sent = app.run.requests.len();
+    let line = json!({"jsonrpc": "2.0", "id": 77, "method": "continue", "params": {"dir": "bb"}});
+    let frames = host.handle(line.to_string().as_bytes());
+    app.drive(frames);
+    assert_eq!(
+        app.run.requests.len(),
+        sent,
+        "the running task's spend counts: nothing sent over a ${budget} budget"
+    );
+}
+
+#[test]
+fn an_unreadable_finished_tasks_file_offer_reports_the_error_without_waiting_forever() {
+    let root = temp_root("finished-task-files");
+    {
+        let host = embedded(Box::new(DirPlaces(root.clone())));
+        let mut app = App::new(&host).script("ft", vec![Reply::Text("ready")]);
+        app.call(
+            "create",
+            json!({"dir": "ft", "provider": "fake", "tasks": true}),
+        );
+        app.call("prompt", json!({"dir": "ft", "text": "[t:ft] hello"}));
+    }
+    {
+        let mut store = Store::open(&root.join("ft/store")).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let input = br#"{"prompt":"write a file"}"#;
+        store
+            .register_task(&spindle_store::meta::TaskRun {
+                task: "app:writer".into(),
+                origin: None,
+                input: input.to_vec(),
+                base: snapshot.workspace.unwrap(),
+                revision: snapshot.revision,
+                queued: true,
+                state: "running".into(),
+                answer: None,
+                delivered: None,
+                lease: None,
+            })
+            .unwrap();
+        store
+            .finish_task_run(
+                "app:writer",
+                input,
+                spindle_store::meta::TaskEnd::Answered(br#"{"content":"written","failed":false}"#),
+            )
+            .unwrap();
+    }
+    let key = spindle_store::reads::task_name("app:writer");
+    let child = root.join("ft/tasks").join(&key).join("store");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(child.join("authority.sqlite"), b"not a database").unwrap();
+    let host = embedded(Box::new(DirPlaces(root.clone())));
+    let mut app = App::new(&host).script("ft", vec![Reply::Text("received")]);
+    let resumed = app.call("continue", json!({"dir": "ft"}));
+    assert!(resumed.get("result").is_some(), "{resumed}");
+    let request = app.run.requests.last().unwrap();
+    assert!(request.contains("its files could not be read"), "{request}");
+    let tasks = app.call("tasks", json!({"dir": "ft"}))["result"]["tasks"].clone();
+    assert_eq!(tasks[0]["delivered"], true, "{tasks}");
+    assert_eq!(tasks[0]["state"], "finished", "{tasks}");
+    assert!(
+        tasks[0]["answer"]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("[task {key}:")),
+        "{tasks}"
+    );
+}
+
+#[test]
+fn an_unreadable_task_store_leaves_background_tasks_to_resume_later() {
+    let fake = fake();
+    let mut catalog = catalog_json(&fake.base);
+    catalog["providers"][0]["model_specs"]["fake-model"]["pricing"] = json!({
+        "input_usd_per_mtok": 1, "output_usd_per_mtok": 1,
+        "cache_read_usd_per_mtok": 1, "cache_create_usd_per_mtok": 1});
+    let root = temp_root("budget-resume");
+    let damaged_key;
+    let priced = || {
+        Embedded::new(
+            Box::new(DirPlaces(root.clone())),
+            Catalog::from_json(&catalog).unwrap(),
+        )
+    };
+    {
+        let host = priced();
+        let mut app = App::new(&host)
+            .script("bq", vec![Reply::Text("ready")])
+            .script("#", vec![Reply::Text("done")]);
+        app.call(
+            "create",
+            json!({"dir": "bq", "provider": "fake", "tasks": true, "max_usd": 1000}),
+        );
+        app.call("prompt", json!({"dir": "bq", "text": "[t:bq] hello"}));
+        let done = app.call(
+            "task_start",
+            json!({"dir": "bq", "task": "done", "prompt": "[t:bq-done] go"}),
+        );
+        assert_eq!(done["result"]["state"], "finished", "{done}");
+        let listed = app.call("tasks", json!({"dir": "bq"}))["result"]["tasks"].clone();
+        damaged_key = listed[0]["task"]
+            .as_str()
+            .unwrap()
+            .rsplit('#')
+            .next()
+            .unwrap()
+            .to_string();
+        // A background task's request goes and its answer never comes: the app closes.
+        app.hold = 3;
+        let queued = app.call(
+            "task_start",
+            json!({"dir": "bq", "task": "later", "prompt": "[t:bq-task] look", "report": "queue"}),
+        );
+        assert_eq!(queued["result"]["queued"], true, "{queued}");
+    }
+    // The finished task's store is damaged meanwhile.
+    let damaged = root.join("bq/tasks").join(&damaged_key);
+    std::fs::write(damaged.join("store/authority.sqlite"), b"not a database").unwrap();
+    let host = priced();
+    let mut app = App::new(&host).script("bq", vec![Reply::Text("more")]);
+    let next = app.call("prompt", json!({"dir": "bq", "text": "[t:bq] again"}));
+    assert!(
+        next["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot be read for the budget")),
+        "{next}"
+    );
+    // Not stopped for it: it waits for an open that can count it.
+    let listed = app.call("tasks", json!({"dir": "bq"}))["result"]["tasks"].clone();
+    let later = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["prompt"] == "[t:bq-task] look")
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(later["state"], "running", "{listed}");
+    assert!(
+        app.run.events.iter().any(|event| event["label"]
+            .as_str()
+            .is_some_and(|label| label.starts_with("background tasks not resumed yet: "))),
+        "the thread says why: {:?}",
+        app.run.events
+    );
+    // Without the budget the turn goes on and takes the task up (its request's outcome is
+    // unknown, so it stops, saying why).
+    app.call("settings", json!({"dir": "bq", "max_usd": null}));
+    let resumed = app.call("continue", json!({"dir": "bq"}));
+    assert!(resumed["error"].is_null(), "{resumed}");
+    let listed = app.call("tasks", json!({"dir": "bq"}))["result"]["tasks"].clone();
+    let later = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["prompt"] == "[t:bq-task] look")
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(later["state"], "stopped", "taken up: {listed}");
+}
+
 #[test]
 fn a_tasks_command_reads_the_tasks_own_files() {
     let host = embedded(Box::new(MemoryPlaces));
@@ -2810,7 +3199,34 @@ fn a_sign_in_whose_headers_read_its_token_is_filled_by_the_app_from_that_token()
 const SUMMARY_SYSTEM: &str = "You summarize the earlier part of a coding session";
 const SUMMARY_PROMPT: &str = "Summarize the session history below";
 const COMPACTED: &str = "[Earlier conversation compacted by spindle";
-const SUMMARY: &str = "SUMMARY: three long answers were given; carry on with four.";
+/// A summary of the length the request asks for (a thin one keeps the digest beside it:
+/// driver `THIN_SUMMARY`).
+const SUMMARY: &str = concat!(
+    "SUMMARY: three long answers were given; carry on with four.",
+    " The user asked for three long answers in turn, each written out in full; all three are done.",
+    " The next step is the fourth answer, in the same style and at the same length as the others.",
+    " Nothing failed, no file was written, no command ran, and nothing is waiting on the user.",
+    " Keep the same tone; number the answer four; do not repeat the earlier ones word for word.",
+    " The user prefers plain paragraphs with no headings and no lists, and the same opening line.",
+    " Earlier answers each began by naming their number, then went on for several paragraphs.",
+    " There were no open questions and no decisions left to make; the plan has not changed since.",
+    " Each answer so far was accepted as written; the user did not ask for any change to any.",
+    " If anything is unclear, the workspace holds no files; the conversation alone carries it.",
+    " Carry on with the fourth answer now, then stop and wait for the user's next message.",
+    " The user asked for three long answers in turn, each written out in full; all three are done.",
+    " The next step is the fourth answer, in the same style and at the same length as the others.",
+    " Nothing failed, no file was written, no command ran, and nothing is waiting on the user.",
+    " Keep the same tone; number the answer four; do not repeat the earlier ones word for word.",
+    " The user prefers plain paragraphs with no headings and no lists, and the same opening line.",
+    " Earlier answers each began by naming their number, then went on for several paragraphs.",
+    " There were no open questions and no decisions left to make; the plan has not changed since.",
+    " Each answer so far was accepted as written; the user did not ask for any change to any.",
+    " If anything is unclear, the workspace holds no files; the conversation alone carries it.",
+    " Carry on with the fourth answer now, then stop and wait for the user's next message.",
+    " The user asked for three long answers in turn, each written out in full; all three are done.",
+    " The next step is the fourth answer, in the same style and at the same length as the others.",
+    " Nothing failed, no file was written, no command ran, and nothing is waiting on the user.",
+);
 
 /// A reply of about 45 KB: three of them take `small-model`'s history past what one
 /// compaction must drop, so the fourth prompt compacts first.
@@ -3903,4 +4319,898 @@ fn native_a_stop_before_a_call_starts_records_it_as_not_run() {
         next.find("before this call started").unwrap() < next.find("do something else").unwrap(),
         "{next}"
     );
+}
+
+#[test]
+fn a_stopped_turn_goes_on_with_another_model_from_its_last_request() {
+    let root = temp_root("switch");
+    {
+        let host = embedded(Box::new(DirPlaces(root.clone())));
+        let mut app = App::new(&host).script(
+            "m",
+            vec![
+                Reply::Text("first done"),
+                Reply::Call("write_file", json!({"path": "a.txt", "content": "kept"})),
+            ],
+        );
+        app.call("create", json!({"dir": "m", "provider": "fake"}));
+        app.call("prompt", json!({"dir": "m", "text": "[t:switch1] first"}));
+        // The second turn's file is written, then its next response is lost (the
+        // provider ran out, the connection broke: the outcome is unknown).
+        app.hold = 3;
+        let line = json!({"jsonrpc": "2.0", "id": 9, "method": "prompt",
+            "params": {"dir": "m", "text": "[t:switch2] write it"}});
+        let frames = host.handle(line.to_string().as_bytes());
+        app.drive(frames);
+        assert_eq!(app.run.requests.len(), 3);
+    }
+    let host = embedded(Box::new(DirPlaces(root.clone())));
+    let mut app = App::new(&host).script("m", vec![Reply::Text("finished on the small one")]);
+    // Its model cannot change where a request is in flight.
+    let refused = app.call("settings", json!({"dir": "m", "model": "small-model"}));
+    assert!(refused.get("error").is_some(), "{refused}");
+    // Back to the newest completed turn, however far: the point before the lost
+    // request, then that turn's end; the turn's own message, not a summary.
+    let turn = app.call("targets", json!({"dir": "m", "until": "settled"}));
+    let turn = &turn["result"];
+    assert_eq!(turn["completed"], true, "{turn}");
+    assert_eq!(turn["prompt"], "[t:switch2] write it", "{turn}");
+    let kinds: Vec<&str> = turn["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| target["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds.first(), Some(&"before_model"), "{turn}");
+    assert_eq!(kinds.last(), Some(&"settled"), "{turn}");
+    let before = turn["targets"][0]["revision"].as_u64().unwrap();
+    let rewound = app.call("rewind", json!({"dir": "m", "revision": before}));
+    assert!(rewound.get("result").is_some(), "{rewound}");
+    let changed = app.call("settings", json!({"dir": "m", "model": "small-model"}));
+    assert_eq!(changed["result"]["model"], "small-model", "{changed}");
+    let continued = app.call("continue", json!({"dir": "m"}));
+    assert!(continued.get("result").is_some(), "{continued}");
+    assert_eq!(app.run.requests.len(), 1, "one fresh request");
+    assert!(
+        app.run.requests[0].contains("\"small-model\""),
+        "{}",
+        app.run.requests[0]
+    );
+    // The turn's work so far stays: its file and its history.
+    let read = app.call("read", json!({"dir": "m", "path": "a.txt"}));
+    assert_eq!(read["result"]["content"], "kept", "{read}");
+    let status = app.call("status", json!({"dir": "m"}));
+    assert_eq!(status["result"]["complete"], true, "{status}");
+    let first = app.call("targets", json!({"dir": "m", "until": "settled"}));
+    assert_eq!(first["result"]["prompt"], "[t:switch2] write it", "{first}");
+}
+
+#[test]
+fn a_first_turn_says_it_has_no_completed_turn_behind_it() {
+    let root = temp_root("firstturn");
+    {
+        let host = embedded(Box::new(DirPlaces(root.clone())));
+        let mut app = App::new(&host);
+        app.call("create", json!({"dir": "f", "provider": "fake"}));
+        app.hold = 1;
+        let line = json!({"jsonrpc": "2.0", "id": 1, "method": "prompt",
+            "params": {"dir": "f", "text": "[t:firstturn] hello"}});
+        let frames = host.handle(line.to_string().as_bytes());
+        app.drive(frames);
+    }
+    let host = embedded(Box::new(DirPlaces(root.clone())));
+    let mut app = App::new(&host);
+    let turn = app.call("targets", json!({"dir": "f", "until": "settled"}));
+    assert_eq!(turn["result"]["completed"], false, "{turn}");
+    assert_eq!(turn["result"]["prompt"], "[t:firstturn] hello", "{turn}");
+    let bad = app.call("targets", json!({"dir": "f", "until": "start"}));
+    assert!(bad.get("error").is_some(), "{bad}");
+}
+
+#[test]
+fn a_move_seals_its_copy_only_at_the_head_of_the_bundle_kept() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host).script("m", vec![Reply::Text("first"), Reply::Text("second")]);
+    app.call("create", json!({"dir": "m", "provider": "fake"}));
+    let fresh = app.call("status", json!({"dir": "m"}))["result"].clone();
+    assert_eq!(fresh["state"], "no turns yet", "{fresh}");
+    app.call("prompt", json!({"dir": "m", "text": "one"}));
+    // Status says how its head stands from the head it read (a completed turn here).
+    let status = app.call("status", json!({"dir": "m"}))["result"].clone();
+    assert_eq!(status["phase"], "stopped", "{status}");
+    assert_eq!(status["state"], status["stop_text"], "{status}");
+    // The bundle is kept (the session stays here); it went on since: nothing sealed.
+    let bytes = host.export_session("m", true, None).unwrap();
+    let kept = spindle_store::bundle::read(&bytes).unwrap();
+    let head = kept.head;
+    app.call("prompt", json!({"dir": "m", "text": "two"}));
+    let moved_on = host
+        .seal_session("m", head, kept.source_state.as_deref().unwrap())
+        .unwrap_err();
+    assert_eq!(moved_on.kind, "head_moved", "{}", moved_on.message);
+    let now = app.call("status", json!({"dir": "m"}))["result"]["head"].clone();
+    assert!(now.as_u64().unwrap() > head);
+    // At the head of the bundle kept now: sealed, and closed here.
+    let bytes = host.export_session("m", true, None).unwrap();
+    let kept = spindle_store::bundle::read(&bytes).unwrap();
+    let sealed = host
+        .seal_session(
+            "m",
+            now.as_u64().unwrap(),
+            kept.source_state.as_deref().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(sealed, json!({"session": "m", "head": now, "sealed": true}));
+    let listed = app.call("list", json!({}))["result"]["sessions"].clone();
+    assert_eq!(listed, json!([]), "{listed}");
+    assert_eq!(
+        host.seal_session("nowhere", 0, "").unwrap_err().kind,
+        "not_found"
+    );
+}
+
+#[test]
+fn files_cross_beside_the_request_line_each_taken_once() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host).script("f", vec![Reply::Text("got them")]);
+    let line = |id: u64, method: &str, params: Value| {
+        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
+    };
+    let created = host.handle_with(
+        line(
+            1,
+            "create",
+            json!({"dir": "f", "provider": "fake", "files": [
+            {"path": "a.bin", "attached": 0}, {"path": "t.txt", "text": "text"}]}),
+        )
+        .as_bytes(),
+        vec![vec![0, 159, 255]],
+    );
+    assert!(created[0].get("result").is_some(), "{created:?}");
+    let frames = host.handle_with(
+        line(
+            2,
+            "prompt",
+            json!({"dir": "f", "text": "take them", "files": [
+            {"path": "b.bin", "attached": 1, "executable": true},
+            {"path": "c.txt", "attached": 0}, {"path": "d.txt", "base64": "ZA=="}]}),
+        )
+        .as_bytes(),
+        vec![b"c".to_vec(), vec![1, 2, 3]],
+    );
+    app.drive(frames);
+    let done = app
+        .run
+        .replies
+        .iter()
+        .find(|reply| reply["id"] == 2)
+        .cloned();
+    assert_eq!(
+        done.as_ref()
+            .map(|reply| reply["result"]["stopped"]["complete"].clone()),
+        Some(json!(true)),
+        "{done:?}"
+    );
+    let files = app.call("files", json!({"dir": "f"}))["result"]["files"].clone();
+    let file = |path: &str| {
+        files
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == path)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {path} in {files}"))
+    };
+    assert_eq!(
+        (
+            file("a.bin")["size"].clone(),
+            file("a.bin")["executable"].clone()
+        ),
+        (json!(3), json!(false))
+    );
+    assert_eq!(
+        (
+            file("b.bin")["size"].clone(),
+            file("b.bin")["executable"].clone()
+        ),
+        (json!(3), json!(true))
+    );
+    for (path, content) in [
+        ("a.bin", "AJ//"),
+        ("c.txt", "c"),
+        ("d.txt", "d"),
+        ("t.txt", "text"),
+    ] {
+        let read = app.call("read", json!({"dir": "f", "path": path}))["result"].clone();
+        assert_eq!(read["content"], content, "{read}");
+    }
+    // One the request did not carry, one taken twice, or one with more than its bytes
+    // is refused; and none is kept past its request.
+    for (files, carried, why) in [
+        (json!([{"path": "x", "attached": 1}]), 1, "names no file"),
+        (
+            json!([{"path": "x", "attached": 0}, {"path": "y", "attached": 0}]),
+            1,
+            "used twice",
+        ),
+        (
+            json!([{"path": "x", "attached": 0, "base64": "AA=="}]),
+            1,
+            "not a key",
+        ),
+        (
+            json!([{"path": "../x", "attached": 0}]),
+            1,
+            "workspace path",
+        ),
+        (json!([{"path": "x", "attached": 0}]), 0, "names no file"),
+    ] {
+        let frames = host.handle_with(
+            line(
+                3,
+                "prompt",
+                json!({"dir": "f", "text": "again", "files": files}),
+            )
+            .as_bytes(),
+            vec![vec![1]; carried],
+        );
+        let message = frames[0]["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(why), "{why}: {frames:?}");
+    }
+}
+
+// ---- freeing a finished task's space (`export_task`, `task_drop`) ---------------------
+
+/// An app over sessions in `root` whose every reply costs $1.10 (as the budget tests'
+/// above).
+fn priced(root: &Path) -> Embedded {
+    let mut catalog = catalog_json(&fake().base);
+    catalog["providers"][0]["model_specs"]["fake-model"]["pricing"] = json!({
+        "input_usd_per_mtok": 1000, "output_usd_per_mtok": 1000,
+        "cache_read_usd_per_mtok": 1000, "cache_create_usd_per_mtok": 1000});
+    Embedded::new(
+        Box::new(DirPlaces(root.to_path_buf())),
+        Catalog::from_json(&catalog).unwrap(),
+    )
+}
+
+/// The replies of a task that runs a task of its own: $2.20 for it, $1.10 for its task.
+fn nested_task_replies() -> Vec<Reply> {
+    vec![
+        Reply::Call("task", json!({"prompt": "delegate deeper"})),
+        Reply::Text("grandchild done"),
+        Reply::Text("child done"),
+    ]
+}
+
+/// Session `dir` under a $9 budget whose app task `t` ran a task of its own (the
+/// session's $1.10, the task's $2.20, its task's $1.10), then a prompt the budget refuses
+/// only with the nested task counted: what the refusal said, and the task's label.
+fn spent_tree(app: &mut App, dir: &str) -> (String, String) {
+    app.call(
+        "create",
+        json!({"dir": dir, "provider": "fake", "tasks": true, "max_usd": 9}),
+    );
+    app.call(
+        "prompt",
+        json!({"dir": dir, "text": format!("[t:{dir}] hello")}),
+    );
+    let started = app.call(
+        "task_start",
+        json!({"dir": dir, "task": "t", "prompt": format!("[t:{dir}-task] go")}),
+    );
+    assert_eq!(started["result"]["state"], "finished", "{started}");
+    let refused = app.call(
+        "prompt",
+        json!({"dir": dir, "text": format!("[t:{dir}] more")}),
+    );
+    let said = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(said.starts_with("spending limit:"), "{refused}");
+    assert!(
+        dollars_after(said, "has spent ") + 2.20 + dollars_after(said, "could cost up to ") <= 9.0,
+        "only the nested task tips it: {said}"
+    );
+    (
+        said.to_string(),
+        started["result"]["task"].as_str().unwrap().to_string(),
+    )
+}
+
+/// What a budget refusal said the session spent, after `continue` (asserted refused).
+fn refused_at(app: &mut App, dir: &str) -> (f64, f64) {
+    let reply = app.call("continue", json!({"dir": dir}));
+    let said = reply["error"]["message"].as_str().unwrap_or_default();
+    assert!(said.starts_with("spending limit:"), "{reply}");
+    (
+        dollars_after(said, "has spent "),
+        dollars_after(said, "could cost up to "),
+    )
+}
+
+/// `continue` under a budget that fits what was spent and the next request once, not
+/// twice: it is sent.
+fn sent_once(app: &mut App, dir: &str, spent: f64, cost: f64) {
+    app.call(
+        "settings",
+        json!({"dir": dir, "max_usd": spent + cost + 0.5}),
+    );
+    let sent = app.requests_after(|app| app.call("continue", json!({"dir": dir})));
+    assert!(sent.0["error"].is_null(), "{}", sent.0);
+    assert_eq!(sent.1, 1, "the request was sent");
+}
+
+impl App<'_> {
+    /// `run`'s reply, and how many requests it sent.
+    fn requests_after(&mut self, run: impl FnOnce(&mut Self) -> Value) -> (Value, usize) {
+        let before = self.run.requests.len();
+        let reply = run(self);
+        (reply, self.run.requests.len() - before)
+    }
+}
+
+fn near(a: f64, b: f64) -> bool {
+    (a - b).abs() < 0.005
+}
+
+#[test]
+fn a_finished_tasks_store_is_kept_in_a_file_then_removed_and_its_spend_counts_once() {
+    let root = temp_root("task-drop");
+    let host = priced(&root);
+    let mut app = App::new(&host)
+        .script("dt", vec![Reply::Text("ready")])
+        .script("#", nested_task_replies());
+    let (said, label) = spent_tree(&mut app, "dt");
+    let cost = dollars_after(&said, "could cost up to ");
+    let key = label.rsplit('#').next().unwrap().to_string();
+    let listed = app.call("tasks", json!({"dir": "dt"}))["result"]["tasks"].clone();
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    let (store, orphan) = (&listed[0]["store"], &listed[0]["orphan"]);
+    assert_eq!((store, orphan), (&json!(true), &json!(false)), "{listed}");
+    assert!(listed[0]["dropped"].is_null(), "{listed}");
+    let bytes = listed[0]["bytes"].as_u64().unwrap();
+    assert!(bytes > 8192, "its store and its task's: {listed}");
+
+    // Kept in a file first: a session of its own, its task's store with it, that
+    // imports and reads as one.
+    let file = host.export_task("dt", "t").unwrap();
+    let bundle = spindle_store::bundle::read(&file).unwrap();
+    let paths: Vec<&str> = bundle.files.iter().map(|file| file.path.as_str()).collect();
+    assert!(paths.contains(&"store/authority.sqlite"), "{paths:?}");
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.starts_with("tasks/") && path.ends_with("/store/authority.sqlite")),
+        "{paths:?}"
+    );
+    host.import_session("dt-task", &file).unwrap();
+    let read = app.call("history", json!({"dir": "dt-task"}))["result"].to_string();
+    assert!(read.contains("child done"), "{read}");
+
+    // Removed: its directory goes, its record stays with its answer.
+    let dropped = app.call(
+        "task_drop",
+        json!({"dir": "dt", "task": label, "at": 1_700_000_000u64}),
+    );
+    let record = dropped["result"]["dropped"].clone();
+    assert_eq!(record["bytes"], bytes, "{dropped}");
+    assert_eq!(
+        (&record["at"], &record["task"], &record["key"]),
+        (&json!(1_700_000_000u64), &json!("app:t"), &json!(key)),
+        "{dropped}"
+    );
+    assert_eq!(record["prompt"], "[t:dt-task] go");
+    assert!(
+        !root.join("dt/tasks").join(&key).exists(),
+        "its files are gone"
+    );
+    assert!(
+        !root.join("dt/tasks.removing").exists(),
+        "nothing is left over"
+    );
+    let listed = app.call("tasks", json!({"dir": "dt"}))["result"]["tasks"].clone();
+    assert_eq!(listed[0]["store"], false, "{listed}");
+    assert!(listed[0]["bytes"].is_null(), "{listed}");
+    assert_eq!(listed[0]["dropped"], record, "{listed}");
+    assert_eq!(listed[0]["state"], "finished");
+    assert!(
+        listed[0]["answer"]["content"]
+            .as_str()
+            .is_some_and(|answer| answer.starts_with("child done")),
+        "the answer stays: {listed}"
+    );
+    let again = app.call("task_drop", json!({"dir": "dt", "task": "t"}));
+    assert_eq!(
+        again["result"]["dropped"], record,
+        "dropping again changes nothing"
+    );
+
+    // Its spend is the session's own now: counted once, in this open and the next.
+    let (spent, cost_now) = refused_at(&mut app, "dt");
+    assert!(near(spent, 4.40), "the tree's $4.40: {spent}");
+    assert!(near(cost_now, cost));
+    sent_once(&mut app, "dt", spent, cost);
+    app.call("close", json!({"dir": "dt"}));
+    let more = app.call("prompt", json!({"dir": "dt", "text": "[t:dt] again"}));
+    let said = more["error"]["message"].as_str().unwrap_or_default();
+    assert!(said.starts_with("spending limit:"), "{more}");
+    let (spent, cost) = (
+        dollars_after(said, "has spent "),
+        dollars_after(said, "could cost up to "),
+    );
+    assert!(near(spent, 5.50), "reopened, still counted: {spent}");
+    sent_once(&mut app, "dt", spent, cost);
+    let usage = app.call("usage", json!({"dir": "dt"}))["result"].clone();
+    assert!(
+        near(usage["usd"].as_f64().unwrap(), 6.60),
+        "its own three replies and the task tree's: {usage}"
+    );
+
+    // The rest of the session reads and moves without it.
+    let history = app.call("history", json!({"dir": "dt"}));
+    assert!(history["error"].is_null(), "{history}");
+    let whole = host.export_session("dt", true, None).unwrap();
+    let bundle = spindle_store::bundle::read(&whole).unwrap();
+    assert!(
+        bundle
+            .files
+            .iter()
+            .all(|file| !file.path.starts_with("tasks/")),
+        "a whole export carries no removed task"
+    );
+    let copy = host.import_session("dt-copy", &whole).unwrap();
+    assert!(copy["head"].as_u64().unwrap() > 0, "{copy}");
+    let listed = app.call("tasks", json!({"dir": "dt-copy"}))["result"]["tasks"].clone();
+    assert_eq!(
+        listed[0]["dropped"], record,
+        "the record moves with it: {listed}"
+    );
+    let compacted = app.call("compact", json!({"dir": "dt"}));
+    assert!(compacted["error"].is_null(), "{compacted}");
+    let status = app.call("status", json!({"dir": "dt"}));
+    assert!(status["error"].is_null(), "it opens again: {status}");
+    // It never runs again, nor starts over in its place; its file is gone too.
+    let rerun = app.call(
+        "task_start",
+        json!({"dir": "dt", "task": "t", "prompt": "[t:dt-task] go"}),
+    );
+    let why = rerun["error"]["message"].as_str().unwrap_or_default();
+    assert!(why.contains("working copy was removed"), "{rerun}");
+    assert_eq!(
+        host.export_task("dt", "t").unwrap_err().kind,
+        "not_found",
+        "nothing is left to export"
+    );
+}
+
+#[test]
+fn a_removal_cut_short_after_the_move_keeps_the_spend_and_the_next_open_finishes_it() {
+    let root = temp_root("task-drop-crash");
+    let host = priced(&root);
+    let mut app = App::new(&host)
+        .script("dc", vec![Reply::Text("ready")])
+        .script("#", nested_task_replies());
+    let (said, label) = spent_tree(&mut app, "dc");
+    let cost = dollars_after(&said, "could cost up to ");
+    let key = label.rsplit('#').next().unwrap().to_string();
+    // A crash once its directory was moved out of `tasks/`, before it was removed.
+    std::fs::write(root.join("dc/fail-removal"), "after").unwrap();
+    let cut = app.call("task_drop", json!({"dir": "dc", "task": "t"}));
+    assert_eq!(kind(&cut), Some("failed"), "{cut}");
+    let why = cut["error"]["message"].as_str().unwrap();
+    assert!(why.contains("spend is kept"), "{cut}");
+    assert!(!root.join("dc/tasks").join(&key).exists());
+    assert!(root.join("dc/tasks.removing").join(&key).exists());
+    // Its spend was kept before anything moved: counted once, here and opened again.
+    let (spent, _) = refused_at(&mut app, "dc");
+    assert!(near(spent, 4.40), "{spent}");
+    std::fs::remove_file(root.join("dc/fail-removal")).unwrap();
+    app.call("close", json!({"dir": "dc"}));
+    let (spent, _) = refused_at(&mut app, "dc");
+    assert!(near(spent, 4.40), "{spent}");
+    assert!(
+        !root.join("dc/tasks.removing").exists(),
+        "the open finished the removal"
+    );
+    sent_once(&mut app, "dc", spent, cost);
+    let listed = app.call("tasks", json!({"dir": "dc"}))["result"]["tasks"].clone();
+    assert_eq!(listed[0]["store"], false, "{listed}");
+    assert!(listed[0]["dropped"].is_object(), "{listed}");
+}
+
+#[test]
+fn a_removal_cut_short_before_the_move_counts_as_done_and_finishes_when_asked_again() {
+    let root = temp_root("task-drop-early");
+    let host = priced(&root);
+    let mut app = App::new(&host)
+        .script("de", vec![Reply::Text("ready")])
+        .script("#", nested_task_replies());
+    let (said, label) = spent_tree(&mut app, "de");
+    let cost = dollars_after(&said, "could cost up to ");
+    let key = label.rsplit('#').next().unwrap().to_string();
+    // A crash once its spend was kept, before its directory moved: still in `tasks/`.
+    std::fs::write(root.join("de/fail-removal"), "before").unwrap();
+    let cut = app.call("task_drop", json!({"dir": "de", "task": "t"}));
+    assert_eq!(kind(&cut), Some("failed"), "{cut}");
+    assert!(root.join("de/tasks").join(&key).exists());
+    let listed = app.call("tasks", json!({"dir": "de"}))["result"]["tasks"].clone();
+    assert_eq!(
+        listed[0]["store"], true,
+        "its files are still there: {listed}"
+    );
+    assert!(
+        listed[0]["dropped"].is_object(),
+        "and it counts as removed: {listed}"
+    );
+    // Nothing carries it or counts it twice meanwhile.
+    let whole = host.export_session("de", true, None).unwrap();
+    let bundle = spindle_store::bundle::read(&whole).unwrap();
+    assert!(
+        bundle
+            .files
+            .iter()
+            .all(|file| !file.path.starts_with("tasks/")),
+        "an export leaves it out"
+    );
+    assert_eq!(host.export_task("de", "t").unwrap_err().kind, "not_found");
+    app.call("close", json!({"dir": "de"}));
+    let (spent, _) = refused_at(&mut app, "de");
+    assert!(near(spent, 4.40), "{spent}");
+    sent_once(&mut app, "de", spent, cost);
+    // Asked again, it finishes.
+    std::fs::remove_file(root.join("de/fail-removal")).unwrap();
+    let done = app.call("task_drop", json!({"dir": "de", "task": "t"}));
+    assert!(done["error"].is_null(), "{done}");
+    assert!(!root.join("de/tasks").join(&key).exists());
+}
+
+#[test]
+fn a_task_still_running_or_needed_is_neither_exported_nor_removed() {
+    let root = temp_root("task-drop-refused");
+    let host = embedded(Box::new(DirPlaces(root.clone())));
+    // A turn waits on a task it called (its request held: the app has not answered it).
+    let held: Held = Held::default();
+    let hold = held.clone();
+    let mut app = App::new(&host)
+        .script(
+            "dw",
+            vec![Reply::Call(
+                "task",
+                json!({"prompt": "[t:dw-task] look around"}),
+            )],
+        )
+        .script(
+            "df",
+            vec![
+                Reply::Call("task", json!({"prompt": "[t:df-task] write b.txt"})),
+                Reply::Text("the task finished"),
+            ],
+        )
+        .script(
+            "#",
+            vec![
+                Reply::Call(
+                    "write_file",
+                    json!({"path": "b.txt", "content": "from the task"}),
+                ),
+                Reply::Text("child done"),
+            ],
+        );
+    app.hook = Some(Box::new(move |_, session: &str, id, _| {
+        if session.starts_with("dw#") && hold.borrow().is_none() {
+            *hold.borrow_mut() = Some((session.to_string(), id));
+            return Some(vec![]);
+        }
+        None
+    }));
+    app.call(
+        "create",
+        json!({"dir": "dw", "provider": "fake", "tasks": true}),
+    );
+    let line = json!({"jsonrpc": "2.0", "id": 77, "method": "prompt",
+        "params": {"dir": "dw", "text": "[t:dw] start it"}});
+    let frames = host.handle(line.to_string().as_bytes());
+    app.drive(frames);
+    let label = held.borrow().clone().expect("the task waits").0;
+    // The turn waits on it: it is running, and listed so (no row names a task a turn
+    // waits for).
+    let listed = app.call("tasks", json!({"dir": "dw"}))["result"]["tasks"].clone();
+    assert_eq!(listed[0]["task"], label.as_str(), "{listed}");
+    assert_eq!(
+        (&listed[0]["orphan"], &listed[0]["state"]),
+        (&json!(true), &json!("running")),
+        "{listed}"
+    );
+    let refused = app.call("task_drop", json!({"dir": "dw", "task": label}));
+    assert_eq!(kind(&refused), Some("busy"), "{refused}");
+    assert_eq!(host.export_task("dw", &label).unwrap_err().kind, "busy");
+    // Its request lost: the turn stops, waiting for the task to be settled in its own
+    // session. Its store is still needed.
+    let (session, id) = held.borrow().clone().unwrap();
+    let frames = host
+        .deliver(
+            &session,
+            id,
+            answer_of(&json!({"kind": "dropped"})).unwrap(),
+        )
+        .unwrap();
+    app.drive(frames);
+    assert!(app.run.replies.iter().any(|reply| reply["id"] == 77));
+    let listed = app.call("tasks", json!({"dir": "dw"}))["result"]["tasks"].clone();
+    assert_eq!(listed[0]["state"], "running", "{listed}");
+    let refused = app.call("task_drop", json!({"dir": "dw", "task": label}));
+    assert_eq!(kind(&refused), Some("conflict"), "{refused}");
+    assert_eq!(host.export_task("dw", &label).unwrap_err().kind, "conflict");
+    let unknown = app.call("task_drop", json!({"dir": "dw", "task": "nope"}));
+    assert_eq!(kind(&unknown), Some("not_found"), "{unknown}");
+    assert!(root.join("dw/tasks").read_dir().unwrap().count() == 1);
+
+    // A task a finished turn waited for: its directory goes, the files it merged stay.
+    app.call(
+        "create",
+        json!({"dir": "df", "provider": "fake", "tasks": true}),
+    );
+    let done = app.call("prompt", json!({"dir": "df", "text": "[t:df] delegate"}));
+    assert!(done["error"].is_null(), "{done}");
+    let listed = app.call("tasks", json!({"dir": "df"}))["result"]["tasks"].clone();
+    assert_eq!(
+        (
+            &listed[0]["orphan"],
+            &listed[0]["state"],
+            &listed[0]["store"]
+        ),
+        (&json!(true), &json!("finished"), &json!(true)),
+        "{listed}"
+    );
+    let label = listed[0]["task"].as_str().unwrap().to_string();
+    let file = host.export_task("df", &label).unwrap();
+    assert!(spindle_store::bundle::read(&file).is_ok());
+    let dropped = app.call("task_drop", json!({"dir": "df", "task": label}));
+    assert!(dropped["result"]["dropped"]["task"].is_null(), "{dropped}");
+    let key = label.rsplit('#').next().unwrap();
+    assert!(!root.join("df/tasks").join(key).exists());
+    let read = app.call("read", json!({"dir": "df", "path": "b.txt"}));
+    assert_eq!(read["result"]["content"], "from the task", "{read}");
+    let listed = app.call("tasks", json!({"dir": "df"}))["result"]["tasks"].clone();
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(
+        (
+            &listed[0]["orphan"],
+            &listed[0]["store"],
+            &listed[0]["state"]
+        ),
+        (&json!(true), &json!(false), &json!("finished")),
+        "listed from its record: {listed}"
+    );
+}
+
+// ---- durability of a retry's swap, a move's seal and a task's removal -----------------
+
+/// Sessions in directories whose retry swaps its store as the package's places do: the
+/// fresh store made whole beside the old one first (`store.fresh`), then the renames. A
+/// `fail-swap` file in the session's directory stops a swap between its renames (a crash
+/// there): nothing finishes it until the file goes, then the next open does.
+struct SwapPlaces(PathBuf);
+struct SwapStorage(DirStorage);
+impl Places for SwapPlaces {
+    fn storage(&self, dir: &str) -> Result<Box<dyn Storage>, String> {
+        Ok(Box::new(SwapStorage(DirStorage(
+            self.0.join(dir).join("store"),
+        ))))
+    }
+    fn exists(&self, dir: &str) -> bool {
+        let dir = self.0.join(dir);
+        dir.join("store").exists() || dir.join("store.fresh").exists()
+    }
+}
+impl SwapStorage {
+    fn fresh(&self) -> PathBuf {
+        self.0.0.with_extension("fresh")
+    }
+    fn stopped(&self) -> bool {
+        self.0.0.parent().unwrap().join("fail-swap").exists()
+    }
+}
+impl Storage for SwapStorage {
+    fn label(&self) -> String {
+        self.0.label()
+    }
+    fn open(&self, create: bool) -> spindle_store::Result<Store> {
+        if !create && !self.0.0.exists() && self.fresh().exists() && !self.stopped() {
+            std::fs::rename(self.fresh(), &self.0.0)?;
+        }
+        self.0.open(create)
+    }
+    fn set_aside(&self, store: Store) -> spindle_store::Result<(Store, String)> {
+        self.0.set_aside(store)
+    }
+    fn replace_store(
+        &self,
+        store: Store,
+        prepare: &mut dyn FnMut(&mut Store, &str) -> spindle_store::Result<()>,
+    ) -> spindle_store::Result<(Store, String)> {
+        let (fresh, aside) = (self.fresh(), self.0.0.with_extension("abandoned-1"));
+        let name = aside.display().to_string();
+        let _ = std::fs::remove_dir_all(&fresh);
+        let mut made = Store::open(&fresh)?;
+        prepare(&mut made, &name)?;
+        drop(made);
+        drop(store);
+        std::fs::rename(&self.0.0, &aside)?;
+        if self.stopped() {
+            return Err(std::io::Error::other("the swap stopped between its renames").into());
+        }
+        std::fs::rename(&fresh, &self.0.0)?;
+        Ok((Store::open(&self.0.0)?, name))
+    }
+    fn child(&self, key: &str) -> Box<dyn Storage> {
+        self.0.child(key)
+    }
+    fn tasks(&self) -> Vec<String> {
+        self.0.tasks()
+    }
+    fn import_store(&self, image: &[u8]) -> spindle_store::Result<()> {
+        self.0.import_store(image)
+    }
+}
+
+/// An app over `places` whose every reply costs $1.10 (as `priced`).
+fn priced_in(places: Box<dyn Places>) -> Embedded {
+    let mut catalog = catalog_json(&fake().base);
+    catalog["providers"][0]["model_specs"]["fake-model"]["pricing"] = json!({
+        "input_usd_per_mtok": 1000, "output_usd_per_mtok": 1000,
+        "cache_read_usd_per_mtok": 1000, "cache_create_usd_per_mtok": 1000});
+    Embedded::new(places, Catalog::from_json(&catalog).unwrap())
+}
+
+#[test]
+fn a_retried_first_request_keeps_its_spend_and_prompt_through_a_swap_cut_short() {
+    let root = temp_root("retry-swap");
+    {
+        let host = priced_in(Box::new(SwapPlaces(root.clone())));
+        let mut app = App::new(&host);
+        app.call("create", json!({"dir": "rs", "provider": "fake"}));
+        app.hold = 1;
+        let line = json!({"jsonrpc": "2.0", "id": 1, "method": "prompt",
+            "params": {"dir": "rs", "text": "[t:rs] hello"}});
+        let frames = host.handle(line.to_string().as_bytes());
+        app.drive(frames);
+        assert_eq!(app.run.requests.len(), 1, "the request went out once");
+        // The app ends here, the response never delivered.
+    }
+    {
+        // The retry's swap stops between its renames: the old store is aside, the fresh
+        // one not yet named.
+        let host = priced_in(Box::new(SwapPlaces(root.clone())));
+        let mut app = App::new(&host);
+        std::fs::write(root.join("rs/fail-swap"), "").unwrap();
+        let cut = app.call("retry", json!({"dir": "rs"}));
+        assert!(cut.get("error").is_some(), "{cut}");
+        assert!(app.run.requests.is_empty(), "nothing was sent");
+        assert!(root.join("rs/store.abandoned-1").exists());
+        assert!(root.join("rs/store.fresh").exists() && !root.join("rs/store").exists());
+    }
+    std::fs::remove_file(root.join("rs/fail-swap")).unwrap();
+    let host = priced_in(Box::new(SwapPlaces(root.clone())));
+    let mut app = App::new(&host).script("rs", vec![Reply::Text("again")]);
+    // Opened, the fresh store holds the restarted turn and the old request's spend.
+    let status = app.call("status", json!({"dir": "rs"}))["result"].clone();
+    assert_eq!(status["head"], 1, "the restarted turn: {status}");
+    let history = app.call("history", json!({"dir": "rs"}))["result"].clone();
+    assert!(
+        history["messages"].to_string().contains("[t:rs] hello"),
+        "its prompt: {history}"
+    );
+    let unknown =
+        |app: &mut App<'_>| app.call("usage", json!({"dir": "rs"}))["result"]["unknown"].clone();
+    assert_eq!(
+        unknown(&mut app),
+        1,
+        "the set-aside request may have been billed"
+    );
+    let sent = app.call("continue", json!({"dir": "rs"}));
+    assert!(sent.get("result").is_some(), "{sent}");
+    assert_eq!(app.run.requests.len(), 1, "sent once, from the fresh store");
+    let status = app.call("status", json!({"dir": "rs"}))["result"].clone();
+    assert_eq!(status["complete"], true, "{status}");
+    assert_eq!(unknown(&mut app), 1, "still counted once");
+}
+
+#[test]
+fn a_kept_bundle_seals_after_the_app_reads_its_spend() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host).script("ks", vec![Reply::Text("first")]);
+    app.call("create", json!({"dir": "ks", "provider": "fake"}));
+    app.call("prompt", json!({"dir": "ks", "text": "one"}));
+    let bytes = host.export_session("ks", true, None).unwrap();
+    let kept = spindle_store::bundle::read(&bytes).unwrap();
+    // Reading the spend keeps the ledger in the store: the seal's check sees the same.
+    let usage = app.call("usage", json!({"dir": "ks"}));
+    assert!(usage.get("result").is_some(), "{usage}");
+    let sealed = host
+        .seal_session("ks", kept.head, kept.source_state.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(sealed["sealed"], true, "{sealed}");
+}
+
+#[test]
+fn an_app_task_left_running_is_neither_exported_nor_removed() {
+    let root = temp_root("task-left");
+    {
+        let host = embedded(Box::new(DirPlaces(root.clone())));
+        let mut app = App::new(&host).script("tl", vec![Reply::Text("ready")]);
+        app.call(
+            "create",
+            json!({"dir": "tl", "provider": "fake", "tasks": true}),
+        );
+        app.call("prompt", json!({"dir": "tl", "text": "[t:tl] hello"}));
+        // The app's task sends its request; the app ends before it is answered.
+        app.hold = 2;
+        let line = json!({"jsonrpc": "2.0", "id": 1, "method": "task_start",
+            "params": {"dir": "tl", "task": "t", "prompt": "[t:tl-task] look"}});
+        let frames = host.handle(line.to_string().as_bytes());
+        app.drive(frames);
+        assert_eq!(app.run.requests.len(), 2, "the task's request went out");
+        assert!(app.run.replies.is_empty());
+    }
+    let host = embedded(Box::new(DirPlaces(root.clone())));
+    let mut app = App::new(&host);
+    let listed = app.call("tasks", json!({"dir": "tl"}))["result"]["tasks"].clone();
+    assert_eq!(
+        (&listed[0]["state"], &listed[0]["queued"]),
+        (&json!("running"), &json!(false)),
+        "{listed}"
+    );
+    // `task_start` with its id takes it up again: its store is still needed.
+    let refused = app.call("task_drop", json!({"dir": "tl", "task": "t"}));
+    assert_eq!(kind(&refused), Some("conflict"), "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("can still go on"),
+        "{refused}"
+    );
+    assert_eq!(host.export_task("tl", "t").unwrap_err().kind, "conflict");
+    let label = listed[0]["task"].as_str().unwrap();
+    let key = label.rsplit('#').next().unwrap();
+    assert!(root.join("tl/tasks").join(key).exists());
+}
+
+#[test]
+fn a_removed_tasks_directory_left_in_tasks_goes_when_the_session_opens() {
+    let root = temp_root("task-drop-open");
+    let host = embedded(Box::new(DirPlaces(root.clone())));
+    let mut app = App::new(&host)
+        .script("do", vec![Reply::Text("ready")])
+        .script("#", vec![Reply::Text("task done")]);
+    app.call(
+        "create",
+        json!({"dir": "do", "provider": "fake", "tasks": true}),
+    );
+    app.call("prompt", json!({"dir": "do", "text": "[t:do] hello"}));
+    let started = app.call(
+        "task_start",
+        json!({"dir": "do", "task": "t", "prompt": "[t:do-task] go"}),
+    );
+    assert_eq!(started["result"]["state"], "finished", "{started}");
+    let label = started["result"]["task"].as_str().unwrap().to_string();
+    let key = label.rsplit('#').next().unwrap();
+    // A stop once the removal's record was kept, before the directory moved: a native
+    // host, which reads no such record, would find the task there.
+    std::fs::write(root.join("do/fail-removal"), "before").unwrap();
+    let cut = app.call("task_drop", json!({"dir": "do", "task": "t"}));
+    assert_eq!(kind(&cut), Some("failed"), "{cut}");
+    assert!(root.join("do/tasks").join(key).exists());
+    std::fs::remove_file(root.join("do/fail-removal")).unwrap();
+    app.call("close", json!({"dir": "do"}));
+    let status = app.call("status", json!({"dir": "do"}));
+    assert!(status.get("result").is_some(), "{status}");
+    assert!(
+        !root.join("do/tasks").join(key).exists(),
+        "the open moved it out of tasks/ and removed it"
+    );
+    assert!(!root.join("do/tasks.removing").exists());
+    let listed = app.call("tasks", json!({"dir": "do"}))["result"]["tasks"].clone();
+    assert_eq!(listed[0]["store"], false, "{listed}");
+    assert!(listed[0]["dropped"].is_object(), "{listed}");
 }

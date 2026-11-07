@@ -190,9 +190,12 @@ pub fn tools_from_json(value: &Value) -> Result<Vec<AppTool>, String> {
 }
 
 /// Applies the app settings `data` names (`tools`, `builtin_tools`, `instructions`,
-/// `resend_unknown`, `tasks`; absent ones stay, null or "" clears instructions) and
-/// checks the result.
+/// `resend_unknown`, `tasks`, `compact_tokens`; absent ones stay, null or "" clears
+/// instructions, null or 0 `compact_tokens`) and checks the result.
 pub fn apply_json(settings: &mut super::Settings, data: &Value) -> Result<(), String> {
+    if let Some(tokens) = data.get("compact_tokens") {
+        settings.compact_tokens = super::compact_tokens(tokens)?;
+    }
     if let Some(tools) = data.get("tools") {
         settings.tools = tools_from_json(tools)?;
     }

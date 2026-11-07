@@ -3,7 +3,25 @@
 // (--enable-unsafe-extension-debugging): branded Chrome ignores --load-extension since
 // 137. Clicks and typing are real input events, so the page sees user gestures.
 import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+
+/** Processes still running with `--user-data-dir=PROFILE` (Linux; none known elsewhere). */
+function profileProcesses(profile) {
+  const flag = `--user-data-dir=${profile}`;
+  let ids;
+  try {
+    ids = readdirSync('/proc').filter((name) => /^\d+$/.test(name));
+  } catch {
+    return [];
+  }
+  return ids.filter((id) => {
+    try {
+      return readFileSync(`/proc/${id}/cmdline`, 'utf8').split('\0').includes(flag);
+    } catch {
+      return false;
+    }
+  });
+}
 
 /** Starts Chrome on `profile` (`args`: more of its flags, such as a net log). */
 export async function launch(binary, { profile, downloads, headless = true, args = [] }) {
@@ -56,10 +74,24 @@ export async function launch(binary, { profile, downloads, headless = true, args
     send,
     on: (listener) => listeners.add(listener),
     off: (listener) => listeners.delete(listener),
-    /** Ends Chrome as a crash would: no clean shutdown. */
-    crash() {
+    /** Ends Chrome as a crash would: no clean shutdown. Resolves once no process of it
+     * is left on the profile (the browser process goes at once, its helpers, such as
+     * renderers, the network service and the crash handler, a moment later), so a
+     * Chrome started next never shares the profile with them. A relaunch after a crash
+     * can still meet SIGTRAP with a large profile; waiting for cleanup does not fix it. */
+    async crash() {
       child.kill('SIGKILL');
-      return new Promise((done) => (exited ? done() : child.once('exit', done)));
+      await new Promise((done) => (exited ? done() : child.once('exit', done)));
+      for (const until = Date.now() + 15_000; Date.now() < until && profileProcesses(profile).length;) {
+        await new Promise((done) => setTimeout(done, 100));
+      }
+      const left = profileProcesses(profile);
+      for (const id of left) {
+        try {
+          process.kill(Number(id), 'SIGKILL');
+        } catch {}
+      }
+      if (left.length) await new Promise((done) => setTimeout(done, 500));
     },
     async close() {
       if (exited) return;

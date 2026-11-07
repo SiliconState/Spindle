@@ -3,6 +3,11 @@
 // moved thread went into). Both belong to this extension's origin: no web page can
 // reach them.
 export const CHANNEL = 'spindle-engine';
+/** Requests for the engine go on a channel only it listens to, and each page's answers
+ * on one of that page's own: a large answer (an export, a file, a history) is copied to
+ * the page that asked, not to every open panel and preview tab. Events stay on CHANNEL. */
+export const REQUESTS = `${CHANNEL}:requests`;
+export const answersFor = (page) => `${CHANNEL}:answers:${page}`;
 
 const STORES = ['kv', 'keys', 'threads', 'bundles'];
 let opening = null;
@@ -55,6 +60,11 @@ export const remove = (store, key) => run(store, 'readwrite', (s) => s.delete(ke
  * undo work done since (a finished reset's). */
 export const removeDurably = (store, key) => run(store, 'readwrite', (s) => s.delete(key), 'strict');
 export const keysOf = (store) => run(store, 'readonly', (s) => s.getAllKeys());
+/** Whether `key` has a record, read without its value (a moved thread's file may be a
+ * gigabyte). */
+export const has = (store, key) => run(store, 'readonly', (s) => s.count(key)).then((count) => count > 0);
+/** The keys that start with `prefix`, read by range (not every key of the store). */
+export const keysWith = (store, prefix) => run(store, 'readonly', (s) => s.getAllKeys(IDBKeyRange.bound(prefix, `${prefix}\uffff`)));
 export const valuesOf = (store) => run(store, 'readonly', (s) => s.getAll());
 /** A store's records as [key, value] pairs, read in one transaction. */
 export async function entriesOf(store) {

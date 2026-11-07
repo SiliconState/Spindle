@@ -260,11 +260,12 @@ const READINGS = 4;
  * `mode` (`POLICY`): how it shows, given whether its frame can be `contained` and what
  * `allowed` says (`{scripts, web, version}`, a choice the user made: `web` lets it reach
  * the web over HTTPS, `scripts` lets it run where it cannot be contained). A choice holds
- * for the `version` it was made for only: the page, the bytes of its own scripts, and the
- * data files it or they name (the only ones it is given); `lapsed`: the choice (`'web'` or
- * `'scripts'`) made for another one. `version` is told whenever its scripts were read (for
- * a choice to be kept for it). `held`: it is made to show only in a frame that is
- * contained (it runs, or keeps its links). `sites`: those it seems to load from; `scripted`: whether
+ * for the `version` it was made for only: the page, the bytes of its own scripts and
+ * stylesheets, and the data files it or its scripts name (the only ones it is given);
+ * `lapsed`: the choice (`'web'` or `'scripts'`) made for another one. `version` is always
+ * told: a choice is offered, and kept, for it (one that takes nothing away holds without
+ * one). `held`: it is made to show only in a frame that is contained (it runs, or keeps
+ * its links). `sites`: those it seems to load from; `scripted`: whether
  * it has anything to run; `serve(name)`: the text of a data file its scripts fetch (null:
  * not given to it), for `previewFrame`. `files` lists the workspace ({path, size,
  * digest}); `read(path)` gives a file's bytes, checked against its digest. */
@@ -288,11 +289,17 @@ export async function pageOf({ path, files, read, html = null, allowed = null, c
     return listed && (await objectDigest(bytes)) === listed ? bytes : null;
   };
   const source = html ?? text(await read(path));
-  const doc = new DOMParser().parseFromString(source, 'text/html');
+  // Its inline handlers (onclick=...) are read here under a name of no meaning, and get
+  // their own back only in the page made (`page`): Edge checks one against the policy of
+  // the page reading it (the panel's or the file tab's, which run none) as soon as it is read, and lists
+  // each as an error of Spindle's, though nothing here would ever run it. The mark is
+  // taken out of all the text again, so the page is as its frame would read it unmarked.
+  const mark = `data-spindle-${hex(crypto.getRandomValues(new Uint8Array(6)))}-`;
+  const doc = new DOMParser().parseFromString(source.replace(/([\s/"'])(on[a-z]+\s*=)/gi, `$1${mark}$2`), 'text/html');
   const all = (selector) => everywhere(doc, selector);
   // What could run: scripts, event handlers, javascript: addresses.
   const scripted = all('script').length > 0 || all('*').some((element) =>
-    [...element.attributes].some((attribute) => /^on/i.test(attribute.name) || /^\s*javascript:/i.test(attribute.value)));
+    [...element.attributes].some((attribute) => attribute.name.startsWith(mark) || /^on/i.test(attribute.name) || /^\s*javascript:/i.test(attribute.value)));
   // The sites it would load from (by address in its elements, styles and scripts): as
   // written, and as its own files put in say.
   const sites = new Set();
@@ -309,33 +316,34 @@ export async function pageOf({ path, files, read, html = null, allowed = null, c
   // Nothing reaches a host by itself (`scrub`).
   scrub(doc);
   scan();
-  // Its scripts, as its version counts them: their bytes, read once and put in as read
-  // (when it may run, or there is a choice about it to check or keep).
-  const wanted = Boolean(allowed || (scripted && contained));
+  // Its scripts and stylesheets, as its version counts them: their bytes, read once and
+  // put in as read.
   const inlined = new Map();
+  const styles = new Map();
   let whole = true;
-  let version = null;
-  let named = [];
-  if (wanted) {
-    for (const script of doc.querySelectorAll('script[src]')) {
-      const name = local(script.getAttribute('src'));
-      if (!name || inlined.has(name)) continue;
-      const bytes = await checked(name);
-      if (!bytes) whole = false;
-      else inlined.set(name, bytes);
-    }
-    // The data files it may fetch: those its page or its scripts name.
-    const said = [source, ...[...inlined.values()].map(text)].join('\n');
-    named = files.filter((file) => DATA.test(file.path) && file.size <= MAX_DATA_FILE && file.path !== path && said.includes(file.path.split('/').pop()));
-    version = await digestOf([
-      source,
-      ...[...inlined].map(([name, bytes]) => `${name}\0${bytes.length}\0${text(bytes)}`),
-      ...named.map((file) => `${file.path}\0${file.digest}`),
-    ].join('\0'));
+  for (const script of doc.querySelectorAll('script[src]')) {
+    const name = local(script.getAttribute('src'));
+    if (!name || inlined.has(name)) continue;
+    const bytes = await checked(name);
+    if (!bytes) whole = false;
+    else inlined.set(name, bytes);
   }
+  for (const link of doc.querySelectorAll('link[rel~="stylesheet"][href]')) {
+    const name = local(link.getAttribute('href'));
+    if (name && !styles.has(name)) styles.set(name, await read(name));
+  }
+  // The data files it may fetch: those its page or its scripts name.
+  const said = [source, ...[...inlined.values()].map(text)].join('\n');
+  const named = files.filter((file) => DATA.test(file.path) && file.size <= MAX_DATA_FILE && file.path !== path && said.includes(file.path.split('/').pop()));
+  const version = await digestOf([
+    source,
+    ...[...inlined].map(([name, bytes]) => `${name}\0${bytes.length}\0${text(bytes)}`),
+    ...[...styles].map(([name, bytes]) => `style\0${name}\0${bytes.length}\0${text(bytes)}`),
+    ...named.map((file) => `${file.path}\0${file.digest}`),
+  ].join('\0'));
   // A script of its own not as listed (changed since): nothing runs. What the user let it
-  // do holds for this version (a choice made without one, as it is shown: for any).
-  const holds = allowed?.version == null || allowed.version === version;
+  // do holds for the version it names only; a choice that gives it nothing holds for any.
+  const holds = allowed?.version === version || !(allowed?.scripts || allowed?.web);
   let mode = !whole ? 'static'
     : allowed?.web && holds ? 'web'
     : scripted && contained ? 'contained'
@@ -357,7 +365,8 @@ export async function pageOf({ path, files, read, html = null, allowed = null, c
     const name = local(link.getAttribute('href'));
     if (!name) continue;
     const style = doc.createElement('style');
-    style.textContent = text(await read(name));
+    // A `</style` in it would end the element, and what follows would be markup.
+    style.textContent = text(styles.get(name)).replace(/<\/style/gi, '<\\/style');
     link.replaceWith(style);
   }
   for (const element of doc.querySelectorAll('img[src], source[src], video[src], audio[src], link[rel~="icon"][href], image[href]')) {
@@ -439,6 +448,7 @@ export async function pageOf({ path, files, read, html = null, allowed = null, c
     }
     page = `<!doctype html>\n${again.documentElement.outerHTML}`;
   }
+  page = page.replaceAll(mark, '');
   const held = contained && mode !== 'web';
   return { html: page, mode, held, sites: [...sites].sort(), scripted, serve: runs ? serve : async () => null, version, lapsed };
 }
@@ -497,6 +507,16 @@ function frameOf(src, title, handlers) {
   sweep();
   const frame = document.createElement('iframe');
   frame.title = title;
+  // Sandboxed as preview.html's own policy sandboxes it (manifest.json), whatever the frame
+  // goes to after (that policy goes with its document; this stays with the frame): no
+  // popup, form, download or navigation of the page around it. Modals only so that it
+  // may print (Chrome counts printing as one); preview.js keeps the page's alert,
+  // confirm, prompt and "Leave site?" as they were without it (nothing shows), and its
+  // printing to what the user asks. Its origin is that policy's to take away
+  // (preview.html's is opaque): Chrome does not send a frame sandboxed without
+  // allow-same-origin through Spindle's service worker, so it would never be contained
+  // (`containment`).
+  frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-modals');
   frames.add({ frame, ...handlers, loaded: false, made: Date.now() });
   frame.src = src;
   return frame;

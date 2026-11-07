@@ -464,6 +464,40 @@ pub fn load(db: &Connection, stored: &[u8], bound: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The first `want` logical bytes of a stored value (fewer when it is shorter): a
+/// chunked value reads only its first chunk, checked against its digest, so a header
+/// read costs one chunk however long the value is.
+pub fn load_prefix(db: &Connection, stored: &[u8], bound: usize, want: usize) -> Result<Vec<u8>> {
+    if stored.first() != Some(&CHUNKED) {
+        let mut bytes = unpack(stored, bound)?;
+        bytes.truncate(want);
+        return Ok(bytes);
+    }
+    let rest = &stored[1..];
+    if rest.len() < 8 + 32 || !(rest.len() - 8).is_multiple_of(32) {
+        return Err(Error::Incompatible);
+    }
+    let length = u64::from_be_bytes(rest[..8].try_into().map_err(|_| Error::Incompatible)?);
+    if length <= INLINE as u64 || length > bound as u64 {
+        return Err(Error::Incompatible);
+    }
+    let digest = &rest[8..40];
+    let packed: Vec<u8> = crate::cached_row(
+        db,
+        "SELECT bytes FROM chunks WHERE digest=?1",
+        [digest],
+        |row| crate::bounded_blob(row, 0, stored_bound(CHUNK_MAX)),
+    )
+    .optional()?
+    .ok_or(Error::Incompatible)?;
+    let mut chunk = unpack(&packed, CHUNK_MAX)?;
+    if chunk.is_empty() || sha256(&chunk)[..] != *digest {
+        return Err(Error::Incompatible);
+    }
+    chunk.truncate(want);
+    Ok(chunk)
+}
+
 fn fingerprint(block: &[u8]) -> u64 {
     block.iter().fold(0u64, |hash, byte| {
         hash.wrapping_mul(BASE).wrapping_add(u64::from(*byte))

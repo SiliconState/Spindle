@@ -14,6 +14,9 @@ pub(super) struct Request {
     length: usize,
     /// Whether the whole body has been read (`read_body`) or streamed (`stream_body`).
     whole: bool,
+    /// Through the tunnel with Cloudflare Access: when its token stops verifying
+    /// (`access::Identity::until`), which an event stream does not outlast.
+    pub access_until: Option<u64>,
 }
 
 /// Reads the request head (the body is read by `read_body`, once the request has
@@ -34,7 +37,8 @@ fn read_head(stream: &mut TcpStream, total: Duration) -> Result<Request, String>
 }
 
 /// Reads the rest of the body within an overall deadline: 10 s, or 2 minutes for an
-/// attachment upload (8 MiB over a slow link). The buffer grows as bytes arrive.
+/// attachment upload (8 MiB over a slow link). The buffer is reserved at the declared
+/// length (within the route's limit), never regrown and copied as bytes arrive.
 pub(super) fn read_body(stream: &mut TcpStream, request: &mut Request) -> Result<(), String> {
     let total = if upload(&request.path) || request.path == "/v1/run" {
         Duration::from_secs(120)
@@ -99,6 +103,12 @@ impl Request {
     pub(super) fn length(&self) -> usize {
         self.length
     }
+    /// Whether the Access token this request came in with has stopped verifying (never,
+    /// for a request that needed none).
+    pub(super) fn access_lapsed(&self) -> bool {
+        self.access_until
+            .is_some_and(|until| super::access::now() > until)
+    }
     /// Whether body bytes the client sent are still unread.
     pub(super) fn unread(&self) -> bool {
         !self.whole && self.body.len() < self.length
@@ -146,6 +156,9 @@ fn finish<S: Read>(
     mut before_read: impl FnMut(&mut S) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut chunk = vec![0u8; 64 * 1024];
+    request
+        .body
+        .reserve_exact(request.length.saturating_sub(request.body.len()));
     while request.body.len() < request.length {
         before_read(stream)?;
         let want = (request.length - request.body.len()).min(chunk.len());
@@ -281,6 +294,7 @@ fn parse<S: Read>(
         whole: body.len() == size,
         body,
         length: size,
+        access_until: None,
     })
 }
 
@@ -388,6 +402,7 @@ fn head(
         413 => "Content Too Large",
         429 => "Too Many Requests",
         503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         _ => "Internal Server Error",
     };
     write!(
@@ -478,6 +493,12 @@ mod tests {
         let head = parse(&mut &b"POST /api/sessions/s/upload HTTP/1.1\r\nHost: x\r\nContent-Length: 8388608\r\n\r\nab"[..], |_| Ok(())).unwrap();
         assert_eq!(head.body, b"ab");
         assert!(head.body.capacity() < 64 * 1024);
+        // Read whole, it is held once at its size: never regrown (and copied) on the way.
+        let mut head = head;
+        let rest = vec![b'x'; 8388608 - 2];
+        finish(&mut &rest[..], &mut head, |_| Ok(())).unwrap();
+        assert_eq!(head.body.len(), 8388608);
+        assert_eq!(head.body.capacity(), 8388608);
     }
     /// A head trickled a byte at a time, each well inside the per-read timeout, still ends
     /// at the overall deadline (refused as too slow, or as incomplete when the last read

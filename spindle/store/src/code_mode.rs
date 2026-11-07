@@ -128,8 +128,9 @@ pub trait Host {
         None
     }
     /// Dollar caps, checked before new children are reserved: `prepared` are the new
-    /// children, `journal` every record this script already has. An error refuses them
-    /// all (nothing is reserved or sent). The default sets no dollar cap.
+    /// children, `journal` the records of this script's earlier model calls (strings
+    /// over 4 KiB as digests). An error refuses them all (nothing is reserved or sent).
+    /// The default sets no dollar cap.
     fn admit_spend(
         &mut self,
         prepared: &[&Value],
@@ -193,12 +194,135 @@ fn fit_batch(mut responses: Vec<Value>) -> Vec<Value> {
 }
 pub(crate) use crate::artifact::child_stage;
 
+/// What `code_plan` checks of one script's journal, kept on this connection as
+/// `artifact::usage` keeps its counts: a row per reserved child (whether its outcome is
+/// known; a model call's records for dollar caps, strings over 4 KiB as digests), for
+/// the script last asked about. It is read from the journal once per connection and
+/// script, then kept in the transaction writing each record, so a script's nested
+/// calls never reread its journal.
+const TALLY: &str = "CREATE TEMP TABLE IF NOT EXISTS code_tallied(id INTEGER PRIMARY KEY CHECK(id=1), parent TEXT NOT NULL, epoch INTEGER NOT NULL, calls INTEGER NOT NULL);
+     CREATE TEMP TABLE IF NOT EXISTS code_tally(id INTEGER PRIMARY KEY, model INTEGER NOT NULL, budget INTEGER NOT NULL, known INTEGER NOT NULL, reserved TEXT, result TEXT);";
+
+/// Counts reserved child `id` of `parent` when the tally is that script's. Its budget is
+/// held at most just past the ceiling: only how the sum compares with a cap matters.
+fn tally_reserved(
+    db: &rusqlite::Connection,
+    parent: &str,
+    epoch: u64,
+    id: u64,
+    record: &Value,
+) -> Result<()> {
+    db.execute_batch(TALLY)?;
+    let model = record["request"]["method"] == "model";
+    let budget = record["budget"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(MAX_MODEL_BUDGET + 1);
+    db.prepare_cached("INSERT OR REPLACE INTO temp.code_tally SELECT ?1,?2,?3,0,?4,NULL FROM temp.code_tallied WHERE parent=?5 AND epoch=?6")?
+        .execute(params![id as i64, model, budget as i64, model.then(|| record.to_string()), parent, epoch as i64])?;
+    Ok(())
+}
+
+/// Settles child `id` of `parent` in the tally (when it is that script's): a result
+/// recording an unknown outcome leaves it uncertain.
+fn tally_result(
+    db: &rusqlite::Connection,
+    parent: &str,
+    epoch: u64,
+    id: u64,
+    record: &Value,
+) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    db.execute_batch(TALLY)?;
+    let Some(model) = db
+        .prepare_cached("SELECT model FROM temp.code_tally WHERE id=?1 AND EXISTS(SELECT 1 FROM temp.code_tallied WHERE parent=?2 AND epoch=?3)")?
+        .query_row(params![id as i64, parent, epoch as i64], |r| r.get::<_, bool>(0))
+        .optional()?
+    else {
+        return Ok(());
+    };
+    db.prepare_cached("UPDATE temp.code_tally SET known=?2, result=?3 WHERE id=?1")?
+        .execute(params![
+            id as i64,
+            !unknown_outcome(&record["response"]),
+            model.then(|| journal_form(record).to_string())
+        ])?;
+    Ok(())
+}
+
+/// A script's journal as `code_plan` checks it: children reserved, model calls among
+/// them, their summed budget and children whose outcome is not known.
+struct Tally {
+    used: usize,
+    models: usize,
+    budget: u64,
+    uncertain: usize,
+}
+
 impl Store {
-    /// Journal records of children `0..calls` of `parent`, by child id, in one query.
-    fn child_records(&self, parent: &str, calls: usize) -> Result<BTreeMap<u64, Vec<Value>>> {
-        let stages: BTreeMap<String, u64> = (0..calls as u64)
-            .map(|id| (child_stage(parent, id), id))
-            .collect();
+    /// The tally of `parent`'s children `0..calls`, read from its journal when this
+    /// connection does not hold it yet.
+    fn code_tally(&mut self, parent: &str, calls: usize) -> Result<Tally> {
+        let epoch = self.epoch;
+        self.db.execute_batch(TALLY)?;
+        let held: bool = self
+            .db
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM temp.code_tallied WHERE parent=?1 AND epoch=?2 AND calls=?3)")?
+            .query_row(params![parent, epoch as i64, calls as i64], |r| r.get(0))?;
+        if !held {
+            let journals = self.child_records(parent, 0..calls as u64)?;
+            let tx = self.db.transaction()?;
+            tx.execute_batch("DELETE FROM temp.code_tally; DELETE FROM temp.code_tallied;")?;
+            tx.execute(
+                "INSERT INTO temp.code_tallied VALUES(1,?1,?2,?3)",
+                params![parent, epoch as i64, calls as i64],
+            )?;
+            for (id, records) in &journals {
+                if let Some(reserved) = records.iter().find(|v| v["kind"] == "reserved") {
+                    tally_reserved(&tx, parent, epoch, *id, reserved)?;
+                    if let Some(result) = records.iter().find(|v| v["kind"] == "result") {
+                        tally_result(&tx, parent, epoch, *id, result)?;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(self.db.prepare_cached("SELECT count(*),coalesce(sum(model),0),coalesce(sum(budget),0),coalesce(sum(1-known),0) FROM temp.code_tally")?
+            .query_row([], |r| {
+                Ok(Tally {
+                    used: r.get::<_, i64>(0)? as usize,
+                    models: r.get::<_, i64>(1)? as usize,
+                    budget: r.get::<_, i64>(2)? as u64,
+                    uncertain: r.get::<_, i64>(3)? as usize,
+                })
+            })?)
+    }
+
+    /// The tallied script's model calls, as journaled (reservation, then any result).
+    fn code_tally_models(&self) -> Result<Vec<Value>> {
+        let mut query = self.db.prepare_cached(
+            "SELECT reserved,result FROM temp.code_tally WHERE model ORDER BY id",
+        )?;
+        let rows = query.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut records = vec![];
+        for row in rows {
+            let (reserved, result) = row?;
+            for text in std::iter::once(reserved).chain(result) {
+                records.push(serde_json::from_str(&text).map_err(|_| Error::Incompatible)?);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Journal records of children `ids` of `parent`, by child id, in one query.
+    fn child_records(
+        &self,
+        parent: &str,
+        ids: std::ops::Range<u64>,
+    ) -> Result<BTreeMap<u64, Vec<Value>>> {
+        let stages: BTreeMap<String, u64> = ids.map(|id| (child_stage(parent, id), id)).collect();
         let mut records: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
         if stages.is_empty() {
             return Ok(records);
@@ -348,7 +472,8 @@ impl Store {
         } else {
             vec![journal_form(request)]
         };
-        let journals = self.child_records(&parent.attempt.id, limits.calls)?;
+        let journals =
+            self.child_records(&parent.attempt.id, first..first + children.len() as u64)?;
         let mut stages = Vec::with_capacity(children.len());
         let mut replayed = Vec::new();
         for (child, id) in children.iter().zip(first..) {
@@ -378,31 +503,19 @@ impl Store {
                 json!({"ok":false,"may_have_run":true,"error":"batch is partially reserved; inspect receipts before an explicit new attempt"}),
             ));
         }
-        let mut used = 0usize;
-        let mut models_used = 0usize;
-        let mut budget = 0u64;
-        for records in journals.values() {
-            // A reservation without a recorded result is uncertain, as is a result
-            // that itself records an unknown outcome; a recorded failure (a refused
-            // request, an exit status) is a known outcome.
-            if records.iter().any(|v| v["kind"] == "reserved")
-                && !records
-                    .iter()
-                    .any(|v| v["kind"] == "result" && !unknown_outcome(&v["response"]))
-            {
-                return Ok(CodePlan::Reply(
-                    json!({"ok":false,"may_have_run":true,"error":"an earlier child outcome is uncertain; inspect receipts before starting new external work"}),
-                ));
-            }
-            for record in records {
-                if record["kind"] == "reserved" {
-                    used += 1;
-                    if record["request"]["method"] == "model" {
-                        models_used += 1;
-                    }
-                    budget = budget.saturating_add(record["budget"].as_u64().unwrap_or(0));
-                }
-            }
+        let Tally {
+            used,
+            models: models_used,
+            mut budget,
+            uncertain,
+        } = self.code_tally(&parent.attempt.id, limits.calls)?;
+        // A reservation without a recorded result is uncertain, as is a result that
+        // itself records an unknown outcome; a recorded failure (a refused request, an
+        // exit status) is a known outcome.
+        if uncertain > 0 {
+            return Ok(CodePlan::Reply(
+                json!({"ok":false,"may_have_run":true,"error":"an earlier child outcome is uncertain; inspect receipts before starting new external work"}),
+            ));
         }
         let new_models = calls.iter().filter(|(name, _)| *name == "model").count();
         if used + calls.len() > limits.calls || models_used + new_models > limits.model_calls {
@@ -442,7 +555,8 @@ impl Store {
             prepared.push((value, allowance));
         }
         if new_models > 0 {
-            let recorded: Vec<&Value> = journals.values().flatten().collect();
+            let recorded = self.code_tally_models()?;
+            let recorded: Vec<&Value> = recorded.iter().collect();
             let fresh: Vec<&Value> = prepared.iter().map(|(value, _)| value).collect();
             if let Err(error) = host.admit_spend(&fresh, &recorded) {
                 return Ok(CodePlan::Reply(failure(&error)));
@@ -489,7 +603,14 @@ impl Store {
         index: usize,
     ) -> Result<()> {
         self.begin_stage(&plan.stages[index])?;
-        self.put_object(&plan.stages[index], &serde_json::to_vec(&json!({"kind":"reserved","parent":parent.attempt.id,"request":plan.children[index],"prepared":journal_form(&plan.prepared[index]),"budget":plan.allowances[index]})).map_err(|_| Error::Invalid)?)?;
+        let record = json!({"kind":"reserved","parent":parent.attempt.id,"request":plan.children[index],"prepared":journal_form(&plan.prepared[index]),"budget":plan.allowances[index]});
+        let (epoch, id) = (self.epoch, plan.first + index as u64);
+        self.put_object_checked(
+            &plan.stages[index],
+            &serde_json::to_vec(&record).map_err(|_| Error::Invalid)?,
+            false,
+            |tx, _| tally_reserved(tx, &parent.attempt.id, epoch, id, &record),
+        )?;
         Ok(())
     }
 
@@ -662,14 +783,15 @@ impl Store {
         {
             response = json!({"ok":false,"may_have_run":true,"unknown":true,"error":"child reply exceeded 1000 KiB; inspect external effects"});
         }
-        self.put_object(
+        let mut record = json!({"kind":"result","parent":parent.attempt.id,"id":id,"response":response,"private":private});
+        let epoch = self.epoch;
+        self.put_object_checked(
             stage,
-            &serde_json::to_vec(
-                &json!({"kind":"result","parent":parent.attempt.id,"id":id,"response":response,"private":private}),
-            )
-            .map_err(|_| Error::Invalid)?,
+            &serde_json::to_vec(&record).map_err(|_| Error::Invalid)?,
+            false,
+            |tx, _| tally_result(tx, &parent.attempt.id, epoch, id, &record),
         )?;
-        Ok(response)
+        Ok(record["response"].take())
     }
 
     /// Operator inspection; this never resumes or retries child effects.
@@ -987,6 +1109,47 @@ mod tests {
             false
         );
         assert_eq!(host.calls, cap);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The caps refuse at the same count across a reopen (the tally is read from the
+    /// journal once), and a connection's later requests never reread the journal.
+    #[test]
+    fn journal_tally_is_read_once_per_connection_with_the_same_caps() {
+        let (root, mut store, mut parent) = fixture();
+        let mut host = Fixture {
+            calls: 0,
+            budget: 1,
+            panic: false,
+        };
+        let cap = Limits::default().model_calls as u64;
+        for n in 0..cap / 2 {
+            assert_eq!(call(&mut store, &parent, &mut host, n, "model")["ok"], true);
+        }
+        drop(store);
+        let mut store = Store::open(&root).unwrap();
+        parent.owner_epoch = store.epoch();
+        for n in cap / 2..cap {
+            assert_eq!(call(&mut store, &parent, &mut host, n, "model")["ok"], true);
+        }
+        let refused = call(&mut store, &parent, &mut host, cap, "model");
+        assert_eq!(refused["error"], "child call cap reached", "{refused}");
+        assert_eq!(host.calls as u64, cap);
+        // Unpinning the earlier children's journal changes nothing this connection
+        // counts: it was read once, then kept as each record was written.
+        for n in 0..cap {
+            store
+                .db
+                .execute(
+                    "DELETE FROM staging_pins WHERE stage=?1",
+                    [child_stage("parent", n)],
+                )
+                .unwrap();
+        }
+        let refused = call(&mut store, &parent, &mut host, cap, "model");
+        assert_eq!(refused["error"], "child call cap reached", "{refused}");
+        assert_eq!(host.calls as u64, cap);
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

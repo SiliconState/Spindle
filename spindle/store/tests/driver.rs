@@ -14,7 +14,7 @@ use spindle_store::driver::{
     self, Answer, Driver, Env, Event, Inbox, Need, Observer, Settings, Start, ToolNeed,
 };
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,6 +37,7 @@ impl Drop for Realm {
 #[derive(Default)]
 struct Facts {
     events: Mutex<Vec<&'static str>>,
+    interrupted: AtomicBool,
 }
 impl Inbox for Facts {
     fn next_steer(&self) -> Option<String> {
@@ -50,7 +51,7 @@ impl Inbox for Facts {
         vec![]
     }
     fn interrupted(&self) -> bool {
-        false
+        self.interrupted.load(Ordering::SeqCst)
     }
 }
 impl Observer for Facts {
@@ -68,6 +69,7 @@ impl Observer for Facts {
             Event::Stopped { .. } => "stopped",
             Event::AppToolDetails { .. } => "app_tool_details",
             Event::ProviderRetry { .. } => "provider_retry",
+            Event::Compacted { .. } => "compacted",
             _ => "other",
         });
     }
@@ -157,10 +159,25 @@ fn setup() -> (Realm, Store, Arc<Facts>, Driver) {
     (realm, store, facts, driver)
 }
 fn send(driver: &mut Driver, store: &mut Store) -> Box<driver::ModelNeed> {
+    let mut next = None;
     for _ in 0..20 {
-        match driver.next(store).unwrap() {
+        match next.take().map_or_else(|| driver.next(store), Ok).unwrap() {
             Need::Continue => {}
             Need::Send(need) => return need,
+            // A compaction: the digest stands in for a summary.
+            Need::Summarize(need) => {
+                next = Some(
+                    driver
+                        .deliver(
+                            store,
+                            Answer::Summary {
+                                need,
+                                summary: None,
+                            },
+                        )
+                        .unwrap(),
+                )
+            }
             _ => panic!("expected model need"),
         }
     }
@@ -683,6 +700,17 @@ fn admitted_task_report_replays_before_a_newly_finished_earlier_task() {
     .unwrap();
     let mut store = Store::open(&realm.0.join("store")).unwrap();
     let mut engine = driver(&facts);
+    assert!(matches!(engine.resume(&mut store).unwrap(), Need::TaskWait));
+    assert!(
+        store
+            .task_runs()
+            .unwrap()
+            .iter()
+            .all(|run| run.delivered.is_none())
+    );
+    for task in ["app:a", "app:b"] {
+        engine.offer_task_changes(task, Ok(driver::TaskChanges::default()));
+    }
     assert!(matches!(engine.resume(&mut store).unwrap(), Need::Continue));
     let runs = store.task_runs().unwrap();
     assert!(runs[0].delivered.is_none());
@@ -789,6 +817,7 @@ fn a_stopped_task_reports_so_and_a_stale_admitted_report_is_dropped_once_it_goes
     .unwrap();
     let mut store = Store::open(&realm.0.join("store")).unwrap();
     let mut engine = driver(&facts);
+    engine.offer_task_changes("app:a", Ok(driver::TaskChanges::default()));
     let mut need = engine.resume(&mut store).unwrap();
     for _ in 0..40 {
         match need {
@@ -809,6 +838,221 @@ fn a_stopped_task_reports_so_and_a_stale_admitted_report_is_dropped_once_it_goes
             .unwrap()
             .is_some()
     );
+    store.check_integrity().unwrap();
+}
+
+#[test]
+fn a_finished_task_waits_for_its_files_before_its_report_is_committed() {
+    let (_realm, mut store, _facts, mut engine) = setup();
+    start(&mut engine, &mut store);
+    let need = send(&mut engine, &mut store);
+    let outcome = record(&mut store, &need, vec![text("done")]);
+    deliver(&mut engine, &mut store, need, outcome);
+    finish(&mut engine, &mut store);
+    let snapshot = store.snapshot().unwrap();
+    let input = br#"{"prompt":"write a file"}"#;
+    store
+        .register_task(&spindle_store::meta::TaskRun {
+            task: "app:writer".into(),
+            origin: None,
+            input: input.to_vec(),
+            base: snapshot.workspace.unwrap(),
+            revision: snapshot.revision,
+            queued: true,
+            state: "running".into(),
+            answer: None,
+            delivered: None,
+            lease: None,
+        })
+        .unwrap();
+    store
+        .finish_task_run(
+            "app:writer",
+            input,
+            spindle_store::meta::TaskEnd::Answered(br#"{"content":"written","failed":false}"#),
+        )
+        .unwrap();
+    for _ in 0..3 {
+        assert!(matches!(engine.next(&mut store).unwrap(), Need::TaskWait));
+        assert_eq!(store.head_revision().unwrap(), snapshot.revision);
+        assert!(store.task_runs().unwrap()[0].delivered.is_none());
+    }
+    engine.offer_task_changes(
+        "app:writer",
+        Ok(driver::TaskChanges {
+            writes: vec![("from-task.txt".into(), b"kept".to_vec(), false)],
+            ..Default::default()
+        }),
+    );
+    assert!(matches!(engine.next(&mut store).unwrap(), Need::Continue));
+    let run = store.task_runs().unwrap().remove(0);
+    let revision = run.delivered.unwrap();
+    let root = store
+        .snapshot_at("operator", revision)
+        .unwrap()
+        .workspace
+        .unwrap();
+    let tree = store.tree_map("operator", &root).unwrap();
+    assert_eq!(tree.files[0].path, "from-task.txt");
+    assert_eq!(
+        store
+            .read_object("operator", &tree.files[0].object)
+            .unwrap(),
+        b"kept"
+    );
+    store.check_integrity().unwrap();
+}
+
+#[test]
+fn a_task_file_error_survives_report_clipping_and_is_only_added_once() {
+    let (_realm, mut store, _facts, mut engine) = setup();
+    start(&mut engine, &mut store);
+    let need = send(&mut engine, &mut store);
+    let outcome = record(&mut store, &need, vec![text("done")]);
+    deliver(&mut engine, &mut store, need, outcome);
+    finish(&mut engine, &mut store);
+    let snapshot = store.snapshot().unwrap();
+    let input = br#"{"prompt":"write a file"}"#;
+    let answer = json!({"content": "x".repeat(64 * 1024), "failed": false}).to_string();
+    store
+        .register_task(&spindle_store::meta::TaskRun {
+            task: "app:writer".into(),
+            origin: None,
+            input: input.to_vec(),
+            base: snapshot.workspace.unwrap(),
+            revision: snapshot.revision,
+            queued: true,
+            state: "running".into(),
+            answer: None,
+            delivered: None,
+            lease: None,
+        })
+        .unwrap();
+    store
+        .finish_task_run(
+            "app:writer",
+            input,
+            spindle_store::meta::TaskEnd::Answered(answer.as_bytes()),
+        )
+        .unwrap();
+    let note = "[task files could not be read; they stay in the task]";
+    store.amend_task_answer("app:writer", note).unwrap();
+    engine.offer_task_changes("app:writer", Err(note.into()));
+    assert!(matches!(engine.next(&mut store).unwrap(), Need::Continue));
+    let run = store.task_runs().unwrap().remove(0);
+    let report =
+        spindle_store::turn::task_report_of(&run.task, false, run.answer.as_deref()).unwrap();
+    assert!(
+        report.contains(note),
+        "the file failure must survive report clipping"
+    );
+    assert_eq!(report.matches(note).count(), 1);
+    assert!(report.len() <= 64 * 1024);
+    assert_eq!(
+        store.head_root().unwrap().1,
+        store
+            .snapshot_at("operator", snapshot.revision)
+            .unwrap()
+            .workspace
+    );
+    store.check_integrity().unwrap();
+}
+
+#[test]
+fn stopping_between_tools_takes_precedence_over_pending_task_files() {
+    let (_realm, mut store, facts, mut engine) = setup();
+    start(&mut engine, &mut store);
+    let need = send(&mut engine, &mut store);
+    let outcome = record(&mut store, &need, vec![call()]);
+    deliver(&mut engine, &mut store, need, outcome);
+    let need = app(&mut engine, &mut store);
+    engine.reserve_app(&mut store, &need).unwrap();
+    let outcome = engine
+        .record_app(
+            &mut store,
+            &need,
+            AppAnswer::from_json(&json!({"content":"found"})).unwrap(),
+        )
+        .unwrap();
+    engine
+        .deliver(
+            &mut store,
+            Answer::App {
+                need,
+                outcome: Ok(outcome),
+                waiting: None,
+            },
+        )
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let input = br#"{"prompt":"write a file"}"#;
+    store
+        .register_task(&spindle_store::meta::TaskRun {
+            task: "app:writer".into(),
+            origin: None,
+            input: input.to_vec(),
+            base: snapshot.workspace.unwrap(),
+            revision: snapshot.revision,
+            queued: true,
+            state: "running".into(),
+            answer: None,
+            delivered: None,
+            lease: None,
+        })
+        .unwrap();
+    store
+        .finish_task_run(
+            "app:writer",
+            input,
+            spindle_store::meta::TaskEnd::Answered(br#"{"content":"written","failed":false}"#),
+        )
+        .unwrap();
+    facts.interrupted.store(true, Ordering::SeqCst);
+    assert!(matches!(engine.next(&mut store), Err(error) if error == driver::STOPPED_HERE));
+    assert_eq!(store.head_revision().unwrap(), snapshot.revision);
+    assert!(store.task_runs().unwrap()[0].delivered.is_none());
+    facts.interrupted.store(false, Ordering::SeqCst);
+    assert!(matches!(engine.next(&mut store).unwrap(), Need::TaskWait));
+    engine.offer_task_changes("app:writer", Ok(driver::TaskChanges::default()));
+    assert!(matches!(engine.next(&mut store).unwrap(), Need::Continue));
+    assert!(store.task_runs().unwrap()[0].delivered.is_some());
+    store.check_integrity().unwrap();
+}
+
+#[test]
+fn a_discarded_task_does_not_need_a_file_offer() {
+    let (_realm, mut store, _facts, mut engine) = setup();
+    start(&mut engine, &mut store);
+    let need = send(&mut engine, &mut store);
+    let outcome = record(&mut store, &need, vec![text("done")]);
+    deliver(&mut engine, &mut store, need, outcome);
+    finish(&mut engine, &mut store);
+    let snapshot = store.snapshot().unwrap();
+    let input = br#"{"prompt":"write a file","files":"discard"}"#;
+    store
+        .register_task(&spindle_store::meta::TaskRun {
+            task: "app:writer".into(),
+            origin: None,
+            input: input.to_vec(),
+            base: snapshot.workspace.clone().unwrap(),
+            revision: snapshot.revision,
+            queued: true,
+            state: "running".into(),
+            answer: None,
+            delivered: None,
+            lease: None,
+        })
+        .unwrap();
+    store
+        .finish_task_run(
+            "app:writer",
+            input,
+            spindle_store::meta::TaskEnd::Answered(br#"{"content":"written","failed":false}"#),
+        )
+        .unwrap();
+    assert!(matches!(engine.next(&mut store).unwrap(), Need::Continue));
+    assert!(store.task_runs().unwrap()[0].delivered.is_some());
+    assert_eq!(store.head_root().unwrap().1, snapshot.workspace);
     store.check_integrity().unwrap();
 }
 
@@ -1188,4 +1432,358 @@ fn driver_sources_have_no_native_effect_dependencies() {
             assert!(!source.contains(forbidden), "{file} contains {forbidden}");
         }
     }
+}
+
+fn calls(n: usize) -> Vec<Block> {
+    (0..n)
+        .map(|i| Block::ToolUse {
+            id: format!("call-{i}"),
+            name: "lookup".into(),
+            input: json!({"q": i}),
+        })
+        .collect()
+}
+
+fn delivered(
+    driver: &mut Driver,
+    store: &mut Store,
+    need: Box<driver::ModelNeed>,
+    outcome: DispatchOutcome,
+) -> driver::Result<Need> {
+    driver.deliver(
+        store,
+        Answer::Model {
+            need,
+            sent: driver::ModelSent {
+                outcome: Ok(outcome),
+                streamed: false,
+                cut: None,
+                rejection: None,
+            },
+        },
+    )
+}
+
+fn answer(driver: &mut Driver, store: &mut Store, content: &str) {
+    let need = app(driver, store);
+    driver.reserve_app(store, &need).unwrap();
+    let outcome = driver
+        .record_app(
+            store,
+            &need,
+            AppAnswer::Result {
+                content: content.into(),
+                failed: false,
+                writes: vec![],
+                deletes: vec![],
+                links: vec![],
+                directories: vec![],
+                state: None,
+                details: None,
+            },
+        )
+        .unwrap();
+    driver
+        .deliver(
+            store,
+            Answer::App {
+                need,
+                outcome: Ok(outcome),
+                waiting: None,
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_reply_with_as_many_calls_as_the_engine_allows_is_adopted_and_reopens() {
+    for n in [9, 256] {
+        let (realm, mut store, _facts, mut engine) = setup();
+        start(&mut engine, &mut store);
+        let need = send(&mut engine, &mut store);
+        let outcome = record(&mut store, &need, calls(n));
+        assert!(matches!(
+            delivered(&mut engine, &mut store, need, outcome).unwrap(),
+            Need::Continue
+        ));
+        let revision = store.snapshot().unwrap().revision;
+        assert_eq!(store.intents(revision).unwrap().len(), n);
+        // Every call is answered in turn, and the store still opens (each intent's
+        // position is within the limit validation checks).
+        answer(&mut engine, &mut store, "found");
+        drop(store);
+        let mut store = Store::open(&realm.0).unwrap();
+        store.check_integrity().unwrap();
+        assert_eq!(store.intents(revision).unwrap().len(), n);
+    }
+}
+
+#[test]
+fn a_tool_name_the_store_cannot_label_is_kept_as_a_call_to_refuse() {
+    for name in ["read file", "functions.lookup<|x|>", &"x".repeat(129)] {
+        let (_realm, mut store, _facts, mut engine) = setup();
+        start(&mut engine, &mut store);
+        let need = send(&mut engine, &mut store);
+        let outcome = record(
+            &mut store,
+            &need,
+            vec![Block::ToolUse {
+                id: "c1".into(),
+                name: name.into(),
+                input: json!({}),
+            }],
+        );
+        delivered(&mut engine, &mut store, need, outcome).unwrap();
+        let revision = store.snapshot().unwrap().revision;
+        let intents = store.intents(revision).unwrap();
+        assert_eq!(intents.len(), 1);
+        assert!(intents[0].adapter.starts_with("invalid:"), "{name}");
+        assert_eq!(intents[0].adapter, spindle_store::turn::tool_adapter(name));
+    }
+}
+
+/// A reply saved but never adoptable (here bytes no engine reads) is asked for again by
+/// retry, as an unknown outcome: in a fresh store for the session's first request, from
+/// the point before it otherwise. Continue says so.
+#[test]
+fn a_saved_reply_the_turn_cannot_adopt_is_retried_never_a_dead_end() {
+    fn unreadable(store: &mut Store, need: &driver::ModelNeed) {
+        let ModelReservation::Reserved(committed) = store
+            .reserve_turn_model(&need.request, &false.into(), |_| Ok(()))
+            .unwrap()
+        else {
+            panic!("fresh reservation")
+        };
+        assert!(
+            store
+                .ingest_turn_model(&need.request, &committed, b"not a reply".to_vec())
+                .is_err()
+        );
+    }
+    fn continued(engine: &mut Driver, store: &mut Store) -> String {
+        let Need::Send(need) = engine.resume(store).unwrap() else {
+            panic!("send")
+        };
+        let ModelReservation::Settled(outcome) = store
+            .reserve_turn_model(&need.request, &false.into(), |_| Ok(()))
+            .unwrap()
+        else {
+            panic!("settled")
+        };
+        delivered(engine, store, need, outcome).err().unwrap()
+    }
+    // The session's first request.
+    let (realm, store, facts, _) = setup();
+    drop(store);
+    let mut store = Store::open(&realm.0).unwrap();
+    let mut engine = driver(&facts);
+    start(&mut engine, &mut store);
+    let need = send(&mut engine, &mut store);
+    unreadable(&mut store, &need);
+    drop(store);
+    let mut store = Store::open(&realm.0).unwrap();
+    for _ in 0..2 {
+        let error = continued(&mut engine, &mut store);
+        assert!(
+            error.contains("`spindle retry` asks for it again"),
+            "{error}"
+        );
+    }
+    assert!(
+        matches!(engine.retry(&mut store).unwrap(), driver::Retry::FreshStore { prompt } if prompt == "go")
+    );
+    // Mid-turn: back to the point before the request, and on from there.
+    let (_realm, mut store, _facts, mut engine) = setup();
+    start(&mut engine, &mut store);
+    let need = send(&mut engine, &mut store);
+    let outcome = record(&mut store, &need, vec![call()]);
+    deliver(&mut engine, &mut store, need, outcome);
+    answer(&mut engine, &mut store, "found");
+    let need = send(&mut engine, &mut store);
+    unreadable(&mut store, &need);
+    let error = continued(&mut engine, &mut store);
+    assert!(
+        error.contains("`spindle retry` asks for it again"),
+        "{error}"
+    );
+    let driver::Retry::InPlace(Need::Continue) = engine.retry(&mut store).unwrap() else {
+        panic!("retried in place")
+    };
+    let need = send(&mut engine, &mut store);
+    let outcome = record(&mut store, &need, vec![text("done")]);
+    deliver(&mut engine, &mut store, need, outcome);
+    finish(&mut engine, &mut store);
+    store.check_integrity().unwrap();
+    // A message goes back past it too, and is read before the request is asked again.
+    let (_realm, mut store, _facts, mut engine) = setup();
+    start(&mut engine, &mut store);
+    let need = send(&mut engine, &mut store);
+    let outcome = record(&mut store, &need, vec![call()]);
+    deliver(&mut engine, &mut store, need, outcome);
+    answer(&mut engine, &mut store, "found");
+    let need = send(&mut engine, &mut store);
+    unreadable(&mut store, &need);
+    assert!(matches!(
+        engine.say(&mut store, "go on".into()).unwrap(),
+        Need::Continue
+    ));
+    let need = send(&mut engine, &mut store);
+    let outcome = record(&mut store, &need, vec![text("done")]);
+    deliver(&mut engine, &mut store, need, outcome);
+    finish(&mut engine, &mut store);
+}
+
+/// An app or task call whose answer cannot be kept (asking again would only repeat
+/// that) is recorded as failed: the turn goes on, and nothing waits on a call that
+/// never settles (a rewind would refuse to pass it).
+#[test]
+fn an_app_call_whose_answer_cannot_be_kept_is_recorded_as_failed() {
+    for reserved in [true, false] {
+        let (_realm, mut store, _facts, mut engine) = setup();
+        start(&mut engine, &mut store);
+        let need = send(&mut engine, &mut store);
+        let outcome = record(&mut store, &need, vec![call()]);
+        deliver(&mut engine, &mut store, need, outcome);
+        let need = app(&mut engine, &mut store);
+        if reserved {
+            engine.reserve_app(&mut store, &need).unwrap();
+        }
+        engine
+            .deliver(
+                &mut store,
+                Answer::App {
+                    need,
+                    outcome: Err(spindle_store::Error::TooLarge {
+                        size: 1 << 30,
+                        limit: 1 << 25,
+                    }),
+                    waiting: None,
+                },
+            )
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let state = TurnContinuation::restore(&snapshot.continuation).unwrap();
+        let transcript = state.transcript().unwrap();
+        let Some(Block::ToolResult {
+            content, is_error, ..
+        }) = transcript.messages.last().unwrap().content.first()
+        else {
+            panic!("a recorded result")
+        };
+        assert_eq!(*is_error, Some(true));
+        assert!(content.contains("could not be kept"), "{content}");
+        // Retry and rewind can pass it; the turn goes on to its next request.
+        assert!(!store.rewind_targets("operator").unwrap().is_empty());
+        let need = send(&mut engine, &mut store);
+        let outcome = record(&mut store, &need, vec![text("done")]);
+        deliver(&mut engine, &mut store, need, outcome);
+        finish(&mut engine, &mut store);
+    }
+}
+
+/// A long thread of small steps is compacted by its message and block counts, well
+/// before the engine's limits (a reply past them could be saved but never adopted),
+/// however small its history is in bytes.
+#[test]
+fn a_history_near_the_engines_block_limit_is_compacted_before_it_reaches_it() {
+    let (_realm, mut store, facts, mut engine) = setup();
+    start(&mut engine, &mut store);
+    let mut reply = vec![text("x"); 4000];
+    reply.push(call());
+    for _ in 0..4 {
+        let need = send(&mut engine, &mut store);
+        let outcome = record(&mut store, &need, reply.clone());
+        deliver(&mut engine, &mut store, need, outcome);
+        answer(&mut engine, &mut store, "found");
+    }
+    assert!(!facts.events.lock().unwrap().contains(&"compacted"));
+    // Past three quarters of the block limit (and far below the byte budget).
+    let need = send(&mut engine, &mut store);
+    assert!(facts.events.lock().unwrap().contains(&"compacted"));
+    let outcome = record(&mut store, &need, vec![text("y"); 4000]);
+    deliver(&mut engine, &mut store, need, outcome);
+    finish(&mut engine, &mut store);
+}
+
+#[test]
+fn compact_tokens_compacts_below_the_window_and_reads_back_as_set() {
+    let settings = |value: Value| Settings::from_json(&value);
+    let base = json!({"provider":"fake", "model":"model"});
+    // Absent (a session from before it existed), null or 0: the window alone.
+    for unset in [
+        base.clone(),
+        json!({"provider":"fake", "model":"model", "compact_tokens": null}),
+        json!({"provider":"fake", "model":"model", "compact_tokens": 0}),
+    ] {
+        let read = settings(unset).unwrap();
+        assert_eq!(read.compact_tokens, None);
+        assert_eq!(read.history_budget(512 * 1024), 512 * 1024);
+        assert!(read.to_json().unwrap().get("compact_tokens").is_none());
+    }
+    let set =
+        settings(json!({"provider":"fake", "model":"model", "compact_tokens": 256_000})).unwrap();
+    assert_eq!(set.compact_tokens, Some(256_000));
+    assert_eq!(set.to_json().unwrap()["compact_tokens"], 256_000);
+    assert_eq!(set.history_budget(usize::MAX), driver::token_bytes(256_000));
+    assert_eq!(set.history_budget(1024), 1024);
+    for bad in [json!(5), json!(-1), json!("big"), json!(1e12)] {
+        let mut value = base.clone();
+        value["compact_tokens"] = bad;
+        assert!(settings(value).is_err());
+    }
+    // A session that set it compacts once its history passes it, though the model's
+    // window (512 KiB here) is far from full.
+    for (tokens, compacts) in [(None, false), (Some(16_000), true)] {
+        let (_realm, mut store, facts, mut engine) = setup();
+        let mut value: Value =
+            serde_json::from_slice(&store.metadata("settings").unwrap().unwrap()).unwrap();
+        value["compact_tokens"] = json!(tokens);
+        store
+            .set_metadata("settings", &serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        start(&mut engine, &mut store);
+        for round in 0..4 {
+            let need = send(&mut engine, &mut store);
+            let outcome = record(
+                &mut store,
+                &need,
+                vec![text(&format!("step {round}")), call()],
+            );
+            deliver(&mut engine, &mut store, need, outcome);
+            answer(&mut engine, &mut store, &"found ".repeat(8 * 1024));
+        }
+        let need = send(&mut engine, &mut store);
+        let outcome = record(&mut store, &need, vec![text("done")]);
+        deliver(&mut engine, &mut store, need, outcome);
+        finish(&mut engine, &mut store);
+        assert_eq!(
+            facts.events.lock().unwrap().contains(&"compacted"),
+            compacts
+        );
+    }
+}
+
+/// A step restores its head once: every read until the head moves shares that turn,
+/// and the turn a step commits is the next read's.
+#[test]
+fn the_head_turn_is_shared_until_the_head_moves() {
+    let (_realm, mut store, _facts, mut engine) = setup();
+    start(&mut engine, &mut store);
+    let (revision, first) = engine.head(&mut store).unwrap();
+    let (again, second) = engine.head(&mut store).unwrap();
+    assert_eq!(revision, again);
+    assert!(Arc::ptr_eq(&first, &second));
+    let need = send(&mut engine, &mut store);
+    let outcome = record(&mut store, &need, vec![text("done")]);
+    deliver(&mut engine, &mut store, need, outcome);
+    let (moved, adopted) = engine.head(&mut store).unwrap();
+    assert!(moved > revision);
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.revision, moved);
+    assert_eq!(adopted.checkpoint().unwrap(), snapshot.continuation);
+    // A new run may hold another store: it reads the head again.
+    engine.begin_run();
+    let (_, read) = engine.head(&mut store).unwrap();
+    assert!(!Arc::ptr_eq(&adopted, &read));
+    finish(&mut engine, &mut store);
 }

@@ -85,8 +85,9 @@ fn line(interrupt: &AtomicBool, deadline: Instant) -> Option<String> {
         .next(interrupt, deadline)
 }
 
+// A pack's words reach the terminal only through `shown` (no escape sequences).
 fn ask_line(question: &str, interrupt: &AtomicBool, deadline: Instant) -> Option<String> {
-    eprint!("{question}");
+    eprint!("{}", super::shown(question));
     let _ = std::io::stderr().flush();
     line(interrupt, deadline)
 }
@@ -119,7 +120,7 @@ fn choose(
     deadline: Instant,
 ) -> Option<Option<Value>> {
     for (index, (_, label)) in list.iter().enumerate() {
-        eprintln!("  {}. {label}", index + 1);
+        eprintln!("  {}. {}", index + 1, super::shown(label));
     }
     let answer = ask_line("  choose a number: ", interrupt, deadline)?;
     Some(
@@ -147,22 +148,23 @@ impl PackUi for Tty {
         let params = &request.params;
         let title = text(params, "title");
         eprintln!(
-            "\n[{pack}] {}",
-            if title.is_empty() {
+            "\n[{}] {}",
+            super::shown(pack),
+            super::shown(if title.is_empty() {
                 &request.method
             } else {
                 &title
-            }
+            })
         );
         let message = text(params, "message");
         if !message.is_empty() {
-            eprintln!("{message}");
+            eprintln!("{}", super::shown(&message));
         }
         let answer = match request.method.as_str() {
             "progress" => {
                 eprintln!(
                     "  {} {}/{}",
-                    text(params, "state"),
+                    super::shown(&text(params, "state")),
                     params["current"],
                     params["total"]
                 );
@@ -200,7 +202,7 @@ impl PackUi for Tty {
                     let kind = field["type"].as_str().unwrap_or("text");
                     let value = match kind {
                         "select" => {
-                            eprintln!("  {label}:");
+                            eprintln!("  {}:", super::shown(&label));
                             match choose(&options(&field["options"]), interrupt, deadline) {
                                 Some(value) => value,
                                 None => return UiResponse::Cancelled,

@@ -83,7 +83,7 @@ pub fn model_catalog() -> Result<Value> {
                     .or_else(|| store.providers.get(&canonical)),
                 Some(StoredCredential::OAuth { .. })
             );
-            let subscription = contract == Some(RequestContract::ChatGptResponses)
+            let subscription = contract.is_some_and(RequestContract::plan_paid)
                 || (contract == Some(RequestContract::AnthropicMessages) && oauth);
             json!({
                 "id": profile.id,

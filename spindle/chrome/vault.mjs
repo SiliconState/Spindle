@@ -153,41 +153,59 @@ const renewing = new Map();
 
 /** `provider`'s secret, or undefined. `renew` (optional) may replace it before it is
  * used (a sign-in refreshing its token). It runs outside the queue, one per provider at
- * a time (callers meanwhile get its result), and what it returns is sealed and kept
- * unless the record changed meanwhile (signed out, or signed in again). */
+ * a time (callers meanwhile get its result). Before returning, the current record is
+ * rechecked: removed secrets stay absent, replacements win, and locked keys refuse. */
 export async function secret(provider, renew) {
-  const held = await exclusive(async () => {
+  const result = await exclusive(async () => {
     const record = await read('keys', provider);
-    if (record === undefined) return undefined;
+    if (record === undefined) return {};
     const key = await usable();
-    const opened = await open(key, provider, record);
+    const held = await open(key, provider, record);
     // A key saved before records were sealed is sealed now that it is read.
-    if (typeof record === 'string') await writeTogether([['keys', provider, await seal(key, provider, opened)]]);
-    return opened;
+    if (typeof record === 'string') await writeTogether([['keys', provider, await seal(key, provider, held)]]);
+    if (!renew) return { held };
+    return { pending: renewing.get(provider) ?? beginRenewal(provider, held, renew) };
   });
-  if (held === undefined || !renew) return held;
-  if (renewing.has(provider)) return renewing.get(provider);
-  const run = (async () => {
-    const next = await renew(held);
-    if (!next) return held;
-    await exclusive(async () => {
-      const record = await read('keys', provider);
-      const key = await usable();
-      const now = record === undefined ? null : await open(key, provider, record).catch(() => null);
-      if (now?.kind === held.kind && now.refresh === held.refresh) {
-        await writeTogether([['keys', provider, await seal(key, provider, next)]]);
-      }
-    });
-    return next;
-  })();
-  renewing.set(provider, run);
-  run.finally(() => renewing.delete(provider)).catch(() => {});
-  return run;
+  return result.pending ? result.pending.promise : result.held;
 }
 
-/** Keeps `secret` ({kind: 'key', key} or {kind: 'signin', ...}) for `provider`. */
+function beginRenewal(provider, held, renew) {
+  const pending = { changed: false };
+  pending.promise = Promise.resolve().then(async () => {
+    const outcome = await Promise.resolve().then(() => renew(held)).then(
+      (next) => ({ next }), (error) => ({ error }),
+    );
+    return exclusive(async () => {
+      const record = await read('keys', provider);
+      if (record === undefined) return undefined;
+      const key = await usable();
+      const now = await open(key, provider, record);
+      if (pending.changed || JSON.stringify(now) !== JSON.stringify(held)) return now;
+      if ('error' in outcome) throw outcome.error;
+      if (!outcome.next) return now;
+      // On disk before it is used: a refresh token rotates, and the spent one, brought
+      // back by a power cut, would end the sign-in.
+      await writeTogether([['keys', provider, await seal(key, provider, outcome.next)]], 'strict');
+      return outcome.next;
+    });
+  });
+  renewing.set(provider, pending);
+  pending.promise.finally(() => renewing.delete(provider)).catch(() => {});
+  return pending;
+}
+
+function replaced(provider) {
+  const pending = renewing.get(provider);
+  if (pending) pending.changed = true;
+}
+
+/** Keeps `secret` ({kind: 'key', key} or {kind: 'signin', ...}) for `provider`, on disk
+ * once it resolves. */
 export function keep(provider, secret) {
-  return exclusive(async () => writeTogether([['keys', provider, await seal(await usable(), provider, secret)]]));
+  return exclusive(async () => {
+    await writeTogether([['keys', provider, await seal(await usable(), provider, secret)]], 'strict');
+    replaced(provider);
+  });
 }
 
 /** Adds `extra` to `provider`'s secret, only if it is still `held` (the same kind and
@@ -207,7 +225,10 @@ export function rebind(provider, held, extra) {
 }
 
 export function forget(provider) {
-  return exclusive(() => writeTogether([['keys', provider, undefined]]));
+  return exclusive(async () => {
+    await writeTogether([['keys', provider, undefined]]);
+    replaced(provider);
+  });
 }
 
 /** The host's token, or undefined (`locked` thrown while a passphrase vault is). */
@@ -321,6 +342,7 @@ export function reset() {
     const key = await newKey(false);
     const gone = (await entriesOf('keys')).map(([provider]) => ['keys', provider, undefined]);
     await writeTogether([...gone, ['kv', 'vault', { version: 1, mode: 'device', key }]]);
+    for (const pending of renewing.values()) pending.changed = true;
     current = key;
   });
 }

@@ -81,8 +81,15 @@ pub fn build(source: &Path) -> Result<PathBuf> {
 }
 
 /// Runs `candidate version` and `candidate doctor` on a private copy of every
-/// session, so a faulty candidate never touches real session state.
-pub fn verify(candidate: &Path, sessions: &[PathBuf]) -> Result<(String, Vec<Check>)> {
+/// session, so a faulty candidate never touches real session state. The copies go in
+/// a private directory under `scratch` (beside the sessions, not a temp directory that
+/// may be memory), one session (with its tasks) at a time, each removed once checked;
+/// what checks a stop cut short left there is removed first (`stale_scratch`).
+pub fn verify(
+    candidate: &Path,
+    sessions: &[PathBuf],
+    scratch: &Path,
+) -> Result<(String, Vec<Check>)> {
     let (ok, version) = run(candidate, &["version".into()], Duration::from_secs(10))?;
     if !ok || !version.starts_with("spindle ") {
         return Err(format!(
@@ -91,15 +98,17 @@ pub fn verify(candidate: &Path, sessions: &[PathBuf]) -> Result<(String, Vec<Che
             version.trim()
         ));
     }
-    let scratch = Scratch(scratch_dir()?);
+    for stale in stale_scratch(scratch) {
+        let _ = std::fs::remove_dir_all(stale);
+    }
+    let scratch = Scratch(scratch_dir(scratch)?);
     let mut checks = vec![];
-    let mut ready = Vec::new();
-    let mut completed = Vec::new();
     for (index, session) in sessions.iter().enumerate() {
         let copy = scratch.0.join(format!("session-{index}"));
+        let mut ready = Vec::new();
         match copy_session(session, &copy) {
             Ok(()) => {
-                let mut pending = vec![(session.clone(), copy)];
+                let mut pending = vec![(session.clone(), copy.clone())];
                 let mut count = 0usize;
                 while let Some((session, copy)) = pending.pop() {
                     count += 1;
@@ -110,32 +119,26 @@ pub fn verify(candidate: &Path, sessions: &[PathBuf]) -> Result<(String, Vec<Che
                         let name = child.file_name().ok_or("task has no directory name")?;
                         pending.push((session.join("tasks").join(name), child.clone()));
                     }
-                    ready.push((index, session, copy));
+                    ready.push((session, copy));
                 }
             }
-            Err(report) => completed.push((
-                index,
-                Check {
-                    session: session.clone(),
-                    passed: false,
-                    report,
-                },
-            )),
+            Err(report) => checks.push(Check {
+                session: session.clone(),
+                passed: false,
+                report,
+            }),
         }
-    }
-    for (index, session, copy) in ready {
-        let check = run(
-            candidate,
-            &[
-                "--dir".into(),
-                copy.to_string_lossy().into_owned(),
-                "doctor".into(),
-            ],
-            Duration::from_secs(60),
-        );
-        completed.push((
-            index,
-            match check {
+        for (session, copy) in ready {
+            let check = run(
+                candidate,
+                &[
+                    "--dir".into(),
+                    copy.to_string_lossy().into_owned(),
+                    "doctor".into(),
+                ],
+                Duration::from_secs(60),
+            );
+            checks.push(match check {
                 Ok((passed, report)) => Check {
                     session,
                     passed,
@@ -146,11 +149,10 @@ pub fn verify(candidate: &Path, sessions: &[PathBuf]) -> Result<(String, Vec<Che
                     passed: false,
                     report,
                 },
-            },
-        ));
+            });
+        }
+        let _ = std::fs::remove_dir_all(&copy);
     }
-    completed.sort_by_key(|(index, _)| *index);
-    checks.extend(completed.into_iter().map(|(_, check)| check));
     Ok((version.trim().to_string(), checks))
 }
 
@@ -177,6 +179,64 @@ pub fn install(candidate: &Path, target: &Path) -> Result<()> {
     rename(&staged, target)
 }
 
+/// Session stores of a schema newer than `schema`, with theirs: those of the host whose
+/// binary `target` is (`HOST_DIR/sessions/*` beside `HOST_DIR/bin/spindle`) and of the
+/// command line's default session (`$SPINDLE_DIR` or `./.spindle`), each with its
+/// tasks. A store that cannot be read is passed over (the kept binary refuses it itself).
+fn newer_stores(target: &Path, schema: u32, also: &[&Path]) -> Vec<(PathBuf, i64)> {
+    let mut pending: Vec<(PathBuf, usize)> = vec![];
+    // A directory the caller names (`--dir`): a session itself, or a host's (its sessions).
+    for dir in also {
+        pending.push((dir.to_path_buf(), 0));
+        if let Ok(sessions) = std::fs::read_dir(dir.join("sessions")) {
+            pending.extend(sessions.flatten().map(|entry| (entry.path(), 0)));
+        }
+    }
+    if let Some(bin) = target.parent()
+        && bin.file_name().is_some_and(|name| name == "bin")
+        && let Some(host) = bin.parent()
+        && let Ok(sessions) = std::fs::read_dir(host.join("sessions"))
+    {
+        pending.extend(sessions.flatten().map(|entry| (entry.path(), 0)));
+    }
+    pending.push((
+        std::env::var_os("SPINDLE_DIR").map_or_else(|| PathBuf::from(".spindle"), PathBuf::from),
+        0,
+    ));
+    let mut newer = vec![];
+    let mut count = 0usize;
+    while let Some((session, depth)) = pending.pop() {
+        count += 1;
+        if count > 4096 * 4 {
+            break;
+        }
+        let store = session.join("store");
+        let version = rusqlite::Connection::open_with_flags(
+            store.join("authority.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .and_then(|db| {
+            db.busy_timeout(Duration::from_secs(5))?;
+            let app: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
+            let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            Ok((app == crate::APP_ID).then_some(version))
+        });
+        if let Ok(Some(version)) = version
+            && version > i64::from(schema)
+            && !newer.iter().any(|(known, _)| *known == store)
+        {
+            newer.push((store, version));
+        }
+        if depth < 32
+            && let Ok(tasks) = std::fs::read_dir(session.join("tasks"))
+        {
+            pending.extend(tasks.flatten().map(|entry| (entry.path(), depth + 1)));
+        }
+    }
+    newer.sort();
+    newer
+}
+
 /// The schema a spindle binary reads, from its `version` line.
 fn schema_of(binary: &Path) -> Option<u32> {
     let (true, version) = run(binary, &["version".into()], Duration::from_secs(10)).ok()? else {
@@ -189,10 +249,18 @@ fn schema_of(binary: &Path) -> Option<u32> {
         .and_then(|number| number.parse::<u32>().ok())
 }
 
-/// Swaps `target` with the kept previous binary; running it twice undoes it. Stores
-/// migrate forward on open, so a kept binary that reads an older schema than the one it
-/// replaces (or does not say which) is refused unless `force`.
+/// Swaps `target` with the kept previous binary; running it twice undoes it. Refused
+/// unless `force` when the kept binary may not open the sessions: it does not say which
+/// schema it reads; it reads one older than `PREVIOUS_SCHEMA`, to which every open of
+/// the current build migrates older stores; or a session store beside `target` is
+/// newer than it reads (one that took a step wider than its schema allows), named.
 pub fn rollback(target: &Path, force: bool) -> Result<()> {
+    rollback_checking(target, force, &[])
+}
+
+/// `rollback`, also checking the sessions under `also` (the CLI's `--dir`) for stores the
+/// kept binary could not open.
+pub fn rollback_checking(target: &Path, force: bool, also: &[&Path]) -> Result<()> {
     let kept = previous(target);
     if !kept.is_file() {
         return Err(format!(
@@ -208,13 +276,31 @@ pub fn rollback(target: &Path, force: bool) -> Result<()> {
                     "the kept binary did not report which schema it reads, so it may not open these sessions; `spindle rollback --force` restores it anyway".into(),
                 );
             }
-            Some(schema) if schema < current => {
+            Some(schema) if schema < current && i64::from(schema) < crate::PREVIOUS_SCHEMA => {
                 return Err(format!(
-                    "the kept binary reads schema {schema}, but sessions opened by the current build are schema {current} and it could not open them. `spindle rollback --force` restores it anyway; then put back each migrated session's pre-migration copy, store/{}, as store/authority.sqlite",
+                    "the kept binary reads schema {schema}, but sessions opened by the current build are schema {} or newer and it could not open them. `spindle rollback --force` restores it anyway; then put back each migrated session's pre-migration copy, store/{}, as store/authority.sqlite",
+                    crate::PREVIOUS_SCHEMA,
                     crate::backup_name(i64::from(schema))
                 ));
             }
-            Some(_) => {}
+            Some(schema) => {
+                let newer = newer_stores(target, schema, also);
+                if !newer.is_empty() {
+                    let named: Vec<String> = newer
+                        .iter()
+                        .take(8)
+                        .map(|(store, version)| format!("{} (schema {version})", store.display()))
+                        .collect();
+                    let more = match newer.len().saturating_sub(named.len()) {
+                        0 => String::new(),
+                        more => format!(" and {more} more"),
+                    };
+                    return Err(format!(
+                        "the kept binary reads schema {schema}, but these session stores are newer (a step in each made more tool calls than it allows) and it could not open them: {}{more}. `spindle rollback --force` restores it anyway; those sessions then open only with a build that reads their schema",
+                        named.join(", ")
+                    ));
+                }
+            }
         }
     }
     let current = sibling(target, "previous-new");
@@ -426,12 +512,55 @@ fn private_dir(path: &Path) -> Result<()> {
         .map_err(|error| format!("cannot create {}: {error}", path.display()))
 }
 
-fn scratch_dir() -> Result<PathBuf> {
+/// The directories of candidate checks in `parent` (`spindle-upgrade-<pid>-<stamp>`,
+/// holding copies of the sessions they reached) whose process is gone: a check a crash
+/// or a kill stopped leaves them. A live process's are never listed, nor any where
+/// that cannot be told (off Unix).
+pub fn stale_scratch(parent: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return vec![];
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("spindle-upgrade-"))
+                    .and_then(|rest| rest.split_once('-'))
+                    .and_then(|(pid, _)| pid.parse::<u32>().ok())
+                    .is_some_and(gone)
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Whether process `pid` is known to be gone (only Unix can tell).
+fn gone(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 is never delivered; the call only asks whether `pid` exists.
+        pid > 0
+            && unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn scratch_dir(parent: &Path) -> Result<PathBuf> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("spindle-upgrade-{}-{stamp}", std::process::id()));
+    let dir = parent.join(format!("spindle-upgrade-{}-{stamp}", std::process::id()));
     private_dir(&dir)?;
     Ok(dir)
 }
@@ -825,7 +954,7 @@ mod tests {
         let binary = dir.join("candidate");
         std::fs::write(&binary, "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'spindle test'; exit 0; fi\ncase \"$2\" in */tasks/child) echo child-failed; exit 1;; *) echo parent-passed;; esac\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let (_, checks) = verify(&binary, std::slice::from_ref(&source)).unwrap();
+        let (_, checks) = verify(&binary, std::slice::from_ref(&source), &dir).unwrap();
         assert_eq!(checks.len(), 2);
         assert!(
             checks
@@ -836,6 +965,45 @@ mod tests {
             checks
                 .iter()
                 .any(|check| check.session == child && !check.passed)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_checks_copy_one_session_at_a_time_under_the_given_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("one-at-a-time");
+        let sessions: Vec<PathBuf> = (0..3)
+            .map(|n| {
+                let session = dir.join(format!("session{n}"));
+                private_dir(&session).unwrap();
+                drop(crate::Store::open(&session.join("store")).unwrap());
+                session
+            })
+            .collect();
+        let scratch = dir.join("scratch");
+        private_dir(&scratch).unwrap();
+        // Its doctor passes only for a copy under `scratch` with no other copy beside it.
+        let binary = dir.join("candidate");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'spindle test'; exit 0; fi\ncase \"$2\" in {}/*) ;; *) echo elsewhere; exit 1;; esac\n[ \"$(ls \"$(dirname \"$2\")\" | wc -l)\" -eq 1 ] || {{ echo crowded; exit 1; }}\n",
+                scratch.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (_, checks) = verify(&binary, &sessions, &scratch).unwrap();
+        assert_eq!(checks.len(), 3);
+        for check in &checks {
+            assert!(check.passed, "{}", check.report);
+        }
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "no copy stays"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -895,7 +1063,7 @@ mod tests {
         std::fs::write(&fake, "#!/bin/sh\necho hello\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(verify(&fake, &[]).is_err());
+        assert!(verify(&fake, &[], &dir).is_err());
         std::fs::write(
             &fake,
             "#!/bin/sh\ncase \"$1\" in version) echo 'spindle 9 schema 14';; *) echo broken; exit 1;; esac\n",
@@ -904,7 +1072,8 @@ mod tests {
         let session = dir.join("session");
         std::fs::create_dir_all(session.join("store")).unwrap();
         std::fs::write(session.join("store/authority.sqlite"), "x").unwrap();
-        let (version, checks) = verify(&fake, &[session.clone(), dir.join("missing")]).unwrap();
+        let (version, checks) =
+            verify(&fake, &[session.clone(), dir.join("missing")], &dir).unwrap();
         assert_eq!(version, "spindle 9 schema 14");
         assert!(!checks[0].passed, "{}", checks[0].report);
         assert!(!checks[1].passed && checks[1].report.contains("not a spindle session"));

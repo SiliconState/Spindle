@@ -14,6 +14,6 @@
   "sandbox": { "pages": ["preview.html"] },
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; frame-src 'self'",
-    "sandbox": "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; style-src 'unsafe-inline' https: data: blob:; img-src https: data: blob:; font-src https: data: blob:; media-src https: data: blob:; connect-src https: data: blob:; worker-src data: blob:; frame-src https: data: blob:; form-action 'none'; base-uri 'none'"
+    "sandbox": "sandbox allow-scripts allow-modals; default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; style-src 'unsafe-inline' https: data: blob:; img-src https: data: blob:; font-src https: data: blob:; media-src https: data: blob:; connect-src https: data: blob:; worker-src data: blob:; frame-src https: data: blob:; form-action 'none'; base-uri 'none'"
   }
 }

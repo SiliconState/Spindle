@@ -127,10 +127,22 @@ pub struct Driver {
     pub(crate) compact_next: bool,
     pub(crate) until_unknown: bool,
     retries: u32,
+    /// The head revision this driver last committed or read, and its turn (shared, not
+    /// copied, by every read until the head moves): a step restores its head once.
+    pub(crate) head: Option<(u64, Arc<TurnContinuation>)>,
+    /// Finished background tasks' file changes, by task, as the host offered them
+    /// before this entry (`offer_task_changes`): a task's report delivers them with it;
+    /// or why the host offers none (over the merge limit), for the report to say.
+    pub(crate) task_changes:
+        std::collections::HashMap<String, std::result::Result<crate::broker::Changes, String>>,
     env: Arc<dyn Env>,
     inbox: Arc<dyn Inbox>,
     observer: Arc<dyn Observer>,
 }
+
+/// A task's file changes, as its host reads them from the task's own session for its
+/// report to deliver (`Driver::offer_task_changes`).
+pub use crate::broker::Changes as TaskChanges;
 
 pub(crate) struct Step<'a> {
     pub(crate) store: &'a mut Store,
@@ -146,6 +158,8 @@ impl Driver {
             compact_next: false,
             until_unknown: false,
             retries: 0,
+            task_changes: std::collections::HashMap::new(),
+            head: None,
             env,
             inbox,
             observer,
@@ -164,6 +178,11 @@ impl Driver {
     /// Rebinds the host's queues after replacing a native store for a first-request retry.
     pub fn set_inbox(&mut self, inbox: Arc<dyn Inbox>) {
         self.inbox = inbox;
+        self.head = None;
+    }
+    /// The head revision of `store` and its turn, restored once per revision.
+    pub fn head(&mut self, store: &mut Store) -> Result<(u64, Arc<TurnContinuation>)> {
+        self.step(store).head()
     }
     /// Reserves an app call before asking the app. Receipt reuse never asks it again.
     pub fn reserve_app(
@@ -181,6 +200,41 @@ impl Driver {
         answer: AppAnswer,
     ) -> crate::Result<DispatchOutcome> {
         self.step(store).record_app_answer(need, answer)
+    }
+
+    /// The background tasks whose reports are due: finished or stopped, queued, not yet
+    /// delivered. A host reads each finished one's file changes from the task's own
+    /// session and offers them (`offer_task_changes`) before a prompt or a continue,
+    /// and after `Need::TaskWait` before asking again. Even no changes need an explicit
+    /// empty offer; a missing offer leaves the report pending.
+    pub fn pending_task_reports(&mut self, store: &mut Store) -> Result<Vec<crate::meta::TaskRun>> {
+        Ok(store
+            .task_runs()
+            .map_err(store_error)?
+            .into_iter()
+            .filter(|run| {
+                run.queued
+                    && matches!(run.state.as_str(), "finished" | "stopped")
+                    && run.delivered.is_none()
+            })
+            .collect())
+    }
+
+    /// Offers finished task `task`'s file changes for its report to deliver: the next
+    /// report of that task commits them with it (`Step::commit_task_report`), refused
+    /// where the session changed the same paths since the task began; or `Err(note)`,
+    /// why the host read none (over the merge limit: `tree_changes`), which the report
+    /// says. Offers are for this entry: `clear_task_changes` before offering again.
+    pub fn offer_task_changes(
+        &mut self,
+        task: &str,
+        changes: std::result::Result<TaskChanges, String>,
+    ) {
+        self.task_changes.insert(task.to_string(), changes);
+    }
+
+    pub fn clear_task_changes(&mut self) {
+        self.task_changes.clear();
     }
     pub fn resume_until_unknown(&mut self, store: &mut Store) -> Result<Need> {
         self.until_unknown = true;
@@ -209,7 +263,7 @@ impl Driver {
                     format!("extend-r{revision}"),
                     &Action::Extend,
                     &state,
-                    &after,
+                    after,
                 )?;
                 step.emit(Event::Extended { steps: 24 });
                 Ok(Need::Continue)
@@ -236,10 +290,10 @@ impl Driver {
     /// a turn stopped part way, resting between its steps or in a model request whose
     /// reply was not saved.
     pub fn takes_message(store: &mut Store) -> Result<bool> {
-        let snapshot = store.snapshot().map_err(store_error)?;
-        if snapshot.revision == 0 {
+        if store.head_revision().map_err(store_error)? == 0 {
             return Ok(false);
         }
+        let snapshot = store.snapshot().map_err(store_error)?;
         let state = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
         Ok(match state.control().phase() {
             Phase::Ready | Phase::AfterTools | Phase::FinalReview => true,
@@ -265,7 +319,7 @@ impl Driver {
     pub fn retry(&mut self, store: &mut Store) -> Result<Retry> {
         self.retries = 0;
         let mut step = self.step(store);
-        let (_, state) = step.head()?;
+        let (revision, state) = step.head()?;
         let pending = state.pending_effects().map_err(turn_error)?;
         let model = pending.iter().find_map(|effect| match effect {
             Effect::Model { id, .. } => Some(id),
@@ -276,11 +330,14 @@ impl Driver {
             .transpose()?
             .flatten();
         let unresolved = match &attempt {
-            Some(attempt) => step
-                .store
-                .receipt(&attempt.id)
-                .map_err(store_error)?
-                .is_none(),
+            // A saved reply the turn cannot adopt (every continue refuses it the same
+            // way) is no outcome to go on from: it is asked for again, as an unknown one.
+            Some(attempt) => match step.store.receipt(&attempt.id).map_err(store_error)? {
+                None => true,
+                Some(bytes) => step
+                    .adoption(revision, &state, &attempt.id, &bytes)
+                    .is_err(),
+            },
             None => false,
         };
         // A turn the user stopped between its steps: its last step is asked again.
@@ -309,7 +366,7 @@ impl Driver {
             .is_empty()
         {
             let prompt = state
-                .transcript()
+                .transcript_ref()
                 .map_err(turn_error)?
                 .messages
                 .iter()
@@ -328,7 +385,7 @@ impl Driver {
         let Phase::Stopped(stop) = state.control().phase() else {
             return Ok(());
         };
-        let files = match step.store.snapshot().map_err(store_error)?.workspace {
+        let files = match step.store.head_root().map_err(store_error)?.1 {
             Some(root) => step
                 .store
                 .tree_map(SCOPE, &root)
@@ -344,16 +401,20 @@ impl Driver {
             files,
             complete: stop == Stop::Complete,
         });
+        // A resting session holds no turn in memory (a host may keep many open).
+        self.head = None;
         Ok(())
     }
     /// Resets transient retry policy for a new host-driven run, not nested restarts.
     pub fn begin_run(&mut self) {
         self.until_unknown = false;
         self.retries = 0;
+        // A host may have replaced the store (a first request retried in a fresh one).
+        self.head = None;
     }
     /// Retains a state patch at a safe boundary.
     pub fn set_state(&mut self, store: &mut Store, patch: &Value) -> Result<u64> {
-        if store.snapshot().map_err(store_error)?.revision == 0 {
+        if store.head_revision().map_err(store_error)? == 0 {
             return Err(
                 "the session has no turn yet; send its first state with the first prompt".into(),
             );
@@ -377,7 +438,7 @@ impl Driver {
         let mut step = self.step(store);
         let config = step.settings()?;
         let route = step.session_route(&config.provider, Some(&config.model))?;
-        let budget = route.history_budget;
+        let budget = config.history_budget(route.history_budget);
         step.start_need(prompt, start, state, config, route, budget)
     }
     /// Delivers an answer only after the host has emitted the need's preview events

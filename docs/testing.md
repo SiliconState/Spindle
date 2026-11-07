@@ -78,6 +78,11 @@ parent crash tests invoke, not disabled coverage.
 | `dext-native` | `strict.rs`, `strict_reuse.rs`, `strict_slots.rs`, `host_runner.rs`, `cgroup.rs` | Shared-mapping writes retained on Linux, workspace reuse by place without stale links/modes/leftovers, runner slots, host runner, cgroup cleanup |
 | `dext-provider` | `portable.rs` | Provider shaping without native features |
 
+The engine host-runner scratch sweep is user-wide: running independent workspaces'
+crash suites concurrently can leave abandoned candidates that another suite sweeps.
+A nonzero cleanup count alone is not evidence that its live run leaked. Keep this
+failure's output and rerun the affected suites separately when diagnosing it.
+
 ## JavaScript suites
 
 | Command (from `spindle/`) | Exercises |
@@ -117,7 +122,11 @@ real provider key send real, billed requests and say so in their usage line.
 
 ## Portable feature gates
 
-The decision driver and the embedded host must build without native code:
+The decision driver and the embedded host must build without native code. CI also
+lints and tests the bare store and each of `dext-turn`, `dext-image-continuation`,
+`driver`, `workspace-tools`, `shape`, `embedded` and `cli` independently, with
+`--no-default-features`. All-feature tests alone cannot detect optional-dependency
+leaks: the JSON-dependent task-answer amendment is compiled only with `driver`.
 
 ```sh
 cargo clippy --locked -p spindle-store --no-default-features --features driver --lib \
@@ -140,16 +149,17 @@ pull request, except those that change only the website or the release workflow:
 | --- | --- |
 | `linux` | fmt and Clippy, debug and release workspace tests, engine tests, Node/Python clients, UI tests, `cargo audit` and `cargo deny --workspace --all-features check licenses` in both workspaces (see [Dependency policy](#dependency-policy)) |
 | `portable` | Clippy and tests of `spindle-store` for each portable feature set, plus the native-free dependency checks |
-| `wasm` | Provider and wire crates on wasm32, browser-target store, WASI, embedded Node/OPFS tests, browser Linux, scripted extension, plus `review_regressions`, `linux_route`, `panel_steps`, `linux_warm`, `vault_host`, `engine_renew` and real-Chrome `review_browser` |
+| `wasm` | Provider/wire wasm32 builds, store/WASI, Node/OPFS, browser Linux and both browser editions; scripted extension and sign-in/vault suites, focused Node checks, renewal and real-Chrome review |
 | `windows` | Native store, CLI and engine tests on Windows |
 
 Two more workflows publish. [`pages.yml`](../.github/workflows/pages.yml) deploys `site/` to
 GitHub Pages when it changes. [`browser-release.yml`](../.github/workflows/browser-release.yml),
-on a `browser-v*` tag, builds Spindle for Browser and tests the exact unpacked zip
-with `extension_real.mjs --scripted`, `review_browser.mjs` and
+on a `browser-v*` tag, builds both source/GitHub and store editions, tests the exact
+unpacked zips with `extension_real.mjs --scripted` and `signin_vault.mjs`, and tests
+the source zip with `review_browser.mjs` and
 `node --expose-gc chrome/tests/engine_renew.mjs UNPACKED/web`. It checks
-`build.json`'s version and both 12-hex source fingerprints, then attests and
-attaches the zip and SHA-256 to the release (see
+`build.json`'s version, edition and source fingerprints, then attests and
+attaches both zips and their SHA-256 files to the release (see
 [chrome.md](chrome.md#install-a-release)).
 
 The extension's focused suites are linked in [chrome.md](chrome.md#tests):

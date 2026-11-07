@@ -43,6 +43,8 @@ pub const FEATURES: &[&str] = &[
     "code_bridge",
     // `authorize` work names claims of the key its headers carry (`{account}`).
     "key_claims",
+    // `task_drop`, `export_task`, and `tasks` saying where each task's store stands.
+    "task_storage",
 ];
 
 /// The `work` frame for work `id` of session `label` (a task's app call named as its
@@ -70,6 +72,13 @@ pub trait Places {
     fn storage(&self, dir: &str) -> Result<Box<dyn Storage>, String>;
     /// Whether a session is stored under `dir`.
     fn exists(&self, dir: &str) -> bool;
+    /// `exists`, or why it cannot be told (storage that failed): never taken for no.
+    fn holds(&self, dir: &str) -> Result<bool, String> {
+        Ok(self.exists(dir))
+    }
+    /// Gives back what the app holds for `dir` that no open store took over (a
+    /// browser's Web Lock), once the session closed or was never opened.
+    fn release(&self, _dir: &str) {}
 }
 
 struct Session {
@@ -91,6 +100,9 @@ pub struct Embedded {
     app_runner: RefCell<Option<[u8; 32]>>,
     /// What scripts' `http()` may reach: a code policy with the app's `http` grants.
     http: RefCell<Value>,
+    /// The bytes of the files the request being handled carries beside its line
+    /// (`handle_with`), each taken once by the file that names it.
+    attached: RefCell<Vec<Option<Vec<u8>>>>,
 }
 
 /// A script request's state as the API gives it.
@@ -135,12 +147,9 @@ fn work_json(work: Work) -> Value {
                 "claims": host::claims_json(&claims),
             })
         }
-        Work::Fetch {
-            endpoint,
-            gzip,
-            body,
-        } => {
-            json!({"kind": "fetch", "endpoint": endpoint, "gzip": gzip, "body": base64_encode(&body)})
+        // The body is asked for apart (`Embedded::request_body`), as bytes.
+        Work::Fetch { endpoint, gzip } => {
+            json!({"kind": "fetch", "endpoint": endpoint, "gzip": gzip})
         }
         Work::Run {
             runner,
@@ -253,6 +262,7 @@ fn new_settings(catalog: &Catalog, provider: &str, model: Option<&str>) -> Resul
         "model": route.model,
         "isolation": "auto",
         "compaction": "model",
+        "compact_tokens": crate::driver::COMPACT_TOKENS,
         "builtin_tools": "files",
     }))
     .map_err(bad)?;
@@ -336,6 +346,7 @@ impl Embedded {
             runner: RefCell::default(),
             app_runner: RefCell::default(),
             http: RefCell::new(json!({})),
+            attached: RefCell::default(),
         }
     }
 
@@ -347,6 +358,62 @@ impl Embedded {
     pub fn handle(&self, line: &[u8]) -> Vec<Value> {
         crate::protocol::handle(self, line, |frame| self.send(frame.clone()));
         self.take_frames()
+    }
+
+    /// `handle`, with the bytes of files the request carries beside its line: a file of
+    /// `create` or `prompt` given as `{path, attached: N, executable}` is the Nth of
+    /// `attached` (each used once), so its bytes cross once, never as base64 in JSON.
+    pub fn handle_with(&self, line: &[u8], attached: Vec<Vec<u8>>) -> Vec<Value> {
+        *self.attached.borrow_mut() = attached.into_iter().map(Some).collect();
+        let frames = self.handle(line);
+        self.attached.borrow_mut().clear();
+        frames
+    }
+
+    /// The `files` param of `create` or `prompt`: as `files_param` reads it, each file
+    /// that names one of the request's attached files (`handle_with`) with its bytes.
+    fn files_of(&self, params: &Params) -> Result<Vec<crate::driver::File>, Fault> {
+        let Some(Value::Array(items)) = params.0.get("files") else {
+            return files_param(params.0.get("files"));
+        };
+        let mut files = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(index) = item.get("attached") else {
+                files.extend(files_param(Some(&Value::Array(vec![item.clone()])))?);
+                continue;
+            };
+            let object = item
+                .as_object()
+                .ok_or_else(|| bad("each file is an object"))?;
+            if let Some(key) = object
+                .keys()
+                .find(|key| !["path", "attached", "executable"].contains(&key.as_str()))
+            {
+                return Err(bad(format!("`{key}` is not a key of an attached file")));
+            }
+            let path = item["path"]
+                .as_str()
+                .filter(|path| crate::workspace::valid_path(path))
+                .ok_or_else(|| {
+                    bad("an attached file's `path` is a workspace path (relative, without empty, `.` or `..` parts)")
+                })?;
+            let bytes = index
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| self.attached.borrow_mut().get_mut(index)?.take())
+                .ok_or_else(|| {
+                    bad(format!(
+                        "`{path}`: `attached` names no file sent with this request (or one used twice)"
+                    ))
+                })?;
+            let executable = match item.get("executable") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(executable)) => *executable,
+                Some(_) => return Err(bad("`executable` must be a boolean")),
+            };
+            files.push((path.to_string(), bytes, executable));
+        }
+        Ok(files)
     }
 
     /// The provider catalog these sessions use (`Catalog::to_json`).
@@ -479,6 +546,15 @@ impl Embedded {
         (self.take_frames(), streaming)
     }
 
+    /// The body of the model request work `work` of `label` sends (`Work::Fetch`),
+    /// while that work waits.
+    pub fn request_body(&self, label: &str, work: u64) -> Result<Vec<u8>, String> {
+        let dir = Self::top(label).to_string();
+        let mut sessions = self.sessions.borrow_mut();
+        let session = sessions.get_mut(&dir).ok_or("no such session")?;
+        session.host.request_body_of(label, work)
+    }
+
     /// One file of the workspace a runner call (work `work` of `label`) runs over.
     pub fn runner_file(&self, label: &str, work: u64, object: &str) -> Result<Vec<u8>, String> {
         let dir = Self::top(label).to_string();
@@ -591,7 +667,7 @@ impl Embedded {
         if self.sessions.borrow().contains_key(dir) {
             return Ok(());
         }
-        if !self.places.exists(dir) {
+        if !self.places.holds(dir).map_err(failed)? {
             return Err(not_found(format!("no session in {dir}; create one first")));
         }
         let storage = self.places.storage(dir).map_err(bad)?;
@@ -636,8 +712,8 @@ impl Embedded {
         params.allow(&keys)?;
         let dir = Self::dir(&params)?;
         let provider = params.required("provider")?;
-        let files = files_param(params.0.get("files"))?;
-        if self.sessions.borrow().contains_key(&dir) || self.places.exists(&dir) {
+        let files = self.files_of(&params)?;
+        if self.sessions.borrow().contains_key(&dir) || self.places.holds(&dir).map_err(failed)? {
             return Err(conflict(format!(
                 "{dir} already holds a session; open it instead"
             )));
@@ -664,7 +740,20 @@ impl Embedded {
         Ok(status)
     }
 
-    fn start(&self, method: &str, params: Params, id: Option<Value>) -> Result<Reply, Fault> {
+    fn start(&self, method: &str, mut params: Params, id: Option<Value>) -> Result<Reply, Fault> {
+        // A prompt's files that came beside its line (`handle_with`) are read here; the
+        // rest of it as any prompt.
+        let attached = match params.0.get("files") {
+            Some(Value::Array(items))
+                if method == "prompt"
+                    && items.iter().any(|item| item.get("attached").is_some()) =>
+            {
+                let files = self.files_of(&params)?;
+                params.0.remove("files");
+                Some(files)
+            }
+            _ => None,
+        };
         let (_, op) = crate::protocol::turn_op(method, &params)?;
         let expected = params.u64("expected_head")?;
         let dir = Self::dir(&params)?;
@@ -693,7 +782,9 @@ impl Embedded {
             // starts, not on a read: their work goes out with this call's.
             session.host.resume_background();
             match op {
-                TurnOp::Prompt { text, files, state } => session.host.prompt(&text, files, state),
+                TurnOp::Prompt { text, files, state } => {
+                    session.host.prompt(&text, attached.unwrap_or(files), state)
+                }
                 TurnOp::Continue { until_unknown } => session.host.resume(until_unknown),
                 TurnOp::Retry => session.host.retry(),
                 TurnOp::Rewind { revision } => session.host.rewind(revision),
@@ -771,6 +862,10 @@ impl Embedded {
                     .to_string(),
             ));
         }
+        // The spend ledger kept first (best effort, as `seal_session` keeps it): one
+        // the app's `usage` saves between this export and the seal would otherwise move
+        // the source state the seal checks.
+        let _ = session.host.keep_usage();
         let copied = match settings {
             None => None,
             Some(Value::Object(changes)) => {
@@ -809,27 +904,101 @@ impl Embedded {
         let (files, opened) = session.host.bundle_files(copied.as_ref()).map_err(failed)?;
         // A copy (the session stays here) is checked as far as the bundle records it; a
         // move, whole, as it goes on only from the bundle.
-        let written = if keep && !whole {
-            crate::bundle::write_copy(files)
-        } else {
-            crate::bundle::write(files)
-        }
-        .map_err(failed)?;
+        let source_state = session.host.transfer_fingerprint(&opened).map_err(failed)?;
+        let written =
+            crate::bundle::write_export(files, !keep || whole, &source_state).map_err(failed)?;
         if !keep {
-            let note = format!(
-                "exported at head {} by an app's embedded Spindle",
-                written.facts.head
-            );
-            // The session itself first: if it cannot be sealed, nothing has moved (and
-            // the bundle is not handed out). Its tasks' copies after, as best they can.
-            session.host.seal(&note).map_err(failed)?;
-            for (place, store) in opened {
-                let _ = place.seal(&note);
-                drop(store);
-            }
+            Self::seal_moved(&mut session.host, written.facts.head, opened)?;
             sessions.remove(dir);
         }
         Ok(written.bytes)
+    }
+
+    /// A finished task of session `dir` (`task`: its name, or a label or key `tasks`
+    /// gave) as a session bundle of its own (bytes): its store and its own tasks', each
+    /// checked record by record (a copy kept before `task_drop` removes them), to read
+    /// later as a session where it is imported. Refused while it runs, while a turn of the
+    /// session runs (it may wait on it), while the session may still need it, and once
+    /// its store was removed. One task at a time: its stores' images and the bundle are
+    /// held in memory while it is written.
+    pub fn export_task(&self, dir: &str, task: &str) -> Result<Vec<u8>, Fault> {
+        if dir.contains('#') {
+            return Err(bad("`dir` names a session, not one of its tasks"));
+        }
+        let written = self.with_host(dir, |host| {
+            let (files, state) = host.task_bundle(task)?;
+            crate::bundle::write_export(files, true, &state).map_err(failed)
+        })?;
+        Ok(written.bytes)
+    }
+
+    /// Seals session `dir` as moved, its bundle (`export_session` with `keep`) now kept
+    /// where it goes on: it closes here and this copy is sealed (`spindle-moved`), as a
+    /// move's export seals it, without writing another bundle. `expected_head` is the
+    /// bundle's head: a session that moved on since (or one with an operation or a
+    /// background task running) is refused, and nothing is sealed. The app keeps the
+    /// bundle first (written where it goes on, or imported there), then seals: whatever
+    /// stops it between, the session is in one place or the other, never only in a
+    /// sealed copy.
+    pub fn seal_session(&self, dir: &str, expected_head: u64, expected_state: &str) -> Outcome {
+        self.open_session(dir)?;
+        let mut sessions = self.sessions.borrow_mut();
+        let session = sessions.get_mut(dir).expect("opened above");
+        if let Some(running) = session.host.running() {
+            return Err(busy(format!(
+                "a {running} is running in this session; wait for it or stop it"
+            )));
+        }
+        if session.host.background_running() {
+            return Err(busy(
+                "a background task of this session is running; wait for it or stop it (`task_stop`)"
+                    .to_string(),
+            ));
+        }
+        let head = crate::reads::head_on(&mut session.host.view()).map_err(failed)?["head"]
+            .as_u64()
+            .unwrap_or_default();
+        if head != expected_head {
+            return Err(Fault::new(
+                -32003,
+                "head_moved",
+                format!(
+                    "the session's head is {head}, not {expected_head}: export it again, then seal"
+                ),
+            ));
+        }
+        // Kept as `export_session` and `usage` keep it, so both sides fingerprint the
+        // same ledger.
+        let _ = session.host.keep_usage();
+        let opened = session.host.task_stores().map_err(failed)?;
+        let state = session.host.transfer_fingerprint(&opened).map_err(failed)?;
+        if state != expected_state {
+            return Err(Fault::new(
+                -32003,
+                "head_moved",
+                "the session or its tasks changed since export: export it again, then seal",
+            ));
+        }
+        Self::seal_moved(&mut session.host, head, opened)?;
+        sessions.remove(dir);
+        Ok(json!({"session": dir, "head": head, "sealed": true}))
+    }
+
+    /// Seals `host`'s session and its task stores (`opened`, held open so no other
+    /// owner takes them meanwhile) as moved at `head`. The session itself first: if it
+    /// cannot be sealed, nothing has moved. Its tasks' copies after, as best they can.
+    fn seal_moved(
+        host: &mut Host,
+        head: u64,
+        opened: Vec<(Box<dyn Storage>, crate::Store)>,
+    ) -> Result<(), Fault> {
+        let note = format!("exported at head {head} by an app's embedded Spindle");
+        host.seal(&note).map_err(failed)?;
+        for (place, store) in opened {
+            let _ = place.seal(&note);
+            drop(store);
+        }
+        Ok(())
     }
 
     /// Gives back the free pages of the session in `dir`: its store's and its tasks'
@@ -840,7 +1009,7 @@ impl Embedded {
         if dir.contains('#') {
             return Err(bad("`dir` names a session, not one of its tasks"));
         }
-        if !self.places.exists(dir) {
+        if !self.places.holds(dir).map_err(failed)? {
             if !self.sessions.borrow().contains_key(dir) {
                 return Err(not_found(format!("no session in {dir}")));
             }
@@ -902,7 +1071,16 @@ impl Embedded {
                 "{dir} is not empty; import into a new place"
             )));
         }
-        for file in &bundle.files {
+        let importing = storage.begin_import().map_err(|error| match error {
+            crate::Error::Conflict | crate::Error::Locked => {
+                conflict("another owner holds the import destination")
+            }
+            other => failed(import_error(other)),
+        })?;
+        // What a failed import wrote goes again (the place was empty), so it can be
+        // tried again there: through a second handle, as opening takes the first.
+        let spare = self.places.storage(dir).map_err(bad)?;
+        let written = bundle.files.iter().try_for_each(|file| {
             let mut place: Option<Box<dyn Storage>> = None;
             let mut rest = file.path.as_str();
             while let Some((key, tail)) = rest
@@ -921,9 +1099,29 @@ impl Embedded {
             } else {
                 at.keep_sidecar(rest, &file.bytes)
             };
-            written.map_err(|error| failed(crate::driver::store_error(error)))?;
+            written.map_err(|error| match error {
+                crate::Error::Conflict | crate::Error::Locked => {
+                    conflict("another owner changed the import destination")
+                }
+                other => failed(import_error(other)),
+            })
+        });
+        if let Err(fault) = written {
+            // A conflict may be another importer publishing its store. Its files are
+            // not ours to roll back, even when this place was empty at the first check.
+            if fault.kind != "conflict" {
+                if importing.is_some() {
+                    drop(importing);
+                    let _ = storage.discard();
+                } else if spare.holder().is_none() {
+                    let _ = spare.discard();
+                }
+            }
+            return Err(fault);
         }
+        drop(importing);
         let mut host = Host::open(dir, storage, self.catalog.clone()).map_err(failed)?;
+        drop(spare);
         Self::bind_runner(&mut host, self.runners());
         self.sessions.borrow_mut().insert(
             dir.to_string(),
@@ -996,6 +1194,14 @@ impl Backend for Embedded {
                     let task = params.required("task")?;
                     now(self.with_host(&dir, |host| host.task_wait(task).map_err(failed)))
                 }
+                "task_drop" => {
+                    params.allow(&["dir", "task", "at", "expected_state"])?;
+                    let dir = Self::dir(&params)?;
+                    let task = params.required("task")?;
+                    let at = params.u64("at")?;
+                    let expected = params.str("expected_state")?;
+                    now(self.with_host(&dir, |host| host.drop_task(task, at, expected)))
+                }
                 "task_stop" => {
                     params.allow(&["dir", "task"])?;
                     let dir = Self::dir(&params)?;
@@ -1067,6 +1273,10 @@ impl Backend for Embedded {
                             true
                         }
                     };
+                    drop(sessions);
+                    // What the app took for it that no store holds (a call that never
+                    // opened it) goes back too.
+                    self.places.release(&dir);
                     now(Ok(json!({"session": dir, "closed": closed})))
                 }
                 "compact" => {
@@ -1259,16 +1469,25 @@ impl Backend for Embedded {
                     }))
                 }
                 "targets" => {
-                    params.allow(&["dir", "limit"])?;
+                    params.allow(&["dir", "limit", "until"])?;
                     let dir = Self::dir(&params)?;
                     let listed = params
                         .u64("limit")?
                         .map_or(48, |limit| limit.clamp(1, 8192) as usize);
+                    // `until: "settled"`: back to the newest completed turn, however far.
+                    let turn = match params.0.get("until") {
+                        None => false,
+                        Some(Value::String(until)) if until == "settled" => true,
+                        Some(_) => return Err(bad("`until` is \"settled\"")),
+                    };
                     now(self.with_host(&dir, |host| {
                         if let Some(running) = host.running() {
                             return Err(busy(format!(
                                 "a {running} is running in this session; wait for it or stop it"
                             )));
+                        }
+                        if turn {
+                            return crate::reads::turn_on(&mut host.view()).map_err(failed);
                         }
                         let targets = crate::reads::targets_among(&mut host.view(), listed)
                             .map_err(failed)?;
@@ -1356,4 +1575,15 @@ impl Backend for Embedded {
         })();
         result.unwrap_or_else(|fault| Reply::Now(Err(fault)))
     }
+}
+
+/// Why an import failed. A full disk (or quota) is said as such: nothing of the import
+/// is kept, so there is no step to continue, only the import to make again.
+fn import_error(error: crate::Error) -> String {
+    if error.is_disk_full() {
+        return "the disk is full (ENOSPC), so the session could not be imported; nothing of it \
+                was kept: free some space, then import it again"
+            .into();
+    }
+    crate::driver::store_error(error)
 }

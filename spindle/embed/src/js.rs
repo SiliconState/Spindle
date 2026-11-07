@@ -54,6 +54,14 @@ pub fn install_node_fs(fs: node::NodeFs, platform: &str) -> Result<(), JsValue> 
     node::install(fs, platform).map_err(fail)
 }
 
+/// How the Node storage tells whether a process of this machine still runs:
+/// `check(pid, start) -> boolean` (null disables takeover). Matching Linux boot and
+/// PID-namespace notes allow takeover only after that exact owner is proved gone.
+#[wasm_bindgen(js_name = setProcessCheck)]
+pub fn set_process_check(check: Option<js_sys::Function>) {
+    node::set_process_check(check);
+}
+
 /// What the lock file of the store at `database` says about its owner.
 #[wasm_bindgen(js_name = nodeLockHolder)]
 pub fn node_lock_holder(database: &str) -> Option<String> {
@@ -219,6 +227,23 @@ impl JsEmbedded {
         frames(self.inner.handle(line.as_bytes()))
     }
 
+    /// One JSON-RPC request line with the bytes of its files beside it (an array of
+    /// Uint8Array): a file of `create` or `prompt` given as `{path, attached: N}` is the
+    /// Nth, so its bytes cross once instead of as base64 in the line.
+    #[wasm_bindgen(js_name = handleWith)]
+    pub fn handle_with(&self, line: &str, attached: js_sys::Array) -> Result<String, JsValue> {
+        let attached = attached
+            .iter()
+            .map(|bytes| {
+                bytes
+                    .dyn_into::<js_sys::Uint8Array>()
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|_| refused("each attached file is a Uint8Array"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(frames(self.inner.handle_with(line.as_bytes(), attached)))
+    }
+
     /// The provider catalog these sessions use, in Dext's format (JSON; no credentials):
     /// each provider's endpoint, contract and models, and the active provider.
     pub fn catalog(&self) -> String {
@@ -232,7 +257,9 @@ impl JsEmbedded {
     }
 
     /// Session `dir` as a session bundle (bytes). Unless `keep`, the session moves: it
-    /// closes here and its copy is sealed, continuing only where the bundle is imported.
+    /// closes here and its copy is sealed, continuing only where the bundle is imported
+    /// (sealed before the bytes are handed out: `keep`, then `sealSession` once they are
+    /// kept elsewhere, never strands the session in a sealed copy).
     /// `settings` (JSON object) change the bundle's copy only, for the host it goes to;
     /// `whole`: a copy's stores are checked record by record too, as a move's are.
     #[wasm_bindgen(js_name = exportSession)]
@@ -256,6 +283,37 @@ impl JsEmbedded {
             .map_err(faulted)
     }
 
+    /// A finished task of session `dir` (`task`: its name, or a label or key `tasks`
+    /// gave) as a session bundle of its own (bytes), its stores checked record by record:
+    /// the copy an app keeps before `task_drop` frees its space, read later as a session
+    /// where it is imported.
+    #[wasm_bindgen(js_name = exportTask)]
+    pub fn export_task(&self, dir: &str, task: &str) -> Result<Vec<u8>, JsValue> {
+        self.inner.export_task(dir, task).map_err(faulted)
+    }
+
+    /// Seals session `dir` as moved, without writing another bundle: once its bundle
+    /// (`exportSession` with `keep`) is kept where it goes on. `expectedHead` is that
+    /// bundle's head; `expected_state` is its sourceState fingerprint. A changed source
+    /// or task refuses the seal. `{session, head, sealed}` (JSON).
+    #[wasm_bindgen(js_name = sealSession)]
+    pub fn seal_session(
+        &self,
+        dir: &str,
+        expected_head: f64,
+        expected_state: &str,
+    ) -> Result<String, JsValue> {
+        if !(expected_head.is_finite() && expected_head >= 0.0 && expected_head.fract() == 0.0) {
+            return Err(refused(
+                "`expectedHead` is the bundle's head, a whole number",
+            ));
+        }
+        self.inner
+            .seal_session(dir, expected_head as u64, expected_state)
+            .map(|sealed| sealed.to_string())
+            .map_err(faulted)
+    }
+
     /// Checks a session bundle whole, as an import does (its framing and checksum, its
     /// manifest, every path and every store), writing nothing: `{head, identity,
     /// files}` (JSON).
@@ -264,7 +322,7 @@ impl JsEmbedded {
         let bundle = spindle_store::bundle::read(bytes).map_err(refused)?;
         Ok(
             serde_json::json!({"head": bundle.head, "identity": bundle.identity,
-            "files": bundle.files.len()})
+            "files": bundle.files.len(), "sourceState": bundle.source_state})
             .to_string(),
         )
     }
@@ -295,6 +353,14 @@ impl JsEmbedded {
     pub fn chunk(&self, session: &str, id: u32, bytes: &[u8]) -> String {
         let (frames, streaming) = self.inner.chunk(session, u64::from(id), bytes);
         serde_json::json!({"frames": frames, "streaming": streaming}).to_string()
+    }
+
+    /// The body of the model request work `id` sends (a `fetch` work), while it waits.
+    #[wasm_bindgen(js_name = requestBody)]
+    pub fn request_body(&self, session: &str, id: u32) -> Result<Vec<u8>, JsValue> {
+        self.inner
+            .request_body(session, u64::from(id))
+            .map_err(refused)
     }
 
     /// One file (by object digest) of the workspace a runner call (work `id`) runs over.

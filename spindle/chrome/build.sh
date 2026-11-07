@@ -8,15 +8,20 @@
 # plain sh commands run there (linux-route.mjs); without it every command runs on v86. Run
 # from the spindle directory. The icons are the native UI's icon.svg drawn at the
 # browser's sizes; THIRD-PARTY.md names the other software a build carries and where its
-# source is.
+# source is. SPINDLE_STORE=1 makes the Chrome Web Store's build: ChatGPT signs in only with
+# OpenAI's Sign in with ChatGPT (`chatgpt-plan`); the sign-in through the Codex CLI client
+# (`chatgpt`, feature `codex-signin`) is left out, and the build checks none of it is there.
 #
-# usage: chrome/build.sh [WASM_BINDGEN_CLI] [OUT_DIR]   (OUT_DIR defaults to chrome/dist)
+# usage: [SPINDLE_STORE=1] chrome/build.sh [WASM_BINDGEN_CLI] [OUT_DIR]   (OUT_DIR defaults to chrome/dist)
 set -euo pipefail
 
 bindgen=${1:-wasm-bindgen}
 out=${2:-chrome/dist}
 linux=${SPINDLE_LINUX:-chrome/linux/dist}
 wasm_linux=${SPINDLE_WASM_LINUX:-}
+store=${SPINDLE_STORE:-}
+features=()
+[ -z "$store" ] || features=(--no-default-features)
 if [ ! -f "$linux/identity" ]; then
     echo "no browser Linux in $linux: build it first (chrome/linux/build.sh)" >&2
     exit 1
@@ -51,7 +56,7 @@ fi
 # The wasm names source files in its panic messages: under /src (this checkout's parent,
 # holding spindle/ and dext-engine/) and /cargo, not this machine's directories.
 RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$(cd .. && pwd)=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo" \
-    cargo build --locked --release -p spindle-embed --target wasm32-unknown-unknown
+    cargo build --locked --release -p spindle-embed --target wasm32-unknown-unknown ${features[@]+"${features[@]}"}
 rm -rf "$out"
 mkdir -p "$out/clients" "$out/icons"
 "$bindgen" --target web --out-dir "$out/web" target/wasm32-unknown-unknown/release/spindle_embed.wasm
@@ -90,6 +95,12 @@ cp chrome/icons/*.png "$out/icons/"
 cp clients/js/common.mjs clients/js/embedded.mjs clients/js/opfs.mjs clients/js/remote.mjs "$out/clients/"
 cp store/ui/text.js store/ui/theme.js "$out/"
 cp chrome/THIRD-PARTY.md "$out/"
+# A store build carries nothing of the Codex CLI's sign-in: not its client, nor its
+# sign-in page's options.
+if [ -n "$store" ] && grep -r -a -l -F -e app_EMoamEEZ73f0CkXaXp7hrann -e codex_cli_simplified_flow "$out"; then
+    echo "the store build still carries the Codex CLI sign-in in the files above" >&2
+    exit 1
+fi
 # What this build is made of (Settings, About shows it; a report of a fault can name
 # it): the sources' commits, marked when they had changes, the tools, the engine wasm's
 # digest and each Linux image's identity. It names no directory of the machine.
@@ -120,7 +131,8 @@ cat > "$out/build.json" <<BUILD
   "rustc": "$built_rustc",
   "wasm": "$built_wasm",
   "linux": "$built_linux",
-  "wasm_linux": $built_wasm_linux
+  "wasm_linux": $built_wasm_linux,
+  "edition": "$([ -n "$store" ] && echo store || echo source)"
 }
 BUILD
-echo "Spindle for Browser in $out ($(du -h "$out/web/spindle_embed_bg.wasm" | cut -f1) wasm, $(du -sh "$out/linux" | cut -f1) Linux$([ -n "$wasm_linux" ] && echo ", $(du -sh "$out/wasm-linux" | cut -f1) wasm Linux"))"
+echo "Spindle for Browser$([ -n "$store" ] && echo " (store build)") in $out ($(du -h "$out/web/spindle_embed_bg.wasm" | cut -f1) wasm, $(du -sh "$out/linux" | cut -f1) Linux$([ -n "$wasm_linux" ] && echo ", $(du -sh "$out/wasm-linux" | cut -f1) wasm Linux"))"

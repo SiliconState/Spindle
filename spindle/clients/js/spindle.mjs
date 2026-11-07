@@ -359,7 +359,8 @@ export class HttpClient {
   /** The session's tasks with their head state: { tasks: [{ task, dir, status }] }. */
   tasks(id) { return this.request('GET', `/v1/sessions/${id}/tasks`); }
   taskStart(id, task, prompt, options = {}, requestId) { return this.command('task_start', { session: id, task, prompt, ...options }, requestId); }
-  taskWait(id, task, timeoutS = 600) { return this.request('POST', `/v1/sessions/${id}/tasks/${encodeURIComponent(task)}/wait`, { timeout_s: timeoutS }); }
+  // (A host waits at most 300 s per request: `pending` says to ask again.)
+  taskWait(id, task, timeoutS = 300) { return this.request('POST', `/v1/sessions/${id}/tasks/${encodeURIComponent(task)}/wait`, { timeout_s: timeoutS }); }
   taskStop(id, task) { return this.request('POST', `/v1/sessions/${id}/tasks/${encodeURIComponent(task)}/stop`, {}); }
   /** A task's messages form. */
   taskMessages(id, task, revision) { return this.request('GET', `/v1/sessions/${id}/tasks/${task}/messages${query({ revision })}`); }

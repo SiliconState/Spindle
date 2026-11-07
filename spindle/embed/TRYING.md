@@ -28,9 +28,11 @@ this guide.
 
 Pick any provider from your catalog that signs in with an API key (Dext's
 `~/.dext/providers.json` is used when present, otherwise Dext's built-in providers).
-A ChatGPT sign-in works when the app passes its access token as the key (the package
-reads the account from the token); Claude subscription sign-ins are not supported (an
-Anthropic key goes in `x-api-key`). The key goes in `SPINDLE_KEY`; it stays in the app's
+A ChatGPT sign-in works when the app passes its access token as the key: on `chatgpt`
+(the Codex route, in builds with feature `codex-signin`) the package reads the account
+from the token; on `chatgpt-plan` (Sign in with ChatGPT) the token is the bearer key as it
+is. Claude subscription sign-ins are not supported (an Anthropic key goes in
+`x-api-key`). The key goes in `SPINDLE_KEY`; it stays in the app's
 process and is never stored.
 
 ```sh
@@ -45,7 +47,8 @@ files. Run it again with another prompt and the same `--dir` to continue the ses
 ## 3. Move a session
 
 - **Into a bundle and onward:** add `--export s1.spindle` to a run. The session moves
-  into that file and `./s1` is sealed (opening it says where it went). Continue it in
+  into that file: the file is written first, then `./s1` is sealed at the file's head
+  (`sealSession`; opening it says where it went). Continue it in
   the `spindle` command built from this repository:
 
   ```sh
@@ -118,8 +121,9 @@ and only requests from its own page.
    Chrome or Edge (the bare `http://localhost:PORT/` takes you there too). From Windows
    this works while the relay runs in WSL.
 3. Type a session name such as `/sessions/one`, pick the provider (the list is your
-   catalog), write a prompt and press Send. Try Stop while it writes, Status, and Export,
-   which downloads a bundle and seals the session in the browser. Then import that file
+   catalog), write a prompt and press Send. Try Stop while it writes, Status, and Copy
+   to a file, which downloads a bundle and leaves the session here (starting a download
+   does not prove the file was saved, so the page never seals it). Then import that file
    into a new session name, or into the `spindle` command (`spindle --dir DIR
    import-session FILE`).
 4. Reload the page or restart the browser: the session is still there (OPFS). A second
@@ -154,7 +158,8 @@ with a real turn in each, then checks the key is in no bundle. It costs a few ce
   again: it says the outcome is unknown) and `retry` (sends it once). A killed app
   leaves its lock file, on purpose: nothing can tell a dead app from a live one, so the
   session stays refused until you delete `store/authority.sqlite.lock` in its directory
-  (only once that app is really gone).
+  (and `authority.sqlite.lock.takeover` if there is one), only once that app is really
+  gone. On Linux a lock whose process is gone is taken over by itself.
 - Moving sessions back and forth between the app and the `spindle` command.
 
 Sessions hold your prompts and files: share a session directory or bundle only if that

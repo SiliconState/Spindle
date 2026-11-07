@@ -909,6 +909,57 @@ fn app_tools_are_offered_answered_and_kept_with_their_files() {
     );
 }
 
+/// Back to the newest completed turn goes along the head's line: rewound to a point
+/// before the model inside the first turn, the session has no completed turn behind
+/// it (the one the rewind left is not it), and only points on the line are offered.
+#[test]
+#[cfg(unix)]
+fn a_turn_a_rewind_left_behind_is_not_the_completed_turn_to_go_back_to() {
+    let port = fake_provider();
+    let root = scratch("line-settled");
+    let dir = root.join("work");
+    let mut api = Api::start(&root, port);
+    api.ok(
+        "create",
+        json!({"dir": dir, "provider": "local", "isolation": "off"}),
+    );
+    let prompt = api.send("prompt", json!({"dir": dir, "text": "write hello.txt"}));
+    let done = api.wait(prompt);
+    assert_eq!(done["result"]["stopped"]["complete"], true, "{done}");
+    let settled = done["result"]["head"].as_u64().unwrap();
+    let turn = spindle_store::api::turn_targets(&dir).unwrap();
+    assert_eq!(turn["completed"], true, "{turn}");
+    let targets = api.ok("targets", json!({"dir": dir}));
+    let before = targets["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|target| target["kind"] == "before_model")
+        .filter_map(|target| target["revision"].as_u64())
+        .filter(|revision| *revision < settled)
+        .max()
+        .unwrap_or_else(|| panic!("a point before the model in the turn: {targets}"));
+    api.ok("rewind", json!({"dir": dir, "revision": before}));
+    let turn = spindle_store::api::turn_targets(&dir).unwrap();
+    assert_eq!(turn["completed"], false, "{turn}");
+    let listed: Vec<u64> = turn["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| target["revision"].as_u64().unwrap())
+        .collect();
+    assert!(listed.contains(&before), "{turn}");
+    assert!(
+        listed
+            .iter()
+            .all(|revision| *revision <= before || *revision > settled),
+        "only points on the line: {turn}"
+    );
+    drop(api.stdin.take());
+    let _ = api.child.wait();
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 #[cfg(unix)]
 fn files_an_app_tool_writes_are_undone_by_rewinding_its_step() {
@@ -1365,11 +1416,14 @@ fn background_task_answer_is_durable_queued_once_and_survives_reopen() {
     );
     api.ok("continue", json!({"dir":dir}));
     assert_eq!(api.ok("history", json!({"dir":dir})).to_string(), history);
+    // The report brought the task's file into the session's workspace, once, and says so.
     assert!(
-        !api.ok("files", json!({"dir":dir}))
+        api.ok("files", json!({"dir":dir}))
             .to_string()
-            .contains("child.txt")
+            .contains("child.txt"),
+        "the task's file came with its report"
     );
+    assert!(history.contains("1 file(s) written"), "{history}");
     let second = api.ok(
         "task_start",
         json!({"dir":dir,"task":"background","prompt":"CHILDWRITE it","report":"queue"}),
@@ -1378,7 +1432,7 @@ fn background_task_answer_is_durable_queued_once_and_survives_reopen() {
 }
 
 #[test]
-fn model_background_tasks_are_waited_reported_once_and_never_adopt_files() {
+fn model_background_tasks_are_waited_reported_once_and_adopt_their_files() {
     let port = fake_provider();
     let root = scratch("model-background");
     let dir = root.join("work");
@@ -1411,11 +1465,15 @@ fn model_background_tasks_are_waited_reported_once_and_never_adopt_files() {
     );
     api.ok("continue", json!({"dir":dir}));
     assert_eq!(api.ok("history", json!({"dir":dir})).to_string(), history);
+    // The task's file came into the session's workspace with its report (read at the
+    // end of the turn that waited for it), and the report counts it.
     assert!(
-        !api.ok("files", json!({"dir":dir}))
+        api.ok("files", json!({"dir":dir}))
             .to_string()
-            .contains("child.txt")
+            .contains("child.txt"),
+        "the task's file came with its report"
     );
+    assert!(history.contains("1 file(s) written"), "{history}");
 }
 
 #[test]
@@ -1599,7 +1657,7 @@ fn recovery_reports_a_job_as_lost_after_its_owner_exits_without_restarting_it() 
 }
 
 #[test]
-fn mixed_background_and_foreground_tasks_share_base_and_keep_background_files_in_child() {
+fn mixed_background_and_foreground_tasks_share_base_and_adopt_both_tasks_files() {
     let port = fake_provider();
     let root = scratch("mixed-tasks");
     let dir = root.join("work");
@@ -1610,7 +1668,14 @@ fn mixed_background_and_foreground_tasks_share_base_and_keep_background_files_in
     );
     api.ok("prompt", json!({"dir":dir,"text":"PARALLEL_PARENT MIXED"}));
     let files = api.ok("files", json!({"dir":dir}));
-    assert!(!files.to_string().contains("one.txt"), "{files}");
+    assert!(
+        files["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "one.txt" && file["executable"] == true),
+        "{files}"
+    );
     assert!(
         files["files"]
             .as_array()

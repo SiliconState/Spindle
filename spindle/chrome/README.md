@@ -16,9 +16,25 @@ your key.
   the extension's permissions: providers come from a catalog, Spindle's built-in one or
   your own `~/.dext/providers.json` (Settings, Providers, Provider list, **Import
   providers.json**; **Use the built-ins** goes back).
-- **Sign in instead of a key** where the provider has a browser sign-in: **Sign in** for
-  ChatGPT opens OpenAI's sign-in page in a tab, Spindle catches where it sends you back,
-  and the engine keeps (and refreshes) the tokens, sealed like keys.
+- **Sign in instead of a key** where the provider has a browser sign-in: the provider's
+  page opens in a tab, Spindle catches where it sends you back, and the engine keeps (and
+  refreshes) the tokens, sealed like keys. **ChatGPT** is OpenAI's Sign in with ChatGPT
+  (**Continue with ChatGPT**): your ChatGPT plan pays for the requests, which go to the
+  OpenAI API. The first sign-in registers Spindle as your own app at OpenAI (you can rename
+  it there) under an ID for this browser profile; Spindle keeps that registration, so
+  signing in again (or after signing out) is the same app for the same account; signed
+  out, **Use another ChatGPT account** registers anew. Spindle checks OpenAI's signature
+  on the sign-in, that it is for this app and this attempt, and that you allowed it to use
+  your plan; signing out also ends the session at OpenAI. Review and limit what Spindle
+  uses of your plan at chatgpt.com/settings/usage (**Manage usage** on the provider's row
+  and in the model page); a usage limit stops the turn, with no retries. Builds from
+  source and the GitHub release zips also offer **ChatGPT (Codex)**, the sign-in through
+  the Codex CLI's client and the Codex backend; the Chrome Web Store build
+  (`SPINDLE_STORE=1 chrome/build.sh`) leaves it out.
+- **Current source versus releases.** This page describes the working tree. A zip from
+  an older tag can differ; the product page keeps its download on the last published
+  tag until a new release exists. The source/GitHub edition retains ChatGPT (Codex)
+  alongside OpenAI's Sign in with ChatGPT; the store edition leaves the Codex client out.
 - **bash, in a Linux inside Chrome:** threads run commands in Alpine Linux (bash,
   coreutils, Python 3 with pip, Node with npm, git, curl, jq, ripgrep) emulated by v86 in
   the extension, sealed off from your computer and from Spindle's keys. Commands run as
@@ -29,7 +45,11 @@ your key.
   network at a time), so a script waiting on its Spindle calls holds up no other
   thread. A thread's workspace stays in the Linux between its commands (for the eight
   threads that ran there last, up to 256 MiB): only files changed since its last command
-  go in, and only files a command changed come back. The Linux keeps the browser's
+  go in, and only files a command changed come back. Packages and caches a command
+  installs (a `.venv`, `node_modules`, `__pycache__`, `.cache` and the like) stay in
+  the Linux between commands too, but are no part of the workspace: never versioned,
+  exported or shown as files, and gone for good when a command removes them or the
+  Linux lets the thread's copy go. The Linux keeps the browser's
   clock. The first command ever boots it (about 20 seconds in our measurements, once for
   each Linux image: an update that changes the image boots it again); after that it
   resumes in under a second, and rests (giving its memory back) after ten idle minutes.
@@ -77,8 +97,10 @@ your key.
   Your computer and its local network are refused by address and name (localhost,
   names without a dot, names under `.local`, `.lan`, `.internal`, `.localdomain` or
   `.home.arpa`, and loopback, private, link-local, shared (100.64.0.0/10) and multicast
-  addresses; a public name that points into your network is not caught, since Chrome
-  resolves names). Redirects are refused: Chrome does not tell an extension where a
+  addresses; a public name is looked up over DNS-over-HTTPS first, at cloudflare-dns.com,
+  so Cloudflare sees each name a command reaches, and refused if any of its addresses is
+  one of those. Chrome then looks it up again itself, so a name that answers otherwise
+  the second time, or whose lookup fails or is too slow, is not caught). Redirects are refused: Chrome does not tell an extension where a
   redirect leads, so the gateway answers every redirect with an error (HTTP 502) rather
   than reach an unchecked address. Ask for the final public address directly, or use
   your own relay. A command without network reaches nothing. Chrome asks once for
@@ -109,9 +131,13 @@ your key.
 - **Run on my host:** in Settings, Your Spindle host, type its address and press
   **Connect**: Chrome asks to reach it, and your host's own page opens in a tab to
   approve this browser (it asks for the host's pairing key first if that tab is not
-  paired). If a passphrase locks Spindle's keys, unlock them first: Connect is refused
-  while they are locked. Once allowed (or with a `--browser` token pasted under Or paste
-  a token), **Run on my host** in a thread's menu (not while a turn runs) moves its
+  paired). The browser connects under a name of its own ("Chrome on Windows" and a
+  short code, kept in this profile). Connecting again under that name, after a reset
+  say, the host's page names the threads the connection holds and asks again with
+  **Replace**: that hands them to this browser and ends the old token's access. If a
+  passphrase locks Spindle's keys, unlock them first: Connect is refused while they are
+  locked. Once allowed (or with a `--browser` token pasted under Or paste a token),
+  **Run on my host** in a thread's menu (not while a turn runs) moves its
   history and workspace there; the host supplies its model credentials, programs and
   required sandbox. If this thread's model is not signed in there, the move asks which
   of your host's models runs it. The panel still drives the thread and answers its page
@@ -149,7 +175,11 @@ your key.
   ref such as `kqm12`, which names a part of that page only) and its HTML (`page_html`,
   scripts and passwords left out). With page actions on, `read_page` with `scroll` reads
   a feed that loads as it scrolls in one call (down that many screens, each new line
-  once). `screenshot` pictures the tab showing once you have let Spindle picture pages
+  once). `read_page` and `page_elements` with `find` (words, or `/a pattern/`) give only
+  the lines or parts that match, with a line's neighbours, however long the page. A file
+  of the workspace open in Spindle's own tab (a report it made and opened for you) reads
+  with `read_page` as the file's text; Chrome pictures no extension page, so `screenshot`
+  says so for such a tab instead. `screenshot` pictures the tab showing once you have let Spindle picture pages
   (saved in the workspace, shown in the panel; a script can show it to a vision model
   with `spindle model --image FILE`). While the switch is off, threads read nothing, not
   even a provider's site Spindle may reach for its key.
@@ -182,21 +212,45 @@ your key.
   turns page reading on too; Chrome's debugger, which Chrome does not offer as an
   optional permission, so the extension holds it and the switch decides): threads browse
   as you would, in your browser, signed in as you: `navigate` (an address, a new tab,
-  back, forward, reload), `click`, `type`, `select`, `press` (Enter, Escape,
-  Control+a...), `scroll` (the page, or the pane under the middle of the window),
+  back, forward, reload), `click`, `type`, `select` (options of a list, or with
+  `files`, files of the thread's workspace put in a site's file field as if picked in
+  its dialog: by the field, its label or the button beside it; up to 10 files, 25 MB
+  each and 40 MB together; never from a script or a task, whose files reach the thread
+  only once they end), `press` (Enter, Escape, Control+a...), `scroll` (the page, or the pane under the middle of the window),
   `wait_for` (text or a selector), `dialog` (answer an alert, confirm or prompt),
   `close_tab`, `screenshot` of any tab (through the debugger) and `network` (record a
-  tab's requests, list them, read a response). Clicks, keys and typing go through
+  tab's requests, list them, read a response). The tabs a thread opens (`navigate`
+  with a new tab, and tabs a page opens on its click, key or choice, such as a link to
+  a new tab) close once its turn is done and the thread rests. They stay after a
+  stopped or failed turn (Continue or Retry may still need them) and while a message
+  you sent meanwhile goes on from it or waits unread; a tab opened with `keep_open` (a
+  page you asked to have open), one you pinned and a browser window's last tab stay too
+  (a popup window a page opened closes whole). A background task's tabs close at a
+  later turn's end once no task of the thread is at work, and deleting the thread
+  closes them all. A file of the workspace opened in a tab for you stays, and so does a
+  tab whose address Chrome does not show Spindle (your own new tab, opened just then, is
+  never taken for one of its). While you write in Spindle's message box (it has the
+  focus and holds text, or you typed in the last few seconds), a tab Spindle opens
+  (`navigate` with a new tab, or a workspace file it opens for you) opens behind the one
+  showing, so the box keeps your typing (Chrome gives the keys to a tab it shows); that
+  thread's tools without a tab go on in it until you show it. A tab a page opens on
+  Spindle's click (a link to a new tab) still opens in front. Clicks, keys and typing go through
   Chrome's debugger, so pages see them as real input; Chrome shows that Spindle is
-  debugging a tab while it acts on it.
-- **Before acting** (Settings, Pages): **Full**, the default, acts without asking, the
-  whole task start to end. **Auto** asks you first before what sends or submits: Enter
+  debugging a tab while it acts on it. A file dialog is your computer's, which Spindle
+  cannot fill: a click on a file field or its label is refused, and one a click opens at
+  once (a site's Upload button) is caught and not shown where Chrome lets Spindle catch
+  it; one a page opens later reaches you.
+- **Before acting** (Settings, Pages): **Auto**, the default, asks you first before
+  what sends or submits; **Full** acts without asking, the whole task start to end (an
+  install from before Auto was the default keeps Full as it updates). **Auto** asks
+  before: Enter
   (pressed, as Enter or Return, or after typing), a click on a submit button or one
-  whose words say it sends, posts, buys, pays, deletes and the like, and accepting a
-  page's dialog (a button counts by its words or by its accessible name, so an icon
-  button named Send does). **Ask** asks before every click, keystroke, choice, page it
-  opens, dialog it answers and tab it closes (looking, waiting, scrolling, pictures and
-  the network log never ask). If Spindle cannot read your saved choice, it asks. The
+  whose words say it sends, posts, buys, pays, deletes and the like, accepting a page's
+  dialog, and putting files in a file field (many sites upload them at once). A button
+  counts by its words or by its accessible name, so an icon button named Send does, and
+  Auto can miss one that sends under other words. **Ask** asks before every click,
+  keystroke, choice, file it puts in a field, page it opens, dialog it answers and tab
+  it closes (looking, waiting, scrolling, pictures and the network log never ask). If Spindle cannot read your saved choice, it asks. The
   question shows above the thread's message box (Allow, Deny) and on its row in the
   list; a question about pressing a key, answering a dialog, closing a tab or moving a
   tab in place (to an address, back, forward, reload) names that tab (the one named, or
@@ -205,18 +259,23 @@ your key.
   checked just before it goes: a key, a move in place or closing a tab only while that
   tab still shows the same page (reloaded, moved to another site or on to another page
   since, it is not done), a click, typing or choice only while its part of the page is
-  still what the question named, and a dialog's answer only to the dialog the question
-  showed, whose words the question quotes (the page itself where Chrome says which it
+  still what the question named (its role and name, its words with their numbers, so
+  "Pay $10" becoming "Pay $10000" is not done, and where it leads: a link's address, the
+  address a submit button sends its form to; a click's or an upload's question shows the
+  words its name, cut short, leaves out, and a click's where it leads), a key only while the part that had the focus, when the page
+  said which, still has it (Enter in another form is not done), and a dialog's answer
+  only to the dialog the question showed, whose words the question quotes (the page itself where Chrome says which it
   is, else the same address). A question that cannot name the tab a key or a dialog's
   answer would go to is not asked: nothing is done. Otherwise nothing is done and the
-  thread is told why, so it can ask again. A task's question says it is a task's. A thread waits up to ten minutes for your answer. Deny, no answer,
+  thread is told why, so it can ask again. A task's question says it is a task's. A
+  thread waits up to ten minutes for your answer. Deny, no answer,
   or Stop: the action is not done, which the thread is told (a known outcome, not an
   unknown one); a script's action waiting for your answer is withdrawn when the command
   that asked ends. Stop ends the turn's own page actions and those of the tasks it waits
   for; a task running in the background goes on, page actions too, until its own Stop
   (or the thread is deleted, moved back, or its host changes). A thread on your host
-  ends every page action at its Stop. While a page dialog Spindle saw is open, it keeps the debugger on
-  that tab (up to 11 minutes), so your answer still reaches it. Opening a file of the
+  ends every page action at its Stop. While a page dialog Spindle saw is open, it keeps
+  the debugger on that tab (up to 11 minutes), so your answer still reaches it. Opening a file of the
   workspace for you never asks.
 - **Your browser's name:** in Edge, Brave or Opera, the panel and the messages it shows
   say that browser's name where they would say Chrome (its prompts, its debugging bar and
@@ -246,7 +305,18 @@ your key.
   play in a player. An SVG shows as a picture, given the namespace a picture needs when
   it was written without one; one whose markup is not XML is drawn as a page instead.
   Each card's name opens it in the workspace page, and its icon buttons
-  show it here (the eye) or download it (their words in their tooltips). The workspace
+  show it here (the eye) or download it (their words in their tooltips). A Markdown
+  file, document or picture a step writes shows itself below that run of steps while
+  the turn works on it, one at a time (the next file written folds the one before; a
+  picture stays beside the file after it), and folds three steps later, when the run
+  moves on or when the turn is done, whichever comes first (one you are reading, scrolled
+  up to it, waits until you have left it); a page does not show itself here (the thread
+  opens it in a tab when it means to show it; the eye opens it below its steps). The
+  thread's own notes (a `NOTES.md` or `notes.md` at the top of the workspace) never show
+  themselves: their card sits folded inside the run, under the step that wrote them. A
+  preview you opened or shut stays as you left it. An edit a step made shows, opened, as
+  a diff: the lines it replaced
+  tinted red, the lines it put there tinted green. The workspace
   is listed once, in a card folded until you open it, just above the last turn's final
   answer: as a tree whose folders stay shut until you open one (a folder holding only a
   folder shares its row, `lib/python3.14/site-packages`; each says how many files it
@@ -257,7 +327,9 @@ your key.
   thread's menu, or a card's workspace button): its files to filter and open, one at a
   time with its preview, the files before and after it a click (or an arrow key) away,
   its path to copy, Download, and for a page, picture, PDF, document, audio or video
-  Open in a tab of its own. With
+  Open in a tab of its own (a page or document there has **Print**, and Ctrl+P (⌘P)
+  prints it too, not the tab around it; Chrome's print dialog also saves it as a PDF).
+  With
   page tools on, a thread can open a file for you itself: `navigate` to
   `/workspace/NAME`. Downloads go through Chrome's downloads API (the `downloads`
   permission), which saves them even when the browser would hold back a download a page
@@ -273,13 +345,17 @@ your key.
   tense (Running build_report.py, Ran build_report.py); a page step shows the site's
   icon and says what it did without the address (Read HTML, Typed into “Search”; the
   address shows on hover). The same step done again and again in a row shares one row
-  (Read HTML ×3, the times added; opened, each shows). A long group shows its first rows
-  and "N more steps" (a running one its last rows, under "N earlier steps"). Opened, a
+  (Read HTML ×3, the times added; opened, each shows). A long group shows its last rows,
+  the newest, under "N earlier steps" (running or done: the newest stay in sight).
+  Opened, a
   step shows the picture it took, its input and its output a line each, and copy, view
   (all of both) and download. A failed step shows a red ✕, and an amber ↻ once a later
   step did it again. A message sent while a turn runs is a bubble of its own at the
   right (three lines of a long one, with an arrow for the rest), checked once the
-  running turn has read it; scrolled up while it runs, Latest takes you back down; while
+  running turn has read it. The conversation follows a running turn down as it grows
+  (a preview coming in, however tall, or the panel growing shorter does not stop that)
+  until you scroll up away from its end; then Latest takes you back down, and so does a
+  message you send; while
   a turn runs (and the box is empty) Send is Stop, a red square. An answer has a copy
   button; a table's short cells stay on one line (a wide table scrolls). Chrome's site
   icons come through its `favicon` permission.
@@ -295,6 +371,13 @@ your key.
   the panel, each with a back button.
 - **Your instructions:** what every thread should keep to (Settings, Your instructions):
   new threads start with them, others take them before their next message.
+- **What a thread knows of its setup:** before each message it takes (Retry and
+  Continue keep what its turn started with), a thread here is told its model and effort,
+  where its commands run and their network, its spending limit, page reading and
+  actions with Before acting, and the sites its scripts may call, and that it cannot
+  change them and should ask you. This sits in its instructions and changes (missing a
+  provider's prompt cache once) only when one of these does; a thread moved to your host
+  or a file leaves it behind.
 - **Settings, About:** the version and what this build is made of (to name in a report
   of a fault), **Open in a tab**, and **Restart engine** (running browser threads are cut
   off and can be retried; threads on your host keep running). **Settings, Commands**
@@ -319,7 +402,13 @@ your key.
   waits for its tasks before it ends ("Waiting for its task"); Stop then stops the
   waiting, not the tasks. A task's report shows as the task's, folded; one that stops
   (or could not go on, saying why) tells the thread so, and the thread goes on. Their
-  spend counts against the thread's limit.
+  spend counts against the thread's limit. A finished task's files come with its report:
+  what it wrote, removed or linked in its own workspace (against the files it began
+  from) goes into the thread's workspace as the report is read, and the report counts
+  them. Not where the thread changed the same path since the task began (the report
+  names the paths; those files stay in the task's own workspace, to be read from it),
+  nor past 64 MiB or 8,192 paths at once, nor from a task started with `files:
+  "discard"`, nor from one that stopped.
 - **Stop, then say what to do:** Stop while a command runs ends it, and the thread keeps
   it as stopped by you, with what it printed: it never runs again, not even on Continue.
   Then type a reply, as you would after any answer ("skip that, do X"): the turn goes
@@ -334,20 +423,24 @@ your key.
   Take back.
 - **Durable:** a turn cut off by closing Chrome, a crash or Stop says so; Retry sends the
   cut request again (Continue goes on when Spindle knows where it stopped). A turn that
-  stopped before it finished (a provider refusing the key, say) can also be started over
-  with another model or effort (the model page: the turn is taken back and its message
-  sent again, its attachments too), or taken back (its message returns to the box).
+  stopped before it finished (a provider refusing the key, say) can also go on with
+  another model or effort (the model page, **Go on with this**: see Changing the model of
+  a stopped turn, below), or be taken back (its message returns to the box). A thread
+  found in storage without its entry in the list (an index entry lost to a power cut,
+  say) is listed again as "Found again", never deleted; rename it from its menu.
 - **Going back:** the back arrow beside any of your messages takes the thread back to
   just before it, conversation and workspace together, and returns the message (and its
   attachments) to the box to change or send again (stop a running thread first; what its
   commands did outside the workspace, on the web say, is not undone). What came after
   stays in the thread's record. (A thread started with another thread's files keeps
   them: its first turn can be started over, but not taken back alone.)
-- **Long threads:** when a thread's history outgrows what its model takes, its earlier
+- **Long threads:** when a thread's history outgrows what its model takes, passes its
+  **Compact history past** limit (below) or grows to thousands of messages, its earlier
   part is folded into a summary the thread's own model writes (one request, on your key;
   if it fails, a shorter digest Spindle makes stands in), and the thread goes on from
   it. The conversation says so where it happened, shows the summary, and shows the
-  earlier messages themselves when asked. A long thread opens on its last 30 turns (the
+  earlier messages themselves when asked (and hides them again on the same button). A
+  long thread opens on its last 30 turns (the
   rest on a click), and a turn's end draws only that turn again. To start clean, the
   thread menu's **New thread with these files** starts a thread with this one's
   workspace and none of its conversation (its model too, to change in the model page).
@@ -355,39 +448,93 @@ your key.
   continues in native Spindle (`spindle --dir DIR import-session FILE`), or in Spindle
   in another browser (Import a .spindle thread; up to 1 GB, as bringing one in holds it
   about three times over in the engine's memory). Native Spindle's `export-session FILE`
-  moves one back. The moved copy keeps the file until you delete it (Save the file
-  again), so a save you cancelled loses nothing; once Spindle has kept the file in this
-  browser's storage (a strict IndexedDB commit) and it reads back as written, it is the
-  thread's one copy here (the store it left goes, all but the note of where it went).
-  Export a copy leaves the thread here. A thread leaves without the page tools (a native
-  host could not answer them) and, where it had the file tools, with native's full tool
-  set (code mode's `run_code` too) run in the native host's own sandbox; the thread in
-  Chrome keeps its own settings. Imported, a thread gets the page tools back, and one
-  from a native host changes what Chrome cannot do (its commands move to the browser
-  Linux, keeping the network they had; the Rust toolchain and host folders go, a dollar
-  budget stays): the panel lists those changes and keeps the thread only if you say so,
-  before anything runs.
+  moves one back. The moved copy keeps the file (Save the file again) until you delete
+  the thread, or until Settings, Storage, **Save and free** has saved it whole
+  to your Downloads, so a save you cancelled loses nothing; once Spindle has kept the
+  file in this browser's storage (a strict IndexedDB commit) and it reads back as
+  written, it is the thread's one copy here (the store it left goes, all but the note of
+  where it went). Export a copy leaves the thread here. A thread leaves without the page
+  tools (a native host could not answer them) and, where it had the file tools, with
+  native's full tool set (code mode's `run_code` too) run in the native host's own
+  sandbox; the thread in Chrome keeps its own settings. Imported, a thread gets the page
+  tools back, and one from a native host changes what Chrome cannot do (its commands
+  move to the browser Linux, keeping the network they had; the Rust toolchain and host
+  folders go, a dollar budget stays): the panel lists those changes and keeps the thread
+  only if you say so, before anything runs.
 - **Deleting:** Delete in a thread's ⋯ menu in the list (or Delete this thread in its
   menu) removes it and its workspace from this browser after a moment to Undo it
   (closing the panel deletes it then); stop a running thread first. A thread on your
   host is deleted there too (not while it moves). Bring a thread back from your host
   before moving it to a file or starting a new thread with its files.
 - **Storage:** Settings, Storage lists what Spindle keeps in this browser, largest
-  first: each thread (with the free space inside its store that can be given back), a
-  moved thread's file, the Linux snapshot v86 resumes from, and everything else
-  (settings, keys, the browser's own bookkeeping). **Free** compacts a thread's store
-  and its tasks' (a copy written beside it with VACUUM INTO, synced, checked whole, then
-  renamed over it: a crash leaves the store or the copy whole), while no thread or
-  background task is at work (it holds the engine for its seconds); **Free all** does
-  every thread that has space to give back. A thread whose first request was tried again
-  keeps the first attempt aside (its unknown request on record); **Remove first
-  attempts** removes them (what they may have cost stays counted). A moved thread that
-  still has its sealed store (one moved by an earlier version) frees it once its file
-  checks whole. **Remove** takes the Linux snapshot away: the next command for v86 boots
-  it afresh (under a minute). **Unreadable** shows only if a file's name in storage was
-  found damaged (not something a crash leaves: every rename and delete is finished or
-  undone whole); its bytes are kept apart, never reused, until **Free** (or Free all)
-  removes them.
+  first: each thread, the Linux snapshot v86 resumes from, and everything else
+  (settings, keys, the browser's own bookkeeping). Each row gives its size, a line of
+  what it holds (a thread's history, its tasks, first attempts, free space inside, or
+  its file), a bar of its share, and at most one action beside that line; what is done
+  less often is in its ⋯ menu.
+  - **Free N** beside a thread compacts its store and its tasks' (a copy written beside
+    it with VACUUM INTO, synced, checked whole, then renamed over it: a crash leaves the
+    store or the copy whole), while no thread or background task is at work (it holds
+    the engine for its seconds). Beside a moved thread that still has its sealed store
+    (one moved by an earlier version), it frees that store once the thread's file checks
+    whole. The **Free N** button at the bottom does both for every thread, and nothing
+    else.
+  - **Free tasks…** (⋯) saves the working copies of a thread's finished tasks
+    (each task's own steps and workspace) into `.zip` files of about 1 GiB each in your
+    Downloads, each task a `.spindle` file that imports as a thread of its own, and
+    removes each batch here once Chrome has its file whole. Each task's answer and the
+    files it gave stay in the thread, and what it spent stays counted against its limit.
+    A task still running is not freed; one freed this way, a stopped one included, never
+    runs again. The remains of a task that never began (storage ran out as it started:
+    a store with no steps and no record) are listed as such and freed without a file,
+    and never stop the task above them from being saved and freed.
+  - **Move to file…** (⋯) is cold storage for a thread you are done with for
+    now: it moves into a `.spindle` file saved to your Downloads, and its copy here goes
+    only once Chrome says the file is complete and whole on disk. (The thread menu's
+    **Move to a file** keeps the file in this browser.) A save that fails or is cancelled
+    leaves the thread moved with its file still here, and **Save and free…** (⋯)
+    tries again; it does the same for any moved thread whose file is kept here.
+    Import the file to go on with it, here or in native Spindle.
+  - **Remove first attempts…** (⋯): a thread whose first request was tried again keeps
+    the first attempt aside (its unknown request on record); this removes it, after
+    asking (what it may have cost stays counted).
+  - An **earlier version** is a thread as it was before it started afresh (its first
+    turn started over or taken back), shown beneath the thread ("As it was on …") with
+    its whole copy kept. **Open** brings it back as a thread of its own (the copy stays
+    kept). **Remove** shows once a week has passed and the thread has finished three
+    more turns (counted in the history it holds now, so a compacted history can keep it
+    longer; a thread on your host or moved into a file, whose history is not here, waits
+    out the week alone), and asks first; deleting the thread deletes it too. Moving a
+    thread into a file leaves its earlier versions here.
+  - **Remove** beside the Linux snapshot takes it away: the next command for v86 boots
+    it afresh (under a minute).
+  - **Unreadable** shows only if a file's name in storage was found damaged (not
+    something a crash leaves: every rename and delete is finished or undone whole). Its
+    bytes are kept apart and never reused; they may be a thread's, so only its own
+    **Remove** takes them, after asking, never the button at the bottom.
+- **Changing the model of a stopped turn:** a turn that stopped before it finished (a
+  provider out of credit, a failed connection, a reply that could not be read) goes on
+  with the model, effort or settings the model menu now says (**Go on with this**):
+  from just before its newest model request when it has one, so what the turn did stays
+  and only the request that stopped goes again; else that turn starts over from the end
+  of the turn before (your message, and its files, sent again; earlier turns stay, and
+  the attempt stays in the thread's history). Only a thread's first turn starts afresh,
+  and the thread as it was is kept as an earlier version. While a background task of
+  the thread is still at work its earlier turns cannot be gone back to: the menu says so
+  and changes nothing. A thread on your host goes on the same way there, except a first
+  turn, which cannot start afresh on your host: bring the thread back first.
+- **Compact history past:** the model menu's limit, in thousands of tokens (16 to
+  100,000), past which a thread's older turns fold into a summary even when the model's
+  window is larger (new threads 256K; empty: the window alone). It is reckoned from the
+  history's size, so folding usually comes somewhat before the provider would count
+  that many. A long thread otherwise sends its whole history with every request. The
+  folded messages stay in the thread's history. The summary ends with the workspace as
+  it stands (how many files, the top level, and the start of a `NOTES.md` when the
+  thread keeps one), so the model goes on knowing what it has.
+- **Long page reads:** a page read (`read_page`, `page_elements`, `page_html`) over
+  32,000 characters keeps its start in the conversation and the whole result in the
+  workspace under `.pages/` (for a thread with file tools): every later request would
+  send it again, so the model reads or searches the file instead.
 - **Appearance:** the native UI's Paper, Light, Dim or System (Light or Dim as the
   system is) theme, with a Textured or Plain background. Dim is the dark theme: a soft
   warm charcoal rather than near-black (a panel that chose the old Dark shows Dim).
@@ -439,7 +586,7 @@ Then in Chrome:
    (Settings, About, **Open in a tab** opens the same Spindle in a tab; if Chrome cannot
    show a permission prompt in the side panel, Spindle offers to open it in a tab.)
 4. **Settings** (the sliders button at the top) → Providers → the **+** on your
-   provider's row (Add … key) → paste → **Save** (or the sign-in button, Sign in to
+   provider's row (Add … key) → paste → **Save** (or the sign-in button: Continue with
    ChatGPT). Chrome asks to let Spindle reach that provider's site; allow it. To use your
    Dext providers, first **Import providers.json** (Settings, Providers, Provider list).
 5. Write in the box at the bottom and press Enter.
@@ -485,8 +632,10 @@ same client reopens it. Taking back or starting over a thread's first turn (or g
 back to before its first message) starts the thread afresh: Spindle validates the
 settings and saves the original session as a private bundle before replacing it, and a
 failed replacement or an interrupted reset restores it (the record is written durably, a
-strict IndexedDB commit, before the store is replaced). Once the reset is done the saved
-record goes (the engine's start also drops any no reset is using). A move sealed before
+strict IndexedDB commit, before the store is replaced). Once the reset is done its
+record goes and the bundle stays, named on disk first, as the thread's earlier version
+(Settings, Storage); the engine's start keeps any reset bundle no record names as an
+earlier version too, never deleting it. A move sealed before
 its index update is recognized on engine restart, and a file a move wrote before the
 engine stopped short of sealing the thread goes then (the thread stayed here, whole).
 Stop, a page-tool deadline, and disabling page actions fence further browser steps; a
@@ -519,21 +668,21 @@ instructions; Restart engine; and deleting (from the thread menu, and from the l
 menu, where Undo brings it back) freeing its storage, with no key in any bundle. With
 `--scripted` it also checks a plain sh command in the wasm Linux (when the build carries
 one), a command stopped while it runs (kept as stopped with what it printed) and a reply
-going on after it, the model page's efforts (a refused turn started over with another
-effort, or taken back), a long thread (a turn's end drawing only that turn, going back
-to before a message with its workspace, compaction with a summary its model writes and
-the earlier messages shown, a new thread with its files), Capture this tab, and Before
-acting (Ask asks and Deny does nothing; Auto asks only before Enter). With `SPINDLE_BIN`
-it moves a thread to native Spindle (without the page tools, with native's full tool
-set, a native turn and budget) and back (page tools again, the budget kept and said),
-saving the moved thread's file again, and, if that host has its sandbox, runs bash
-there. With `--scripted` and a host with its sandbox it also runs threads on the host:
-Connect, Run on my host, a hosted turn steered and answering page tools, Stop and Retry
-there, the engine restarted mid-turn, the host out of reach, an offline Stop, Bring
-back, and a crash or reload at every step of both moves (a wait for a move that times
-out says what the panel shows and what the engine holds). `SPINDLE_ONLY=hosted` runs
-only that part, `SPINDLE_ONLY=browser` skips it, and `SPINDLE_STEP_WAIT` (ms, default
-300000) bounds each long step.
+going on after it, the model page's efforts (a refused first turn going on with another
+effort, its message sent once; a refused later turn taken back), a long thread (a turn's
+end drawing only that turn, going back to before a message with its workspace,
+compaction with a summary its model writes and the earlier messages shown, a new thread
+with its files), Capture this tab, and Before acting (Ask asks and Deny does nothing;
+Auto asks only before Enter). With `SPINDLE_BIN` it moves a thread to native Spindle
+(without the page tools, with native's full tool set, a native turn and budget) and back
+(page tools again, the budget kept and said), saving the moved thread's file again, and,
+if that host has its sandbox, runs bash there. With `--scripted` and a host with its
+sandbox it also runs threads on the host: Connect, Run on my host, a hosted turn steered
+and answering page tools, Stop and Retry there, the engine restarted mid-turn, the host
+out of reach, an offline Stop, Bring back, and a crash or reload at every step of both
+moves (a wait for a move that times out says what the panel shows and what the engine
+holds). `SPINDLE_ONLY=hosted` runs only that part, `SPINDLE_ONLY=browser` skips it, and
+`SPINDLE_STEP_WAIT` (ms, default 300000) bounds each long step.
 
 `node chrome/tests/linux_node.mjs chrome/linux/dist` runs the browser Linux itself in
 Node: commands side by side in their own namespaces, a thread's workspace kept between
@@ -550,6 +699,11 @@ writes its page into DIST, which must be a test build made with `SPINDLE_WASM_LI
 not the folder you load. `engine_renew.mjs WEB_DIR` (run with `node --expose-gc`)
 checks that a renewed engine gives a grown instance's memory back; `vault_host.mjs` the
 host's token in the vault (sealed, locked with the keys, gone with a reset).
+`linux_worker.mjs` runs the v86 Linux's worker with a stand-in machine (no image): a
+boot that cannot be saved, a saved state that never loads, a command that never ends
+let go of alone, a silent machine restarted, files shared with the guest, and the local
+addresses its gateway refuses. `zip.mjs` checks the .zip of a thread's files (read back
+whole by Python's zipfile; refused past 65,534 files or 4 GiB).
 `panel_long_run.mjs DIST [SHOTS]` drives one long turn (34 steps, failures, a retry, a
 message sent mid-run, a page written) through the panel in each theme (Paper, Light
 with the Plain background, Dim, and System in a light and in a dark system) and checks
@@ -585,18 +739,17 @@ rolled back after its first request was lost and a later one refused, a move bac
 waiting on its own export) and the theme (the old Dark shows Dim).
 `review_browser.mjs DIST` uses a disposable real Chrome profile and a scripted provider
 to check permission/send races, camera gating, interrupted-reset and sealed-move
-recovery (no reset backup kept after), a moved thread keeping one copy, Storage freeing
-a thread's free space (a store fragmented under Node by the build's own wasm, then
-imported) and a set-aside first attempt, page Stop, a covered click refused, file
-previews (contained: no WebRTC, hint or navigation leaves a running one), documents
-(Word, Excel and PowerPoint drawn as pages, nothing hidden shown; a PDF's tab becoming
-Chrome's viewer of it, served by the worker; SVGs; audio; in a tab and on the workspace
-page), tasks (their
-cards, the chip, Stop on the waiting) and a message with a screenshot waiting for the
-turn. The package's `embed/tests/browser_opfs.mjs` checks two workers contending for one
-session, 80 close/reopen cycles in one worker with reads at once, and compacting a store
-with free pages in OPFS; `embed/tests/node_compact.mjs` compacts one with its task's
-under Node.
+recovery (a finished reset kept as an earlier version that opens as a thread), a moved
+thread keeping one copy, Storage freeing a thread's free space (a store fragmented under
+Node by the build's own wasm, then imported) and a set-aside first attempt, page Stop, a
+covered click refused, file previews (contained: no WebRTC, hint or navigation leaves a
+running one), documents (Word, Excel and PowerPoint drawn as pages, nothing hidden
+shown; a PDF's tab becoming Chrome's viewer of it, served by the worker; SVGs; audio; in
+a tab and on the workspace page), tasks (their cards, the chip, Stop on the waiting) and
+a message with a screenshot waiting for the turn. The package's
+`embed/tests/browser_opfs.mjs` checks two workers contending for one session, 80
+close/reopen cycles in one worker with reads at once, and compacting a store with free
+pages in OPFS; `embed/tests/node_compact.mjs` compacts one with its task's under Node.
 
 ```sh
 node chrome/tests/review_regressions.mjs
@@ -653,8 +806,10 @@ always removed; `SPINDLE_SHOTS=DIR` keeps only screenshots, in DIR.
   every transformation of it. While the keys are locked such requests are refused;
   **Forgot it** deletes these headers with the keys (Spindle then refuses requests to
   that site, sending nothing, until you add it again with its header).
-- Browser sign-in is offered for providers whose catalog entry has a standard OAuth flow
-  with a loopback redirect (ChatGPT among the built-ins). Anthropic takes an API key here.
+- Browser sign-in is offered for providers whose catalog entry has an OAuth flow with a
+  loopback redirect: a standard one (`generic`, with any `authorize_params` the provider's
+  page takes), or `chatgpt-plan` (Sign in with ChatGPT, with its `issuer`). Anthropic takes
+  an API key here.
 - Without a passphrase, keys are sealed with a key kept in the same Chrome profile: they
   never sit there as text, but a copy of the whole profile can still open them. Chrome
   may keep earlier copies of records in its storage files until it compacts them (keys
@@ -694,7 +849,12 @@ always removed; `SPINDLE_SHOTS=DIR` keeps only screenshots, in DIR.
   run that version of it, which then runs uncontained. Meta refreshes, resource hints
   and a page's own DNS-prefetch switch are taken out either way. A page that tries
   WebRTC from a `srcdoc` or `data:` frame it makes loses its preview (Chrome ends the
-  frame's process; nothing leaves).
+  frame's process; nothing leaves). Its sandbox allows modals only so that it can print,
+  and only when you ask: the tab's Print, Ctrl+P, or the page's own print button while
+  your click is fresh (never as it loads). The page's `alert`, `confirm` and `prompt`
+  still show nothing, and it never asks "Leave site?". A frame the page makes inside
+  itself has its own window, which can show those and print as it loads (it still
+  reaches nothing).
 - A PDF opens in a tab of its own, in Chrome's own viewer, as a PDF you download and
   open does (its links and buttons work as there; where Chrome is set to download PDFs,
   it is saved instead), not in the panel: the viewer takes the page around it to a link

@@ -4,7 +4,7 @@
 //
 // usage: node chrome/tests/panel_steps.mjs
 import assert from 'node:assert/strict';
-import { clock, describe, duration, elapsed, isScratch, isSpan, partsFrom, retried, shownName, shownPath, tabsFrom } from '../steps.mjs';
+import { clock, describe, duration, elapsed, isNotes, isScratch, isSpan, partsFrom, retried, shownName, shownPath, tabsFrom } from '../steps.mjs';
 
 const label = (name, input, state = 'done', tabs, parts) => describe(name, input, state, tabs, parts).label;
 
@@ -106,6 +106,9 @@ assert.equal(elapsed([at(0, 4), { span: [3 * minute, 1 * minute] }, { span: ['a'
 assert.ok(isSpan([1, 1]) && isSpan([0, 5]) && !isSpan([5, 0]) && !isSpan([1]) && !isSpan('1,2') && !isSpan([1, Infinity]) && !isSpan(null));
 assert.ok(isScratch('notes.txt') && isScratch('build_report.py') && isScratch('tests/test_a.js') && isScratch('src/__pycache__/a.pyc'));
 assert.ok(!isScratch('report.html') && !isScratch('data/table.csv') && !isScratch('README.md') && !isScratch('latest/index.html'));
+// The thread's own notes: the workspace's top-level NOTES.md (or notes.md) only.
+assert.ok(isNotes('NOTES.md') && isNotes('notes.md'));
+assert.ok(!isNotes('docs/NOTES.md') && !isNotes('Notes.md') && !isNotes('NOTES.txt') && !isNotes('release-notes.md'));
 // A picture named for its moment shows as one: its time, the day too when not today; any
 // other file by its name.
 const taken = new Date(Date.UTC(2026, 9, 30, 23, 26, 33));
@@ -118,4 +121,4 @@ assert.match(shownPath('screenshots/20261030T232633287-tab7.jpg'), /^screenshots
 for (const plain of ['report.html', 'data/20261030-232633.png', 'screenshots/20261030T232633287.jpg', 'notes/screenshot-2026-10-30.png']) {
   assert.equal(shownName(plain), plain.split('/').pop(), plain);
 }
-console.log('panel-steps passed: labels in three tenses, pages and parts named, short page labels and kinds, retried failures, durations, a group\'s time on the clock, scratch files, screenshots by their time');
+console.log('panel-steps passed: labels in three tenses, pages and parts named, short page labels and kinds, retried failures, durations, a group\'s time on the clock, scratch files, the thread\'s notes, screenshots by their time');

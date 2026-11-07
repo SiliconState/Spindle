@@ -6,7 +6,10 @@ license = "MIT"
 publish = false
 
 [features]
-default = ["native"]
+default = ["native", "codex-signin"]
+# The ChatGPT sign-in through the Codex CLI client and the Codex backend (`chatgpt`):
+# builds made from source; a store build leaves it out and offers `chatgpt-plan`.
+codex-signin = []
 native = ["dep:reqwest", "dep:libc", "dep:getrandom"]
 test-support = ["native"]
 

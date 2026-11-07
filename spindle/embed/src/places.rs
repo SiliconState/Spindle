@@ -45,11 +45,42 @@ mod node {
         note: String,
         /// The seal its open store's lock file takes when it closes (`Storage::seal`).
         seal: node::Seal,
+        importing: std::cell::RefCell<Option<std::rc::Rc<node::NodeOwner>>>,
+        /// The lock file of the store last opened here, kept past that store's close
+        /// while a retry's swap moves it (`replace_store`).
+        owner: std::cell::RefCell<std::rc::Weak<node::NodeOwner>>,
     }
 
     impl NodeStorage {
+        fn new(dir: String, journal: JournalMode, note: String) -> Self {
+            Self {
+                dir,
+                journal,
+                note,
+                seal: node::Seal::default(),
+                importing: Default::default(),
+                owner: Default::default(),
+            }
+        }
+
         fn database(&self) -> String {
             format!("{}/store/authority.sqlite", self.dir)
+        }
+
+        /// Opens the session's store behind `owner`, its lock file, which the place
+        /// keeps sight of (`replace_store`).
+        fn open_held(
+            &self,
+            owner: std::rc::Rc<node::NodeOwner>,
+            initialization: Initialization,
+        ) -> spindle_store::Result<Store> {
+            *self.owner.borrow_mut() = std::rc::Rc::downgrade(&owner);
+            node::open_owned(
+                &self.database(),
+                self.journal,
+                initialization,
+                Held { _owner: owner },
+            )
         }
     }
 
@@ -60,9 +91,163 @@ mod node {
             .filter(|key| {
                 key.len() == 20
                     && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                    // One that cannot be told is listed: opening it says why.
                     && node::exists(&format!("{dir}/tasks/{key}/store/authority.sqlite"))
+                        .unwrap_or(true)
             })
             .collect()
+    }
+
+    /// Whether `dir` holds a session's store: `store`, or a fresh store a retry's swap
+    /// was cut short before it took that name (`finish_swap`).
+    fn holds_store(dir: &str) -> spindle_store::Result<bool> {
+        Ok(node::exists(&format!("{dir}/store/authority.sqlite"))?
+            || node::exists(&format!("{dir}/{FRESH}/authority.sqlite"))?
+                && !node::exists(&format!("{dir}/store"))?)
+    }
+
+    /// Where a retry builds the store that replaces a session's (`replace_store`).
+    const FRESH: &str = "store.fresh";
+
+    /// Finishes a swap a retry's `replace_store` began: the old store was kept aside and
+    /// the fresh one (whole: made before the old moved) had not taken its name yet.
+    fn finish_swap(dir: &str) -> spindle_store::Result<()> {
+        let fresh = format!("{dir}/{FRESH}");
+        if !node::exists(&format!("{dir}/store"))?
+            && node::exists(&format!("{fresh}/authority.sqlite"))?
+            && let Err(error) = node::rename(&fresh, &format!("{dir}/store"))
+            // Another owner finishing it at once may have renamed it first.
+            && !node::exists(&format!("{dir}/store/authority.sqlite"))?
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// A free `store.abandoned-N` name in `dir` (any file there refuses the rename).
+    fn aside_name(dir: &str) -> spindle_store::Result<String> {
+        let mut index = 1;
+        loop {
+            let aside = format!("{dir}/store.abandoned-{index}");
+            if !node::exists(&aside)? {
+                return Ok(aside);
+            }
+            index += 1;
+        }
+    }
+
+    /// What keeps every other owner out of a store through a swap (`swap_store`), past
+    /// the store's close: a Node store's lock file, which goes with its directory when
+    /// that is renamed; nothing for OPFS (the session's Web Lock is held throughout).
+    trait SwapHold {
+        /// The store's directory was renamed: its lock file is `database`'s now.
+        fn moved(&self, _database: &str) {}
+        /// The store was set aside: no longer the session's (its seal stays behind).
+        fn detach(&self) {}
+    }
+    impl SwapHold for () {}
+    impl SwapHold for std::rc::Rc<node::NodeOwner> {
+        fn moved(&self, database: &str) {
+            node::NodeOwner::moved(self, database);
+        }
+        fn detach(&self) {
+            node::NodeOwner::detach(self);
+        }
+    }
+
+    /// Replaces the store of the session in `dir` (`Storage::replace_store`): the new
+    /// store is made whole beside it first (`store.fresh`, by `make`, then `prepare`d
+    /// with the name the old one will be kept under, and closed), the old one closed and
+    /// renamed aside, then the fresh one renamed into its place and opened (`open`). A
+    /// crash before the old store moves leaves the session as it was (and a fresh store
+    /// the next retry removes); one between the two renames, a whole fresh store that
+    /// `finish_swap` names when the session opens. Each store's hold (`old`'s and the
+    /// one `make` gives) is kept from before its store closes until its directory has its
+    /// new name, so no other owner opens either store meanwhile: an opener finds the old
+    /// store's lock file, or the fresh one's, which goes with it into `store` (an opener
+    /// that names the fresh store itself, `finish_swap`, then finds it held). The old
+    /// store's lock file is let go where it went, never where it was.
+    fn swap_store<H: SwapHold>(
+        dir: &str,
+        old: (Store, H),
+        prepare: &mut dyn FnMut(&mut Store, &str) -> spindle_store::Result<()>,
+        make: impl FnOnce(&str) -> spindle_store::Result<(Store, H)>,
+        open: impl FnOnce(H) -> spindle_store::Result<Store>,
+    ) -> spindle_store::Result<(Store, String)> {
+        let database = |at: &str| format!("{at}/authority.sqlite");
+        let fresh = format!("{dir}/{FRESH}");
+        let store = format!("{dir}/store");
+        let aside = aside_name(dir)?;
+        node::remove_tree(&fresh)?;
+        node::make_dirs(&fresh)?;
+        let made = make(&database(&fresh)).and_then(|(mut made, hold)| {
+            let prepared = prepare(&mut made, &aside);
+            // Closed before its hold can go.
+            drop(made);
+            prepared.map(|()| hold)
+        });
+        let fresh_hold = match made {
+            Ok(hold) => hold,
+            Err(error) => {
+                let _ = node::remove_tree(&fresh);
+                return Err(error);
+            }
+        };
+        let (old, old_hold) = old;
+        drop(old);
+        if let Err(error) = node::rename(&store, &aside) {
+            // Nothing moved: the old store's lock file goes where it is.
+            drop(fresh_hold);
+            let _ = node::remove_tree(&fresh);
+            return Err(error);
+        }
+        old_hold.detach();
+        old_hold.moved(&database(&aside));
+        drop(old_hold);
+        if let Err(error) = node::rename(&fresh, &store)
+            // An opener may have named it first (`finish_swap`): held by this lock file.
+            && (node::exists(&fresh)? || !node::exists(&database(&store))?)
+        {
+            // Its lock file goes, so the next open names it (`finish_swap`).
+            return Err(error);
+        }
+        fresh_hold.moved(&database(&store));
+        Ok((open(fresh_hold)?, aside))
+    }
+
+    /// Where `remove_task` moves a task's directory before removing it: out of `tasks/`,
+    /// so neither host lists it (or a part of it) meanwhile.
+    const REMOVING: &str = "tasks.removing";
+
+    /// Removes task `key` of the session in `dir` (`Storage::remove_task`): its directory
+    /// renamed out of `tasks/` in one step (a crash leaves it whole there, or out of
+    /// every listing), then removed with whatever an earlier removal cut short left.
+    fn remove_task(dir: &str, key: &str) -> spindle_store::Result<()> {
+        let task = format!("{dir}/tasks/{key}");
+        let removing = format!("{dir}/{REMOVING}");
+        if node::exists(&task)? {
+            sweep(dir)?;
+            node::make_dirs(&removing)?;
+            node::rename(&task, &format!("{removing}/{key}"))?;
+        }
+        sweep(dir)
+    }
+
+    /// Removes what a `remove_task` in `dir` cut short left, if anything.
+    fn sweep(dir: &str) -> spindle_store::Result<()> {
+        let removing = format!("{dir}/{REMOVING}");
+        if node::exists(&removing)? {
+            node::remove_tree(&removing)?;
+        }
+        Ok(())
+    }
+
+    /// Removes everything in `dir` (an import's files, written into an empty place).
+    fn clear_dir(dir: &str) -> spindle_store::Result<()> {
+        for name in node::read_dir(dir) {
+            node::remove_tree(&format!("{dir}/{name}"))?;
+        }
+        Ok(())
     }
 
     /// Writes `image` as the store in `dir/store` (refused where one is), with the
@@ -70,7 +255,7 @@ mod node {
     /// host may open in place).
     fn write_store(dir: &str, image: &[u8], native: bool) -> spindle_store::Result<()> {
         let store = format!("{dir}/store");
-        if node::exists(&format!("{store}/authority.sqlite")) {
+        if node::exists(&format!("{store}/authority.sqlite"))? {
             return Err(spindle_store::Error::Conflict);
         }
         node::make_dirs(&store)?;
@@ -122,12 +307,13 @@ mod node {
             drop(copied);
             // A store not closed cleanly keeps a log or journal that would be read into
             // the copy once it has the name: no swap then.
-            if leftovers(database)[1..3]
+            for path in leftovers(database)[1..3]
                 .iter()
-                .any(|path| node::exists(path))
-                || leftovers(&copy)[1..].iter().any(|path| node::exists(path))
+                .chain(&leftovers(&copy)[1..])
             {
-                return Err(spindle_store::Error::Locked);
+                if node::exists(path)? {
+                    return Err(spindle_store::Error::Locked);
+                }
             }
             Ok(page * pages)
         });
@@ -171,18 +357,17 @@ mod node {
             if dir.contains('#') {
                 return Err("`dir` may not contain `#`".into());
             }
-            Ok(Box::new(NodeStorage {
-                dir: dir.trim_end_matches(['/', '\\']).to_string(),
-                journal: self.journal,
-                note: self.note.clone(),
-                seal: node::Seal::default(),
-            }))
+            Ok(Box::new(NodeStorage::new(
+                dir.trim_end_matches(['/', '\\']).to_string(),
+                self.journal,
+                self.note.clone(),
+            )))
         }
         fn exists(&self, dir: &str) -> bool {
-            node::exists(&format!(
-                "{}/store/authority.sqlite",
-                dir.trim_end_matches(['/', '\\'])
-            ))
+            self.holds(dir).unwrap_or(false)
+        }
+        fn holds(&self, dir: &str) -> Result<bool, String> {
+            holds_store(dir.trim_end_matches(['/', '\\'])).map_err(|error| error.to_string())
         }
     }
 
@@ -198,39 +383,67 @@ mod node {
             } else {
                 Initialization::Open
             };
+            finish_swap(&self.dir)?;
             // The file a native host flocks: it opens no store directory without it.
-            if node::exists(&store) {
+            if node::exists(&store)? {
                 node::ensure_file(&format!("{store}/owner.lock"))?;
             }
-            node::open_sealable(
-                &self.database(),
-                self.journal,
-                initialization,
-                &self.note,
-                Some(self.seal.clone()),
-            )
+            let importing = self.importing.borrow_mut().take();
+            let owner = match importing {
+                Some(owner) => owner,
+                None => std::rc::Rc::new(node::acquire_sealable(
+                    &self.database(),
+                    &self.note,
+                    Some(self.seal.clone()),
+                )?),
+            };
+            self.open_held(owner, initialization)
         }
         fn set_aside(&self, store: Store) -> spindle_store::Result<(Store, String)> {
-            drop(store);
-            let mut index = 1;
-            let aside = loop {
-                let aside = format!("{}/store.abandoned-{index}", self.dir);
-                if !node::exists(&aside) {
-                    break aside;
-                }
-                index += 1;
-            };
-            node::rename(&format!("{}/store", self.dir), &aside)?;
-            let store = self.open(true)?;
-            Ok((store, aside))
+            self.replace_store(store, &mut |_, _| Ok(()))
+        }
+        fn replace_store(
+            &self,
+            store: Store,
+            prepare: &mut dyn FnMut(&mut Store, &str) -> spindle_store::Result<()>,
+        ) -> spindle_store::Result<(Store, String)> {
+            // The lock file `store` was opened behind (`open`), held past its close.
+            let held = self
+                .owner
+                .borrow()
+                .upgrade()
+                .filter(|owner| owner.holds(&self.database()))
+                .ok_or(spindle_store::Error::Invalid)?;
+            swap_store(
+                &self.dir,
+                (store, held),
+                prepare,
+                |database| {
+                    node::ensure_file(&format!("{}/{FRESH}/owner.lock", self.dir))?;
+                    let owner =
+                        std::rc::Rc::new(node::acquire_sealable(database, &self.note, None)?);
+                    let made = node::open_owned(
+                        database,
+                        self.journal,
+                        Initialization::Create,
+                        Held {
+                            _owner: owner.clone(),
+                        },
+                    )?;
+                    Ok((made, owner))
+                },
+                |owner| {
+                    owner.attach(Some(self.seal.clone()));
+                    self.open_held(owner, Initialization::Open)
+                },
+            )
         }
         fn child(&self, key: &str) -> Box<dyn Storage> {
-            Box::new(NodeStorage {
-                dir: format!("{}/tasks/{key}", self.dir),
-                journal: self.journal,
-                note: self.note.clone(),
-                seal: node::Seal::default(),
-            })
+            Box::new(NodeStorage::new(
+                format!("{}/tasks/{key}", self.dir),
+                self.journal,
+                self.note.clone(),
+            ))
         }
         fn sidecar(&self, name: &str) -> Option<Vec<u8>> {
             node::read_file(&format!("{}/{name}", self.dir))
@@ -241,17 +454,54 @@ mod node {
             node::write_file(&format!("{}/{name}", self.dir), bytes)
         }
         fn is_empty(&self) -> bool {
-            node::read_dir(&self.dir).is_empty()
+            let names = node::read_dir(&self.dir);
+            names.is_empty()
+                || names == ["store"] && node::read_dir(&format!("{}/store", self.dir)).is_empty()
         }
         fn tasks(&self) -> Vec<String> {
             task_keys(&self.dir)
         }
+        fn begin_import(
+            &self,
+        ) -> spindle_store::Result<Option<Box<dyn spindle_store::OwnerExclusion>>> {
+            node::make_dirs(&format!("{}/store", self.dir))?;
+            let owner = node::NodeOwner::acquire(&self.database(), &self.note)?;
+            if node::exists(&self.database())? {
+                return Err(spindle_store::Error::Conflict);
+            }
+            owner.attach(Some(self.seal.clone()));
+            let owner = std::rc::Rc::new(owner);
+            *self.importing.borrow_mut() = Some(owner.clone());
+            Ok(Some(Box::new(Held { _owner: owner })))
+        }
         fn import_store(&self, image: &[u8]) -> spindle_store::Result<()> {
             write_store(&self.dir, image, true)
         }
+        /// Written now, into the lock file its open store holds (refused while none is
+        /// open here): a seal that cannot be written fails the move, and the store stays
+        /// this session's.
         fn seal(&self, note: &str) -> spindle_store::Result<()> {
-            *self.seal.borrow_mut() = Some(format!("{}{note}\n", spindle_store::MOVED_FENCE));
-            Ok(())
+            node::seal_held(
+                &self.seal,
+                &format!("{}{note}\n", spindle_store::MOVED_FENCE),
+            )
+        }
+        fn discard(&self) -> spindle_store::Result<()> {
+            if self.importing.borrow().is_some() {
+                for name in node::read_dir(&self.dir) {
+                    if name == "store" {
+                        for file in node::read_dir(&format!("{}/store", self.dir)) {
+                            if file != "authority.sqlite.lock" {
+                                node::remove_tree(&format!("{}/store/{file}", self.dir))?;
+                            }
+                        }
+                    } else {
+                        node::remove_tree(&format!("{}/{name}", self.dir))?;
+                    }
+                }
+                return Ok(());
+            }
+            clear_dir(&self.dir)
         }
         fn holder(&self) -> Option<String> {
             fence_of(&self.dir)
@@ -277,6 +527,15 @@ mod node {
                 |copy| node::open(copy, self.journal, Initialization::Open, &self.note),
             )
             .map(Some)
+        }
+        fn size(&self) -> u64 {
+            node::tree_size(&self.dir)
+        }
+        fn remove_task(&self, key: &str) -> spindle_store::Result<()> {
+            remove_task(&self.dir, key)
+        }
+        fn sweep(&self) -> spindle_store::Result<()> {
+            sweep(&self.dir)
         }
     }
 
@@ -347,6 +606,12 @@ mod node {
         fn exists(&self, dir: &str) -> bool {
             self.0.exists(dir)
         }
+        fn holds(&self, dir: &str) -> Result<bool, String> {
+            self.0.holds(dir)
+        }
+        fn release(&self, dir: &str) {
+            self.0.release(dir)
+        }
     }
 
     struct OpfsStorage {
@@ -384,7 +649,19 @@ mod node {
             }))
         }
         fn exists(&self, dir: &str) -> bool {
-            opfs_path(dir) && node::exists(&format!("{dir}/store/authority.sqlite"))
+            self.holds(dir).unwrap_or(false)
+        }
+        fn holds(&self, dir: &str) -> Result<bool, String> {
+            if !opfs_path(dir) {
+                return Ok(false);
+            }
+            holds_store(dir).map_err(|error| error.to_string())
+        }
+        /// The app's hold on `dir`'s Web Lock, if no store took it over: given back now
+        /// (a session closed, or never opened by the calls that took it).
+        fn release(&self, dir: &str) {
+            let held = self.held.borrow_mut().remove(dir);
+            drop(held);
         }
     }
 
@@ -403,9 +680,10 @@ mod node {
             } else {
                 Initialization::Open
             };
+            finish_swap(&self.dir)?;
             // OPFS stores have no lock file of their own (the Web Lock excludes): a fence
             // here is a moved session's seal, or another host's, and refuses the open.
-            if node::exists(&format!("{}/store/{}", self.dir, spindle_store::FENCE)) {
+            if node::exists(&format!("{}/store/{}", self.dir, spindle_store::FENCE))? {
                 return Err(spindle_store::Error::Locked);
             }
             node::open_owned(
@@ -418,18 +696,30 @@ mod node {
             )
         }
         fn set_aside(&self, store: Store) -> spindle_store::Result<(Store, String)> {
-            drop(store);
-            let mut index = 1;
-            let aside = loop {
-                let aside = format!("{}/store.abandoned-{index}", self.dir);
-                // Any file there (not only a database) refuses the rename.
-                if !node::exists(&aside) {
-                    break aside;
-                }
-                index += 1;
-            };
-            node::rename(&format!("{}/store", self.dir), &aside)?;
-            Ok((self.open(true)?, aside))
+            self.replace_store(store, &mut |_, _| Ok(()))
+        }
+        fn replace_store(
+            &self,
+            store: Store,
+            prepare: &mut dyn FnMut(&mut Store, &str) -> spindle_store::Result<()>,
+        ) -> spindle_store::Result<(Store, String)> {
+            swap_store(
+                &self.dir,
+                (store, ()),
+                prepare,
+                |database| {
+                    let made = node::open_owned(
+                        database,
+                        self.journal,
+                        Initialization::Create,
+                        Shared {
+                            _lock: self.lock.clone(),
+                        },
+                    )?;
+                    Ok((made, ()))
+                },
+                |()| self.open(false),
+            )
         }
         fn child(&self, key: &str) -> Box<dyn Storage> {
             Box::new(OpfsStorage {
@@ -475,6 +765,9 @@ mod node {
         fn holder(&self) -> Option<String> {
             fence_of(&self.dir)
         }
+        fn discard(&self) -> spindle_store::Result<()> {
+            clear_dir(&self.dir)
+        }
         fn compact(&self) -> spindle_store::Result<Option<(u64, u64)>> {
             let database = format!("{}/store/authority.sqlite", self.dir);
             compact_store(
@@ -493,6 +786,15 @@ mod node {
                 },
             )
             .map(Some)
+        }
+        fn size(&self) -> u64 {
+            node::tree_size(&self.dir)
+        }
+        fn remove_task(&self, key: &str) -> spindle_store::Result<()> {
+            remove_task(&self.dir, key)
+        }
+        fn sweep(&self) -> spindle_store::Result<()> {
+            sweep(&self.dir)
         }
     }
 }

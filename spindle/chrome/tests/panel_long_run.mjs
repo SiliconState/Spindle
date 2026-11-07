@@ -11,7 +11,8 @@
 //     never more than the turn ran;
 //   - steps in plain words in their tense ("Running build_report.py", "Ran …"), browser
 //     steps with the page's icon and name, the full command (with a copy button) inside;
-//   - the message sent while it ran as a bubble of its own; "Latest" while scrolled up;
+//   - the message sent while it ran as a bubble of its own; a panel grown shorter kept at
+//     the running turn's end; "Latest" while scrolled up;
 //     Send as Stop while the turn runs; a copy button on the answer; short table cells
 //     on one line; the composer's chip without the provider;
 //   - the workspace: folders shut until opened (saying what is new in them), new/edited
@@ -302,10 +303,15 @@ for (const theme of THEMES) {
   await new Promise((done) => setTimeout(done, 1600));
   const running = await panel.eval(`(() => { const card = document.querySelector('#history .tool.running'); return { label: card.querySelector('.tool-label').textContent, time: card.querySelector('.tool-time').textContent, group: card.closest('.steps').querySelector('.group-label').textContent, spinning: getComputedStyle(card.querySelector('.tool-icon svg')).animationName, phase: document.querySelector('#phase').textContent, elapsed: document.querySelector('#elapsed').textContent }; })()`);
   await shot(`${name}-2-step-running`);
-  // Scrolled up while it runs: "Latest" shows.
+  // Scrolled up while it runs: "Latest" shows. The conversation so far fits a tall panel,
+  // with nowhere to scroll up to (the panel goes on following it then): in a panel short
+  // enough that it reaches 320 px past the bottom, kept at its end as it grew shorter.
+  const fit = await panel.eval(`(() => { const main = document.querySelector('#main'); return { content: document.querySelector('#history').getBoundingClientRect().height, around: innerHeight - main.clientHeight }; })()`);
+  await panel.size(420, Math.max(200, Math.round(fit.content + 28 - 320 + fit.around)));
+  const keptAtEnd = await panel.until(`(() => { const main = document.querySelector('#main'); return main.scrollHeight - main.clientHeight > 250 && main.scrollHeight - main.scrollTop - main.clientHeight < 2; })() || null`, { timeout: 5000, what: 'a short panel kept at the end' }).catch(() => false);
   await panel.eval(`document.querySelector('#main').scrollTop = 0; document.querySelector('#main').dispatchEvent(new Event('scroll'))`);
   const jump = await panel.until(`!document.querySelector('#jump').hidden || null`, { timeout: 5000, what: 'Latest' }).catch(() => false);
-  await shot(`${name}-3-scrolled-up`);
+  await panel.screenshot(join(shots, `${name}-3-scrolled-up.png`));
   // Latest takes the conversation to its end (the turn may have ended meanwhile, and
   // Latest with it).
   if (jump && await panel.eval(`!document.querySelector('#jump').hidden`)) await panel.eval(`document.querySelector('#jump').click()`);
@@ -429,6 +435,7 @@ for (const theme of THEMES) {
     assert.ok(after.copyAnswer);
     assert.ok(after.nowrap.includes('@nvidia') && after.nowrap.includes('+2.4%'), JSON.stringify(after.nowrap));
     assert.equal(after.wrapped, 0);
+    assert.ok(keptAtEnd, 'a panel grown shorter kept the running turn\'s end in sight');
     assert.ok(jump, 'Latest showed while scrolled up');
     assert.equal(after.jump, false, 'Latest gone once the turn ended');
     assert.equal(after.send, 'send');

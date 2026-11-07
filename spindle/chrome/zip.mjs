@@ -1,6 +1,7 @@
 // A thread's files as one .zip to download: entries stored as they are (no compression;
-// what threads make is mostly small or compressed already), names in UTF-8. Under 4 GiB
-// and 65535 files, as a workspace always is.
+// what threads make is mostly small or compressed already), names in UTF-8. Without
+// ZIP64: fewer than 65,535 files and under 4 GiB in all, or it is refused (not wrapped
+// into an archive that does not read).
 
 const TABLE = Array.from({ length: 256 }, (_, n) => {
   let c = n;
@@ -14,8 +15,13 @@ function crc32(bytes) {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-/** `files` ({path, bytes}) as the bytes of a .zip. */
+/** Most a .zip without ZIP64 holds: entries, and bytes (sizes and offsets). */
+const MOST_ENTRIES = 0xfffe;
+const MOST_BYTES = 0xfffffffe;
+
+/** `files` ({path, bytes}) as a .zip (a Blob: its parts are not copied into one array). */
 export function zip(files, when = new Date()) {
+  if (files.length > MOST_ENTRIES) throw new Error(`a .zip holds at most ${MOST_ENTRIES.toLocaleString('en')} files, and these are ${files.length.toLocaleString('en')}`);
   const time = (when.getHours() << 11) | (when.getMinutes() << 5) | (when.getSeconds() >> 1);
   const date = ((when.getFullYear() - 1980) << 9) | ((when.getMonth() + 1) << 5) | when.getDate();
   const encoder = new TextEncoder();
@@ -24,6 +30,7 @@ export function zip(files, when = new Date()) {
   let offset = 0;
   for (const { path, bytes } of files) {
     const name = encoder.encode(path);
+    if (offset + 30 + name.length + bytes.length > MOST_BYTES) throw new Error('these files come to 4 GiB or more, more than a .zip holds');
     const crc = crc32(bytes);
     // version, flags (UTF-8 names), method (stored), time, date, crc, sizes, name length.
     const head = (signature, extra) => {
@@ -44,18 +51,12 @@ export function zip(files, when = new Date()) {
     offset += local.length + name.length + bytes.length;
   }
   const size = central.reduce((total, part) => total + part.length, 0);
+  if (offset + size > MOST_BYTES) throw new Error('these files come to 4 GiB or more, more than a .zip holds');
   const end = new DataView(new ArrayBuffer(22));
   end.setUint32(0, 0x06054b50, true);
   end.setUint16(8, files.length, true);
   end.setUint16(10, files.length, true);
   end.setUint32(12, size, true);
   end.setUint32(16, offset, true);
-  const all = [...parts, ...central, new Uint8Array(end.buffer)];
-  const out = new Uint8Array(all.reduce((total, part) => total + part.length, 0));
-  let at = 0;
-  for (const part of all) {
-    out.set(part, at);
-    at += part.length;
-  }
-  return out;
+  return new Blob([...parts, ...central, new Uint8Array(end.buffer)], { type: 'application/zip' });
 }

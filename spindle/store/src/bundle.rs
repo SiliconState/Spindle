@@ -51,6 +51,7 @@ pub struct BundleFile {
 pub struct Bundle {
     pub head: u64,
     pub identity: String,
+    pub source_state: Option<String>,
     pub files: Vec<BundleFile>,
 }
 
@@ -396,24 +397,49 @@ pub struct Written {
 /// it checked whole first: what a move needs, as the session then goes on only from
 /// the bundle.
 pub fn write(files: Vec<BundleFile>) -> Result<Written, String> {
-    written(files, true)
+    written(files, true, None)
 }
 
 /// `write` for a copy: the session stays where it is, so each store is checked as far
 /// as the bundle records it (pages, schema, facts), not record by record; `read` checks
 /// every record before an import uses one.
 pub fn write_copy(files: Vec<BundleFile>) -> Result<Written, String> {
-    written(files, false)
+    written(files, false, None)
 }
 
-fn written(mut files: Vec<BundleFile>, whole: bool) -> Result<Written, String> {
+/// An embedded export carries the source's transfer fence, independent of settings
+/// deliberately changed in the exported copy.
+pub fn write_export(
+    files: Vec<BundleFile>,
+    whole: bool,
+    source_state: &str,
+) -> Result<Written, String> {
+    written(files, whole, Some(source_state))
+}
+
+fn written(
+    mut files: Vec<BundleFile>,
+    whole: bool,
+    source_state: Option<&str>,
+) -> Result<Written, String> {
     let main = check_files(&mut files, whole)?;
     order(&mut files);
+    // The newest schema among its stores (SQLite keeps it at bytes 60..64 of a file): a
+    // bundle of schema-20 stores stays one an earlier build reads.
+    let schema = files
+        .iter()
+        .filter(|file| file.path.ends_with("authority.sqlite"))
+        .filter_map(|file| file.bytes.get(60..64))
+        .map(|at| i64::from(u32::from_be_bytes([at[0], at[1], at[2], at[3]])))
+        .max()
+        .unwrap_or(crate::PREVIOUS_SCHEMA)
+        .max(crate::PREVIOUS_SCHEMA);
     let manifest = json!({
         "format": FORMAT,
-        "schema": crate::CAPABILITIES.schema,
+        "schema": schema,
         "head": main.head,
         "identity": main.identity,
+        "source_state": source_state,
         "files": files.iter().map(|file| json!({
             "path": file.path,
             "size": file.bytes.len(),
@@ -642,6 +668,7 @@ impl Entry {
 struct Manifest {
     head: Option<u64>,
     identity: Option<String>,
+    source_state: Option<String>,
     entries: Vec<Entry>,
 }
 
@@ -712,6 +739,7 @@ fn manifest(reader: &mut impl std::io::Read, length: usize) -> Result<Manifest, 
     Ok(Manifest {
         head: manifest["head"].as_u64(),
         identity: manifest["identity"].as_str().map(String::from),
+        source_state: manifest["source_state"].as_str().map(String::from),
         entries,
     })
 }
@@ -767,6 +795,7 @@ fn parse(reader: &mut impl std::io::Read, length: usize) -> Result<Bundle, Strin
     Ok(Bundle {
         head: main.head,
         identity: main.identity,
+        source_state: manifest.source_state,
         files,
     })
 }

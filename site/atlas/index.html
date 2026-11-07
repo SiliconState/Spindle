@@ -1031,7 +1031,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
       </div>
       <div class="note-box">
         <h3>Trust boundaries</h3>
-        <p>Reading and acting on pages are separate switches, both off until you turn them on. Page tools are accepted only from <code>engine.html</code>; actions use <code>chrome.debugger</code>. Under Before acting (Auto or Ask), an action you allow is done only while the tab still shows the page, part or dialog the question showed you (new in 0.1.7). Provider keys, host tokens, and site secrets are sealed by AES-GCM in the vault.</p>
+        <p>Reading and acting on pages are separate switches, both off until you turn them on. Page tools are accepted only from <code>engine.html</code>; actions use <code>chrome.debugger</code>. Under Before acting (Auto by default in current source, or Ask), an action you allow is done only while the tab still shows the page, part or dialog the question showed you (new in 0.1.7). Provider keys, host tokens, and site secrets are sealed by AES-GCM in the vault.</p>
       </div>
       <div class="note-box">
         <h3>Preview containment</h3>
@@ -1094,7 +1094,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
         <line x1="30" y1="48" x2="1170" y2="48" class="thin"/>
         <text x="30" y="76" class="h1">THE BROWSER WORKS</text>
         <text x="30" y="96" class="sub">panel → BroadcastChannel → offscreen engine → WASM host → executor → events</text>
-        <text x="1170" y="76" text-anchor="end" class="code">SCHEMA 20 / OPFS</text>
+        <text x="1170" y="76" text-anchor="end" class="code">SCHEMA 20/21 / OPFS</text>
         <text x="1170" y="94" text-anchor="end" class="code">CHROMIUM 116+ / 0.1.7</text>
 
         <ellipse cx="600" cy="550" rx="450" ry="116" fill="var(--shadow)" opacity=".42"/>

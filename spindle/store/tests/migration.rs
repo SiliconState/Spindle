@@ -333,7 +333,8 @@ fn schema_18_preserves_all_metadata_and_history_and_keeps_its_backup() {
 
 #[test]
 fn other_schemas_are_refused_untouched() {
-    for version in [13, 21] {
+    // 21 is read (schema 20's tables with wider steps); 22 is no schema yet.
+    for version in [13, 22] {
         let realm = Realm::legacy();
         let database = realm.0.join("authority.sqlite");
         Connection::open(&database)

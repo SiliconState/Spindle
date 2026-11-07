@@ -685,6 +685,43 @@ pub fn hosts_for_tool_call(name: &str, input: &Value) -> Vec<String> {
     }
 }
 
+/// Whether every `for` loop of a command runs over a handful of literal words (`for
+/// c in guatemala mexico; do curl ...`): at most `SMALL_LOOP` items, none made at run
+/// time (no `$`, backtick, glob or brace). A few named items are not a bulk
+/// collection, and need no probe first.
+fn small_literal_loop(lower: &str) -> bool {
+    const SMALL_LOOP: usize = 4;
+    let bytes = lower.as_bytes();
+    let mut found = false;
+    for (at, _) in lower.match_indices("for ") {
+        // A word of its own, not the end of another ("before ").
+        if at > 0
+            && !matches!(
+                bytes[at - 1],
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b'{'
+            )
+        {
+            continue;
+        }
+        let rest = &lower[at + 4..];
+        let Some((_, items)) = rest.split_once(" in ") else {
+            return false;
+        };
+        let end = items.find([';', '\n']).unwrap_or(items.len());
+        let words: Vec<&str> = items[..end].split_whitespace().collect();
+        if words.is_empty()
+            || words.len() > SMALL_LOOP
+            || words
+                .iter()
+                .any(|word| word.contains(['$', '`', '*', '?', '{', '(', '<']))
+        {
+            return false;
+        }
+        found = true;
+    }
+    found && !lower.contains("while ")
+}
+
 pub fn looks_like_bulk_network_call(name: &str, input: &Value) -> bool {
     match name {
         "bash" => {
@@ -697,8 +734,9 @@ pub fn looks_like_bulk_network_call(name: &str, input: &Value) -> bool {
                         let line = line.trim_start();
                         line == "do" || line.starts_with("do ")
                     }));
-            let loopish =
-                has_url && (shell_loop || lower.contains("xargs") || lower.contains("parallel"));
+            let loopish = has_url
+                && (shell_loop || lower.contains("xargs") || lower.contains("parallel"))
+                && !small_literal_loop(&lower);
             let bulk_query = lower.contains("size=")
                 || lower.contains("limit=")
                 || lower.contains("offset=")
@@ -2137,6 +2175,10 @@ pub fn commands_similar(a: &str, b: &str) -> bool {
 pub use dext_core::recovery::{FailureKind, RetryPlan, classify_stream_error};
 
 pub fn classify_http_failure(status: u16, body: &str) -> RetryPlan {
+    // A ChatGPT plan's usage limit comes as a 429 that waiting out does not end.
+    if let Some(plan) = dext_core::recovery::chatgpt_plan_refusal(body) {
+        return plan;
+    }
     if matches!(status, 401 | 403 | 407)
         || dext_core::recovery::output_has_auth_failure_markers(body)
     {
@@ -3286,6 +3328,54 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_plan_refusals_are_not_retried_but_its_unavailable_answers_are() {
+        let limit =
+            r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"limit"}}"#;
+        let http = classify_http_failure(429, limit);
+        assert!(
+            !http.retry,
+            "a plan usage limit pauses: waiting does not end it"
+        );
+        assert_eq!(http.kind, FailureKind::Permanent);
+        assert!(
+            !classify_stream_error(limit).retry,
+            "nor when it arrives in the stream"
+        );
+        for (code, kind) in [
+            (
+                "subscription_sharing_user_not_eligible",
+                FailureKind::Permanent,
+            ),
+            (
+                "subscription_sharing_route_not_supported",
+                FailureKind::Permanent,
+            ),
+            (
+                "subscription_sharing_unsupported_capability",
+                FailureKind::Schema,
+            ),
+            ("subscription_sharing_invalid_user", FailureKind::Auth),
+            ("chatpass_v2_scope_not_authorized", FailureKind::Auth),
+        ] {
+            let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
+            let plan = classify_http_failure(400, &body);
+            assert_eq!((plan.kind, plan.retry), (kind, false), "{code}");
+        }
+        for code in [
+            "subscription_sharing_usage_unavailable",
+            "subscription_sharing_user_unavailable",
+        ] {
+            let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
+            assert!(
+                classify_http_failure(503, &body).retry,
+                "{code} is retried with backoff"
+            );
+        }
+        // An ordinary rate limit still waits and retries.
+        assert!(classify_http_failure(429, r#"{"error":{"code":"rate_limit_exceeded"}}"#).retry);
+    }
+
+    #[test]
     fn classify_stream_error_does_not_retry_permanent_failures() {
         // Context length exceeded is terminal — retry would just waste tokens.
         let ctx =
@@ -3499,5 +3589,48 @@ mod tests {
             .expect("should halt after continued empty-call loop");
         assert!(halt.contains("halted"), "{halt}");
         assert!(halt.contains("switch provider/model"), "{halt}");
+    }
+}
+
+#[cfg(test)]
+mod bulk_tests {
+    use super::looks_like_bulk_network_call;
+    use serde_json::json;
+
+    fn bash(command: &str) -> bool {
+        looks_like_bulk_network_call("bash", &json!({ "command": command }))
+    }
+
+    #[test]
+    fn a_few_named_urls_in_a_loop_are_no_bulk_collection() {
+        // Fetching two or three named items is not a sweep: no probe first.
+        assert!(!bash(
+            "for u in https://a.example/x https://b.example/y; do curl -s $u; done"
+        ));
+        assert!(!bash(
+            "for p in about pricing docs; do curl -s https://site.example/$p; done"
+        ));
+        // A sweep over a computed list, a glob, a range or a variable still is.
+        assert!(bash(
+            "for u in $(cat urls.txt); do curl -s https://site.example/$u; done"
+        ));
+        assert!(bash(
+            "for p in $(seq 1 200); do curl -s https://site.example/page/$p; done"
+        ));
+        assert!(bash(
+            "for p in a b c d e f; do curl -s https://site.example/$p; done"
+        ));
+        assert!(bash(
+            "for f in *.txt; do curl -s https://site.example/$f; done"
+        ));
+        assert!(bash(
+            "for p in {1..50}; do curl -s https://site.example/$p; done"
+        ));
+        assert!(bash(
+            "while read u; do curl -s $u; done < https://site.example/list"
+        ));
+        assert!(bash("cat urls | xargs -n1 curl -s https://site.example/"));
+        // "before " is not "for ".
+        assert!(!bash("curl -s https://site.example/before; echo done"));
     }
 }

@@ -16,7 +16,8 @@ pub fn sse_event_cap(contract: impl Into<RequestContract>) -> usize {
     match contract.into() {
         RequestContract::AnthropicMessages
         | RequestContract::OpenAiResponses
-        | RequestContract::ChatGptResponses => 4 * 1024 * 1024,
+        | RequestContract::ChatGptResponses
+        | RequestContract::ChatGptPlan => 4 * 1024 * 1024,
         RequestContract::OpenAiChatCompletions => 256_000,
     }
 }
@@ -119,9 +120,9 @@ impl ProviderStreamParser {
                 preserve_timing_cache,
                 ..OpenAiState::default()
             }),
-            RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
-                ProviderState::ChatGpt(ChatGptState::default())
-            }
+            RequestContract::OpenAiResponses
+            | RequestContract::ChatGptResponses
+            | RequestContract::ChatGptPlan => ProviderState::ChatGpt(ChatGptState::default()),
         };
         Self { contract, state }
     }

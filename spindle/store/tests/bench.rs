@@ -168,9 +168,8 @@ impl Bench {
             "authorize" => deliver(json!({"kind": "authorized"})),
             "wait" => deliver(json!({"kind": "waited"})),
             "fetch" => {
-                let body =
-                    spindle_store::protocol::base64_decode(work["body"].as_str().unwrap()).unwrap();
-                let body = String::from_utf8(body).unwrap();
+                // The body is read apart, as bytes; the frame carries none.
+                let body = String::from_utf8(self.host.request_body(session, id).unwrap()).unwrap();
                 self.requests.set(self.requests.get() + 1);
                 let index = self.requests.get();
                 let delta = if body.contains(SUMMARY_ASK) {

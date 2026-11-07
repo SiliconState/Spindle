@@ -93,9 +93,15 @@ fn sources_need_toolchain(flags: &Flags, settings: &Settings) -> Result<()> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(message) = run(args) {
-        eprintln!("spindle: {message}");
+        eprintln!("{}", failure_line(&message));
         std::process::exit(1);
     }
+}
+
+/// What a failed command prints: its error (which may carry a provider's reply) as text
+/// the terminal shows rather than runs (`shown`).
+fn failure_line(message: &str) -> String {
+    format!("spindle: {}", shown(message))
 }
 
 fn run(mut args: Vec<String>) -> Result<()> {
@@ -212,6 +218,19 @@ fn run(mut args: Vec<String>) -> Result<()> {
         }
         "say" => {
             let prompt = flags.prompt()?;
+            // The settings the user names (a queued change to them gives way).
+            let named: Vec<&str> = [
+                ("provider", flags.provider.is_some()),
+                ("model", flags.model.is_some()),
+                ("effort", flags.effort.is_some()),
+                ("network", flags.network.is_some()),
+                ("toolchain", flags.toolchain.is_some()),
+                ("compaction", flags.compaction.is_some()),
+                ("max_usd", flags.max_usd.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(key, given)| given.then_some(key))
+            .collect();
             let mut settings = Settings::load(&dir)?;
             let network = flags.network.unwrap_or(settings.network);
             let toolchain = flags.toolchain.unwrap_or(settings.toolchain);
@@ -270,7 +289,7 @@ fn run(mut args: Vec<String>) -> Result<()> {
             // the config may change only between turns. A turn stopped part way takes the
             // message as it is set up (unchanged settings are not saved again).
             if session.accepts_prompt() || settings.to_json()? != Settings::load(&dir)?.to_json()? {
-                session.set_settings(settings)?;
+                session.set_chosen_settings(settings, &named)?;
             }
             session.prompt_with_files(&prompt, files)
         }
@@ -442,7 +461,7 @@ fn run(mut args: Vec<String>) -> Result<()> {
             let target = flags.to.take().map_or_else(current_exe, Ok)?;
             let force = std::mem::take(&mut flags.force);
             flags.none()?;
-            spindle_store::upgrade::rollback(&target, force)?;
+            spindle_store::upgrade::rollback_checking(&target, force, &[dir.as_path()])?;
             println!("Restored the previous binary: {}", version_of(&target));
             Ok(())
         }
@@ -652,7 +671,8 @@ fn upgrade(mut flags: Flags, dir: &std::path::Path) -> Result<()> {
         _ => return Err("upgrade needs exactly one of --from SRC or --binary BIN".into()),
     };
     flags.none()?;
-    let (version, checks) = upgrade::verify(&candidate, &sessions)?;
+    let (version, checks) =
+        upgrade::verify(&candidate, &sessions, &upgrade_scratch(dir, &sessions))?;
     println!("Candidate: {version}");
     for check in &checks {
         println!(
@@ -678,6 +698,25 @@ fn upgrade(mut flags: Flags, dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Where `upgrade` copies the sessions its candidate is checked on: beside them, not in
+/// a temp directory that may be memory. A host directory's `promotions/` (where its own
+/// promotions check candidates, and its start removes what a stopped check left), else
+/// the directory of the first session.
+fn upgrade_scratch(dir: &std::path::Path, sessions: &[PathBuf]) -> PathBuf {
+    if dir.join("host.sqlite").is_file() {
+        return dir.join("promotions");
+    }
+    match sessions
+        .first()
+        .and_then(|session| session.parent())
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => parent.to_path_buf(),
+        None if dir.is_dir() => dir.to_path_buf(),
+        None => PathBuf::from("."),
+    }
+}
+
 #[derive(Default)]
 struct Live {
     shown: usize,
@@ -697,7 +736,7 @@ struct Terminal {
 impl Observer for Terminal {
     fn event(&self, event: Event<'_>) {
         match event {
-            Event::Prompt { text: prompt } => println!("> {prompt}"),
+            Event::Prompt { text: prompt } => println!("> {}", shown(prompt)),
             Event::Compacted { before, after } => println!(
                 "(compacted earlier history: {} KiB -> {} KiB)",
                 before / 1024,
@@ -710,7 +749,7 @@ impl Observer for Terminal {
             } => println!("... {} / {} (step {})", provider, model, step),
             Event::ModelDelta { text } => {
                 let mut out = std::io::stdout().lock();
-                let _ = out.write_all(text.as_bytes());
+                let _ = out.write_all(shown(text).as_bytes());
                 let _ = out.flush();
             }
             Event::ModelTextWithdrawn => {
@@ -718,7 +757,7 @@ impl Observer for Terminal {
                 let _ = out.write_all(b"\n(the provider withdrew the text above)");
                 let _ = out.flush();
             }
-            Event::ModelText { text } => println!("{}", text.trim_end()),
+            Event::ModelText { text } => println!("{}", shown(text.trim_end())),
             Event::Usage { input, output } => {
                 println!("    [tokens in {} out {}]", input, output)
             }
@@ -743,7 +782,7 @@ impl Observer for Terminal {
             }
             Event::ToolCall { name, input, .. } => self.call(name, input),
             Event::ToolSkipped => println!("  | (skipped by the repeat guard)"),
-            Event::ToolRefused { reason } => println!("  | (refused: {reason})"),
+            Event::ToolRefused { reason } => println!("  | (refused: {})", shown(reason)),
             Event::ToolReused => println!("  | (reusing the recorded result; not run again)"),
             Event::Unisolated { reason } => {
                 println!("(no isolation: {reason}; commands run directly on this host)")
@@ -752,7 +791,7 @@ impl Observer for Terminal {
                 println!("  | (interrupted when spindle stopped; recorded as not completed)")
             }
             Event::ToolResult { content, failed } => self.tool_result(content, failed),
-            Event::Steered { text } => println!("> (while running) {text}"),
+            Event::Steered { text } => println!("> (while running) {}", shown(text)),
             Event::ReplyCut => println!(
                 "(cut the reply being written to read your message now; it may still be billed)"
             ),
@@ -764,9 +803,9 @@ impl Observer for Terminal {
                 title,
                 markdown,
             } => {
-                println!("  ┌ {pack}: {title}");
+                println!("  ┌ {}: {}", shown(pack), shown(title));
                 for line in markdown.lines() {
-                    println!("  │ {line}");
+                    println!("  │ {}", shown(line));
                 }
             }
             Event::ProviderRetry {
@@ -792,7 +831,7 @@ impl Observer for Terminal {
                     String::new()
                 }
             ),
-            Event::Nested { label } => println!("  | ↳ {label}"),
+            Event::Nested { label } => println!("  | ↳ {}", shown(label)),
             Event::Output { stream: _, bytes } => self.output(bytes),
             Event::OutputEnd => self.output_end(),
             Event::Stopped {
@@ -867,7 +906,7 @@ impl Observer for Terminal {
             Event::Extended { steps } => {
                 println!("Continuing past the step limit with {steps} more steps.")
             }
-            Event::SettingsApplied { text } => println!("{text}"),
+            Event::SettingsApplied { text } => println!("{}", shown(text)),
             _ => {}
         }
     }
@@ -891,7 +930,7 @@ impl Terminal {
             live.name.clear();
             live.name.push_str(name);
         }
-        println!("{}", describe_call(name, input));
+        println!("{}", shown(&describe_call(name, input)));
     }
 
     fn output(&self, bytes: &[u8]) {
@@ -908,7 +947,7 @@ impl Terminal {
                 if !live.mid_line {
                     let _ = out.write_all(b"  | ");
                 }
-                let _ = out.write_all(piece.as_bytes());
+                let _ = out.write_all(shown(piece).as_bytes());
                 live.mid_line = !piece.ends_with('\n');
             }
         } else if !live.noted {
@@ -966,9 +1005,28 @@ impl Terminal {
             });
         }
         if !text.is_empty() {
-            println!("{text}");
+            println!("{}", shown(&text));
         }
     }
+}
+
+/// Model, tool and command text as the terminal shows it: a control character other
+/// than newline and tab is written out (`\u{1b}`), so no escape sequence in it can set
+/// the clipboard, plant a link, move the cursor or clear the screen.
+fn shown(text: &str) -> std::borrow::Cow<'_, str> {
+    let hidden = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !text.chars().any(hidden) {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if hidden(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out.into()
 }
 
 fn shorten(text: &str, lines: usize) -> String {
@@ -1124,7 +1182,7 @@ fn print_usage(report: &agent::UsageReport) {
     );
     for turn in &report.turns {
         let usage = &turn.usage;
-        let mut prompt = turn.prompt.clone();
+        let mut prompt = shown(&turn.prompt).into_owned();
         let mut parts = vec![];
         if turn.nested.calls > 0 {
             parts.push(format!("nested {}", dollars(turn.nested.usd)));
@@ -1201,16 +1259,18 @@ fn print_log(history: Vec<Message>) {
         for block in &message.content {
             match block {
                 Block::Text { text } if message.role == "user" => match steered_text(text) {
-                    Some(user) => println!("\n> (while running) {user}"),
-                    None => println!("\n> {text}"),
+                    Some(user) => println!("\n> (while running) {}", shown(user)),
+                    None => println!("\n> {}", shown(text)),
                 },
                 Block::Text { text } | Block::PartialStream { text } => {
-                    println!("{}", text.trim_end())
+                    println!("{}", shown(text.trim_end()))
                 }
                 Block::ToolUse { name, input, .. } => {
-                    println!("{}", describe_call(name, input))
+                    println!("{}", shown(&describe_call(name, input)))
                 }
-                Block::ToolResult { content, .. } => println!("{}", shorten(content, 6)),
+                Block::ToolResult { content, .. } => {
+                    println!("{}", shown(&shorten(content, 6)))
+                }
                 _ => {}
             }
         }
@@ -1226,13 +1286,64 @@ fn print_targets(targets: Vec<Target>) {
             RewindTargetKind::Settled => "after a finished turn",
             RewindTargetKind::BeforeModel => "before a model request",
         };
-        let last = target.last;
+        let last = shown(&target.last).into_owned();
         println!("{:>5}  {kind:<24} {last}", target.revision);
     }
 }
 
 fn print_files(files: Vec<(String, u64)>) {
     for (path, size) in files {
-        println!("{size:>9}  {}", path);
+        println!("{size:>9}  {}", shown(&path));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn terminal_text_shows_escape_sequences_instead_of_running_them() {
+        // OSC 52 (set the clipboard), OSC 8 (a link), clear screen, C1 CSI, a bell, and a
+        // carriage return that would draw over the line.
+        let text =
+            "a\u{1b}]52;c;cHduZWQ=\u{7}b\u{1b}]8;;https://x\u{1b}\\c\u{1b}[2J\u{9b}31m\r\n\tz";
+        assert_eq!(
+            super::shown(text),
+            "a\\u{1b}]52;c;cHduZWQ=\\u{7}b\\u{1b}]8;;https://x\\u{1b}\\c\\u{1b}[2J\\u{9b}31m\\r\n\tz"
+        );
+        assert!(matches!(
+            super::shown("plain\ttext\n"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn a_failure_shows_a_providers_escape_sequences_instead_of_running_them() {
+        assert_eq!(
+            super::failure_line("provider said: \u{1b}]52;c;eA==\u{7}no"),
+            "spindle: provider said: \\u{1b}]52;c;eA==\\u{7}no"
+        );
+    }
+
+    #[test]
+    fn an_upgrade_copies_sessions_beside_them() {
+        use std::path::{Path, PathBuf};
+        let host = std::env::temp_dir().join(format!("spindle-cli-host-{}", std::process::id()));
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("host.sqlite"), b"").unwrap();
+        let sessions = [PathBuf::from("/data/threads/one")];
+        assert_eq!(
+            super::upgrade_scratch(&host, &sessions),
+            host.join("promotions")
+        );
+        let plain = host.join("sessions");
+        assert_eq!(
+            super::upgrade_scratch(&plain, &sessions),
+            Path::new("/data/threads")
+        );
+        assert_eq!(
+            super::upgrade_scratch(&plain, &[PathBuf::from("one")]),
+            Path::new(".")
+        );
+        assert_eq!(super::upgrade_scratch(&host, &[]), host.join("promotions"));
+        std::fs::remove_dir_all(host).unwrap();
     }
 }

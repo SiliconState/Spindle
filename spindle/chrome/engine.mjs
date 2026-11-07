@@ -10,10 +10,14 @@ worker.onmessage = async ({ data }) => {
     chrome.runtime.sendMessage({ type: data.type, call: data.call }).catch(() => {});
     return;
   }
+  if (data?.type === 'tabs_done') {
+    chrome.runtime.sendMessage({ type: data.type, thread: data.thread, tasks: data.tasks }).catch(() => {});
+    return;
+  }
   if (data?.type !== 'page_tool') return;
   let answer;
   try {
-    answer = await chrome.runtime.sendMessage({ type: 'page_tool', call: data.call, name: data.name, input: data.input, allowed: data.allowed });
+    answer = await chrome.runtime.sendMessage({ type: 'page_tool', call: data.call, name: data.name, input: data.input, allowed: data.allowed, thread: data.thread, task: data.task });
   } catch (error) {
     answer = uncertain(data.name, `${BROWSER}'s answer to the page tool was lost: ${error.message}`);
   }

@@ -406,10 +406,13 @@ that offset. Each page ends with
 field, `read_job` lists the session's jobs. `stop_job` ends the job and everything it
 started, and returns the newest 4 KiB of its output.
 
-Jobs exist only in the owner process ([`jobs.rs`](../spindle/store/src/jobs.rs)). The
-receipts of `start_job`, `read_job` and `stop_job` record only what the model saw.
-After a restart, a job id from history names nothing, and reading it says so. Recovery
-reports such a job as lost and never restarts it. Without `network`, each sandboxed job
+Jobs themselves exist only in the owner process ([`jobs.rs`](../spindle/store/src/jobs.rs)).
+The newest 64 KiB of each job's output and its state are also saved in `store/job-output`
+(private directory and files), at most every two seconds while output changes and once
+at the end, up to 64 jobs per store. After a restart, `read_job` returns this tail clearly
+labelled as saved output, not a live job; it is never exported in a session bundle.
+Receipts record only what the model saw. Recovery still reports the job as lost and
+never restarts it. Without `network`, each sandboxed job
 has its own private network, so a later `bash` call cannot reach a server the job
 started.
 
@@ -433,7 +436,10 @@ whose owner died is sealed as interrupted and is never run again.
   With fields, it checks the change against the current settings plus anything already
   queued. Checks include known providers, models and efforts, sign-in for a new
   provider, a toolchain present on the host, and `max_usd` being non-negative or null.
-  It then queues the change. The change is applied when the turn ends
+  It then queues the change. A model may turn network or toolchain off, or lower a
+  dollar cap; only the user may turn those grants on or raise/remove the cap. Checks
+  run again against the queue while writing, so a racing narrower user choice wins.
+  The change is applied when the turn ends
   ([`apply_pending`](../spindle/store/src/agent/host_tools.rs)), never mid-turn, and is
   checked again at that point. `name` renames the thread and needs a host that keeps
   thread names.
@@ -574,7 +580,12 @@ step. If any path overlaps, none of the task's changes are adopted, the answer g
 `[task file conflict: ...]`, and it is marked failed.
 
 A background task's call is answered at once, saying the task started and will
-report as a queued update. Its files stay in the child session.
+report as a queued update. On a finished task's report, both hosts offer its changes
+against its original base and commit mergeable files with that report. A stopped task,
+`files: "discard"`, overlapping parent changes, or more than 64 MiB / 8192 changed paths
+leaves the files in the child, with the reason in the report. The driver waits for the
+host's explicit file offer (even an empty offer) before consuming a finished report,
+so a task finishing between two host polls cannot lose its files.
 When it ends, its retained answer, or a stopped report with the reason when it
 could not go on, is delivered to the parent's running or next turn. Delivery is
 committed once per lineage; a rewind before it makes the report readable again.
@@ -588,8 +599,9 @@ hold, divided by `max_running`. Each time the task runs, its `max_usd` is set ag
 the smaller of that lease and what the parent has left, leaving out the task's own
 spend. A `settings.max_usd` in the call can lower it further
 ([`lease`](../spindle/store/src/agent/tasks.rs)). The task's spend counts against the
-parent's usage report. Embedded tasks instead share their open task tree's spend
-and in-flight worst cases against the inherited or narrowed budget; embedded
+parent's usage report. Embedded tasks share the task tree's spend
+and in-flight worst cases against the inherited or narrowed budget, recounting retained
+child stores recursively after reopen; embedded
 `usage` reports only the session itself. See
 [embedded.md](embedded.md#settings-and-limits).
 

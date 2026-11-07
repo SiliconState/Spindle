@@ -1056,3 +1056,135 @@ fn killed_owner_recovers_joint_continuation_and_intent_publication() {
     retry.expected_revision = 0;
     assert_eq!(recovered.commit_proposal(&retry).unwrap(), 1);
 }
+
+/// A step of `width` intents for `prepare`d `proposal` (ids prefixed by `name`).
+fn widened(mut proposal: Proposal, name: &str, width: usize) -> Proposal {
+    proposal.effects = (0..width)
+        .map(|n| EffectIntent {
+            id: format!("{name}-{n}"),
+            adapter: "test-only".into(),
+            input: vec![],
+        })
+        .collect();
+    proposal
+}
+
+/// The schema a store's file records.
+fn schema(root: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(root.join("authority.sqlite"))
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap()
+}
+
+/// Builds of schema 20 refuse a store holding a step of more than 8 intents: the
+/// transaction that first commits one moves the store to schema 21, which they refuse
+/// by its number; a store without one stays 20, readable by them, and a refused commit
+/// moves nothing. A wide step an earlier build left at 20 moves it on the next open.
+#[test]
+fn a_step_wider_than_schema_20_holds_moves_its_store_to_21() {
+    let realm = Realm::new();
+    let mut store = Store::open(&realm.0).unwrap();
+    assert_eq!(schema(&realm.0), 20, "a new store");
+    let narrow = widened(prepare(&mut store, "narrow"), "narrow", 8);
+    store.commit_proposal(&narrow).unwrap();
+    assert_eq!(schema(&realm.0), 20);
+    let wide = widened(prepare(&mut store, "wide"), "wide", 9);
+    let mut stale = wide.clone();
+    stale.expected_revision = 0;
+    assert!(matches!(store.commit_proposal(&stale), Err(Error::Stale)));
+    assert_eq!(schema(&realm.0), 20, "a refused commit moves nothing");
+    assert_eq!(store.commit_proposal(&wide).unwrap(), 2);
+    assert_eq!(schema(&realm.0), 21);
+    spindle_store::check_image(&store.image().unwrap()).unwrap();
+    drop(store);
+    let mut store = Store::open(&realm.0).unwrap();
+    assert_eq!(store.intents(2).unwrap(), wide.effects);
+    store.check_integrity().unwrap();
+    drop(store);
+    rusqlite::Connection::open(realm.0.join("authority.sqlite"))
+        .unwrap()
+        .execute_batch("PRAGMA user_version=20")
+        .unwrap();
+    drop(Store::open(&realm.0).unwrap());
+    assert_eq!(schema(&realm.0), 21, "moved on open");
+}
+
+/// `spindle rollback` to a build of schema 20 is refused while a session store of the
+/// host took a step wider than that schema holds, naming it (and only it); `--force`
+/// restores the binary anyway, and with no such store the rollback goes ahead.
+#[cfg(unix)]
+#[test]
+fn rollback_names_the_session_stores_the_kept_binary_could_not_open() {
+    use spindle_store::upgrade::{previous, rollback};
+    use std::os::unix::fs::PermissionsExt;
+    let realm = Realm::new();
+    let bin = realm.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let binary = |path: &std::path::Path, schema: u32| {
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\necho 'spindle 0.0.0 schema {schema} engine test build test'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let target = bin.join("spindle");
+    binary(&target, 21);
+    binary(&previous(&target), 20);
+    let reads = |path: &std::path::Path| std::fs::read_to_string(path).unwrap();
+    for (name, width) in [("narrow", 8), ("wide", 9)] {
+        let session = realm.0.join("sessions").join(name);
+        std::fs::create_dir_all(&session).unwrap();
+        let mut store = Store::open(&session.join("store")).unwrap();
+        let step = widened(prepare(&mut store, name), name, width);
+        store.commit_proposal(&step).unwrap();
+    }
+    let refused = rollback(&target, false).unwrap_err();
+    assert!(
+        refused.contains(&format!(
+            "{} (schema 21)",
+            realm.0.join("sessions/wide/store").display()
+        )),
+        "{refused}"
+    );
+    assert!(!refused.contains("narrow"), "{refused}");
+    assert!(reads(&target).contains("schema 21"), "nothing swapped");
+    rollback(&target, true).unwrap();
+    assert!(reads(&target).contains("schema 20"));
+    // Running it again undoes it: the kept binary reads every store.
+    rollback(&target, false).unwrap();
+    assert!(reads(&target).contains("schema 21"));
+    std::fs::remove_dir_all(realm.0.join("sessions/wide")).unwrap();
+    rollback(&target, false).unwrap();
+    assert!(reads(&target).contains("schema 20"));
+}
+
+/// `doctor`'s full check reads every record's column types, also of those an earlier
+/// open validated (an open reads only the ones above its watermark again).
+#[test]
+fn the_full_check_reads_the_types_of_records_an_open_passes_over() {
+    use spindle_store::completion::Attempt;
+    let realm = Realm::new();
+    let mut store = Store::open(&realm.0).unwrap();
+    let step = prepare(&mut store, "one");
+    store.commit_proposal(&step).unwrap();
+    let attempt = Attempt {
+        id: "attempt-one".into(),
+        effect: "effect-one".into(),
+        owner_epoch: store.epoch(),
+        implementation: "test-native-v1".into(),
+        grant_reference: "grant".into(),
+    };
+    store.reserve_attempt(&attempt).unwrap();
+    store.ingest_receipt(&attempt.id, b"result").unwrap();
+    drop(store);
+    // Validated past the receipt.
+    drop(Store::open(&realm.0).unwrap());
+    rusqlite::Connection::open(realm.0.join("authority.sqlite"))
+        .unwrap()
+        .execute("UPDATE receipts SET result='not a blob'", [])
+        .unwrap();
+    let mut store = Store::open(&realm.0).unwrap();
+    assert!(matches!(store.check_integrity(), Err(Error::Incompatible)));
+}

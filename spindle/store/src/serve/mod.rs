@@ -47,9 +47,14 @@ const MAX_ATTACHMENTS: usize = 32;
 /// Finished receipts are kept a week (retries stay idempotent), a deleted thread's an hour.
 const KEEP_RECEIPTS: u64 = 7 * 24 * 3600 * 1000;
 const KEEP_DELETED: u64 = 3600 * 1000;
+/// A deleted thread's directory stays in HOST_DIR/trash this long, for an operator to
+/// move back (with its `sessions` row).
+const KEEP_TRASH: Duration = Duration::from_secs(24 * 3600);
 /// A snapshot lists the newest steps; the newest of those are checked as rewind points.
 const LISTED_STEPS: u64 = 8192;
 const CHECKED_TARGETS: usize = 48;
+/// Connections served at once; one more is answered 429 and closed.
+const MAX_CONNECTIONS: usize = 48;
 const HEARTBEAT: Duration = Duration::from_secs(10);
 /// Holds the fingerprint of a binary a promotion or rollback just installed; if that
 /// binary cannot start the host, it restores the kept previous one (see run).
@@ -314,6 +319,8 @@ struct Host {
     source: Option<PathBuf>,
     updating: AtomicBool,
     connections: AtomicUsize,
+    /// Remote runs (`POST /v1/run`) from their body's read to their answer (v1.rs).
+    runs: AtomicUsize,
     started: Instant,
     /// Fingerprint of the running binary, taken once at start (never under a lock, and
     /// never of a file a promotion has since replaced).
@@ -321,8 +328,9 @@ struct Host {
     /// Thread-list status per session, valid while the store files are unchanged.
     summaries: Mutex<BTreeMap<String, (Stamp, Value)>>,
     disk: Mutex<Option<(Instant, Value)>>,
-    /// The device token most recently minted for a legacy key cookie (see auth.rs).
-    legacy: Mutex<Option<(Instant, String, String, String)>>,
+    /// The thread list's providers, reused for a while (`providers`).
+    provider_generation: AtomicUsize,
+    providers: Mutex<Option<(Instant, Vec<Value>)>>,
     /// Outstanding static-site preview tokens (preview.rs).
     previews: preview::Grants,
     /// What self-edit snapshots reuse (selfedit.rs).
@@ -334,11 +342,15 @@ struct Host {
     interrupted: Vec<String>,
     /// Outstanding one-click connect codes (connect.rs).
     connect: Mutex<connect::Codes>,
+    /// Wrong pairing keys and connect trades, by source (auth.rs).
+    failures: auth::Failures,
     /// Held by a thread import while it unpacks and checks its upload, and again while
     /// its staged session is put in place and opened (threads.rs), not in between (its
     /// credential check): one bundle unpacked or checked at a time, however many arrive
     /// at once.
     importing: Mutex<()>,
+    /// Thread imports under way and the bytes of their bundles (threads.rs).
+    arriving: Mutex<(usize, u64)>,
     /// Points where a test stops a thread import as a stopped host would (threads.rs).
     #[cfg(test)]
     cuts: Mutex<Vec<&'static str>>,
@@ -512,6 +524,34 @@ fn private_database(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+/// Trash no registered thread names that was put there `KEEP_TRASH` ago or more (its
+/// directory's modified time, which a deletion sets).
+fn old_trash(root: &Path, registered: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    trash_to_purge(
+        root,
+        registered,
+        disk::space(root).is_some_and(|(free, _)| free < 1 << 30),
+    )
+}
+
+fn trash_to_purge(root: &Path, registered: impl Fn(&str) -> bool, pressure: bool) -> Vec<PathBuf> {
+    std::fs::read_dir(root.join("trash"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| id_ok(name) && !registered(name))
+        })
+        .filter(|entry| {
+            let at = entry.metadata().and_then(|meta| meta.modified()).ok();
+            pressure || at.is_none_or(|at| at.elapsed().is_ok_and(|age| age >= KEEP_TRASH))
+        })
+        .map(|entry| entry.path())
+        .collect()
 }
 fn random() -> Result<String> {
     #[cfg(unix)]
@@ -777,7 +817,17 @@ pub fn run(root: PathBuf, args: Vec<String>) -> Result<()> {
         }
     }
     let access = match (team, audience) {
-        (None, None) => None,
+        (None, None) => {
+            if let Some(origin) = &origin {
+                eprintln!(
+                    "spindle serve: warning: {origin} is served without --access-team/--access-aud: \
+                     anyone who reaches it can try pairing keys, and a stolen device cookie \
+                     alone gets in. Put the hostname behind Cloudflare Access and pass both \
+                     flags."
+                );
+            }
+            None
+        }
         (Some(team), Some(audience)) => {
             if origin.is_none() {
                 return Err("--access-team checks requests to --origin; set it too".into());
@@ -819,6 +869,10 @@ pub fn run(root: PathBuf, args: Vec<String>) -> Result<()> {
         let host = host.clone();
         std::thread::spawn(move || host.resume_known());
     }
+    if host.access.get().is_some() {
+        let host = host.clone();
+        std::thread::spawn(move || host.access.get().map(access::Access::refresh_kept));
+    }
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(stream) => stream,
@@ -830,12 +884,12 @@ pub fn run(root: PathBuf, args: Vec<String>) -> Result<()> {
                 continue;
             }
         };
-        if host.connections.fetch_add(1, Ordering::SeqCst) >= 48 {
+        if host.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             host.connections.fetch_sub(1, Ordering::SeqCst);
             let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
             // The v1 envelope; the phone shows its `error` as it showed the plain text.
             let limit = json!({"error": "connection limit", "code": "rate_limited"});
-            let _ = send_json(&mut stream, 429, &limit, "");
+            let _ = send_json(&mut stream, 429, &limit, "Retry-After: 2\r\n");
             continue;
         }
         let host = host.clone();
@@ -942,7 +996,7 @@ impl Host {
             UPDATE commands SET state='interrupted',error='Host restarted. Outcome may be committed; inspect the session. This command will not be re-dispatched.' WHERE state='running';").map_err(err)?;
         db.execute_batch(threads::TABLES).map_err(err)?;
         // Before sessions are listed: imports cut before their commit are taken away.
-        threads::recover(&root, &db)?;
+        let discarded = threads::recover(&root, &db)?;
         // Receipts from before command_times start their retention window now.
         db.execute(
             "INSERT OR IGNORE INTO command_times SELECT id,?1 FROM commands",
@@ -975,28 +1029,20 @@ impl Host {
             let store = dir.join("store");
             if spindle_store::legacy_store(&store) {
                 match spindle_store::Store::open(&store) {
-                    Ok(_) => println!(
+                    Ok(opened) => println!(
                         "session {id}: store migrated to schema {} (the pre-migration copy is kept as store/authority.vNN.sqlite)",
-                        spindle_store::CAPABILITIES.schema
+                        opened.schema().unwrap_or(20)
                     ),
                     Err(error) => eprintln!("session {id}: store not migrated: {error}"),
                 }
             }
         }
-        // Whatever remains in trash belongs to no thread: deletions whose removal
-        // failed or was cut off. Remove it in the background so start is not delayed.
-        let stale: Vec<PathBuf> = std::fs::read_dir(root.join("trash"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| id_ok(name) && !lives.contains_key(name))
-            })
-            .map(|entry| entry.path())
-            .collect();
+        // Whatever else is in trash belongs to no thread: deletions a day old (and those
+        // whose removal failed or was cut off), and the half-made imports just taken
+        // away. Removed in the background so start is not delayed.
+        let mut stale = old_trash(&root, |name| lives.contains_key(name));
+        stale.extend(discarded);
+        stale.extend(stale_checks(&root));
         if !stale.is_empty() {
             std::thread::spawn(move || stale.iter().for_each(|path| disk::purge(path)));
         }
@@ -1012,17 +1058,21 @@ impl Host {
             source,
             updating: AtomicBool::new(false),
             connections: AtomicUsize::new(0),
+            runs: AtomicUsize::new(0),
             started: Instant::now(),
             build: OnceLock::new(),
             summaries: Mutex::new(BTreeMap::new()),
             disk: Mutex::new(None),
-            legacy: Mutex::new(None),
+            provider_generation: AtomicUsize::new(0),
+            providers: Mutex::new(None),
             previews: preview::Grants::default(),
             self_edit: selfedit::Cache::default(),
             attention: Mutex::new(attention::Attention::new()),
             interrupted,
             connect: Mutex::default(),
+            failures: auth::Failures::default(),
             importing: Mutex::default(),
+            arriving: Mutex::default(),
             #[cfg(test)]
             cuts: Mutex::default(),
             #[cfg(test)]
@@ -1149,26 +1199,27 @@ impl Host {
             error
         })
     }
-    fn keep_on_shelf(&self, id: &str, body: &Value) -> Result<Value> {
+    fn keep_on_shelf(&self, id: &str, body: &Value) -> std::result::Result<Value, Refused> {
         let path = body["path"]
             .as_str()
             .filter(|path| !path.is_empty())
-            .ok_or("path required")?;
-        let mut view = View::open(&self.dir(id).join("store")).map_err(err)?;
+            .ok_or_else(|| bad("path required"))?;
+        let mut view = View::open(&self.dir(id).join("store")).map_err(unknown)?;
         let head = view
             .read(|view| view.head().map(|(head, _, _)| head))
-            .map_err(err)?;
+            .map_err(unknown)?;
         let found = self
-            .files_at(id, head)?
+            .files_at(id, head)
+            .map_err(bad)?
             .into_iter()
             .find(|file| file.entry.path == path)
-            .ok_or("no such file at the head")?;
+            .ok_or_else(|| bad("no such file at the head"))?;
         if found.size > SHELF_FILE_MAX as u64 {
-            return Err("a shelf note is at most 256 KiB".into());
+            return Err(bad("a shelf note is at most 256 KiB"));
         }
         let bytes = view
             .read(|view| view.object(&found.entry.object))
-            .map_err(err)?;
+            .map_err(unknown)?;
         // The file's name, made a valid note name (other characters become '-').
         let name: String = path
             .rsplit('/')
@@ -1192,9 +1243,27 @@ impl Host {
         } else {
             name
         };
-        let target = shelf_path(self, &name)?;
-        std::fs::create_dir_all(self.root.join("shelf")).map_err(err)?;
-        spindle_store::durable::write(&target, &bytes).map_err(err)?;
+        let target = shelf_path(self, &name).map_err(bad)?;
+        std::fs::create_dir_all(self.root.join("shelf")).map_err(unknown)?;
+        // Another note of that name is the operator's: never overwritten from here.
+        match std::fs::read(&target) {
+            Ok(kept) if kept == bytes => {}
+            Ok(_) => {
+                return Err(Refused(
+                    409,
+                    format!(
+                        "the shelf already has a different note named “{name}”: rename or delete it there first"
+                    ),
+                ));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(unknown(error));
+            }
+            Err(_) if shelf_files(self)?.len() >= SHELF_FILES_MAX => {
+                return Err(Refused(413, "the shelf holds at most 64 notes".into()));
+            }
+            Err(_) => spindle_store::durable::write(&target, &bytes).map_err(unknown)?,
+        }
         Ok(json!({"kept": name, "files": shelf_files(self)?}))
     }
     fn live(&self, id: &str) -> Result<Arc<Watch>> {
@@ -1248,6 +1317,12 @@ impl Host {
                 | "task_start"
         ) {
             return Err(bad("unsupported command"));
+        }
+        // A thread's id names its directory: one no thread can have is refused before
+        // anything there is read (a new thread's id is made here; a host rollback may
+        // name none).
+        if kind != "new" && !(kind == "rollback" && id.is_empty()) && !id_ok(id) {
+            return Err(Refused(404, "session not found".into()));
         }
         // App state changes are JSON merge patches (objects) of bounded size.
         for (field, needed) in [("patch", kind == "state"), ("state", false)] {
@@ -1340,6 +1415,16 @@ impl Host {
                 .map(String::from);
             Settings::resolve(provider, model).map_err(bad)?;
         }
+        // The thread's head is read before the host's locks (a store read can take a
+        // while, and every request's sign-in waits on the registry lock), and again
+        // under them only if the store's files changed meanwhile.
+        let store = self.dir(id).join("store");
+        let read_head = || -> Result<(u64, Vec<u8>)> {
+            let (head, bytes, _) = View::open(&store).map_err(err)?.head().map_err(err)?;
+            Ok((head, bytes))
+        };
+        let early = (!anytime && !matches!(kind, "new" | "rename" | "delete" | "rollback"))
+            .then(|| (stamp(&store), read_head()));
         let mut db = lock(&self.db);
         if let Some(existing) = db
             .query_row("SELECT digest FROM commands WHERE id=?1", [&request], |r| {
@@ -1449,8 +1534,10 @@ impl Host {
                 return Err(BUSY_HOST.into());
             }
             if !matches!(kind, "new" | "rename" | "delete" | "rollback") && !queued {
-                let mut view = View::open(&self.dir(id).join("store")).map_err(err)?;
-                let (head, bytes, _) = view.head().map_err(err)?;
+                let (head, bytes) = match early {
+                    Some((Some(before), read)) if stamp(&store) == Some(before) => read?,
+                    _ => read_head()?,
+                };
                 if self_edit && selfedit::prefix_at(&self.dir(id), dev, head)?.is_none() {
                     return Err(if upgrading {
                         "this thread holds no Spindle source to install: ask it to change \
@@ -1744,9 +1831,24 @@ impl Host {
                         }
                         return Err(error);
                     }
-                    // Removal can take minutes for a large build cache: never under the locks.
+                    // The screen's Undo ends with the page, so the thread stays in trash
+                    // for a day (from now, not its last change); older deletions go
+                    // now. Removal can take minutes for a large build cache: never under
+                    // the locks.
                     if moved {
-                        std::thread::spawn(move || disk::purge(&target));
+                        let _ =
+                            File::open(&target).and_then(|dir| dir.set_modified(SystemTime::now()));
+                    }
+                    let old = old_trash(&self.root, |name| {
+                        db.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+                            [name],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(true)
+                    });
+                    if !old.is_empty() {
+                        std::thread::spawn(move || old.iter().for_each(|path| disk::purge(path)));
                     }
                     Ok(())
                 })();
@@ -2173,6 +2275,9 @@ impl Host {
             )
             .map_err(err)?;
             live.lock().install_failed = None;
+            if let Some(note) = promotion_cache(&self.root)? {
+                live.push(json!({"type":"notice","text":note}));
+            }
             for args in [
                 vec!["fmt", "--all", "--", "--check"],
                 vec![
@@ -2222,6 +2327,8 @@ impl Host {
             stopped()?;
             self.verify_candidate(&candidate)?;
             install_unless_stopped(live, cancel, || upgrade::install(&candidate, &target))?;
+            // What built the cache is now the host's own code.
+            let _ = std::fs::remove_file(self.root.join(CACHE_UNTRUSTED));
             // Installed: the request it answered is done.
             let _ = selfedit::clear_request(&self.dir(id));
             // The installed binary now carries this thread's changes; keep the host
@@ -2402,7 +2509,9 @@ impl Host {
             .map(|id| self.dir(&id))
             .filter(|dir| dir.join("store").exists())
             .collect::<Vec<_>>();
-        let (_, checks) = spindle_store::upgrade::verify(binary, &sessions)?;
+        // Copies of the sessions beside them, not in /tmp (often memory).
+        let (_, checks) =
+            spindle_store::upgrade::verify(binary, &sessions, &self.root.join("promotions"))?;
         if checks.iter().any(|check| !check.passed) {
             return Err("candidate failed doctor on session copies; nothing installed".into());
         }
@@ -2844,6 +2953,26 @@ impl Host {
         *cached = Some((Instant::now(), value.clone()));
         value
     }
+    /// The providers this host can send to, with their default models, for the thread
+    /// list. Each resolves its credentials (a key command, a sign-in refresh) and the
+    /// list is polled, so an answer is reused for half a minute or until a sign-in.
+    fn providers(&self) -> Result<Vec<Value>> {
+        let generation = self.provider_generation.load(Ordering::SeqCst);
+        if let Some((at, value)) = &*lock(&self.providers)
+            && at.elapsed() < Duration::from_secs(30)
+        {
+            return Ok(value.clone());
+        }
+        let value: Vec<Value> = agent::providers()?
+            .into_iter()
+            .filter_map(|(id, r)| r.ok().map(|(_, model)| json!({"id":id,"model":model})))
+            .collect();
+        let mut cached = lock(&self.providers);
+        if self.provider_generation.load(Ordering::SeqCst) == generation {
+            *cached = Some((Instant::now(), value.clone()));
+        }
+        Ok(value)
+    }
     /// Restarts the supervised host (exit 75) when no worker is running.
     fn restart(&self) -> std::result::Result<(), Refused> {
         if std::env::var("SPINDLE_SUPERVISED").as_deref() != Ok("1") {
@@ -3051,6 +3180,68 @@ fn write_back(source: &Path, ours: &[SourceFile], composed: &[SourceFile]) -> Re
 const CARGO: &str = "/opt/cargo/bin/cargo";
 const NODE: &str = "/usr/bin/node";
 
+/// Present from a promotion's first gate until its install: the build cache holds
+/// what code that was never installed wrote (outside the cache, which gates can write).
+const CACHE_UNTRUSTED: &str = "promotions/cache.untrusted";
+
+/// What candidate checks a stop of the host (or of `spindle upgrade`) cut short left
+/// under `promotions/`: copies of sessions in `spindle-upgrade-*` directories of a
+/// process that is gone, and the private registry copies `verify_candidate` makes
+/// (`check-*`, made only by the host holding this directory, which has just started).
+fn stale_checks(root: &Path) -> Vec<PathBuf> {
+    let promotions = root.join("promotions");
+    let mut stale = spindle_store::upgrade::stale_scratch(&promotions);
+    if let Ok(entries) = std::fs::read_dir(&promotions) {
+        stale.extend(
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.file_type().is_ok_and(|kind| kind.is_dir())
+                        && entry.file_name().to_string_lossy().starts_with("check-")
+                })
+                .map(|entry| entry.path()),
+        );
+    }
+    stale
+}
+
+/// Readies the build cache every promotion shares. One that did not install (a gate
+/// failed, Stop, a refused candidate, a host stopped mid-build) may have planted
+/// artifacts the next build would link, whichever thread it is for, so that cache is
+/// emptied first; so is one past `PROMOTION_CACHE_MAX`. Returns the notice saying it
+/// was, and why, when it was.
+fn promotion_cache(root: &Path) -> Result<Option<String>> {
+    promotion_cache_within(root, PROMOTION_CACHE_MAX)
+}
+
+/// The most the shared promotion build cache may hold as a promotion starts: past it,
+/// it is emptied first (that build starts cold) rather than growing with every build.
+const PROMOTION_CACHE_MAX: u64 = 8 * 1024 * 1024 * 1024;
+
+/// `promotion_cache` with its size limit given: what was emptied and why, if anything.
+fn promotion_cache_within(root: &Path, max: u64) -> Result<Option<String>> {
+    let marker = root.join(CACHE_UNTRUSTED);
+    let cache = root.join("promotions/cache");
+    let note = if marker.exists() {
+        Some("Emptied the build cache: the last promotion did not install, so its code never became trusted.".to_string())
+    } else {
+        let held = disk::usage(&cache);
+        (held > max).then(|| {
+            format!(
+                "Emptied the build cache: it held {:.1} GiB, past its {} GiB limit, so this build starts cold.",
+                held as f64 / (1u64 << 30) as f64,
+                max >> 30
+            )
+        })
+    };
+    if note.is_some() {
+        disk::remove_tree(&cache).map_err(err)?;
+    }
+    private_dir(&root.join("promotions"))?;
+    spindle_store::durable::write(&marker, b"").map_err(err)?;
+    Ok(note)
+}
+
 /// Runs one gate program in the sandbox over `tree`. Err carries the message and the
 /// end of the program's output (empty when it never ran).
 fn sandboxed_gate(
@@ -3082,7 +3273,8 @@ fn sandboxed_gate(
     let cargo = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".cargo"));
-    // One build cache for every promotion; exports are removed after each attempt.
+    // One build cache for every promotion (emptied after one that did not install:
+    // `promotion_cache`); exports are removed after each attempt.
     let cache = tree
         .parent()
         .and_then(Path::parent)
@@ -3203,9 +3395,13 @@ fn route(
     {
         return Err(Refused(403, "cross-site request refused".into()));
     }
-    // Through the tunnel, Cloudflare Access must have let the request in.
-    if public && let Some(access) = host.access.get() {
-        access.check(&request.headers).map_err(|why| {
+    // Through the tunnel, Cloudflare Access must have let the request in. The Host
+    // header is the client's to choose: Cloudflare's own headers mark the tunnel too.
+    let tunneled = public
+        || request.headers.contains_key("cf-ray")
+        || request.headers.contains_key("cf-connecting-ip");
+    if tunneled && let Some(access) = host.access.get() {
+        let identity = access.check(&request.headers).map_err(|why| {
             // A preview path holds its token: never logged.
             let path = if preview {
                 "/api/preview/…"
@@ -3215,6 +3411,7 @@ fn route(
             eprintln!("spindle serve: refused {} {path}: {why}", request.method);
             Refused(403, why)
         })?;
+        request.access_until = Some(identity.until);
     }
     if preview {
         return preview::serve(host, stream, &request, &origin);
@@ -3243,7 +3440,15 @@ fn route(
         http::read_body(stream, &mut request).map_err(bad)?;
         let data: Value = serde_json::from_slice(&request.body).map_err(|e| bad(err(e)))?;
         let key = data["key"].as_str().unwrap_or_default();
+        let source = auth::source(&request.headers);
+        if host.failures.blocked(&source) {
+            return Err(Refused(
+                429,
+                "too many wrong pairing keys; wait a minute".into(),
+            ));
+        }
         if !auth::same(key.as_bytes(), host.token.as_bytes()) {
+            host.failures.failed(&source);
             return Err(Refused(401, "Invalid pairing key".into()));
         }
         let label = auth::label(request.headers.get("user-agent").map(String::as_str));
@@ -3259,12 +3464,7 @@ fn route(
         return Ok(());
     }
     let device = match auth::cookie(request.headers.get("cookie")) {
-        Some(token) => host.authenticate(
-            token,
-            request.headers.get("user-agent").map(String::as_str),
-            public,
-            extra,
-        )?,
+        Some(token) => host.authenticate(token, public, extra)?,
         None => None,
     };
     let Some(device) = device else {
@@ -3289,10 +3489,7 @@ fn route(
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/api/sessions") => {
             let rows = host.sessions()?;
-            let providers = agent::providers()?
-                .into_iter()
-                .filter_map(|(id, r)| r.ok().map(|(_, model)| json!({"id":id,"model":model})))
-                .collect::<Vec<_>>();
+            let providers = host.providers()?;
             return send_json(
                 stream,
                 200,
@@ -3430,6 +3627,10 @@ fn route(
                 return Err(bad("credential too long"));
             }
             let (message, awaiting) = agent::login_remote(provider, credential).map_err(bad)?;
+            let mut cached = lock(&host.providers);
+            host.provider_generation.fetch_add(1, Ordering::SeqCst);
+            *cached = None;
+            drop(cached);
             return send_json(
                 stream,
                 200,
@@ -3443,6 +3644,10 @@ fn route(
                 .as_str()
                 .ok_or_else(|| bad("provider required"))?;
             let message = agent::logout(provider).map_err(bad)?;
+            let mut cached = lock(&host.providers);
+            host.provider_generation.fetch_add(1, Ordering::SeqCst);
+            *cached = None;
+            drop(cached);
             return send_json(stream, 200, &json!({"message":message}), extra);
         }
         _ => {}
@@ -3573,7 +3778,7 @@ fn route(
         if !id_ok(id) || host.live(id).is_err() {
             return Err(Refused(404, "thread not found".into()));
         }
-        let kept = host.keep_on_shelf(id, &json_body()?).map_err(bad)?;
+        let kept = host.keep_on_shelf(id, &json_body()?)?;
         return send_json(stream, 200, &kept, extra);
     }
     let parts: Vec<_> = request.path.trim_matches('/').split('/').collect();
@@ -3949,8 +4154,9 @@ fn events(
             }
         }
         if heartbeat.elapsed() >= HEARTBEAT {
-            // A revoked screen loses its open stream too.
-            if !host.paired(device) {
+            // A revoked screen loses its open stream too, and one whose Access token
+            // stopped verifying (the reconnect meets Access again).
+            if !host.paired(device) || request.access_lapsed() {
                 return Ok(());
             }
             out.push_str(": heartbeat\n\n");
@@ -4112,6 +4318,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    /// Makes a trash entry older than it is kept.
+    #[cfg(unix)]
+    fn age(path: &Path) {
+        File::open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - KEEP_TRASH - Duration::from_secs(60))
+            .unwrap();
+    }
     #[cfg(unix)]
     fn temp_host(name: &str) -> (PathBuf, Arc<Host>) {
         let root = std::env::temp_dir().join(format!("spindle-host-{name}-{}", std::process::id()));
@@ -4232,6 +4446,115 @@ mod tests {
         let head = String::from_utf8_lossy(&bytes[..split]).into_owned();
         let status = head[9..12].parse().unwrap();
         (status, head, bytes[split + 4..].to_vec())
+    }
+    /// Wrong pairing keys are limited per source: ten a minute, then 429 even for the
+    /// right key, while another source pairs as before.
+    #[test]
+    #[cfg(unix)]
+    fn wrong_pairing_keys_are_limited_per_source() {
+        let (root, host) = temp_host("pair-limit");
+        let pair = |key: &str, extra: &str| {
+            let body = format!("{{\"key\":\"{key}\"}}");
+            exchange(
+                &host,
+                &format!(
+                    "POST /api/pair HTTP/1.1\r\nHost: HOST\r\nOrigin: http://HOST\r\nX-Spindle: 1\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+            .0
+        };
+        for _ in 0..auth::MAX_FAILURES {
+            assert_eq!(pair("nope", ""), 401);
+        }
+        let key = host.token.clone();
+        assert_eq!(pair(&key, ""), 429, "locked for now, even with the key");
+        assert_eq!(
+            pair(&key, "Cf-Connecting-Ip: 203.0.113.9\r\n"),
+            200,
+            "another source is not locked out"
+        );
+        drop(host);
+        let _ = disk::remove_tree(&root);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn disk_pressure_releases_recent_trash_but_never_registered_threads() {
+        let (root, host) = temp_host("trash-pressure");
+        for id in ["recent", "registered"] {
+            std::fs::create_dir_all(root.join("trash").join(id)).unwrap();
+        }
+        assert!(trash_to_purge(&root, |id| id == "registered", false).is_empty());
+        assert_eq!(
+            trash_to_purge(&root, |id| id == "registered", true),
+            vec![root.join("trash/recent")]
+        );
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_thread_list_reuses_its_providers_for_a_while() {
+        let (root, host) = temp_host("providers");
+        // Resolving them for real reads this machine's credentials: never in a test.
+        let listed = vec![json!({"id": "test", "model": "m"})];
+        *lock(&host.providers) = Some((Instant::now(), listed.clone()));
+        assert_eq!(host.providers().unwrap(), listed);
+        assert_eq!(host.providers().unwrap(), listed);
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn keep_on_shelf_never_replaces_another_note_and_keeps_the_limit() {
+        let (root, host) = temp_host("keep");
+        store_thread(&host, "s");
+        commit_files(
+            &host,
+            "s",
+            &[("docs/notes.md".into(), b"from the thread".to_vec(), false)],
+        );
+        let keep = || host.keep_on_shelf("s", &json!({"path": "docs/notes.md"}));
+        assert_eq!(keep().unwrap()["kept"], "notes.md");
+        assert!(keep().is_ok(), "the same note again changes nothing");
+        let note = root.join("shelf/notes.md");
+        std::fs::write(&note, b"the operator's own").unwrap();
+        assert_eq!(keep().unwrap_err().0, 409);
+        assert_eq!(std::fs::read(&note).unwrap(), b"the operator's own");
+        std::fs::remove_file(&note).unwrap();
+        for n in 0..SHELF_FILES_MAX {
+            std::fs::write(root.join(format!("shelf/note-{n}")), b"x").unwrap();
+        }
+        assert_eq!(keep().unwrap_err().0, 413);
+        assert!(!note.exists());
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn cloudflare_headers_need_access_whatever_the_host_header_says() {
+        let (root, host) = temp_host("tunnel");
+        let ping = |header: &str| {
+            exchange(
+                &host,
+                &format!("GET /api/ping HTTP/1.1\r\nHost: HOST\r\n{header}\r\n"),
+            )
+        };
+        // Loopback without Cloudflare's headers: only pairing is asked for.
+        assert_eq!(ping("").0, 401);
+        assert!(host.access.set(access::Access::keyless()).is_ok());
+        assert_eq!(ping("").0, 401);
+        for header in [
+            "Cf-Ray: 8a1b2c3d4e5f6789-AMS\r\n",
+            "Cf-Connecting-Ip: 203.0.113.9\r\n",
+        ] {
+            let (status, _, body) = ping(header);
+            assert_eq!(status, 403, "{header}");
+            assert!(String::from_utf8_lossy(&body).contains("Cloudflare Access"));
+        }
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     #[cfg(unix)]
@@ -4871,7 +5194,7 @@ mod tests {
             host.submit("s", json!({"request_id":"again","kind":"delete"}))
                 .is_err()
         );
-        settle(&root.join("trash/s"));
+        assert!(root.join("trash/s").exists(), "kept a day for the operator");
         drop(host);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -5507,6 +5830,102 @@ mod tests {
     }
     #[test]
     #[cfg(unix)]
+    fn a_command_for_an_id_no_thread_can_have_reads_nothing_there() {
+        let (root, host) = temp_host("bad-id");
+        // Refused as no thread before its uploads (outside the threads' directory) are
+        // looked for: not as an upload that is gone.
+        let bytes = b"an upload";
+        for (request, data) in [
+            ("r1", json!({"kind": "continue"})),
+            (
+                "r2",
+                json!({"kind": "say", "text": "hi", "attachments": [{"path": "a.txt", "digest": hash(bytes)}]}),
+            ),
+        ] {
+            let mut data = data;
+            data["request_id"] = json!(request);
+            match host.submit("../x", data) {
+                Err(Refused(status, message)) => {
+                    assert_eq!((status, message.as_str()), (404, "session not found"))
+                }
+                Ok(receipt) => panic!("admitted: {receipt}"),
+            }
+        }
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn what_a_stopped_candidate_check_left_goes_when_the_host_starts() {
+        let (root, host) = temp_host("check-leftovers");
+        drop(host);
+        let promotions = root.join("promotions");
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
+        let pid = ended.id();
+        ended.wait().unwrap();
+        let left = promotions.join(format!("spindle-upgrade-{pid}-1"));
+        let running = promotions.join(format!("spindle-upgrade-{}-2", std::process::id()));
+        let check = promotions.join("check-0123456789abcdef");
+        let cache = promotions.join("cache");
+        for dir in [&left, &running, &check, &cache] {
+            std::fs::create_dir_all(dir.join("session-0/store")).unwrap();
+            std::fs::write(dir.join("session-0/store/authority.sqlite"), b"copy").unwrap();
+        }
+        let host = reopen(&root);
+        let started = Instant::now();
+        while (left.exists() || check.exists()) && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!left.exists(), "a gone process's copies are removed");
+        assert!(!check.exists(), "and the host's own registry copies");
+        assert!(running.exists(), "a running process's are kept");
+        assert!(cache.exists(), "the build cache is not a check's");
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_promotion_that_did_not_install_leaves_no_build_cache_behind() {
+        let (root, host) = temp_host("promotion-cache");
+        let planted = root.join("promotions/cache/target/release/spindle");
+        private_dir(&root.join("promotions")).unwrap();
+        std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+        std::fs::write(&planted, b"from an earlier, installed promotion").unwrap();
+        // The first promotion builds on what an install left.
+        assert_eq!(promotion_cache(&root).unwrap(), None);
+        assert!(planted.exists());
+        // It failed (or stopped, or the host died): its artifacts never reach the next.
+        std::fs::write(&planted, b"planted by code never installed").unwrap();
+        assert!(
+            promotion_cache(&root)
+                .unwrap()
+                .unwrap()
+                .contains("did not install")
+        );
+        assert!(!planted.exists());
+        // One that installed leaves its cache to the next.
+        std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+        std::fs::write(&planted, b"installed").unwrap();
+        std::fs::remove_file(root.join(CACHE_UNTRUSTED)).unwrap();
+        assert_eq!(promotion_cache(&root).unwrap(), None);
+        assert!(planted.exists());
+        // Unless it has grown past its limit: then the next build starts cold.
+        std::fs::remove_file(root.join(CACHE_UNTRUSTED)).unwrap();
+        std::fs::write(&planted, vec![7u8; 64 * 1024]).unwrap();
+        assert_eq!(
+            promotion_cache_within(&root, 1024 * 1024).unwrap(),
+            None,
+            "within the limit"
+        );
+        std::fs::remove_file(root.join(CACHE_UNTRUSTED)).unwrap();
+        let note = promotion_cache_within(&root, 16 * 1024).unwrap().unwrap();
+        assert!(note.contains("past its"), "{note}");
+        assert!(!planted.exists());
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
     fn a_panic_poisons_nothing_and_never_leaves_a_thread_busy() {
         let (root, host) = temp_host("poison");
         thread(&host, "s");
@@ -5575,7 +5994,17 @@ mod tests {
                 .unwrap()["state"],
             "completed"
         );
+        // Kept a day; a deletion after that removes it, the mode-000 directory too.
+        assert!(root.join("trash/s").exists());
+        age(&root.join("trash/s"));
+        thread(&host, "t");
+        assert_eq!(
+            host.submit("t", json!({"request_id":"d3","kind":"delete"}))
+                .unwrap()["state"],
+            "completed"
+        );
         settle(&root.join("trash/s"));
+        assert!(root.join("trash/t").exists());
         drop(host);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -5595,9 +6024,17 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o000)).unwrap();
         }
+        age(&root.join("trash/orphan"));
+        // Deleted an hour ago: still within its day.
+        std::fs::create_dir_all(root.join("trash/recent/store")).unwrap();
+        File::open(root.join("trash/recent"))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
         let host = reopen(&root);
         assert!(host.dir("kept").join("store/owner.lock").exists());
         settle(&root.join("trash/orphan"));
+        assert!(root.join("trash/recent/store").exists());
         let disk = host.about()["disk"].clone();
         assert!(disk["sessions"].as_u64().unwrap() > 0 && disk["free"].as_u64().is_some());
         #[cfg(unix)]

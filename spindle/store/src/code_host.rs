@@ -1161,75 +1161,105 @@ fn execute(
     let stderr = child.stderr.take().ok_or("missing tool stderr")?;
     let bytes = serde_json::to_vec(input).map_err(|e| e.to_string())?;
     let started = Instant::now();
-    let flood = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        let writer = scope.spawn(move || {
-            stdin.write_all(&bytes)?;
-            stdin.write_all(b"\n")
-        });
-        let flood_ref = &flood;
-        let output = scope.spawn(move || {
-            let mut bytes = vec![];
-            stdout
-                .take(crate::code_mode::MAX_REPLY as u64 + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() > crate::code_mode::MAX_REPLY {
-                flood_ref.store(true, Ordering::SeqCst);
-            }
-            Ok::<_, std::io::Error>(bytes)
-        });
-        let flood_ref = &flood;
-        let errors = scope.spawn(move || {
-            let mut bytes = vec![];
-            stderr.take(16385).read_to_end(&mut bytes)?;
-            if bytes.len() > 16384 {
-                flood_ref.store(true, Ordering::SeqCst);
-            }
-            Ok::<_, std::io::Error>(bytes)
-        });
-        let status = loop {
-            if interrupt.load(Ordering::SeqCst)
-                || started.elapsed() >= timeout
-                || flood.load(Ordering::SeqCst)
-            {
-                tree.terminate_std_child(&mut child);
-                break Err("external tool stopped; outcome may be unknown".to_string());
-            }
+    // Stdout, stderr and stdin each have a thread the call never joins: a daemon the
+    // tool started can hold them open, so they are waited for only until the deadline
+    // or a stop, then abandoned.
+    let (sender, pieces) = std::sync::mpsc::channel();
+    let caps = [crate::code_mode::MAX_REPLY, 16384];
+    read_pipe(0, stdout, caps[0] as u64 + 1, sender.clone());
+    read_pipe(1, stderr, caps[1] as u64 + 1, sender.clone());
+    std::thread::spawn(move || {
+        let written = stdin
+            .write_all(&bytes)
+            .and_then(|()| stdin.write_all(b"\n"));
+        let _ = sender.send((2, written.map(|()| vec![])));
+    });
+    let mut output = [vec![], vec![]];
+    let mut open = [true; 3];
+    let mut broken = None;
+    let mut exited = None;
+    let status = loop {
+        let stopped = interrupt.load(Ordering::SeqCst) || started.elapsed() >= timeout;
+        let flood = output[0].len() > caps[0] || output[1].len() > caps[1];
+        // Before any pipe error: a stopped tool's broken pipes are part of its stop.
+        if exited.is_none() && (stopped || flood) {
+            tree.terminate_std_child(&mut child);
+            return Err("external tool stopped; outcome may be unknown".to_string());
+        }
+        if exited.is_none() {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     tree.terminate_after_root_exit();
-                    break Ok(status);
+                    exited = Some(status);
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {}
                 Err(error) => {
                     tree.terminate_std_child(&mut child);
-                    break Err(error.to_string());
+                    return Err(error.to_string());
                 }
             }
-        };
-        let out = output
-            .join()
-            .map_err(|_| "tool reader panicked")?
-            .map_err(|e| e.to_string())?;
-        let err = errors
-            .join()
-            .map_err(|_| "tool reader panicked")?
-            .map_err(|e| e.to_string())?;
-        writer
-            .join()
-            .map_err(|_| "tool writer panicked")?
-            .map_err(|e| e.to_string())?;
-        if !status?.success() {
-            return Err(format!(
-                "external tool failed: {}",
-                String::from_utf8_lossy(&err)
-            ));
         }
-        if out.len() > crate::code_mode::MAX_REPLY || err.len() > 16384 {
-            return Err("external tool output limit".into());
+        // Once the tool exited and the call must end, only what already came is kept.
+        let ending = exited.is_some() && (stopped || flood);
+        let wait = Duration::from_millis(if ending { 0 } else { 10 });
+        match (pieces.recv_timeout(wait), exited) {
+            (Ok((index, Ok(bytes))), _) if bytes.is_empty() => open[index] = false,
+            (Ok((index, Ok(bytes))), _) => output[index].extend_from_slice(&bytes),
+            (Ok((index, Err(error))), _) => {
+                open[index] = false;
+                broken.get_or_insert(error);
+            }
+            (Err(_), Some(status)) if ending || !open.contains(&true) => break status,
+            (Err(std::sync::mpsc::RecvTimeoutError::Disconnected), _) => {
+                open = [false; 3];
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (Err(_), _) => {}
         }
-        serde_json::from_slice(&out).map_err(|_| "external tool must return one JSON value".into())
-    })
+    };
+    let [out, err] = output;
+    if !status.success() {
+        return Err(format!(
+            "external tool failed: {}",
+            String::from_utf8_lossy(&err)
+        ));
+    }
+    if let Some(error) = broken {
+        return Err(error.to_string());
+    }
+    if out.len() > caps[0] || err.len() > caps[1] {
+        return Err("external tool output limit".into());
+    }
+    serde_json::from_slice(&out).map_err(|_| "external tool must return one JSON value".into())
+}
+
+/// One pipe piece for `execute`: which pipe (stdout, stderr, stdin), and bytes read
+/// (none at its end) or the error that ended it.
+type Piece = (usize, std::io::Result<Vec<u8>>);
+
+/// Reads at most `cap` bytes of `pipe` on a thread of its own, sending each read and
+/// then an empty piece at the end. It stops early once the call stops taking pieces.
+fn read_pipe(
+    index: usize,
+    pipe: impl Read + Send + 'static,
+    cap: u64,
+    pieces: std::sync::mpsc::Sender<Piece>,
+) {
+    std::thread::spawn(move || {
+        let mut pipe = pipe.take(cap);
+        let mut buffer = vec![0; 16 * 1024];
+        loop {
+            let piece = match pipe.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(read) => Ok(buffer[..read].to_vec()),
+                Err(error) => Err(error),
+            };
+            let end = !matches!(&piece, Ok(bytes) if !bytes.is_empty());
+            if pieces.send((index, piece)).is_err() || end {
+                break;
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1445,5 +1475,47 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A helper that answers, then leaves a daemon (its own session, past the process
+    /// group kill) holding its pipes: the call ends at its deadline with the answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_holding_the_pipes_does_not_hold_the_call() {
+        let script = "import os,time; print('{\"n\": 1}', flush=True)\nif os.fork() == 0:\n    os.setsid(); time.sleep(5)\nelse:\n    time.sleep(0.2)";
+        let descriptor = json!({"command":"/usr/bin/python3","args":["-c",script]});
+        let start = Instant::now();
+        let value = execute(
+            &descriptor,
+            &json!({}),
+            &std::env::temp_dir(),
+            &AtomicBool::new(false),
+            Duration::from_millis(800),
+        )
+        .unwrap();
+        assert_eq!(value["n"], 1);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A tool stopped while its input is still being written reports the stop (an
+    /// unknown outcome), not the broken pipe the stop caused.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_tool_is_unknown_not_a_pipe_failure() {
+        let descriptor = json!({"command":"/bin/sleep","args":["30"]});
+        let error = execute(
+            &descriptor,
+            &json!({"pad": "x".repeat(1 << 20)}),
+            &std::env::temp_dir(),
+            &AtomicBool::new(false),
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(error.starts_with(STOPPED), "{error}");
+        assert_eq!(external_failure(error)["unknown"], true);
     }
 }

@@ -176,11 +176,17 @@ jobs:
             node chrome/tests/extension_real.mjs chrome/dist --scripted
           # The focused suites: the engine's own regressions (queued messages, page
           # tools, the gateway), routing between the two Linuxes, the panel's steps,
-          # warming, the vault's host token, a renewed engine giving its memory back, and
-          # the review checks in Chrome (previews, tasks, sends).
-          for test in review_regressions linux_route panel_steps linux_warm vault_host; do
+          # warming, the vault's host token, the v86 Linux's worker with a stand-in
+          # machine, a thread's files as a .zip (read back by Python's zipfile), a
+          # renewed engine giving its memory back, and the review checks in Chrome
+          # (previews, tasks, sends).
+          for test in review_regressions linux_route panel_steps linux_warm vault_host linux_worker zip; do
             node "chrome/tests/$test.mjs"
           done
+          SPINDLE_BROWSER="$(command -v google-chrome)" node chrome/tests/signin_vault.mjs chrome/dist
+          SPINDLE_STORE=1 chrome/build.sh "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen" "$RUNNER_TEMP/store-dist"
+          SPINDLE_BROWSER="$(command -v google-chrome)" node chrome/tests/signin_vault.mjs "$RUNNER_TEMP/store-dist"
+          SPINDLE_BROWSER="$(command -v google-chrome)" node chrome/tests/extension_real.mjs "$RUNNER_TEMP/store-dist" --scripted
           node --expose-gc chrome/tests/engine_renew.mjs chrome/dist/web
           SPINDLE_BROWSER="$(command -v google-chrome)" node chrome/tests/review_browser.mjs chrome/dist
   windows:

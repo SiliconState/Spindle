@@ -19,17 +19,20 @@ use crate::driver::{
     SummaryJournal, SummaryNeed, ToolNeed, ToolRan,
 };
 use crate::meta::{TaskEnd, TaskRun};
+use crate::protocol::{Fault, busy, conflict, failed, not_found};
+use crate::spend::{Billing, Call, CallKind};
 use crate::workspace::Tree;
 use crate::{Error, ModelError, Store};
 use dext_core::turn::{Phase, Stop};
 use dext_native::attempt::{self, AttemptError, WireAttempt};
 use dext_native::streaming::StreamUpdate;
-use dext_provider_catalog::catalog::RequestContract;
+use dext_provider_catalog::catalog::{ProviderCatalog, RequestContract};
 use dext_transcript::Block;
 use dext_transcript::checkpoint::NativeResponse;
 use dext_transcript::turn::{Effect, TurnContinuation};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -230,15 +233,13 @@ pub enum Work {
         auth: Vec<(String, String)>,
         claims: Vec<Claim>,
     },
-    /// Send the reserved request once: POST `body` to `endpoint` (with the authorized
-    /// headers, `content-type: application/json` and `accept: text/event-stream`, and
-    /// `content-encoding: gzip` when `gzip`), stream the body into `chunk`, then
-    /// answer `Response`; a request that cannot finish is `Dropped`.
-    Fetch {
-        endpoint: String,
-        gzip: bool,
-        body: Vec<u8>,
-    },
+    /// Send the reserved request once: POST its body (`Host::request_body`, read
+    /// while the work waits) to `endpoint` (with the authorized headers, `content-type:
+    /// application/json` and `accept: text/event-stream`, and `content-encoding: gzip`
+    /// when `gzip`), stream the response body into `chunk`, then answer `Response`; a
+    /// request that cannot finish is `Dropped`. The body stays in the session (one
+    /// copy, handed over as bytes when asked), never in the work itself.
+    Fetch { endpoint: String, gzip: bool },
     /// Run `command` (bash) over the call's workspace for the session's runner, within
     /// `timeout` seconds; `network` is the session's grant. Files are read with
     /// `Host::runner_file`. Answer `Ran`.
@@ -336,9 +337,9 @@ enum Waiting {
 /// native host asks it: the request, journaled as one nested call.
 struct SummaryWait {
     need: Box<SummaryNeed>,
-    /// The messages a queued prompt starting with this compaction joined, steered once
-    /// its start commits.
-    joined: Vec<String>,
+    /// What a queued prompt starting with this compaction carries until its start
+    /// commits.
+    joined: Joined,
     journal: SummaryJournal,
     /// The request (`code_model_request`'s form).
     prepared: Value,
@@ -351,6 +352,17 @@ enum SummaryPlan {
     Ready(Option<String>),
     /// A request to send, with the credentials it needs first.
     Ask(SummaryJournal, Value, Box<Work>),
+}
+
+/// What a queued prompt's start carries until it commits: the messages it joined
+/// (steered once it does), and what goes back to the queue if it fails, so nothing the
+/// user wrote is lost: those messages, or a turn a retry restarted its own prompt (the
+/// turn was rewound already: its prompt is held only here), as the native host gives
+/// them back.
+#[derive(Default)]
+struct Joined {
+    steered: Vec<String>,
+    back: Vec<String>,
 }
 
 /// A nested need answered here, or waiting on the app.
@@ -396,9 +408,11 @@ pub enum CodeStep {
 }
 
 struct Started {
+    /// Its row's key (`app:<task>`), where its end is kept.
+    run: String,
     child: Box<Host>,
     input: Value,
-    base: Workspace,
+    base: Tree,
 }
 
 /// A task running in the background (`task_start` with `report: queue`, or a `task`
@@ -408,7 +422,7 @@ struct Started {
 struct Background {
     run: String,
     input: Value,
-    base: Workspace,
+    base: Tree,
     child: Box<Host>,
 }
 
@@ -433,9 +447,11 @@ impl Ended {
     }
 }
 
-/// A batch of task calls (one model step's), running as child sessions.
+/// A batch of task calls (one model step's), running as child sessions. Its base,
+/// as every task's, is a tree (files by object digest): bytes are read only where a
+/// task starts from them or an answer carries them (`files_of`, `changes`).
 struct Batch {
-    base: Workspace,
+    base: Tree,
     calls: Vec<TaskCall>,
 }
 
@@ -486,6 +502,8 @@ pub struct Host {
     /// The store was moved aside and could not be opened again: this host no longer
     /// holds the session (the app opens it again).
     detached: bool,
+    /// Its task sessions' kept spend is in the pool (`count_tasks`).
+    tasks_counted: bool,
 }
 
 impl Host {
@@ -534,6 +552,7 @@ impl Host {
             background: Vec::new(),
             works: Vec::new(),
             detached: false,
+            tasks_counted: false,
         }
     }
 
@@ -576,11 +595,29 @@ impl Host {
         Ok(host)
     }
 
-    /// Opens the session `label` in `storage`, finishing a rewind its last owner began.
+    /// Opens the session `label` in `storage`, finishing a rewind its last owner began
+    /// and the removal of a task's files one cut short (`drop_task`; nothing reads them,
+    /// so one that fails again waits for the next open).
     pub fn open(label: &str, storage: Box<dyn Storage>, catalog: Arc<Catalog>) -> Result<Self> {
         let mut host = Self::open_at(storage, catalog, 0, None)?;
         host.set_label(label.into());
+        let _ = host.finish_removals();
         Ok(host)
+    }
+
+    /// Finishes what removals of tasks' files cut short: the directory of a task this
+    /// session records as removed (`dropped`) and still in `tasks/` (a stop between the
+    /// record and the move) is moved out and removed (a native host, which reads no such
+    /// record, would count and resume it), then whatever a removal left (`sweep`).
+    fn finish_removals(&self) -> Result<()> {
+        let dropped = self.dropped_keys()?;
+        if !dropped.is_empty() {
+            let kept = self.storage.tasks();
+            for key in dropped.iter().filter(|key| kept.contains(key)) {
+                self.storage.remove_task(key).map_err(store_error)?;
+            }
+        }
+        self.storage.sweep().map_err(store_error)
     }
 
     fn open_at(
@@ -690,9 +727,38 @@ impl Host {
                 bytes,
             });
         }
+        // A task whose store was removed is not carried, even where a removal cut short
+        // left its files: its spend is this session's own now.
         let mut opened = vec![];
-        bundle_tasks(self.storage.as_ref(), "", &mut files, &mut opened)?;
+        let dropped = self.dropped_keys()?;
+        bundle_tasks(
+            self.storage.as_ref(),
+            "",
+            &dropped,
+            Some(&mut files),
+            &mut opened,
+        )?;
         Ok((files, opened))
+    }
+
+    /// Every task store kept beside this session's (nested ones too), opened so nothing
+    /// else runs them meanwhile, with their places: to be sealed as the session moves.
+    /// Refused while an operation runs.
+    #[allow(clippy::type_complexity)]
+    pub fn task_stores(&mut self) -> Result<Vec<(Box<dyn Storage>, Store)>> {
+        if let Some(running) = self.running {
+            return Err(format!(
+                "a {running} is running in this session; wait for it or stop it"
+            ));
+        }
+        let mut opened = vec![];
+        let dropped = self.dropped_keys()?;
+        bundle_tasks(self.storage.as_ref(), "", &dropped, None, &mut opened)?;
+        Ok(opened)
+    }
+
+    pub fn transfer_fingerprint(&self, opened: &[(Box<dyn Storage>, Store)]) -> Result<String> {
+        transfer_fingerprint(&self.store, opened)
     }
 
     /// Seals this session's place as moved elsewhere (`Storage::seal`), in effect once
@@ -733,9 +799,21 @@ impl Host {
             now.to_json()? == settings.to_json()?
         };
         if !budget_only {
-            self.ensure_idle()?;
+            self.ensure_settable()?;
         }
+        let was = *lock(&self.facts.budget);
         check_settings(&settings)?;
+        // A budget set where there was none: what the task tree spent meanwhile went
+        // uncounted (a task without a budget counts nothing as it goes), so the tree is
+        // counted again, the top session's own (a task's budget is its parent's): those
+        // running here now, then the rest from their stores (`count_tasks`). Before the
+        // budget is kept: one that cannot be counted is refused.
+        let counted_again = was.is_none() && settings.max_usd.is_some() && self.facts.depth == 0;
+        if counted_again {
+            self.facts.forget_spent();
+            self.facts.spent(&self.store, false)?;
+            count_background(&self.background, settings.max_usd)?;
+        }
         self.facts
             .catalog
             .route(&settings.provider, Some(&settings.model))?;
@@ -744,6 +822,9 @@ impl Host {
             .set_metadata("settings", &bytes)
             .map_err(store_error)?;
         *lock(&self.facts.budget) = settings.max_usd;
+        if counted_again {
+            self.tasks_counted = false;
+        }
         self.storage
             .keep_sidecar(SETTINGS_SIDECAR, &bytes)
             .map_err(store_error)
@@ -1035,6 +1116,21 @@ impl Host {
         }
     }
 
+    /// Settings change between turns, or where a stopped turn waits for its next model
+    /// request (`driver::before_model`): a rewind there, then a new model, goes on with
+    /// the turn instead of starting it over.
+    fn ensure_settable(&mut self) -> Result<()> {
+        let snapshot = self.store.snapshot().map_err(store_error)?;
+        if snapshot.revision > 0
+            && driver::before_model(
+                &crate::turn::restored(&snapshot.continuation).map_err(turn_error)?,
+            )
+        {
+            return Ok(());
+        }
+        self.ensure_idle()
+    }
+
     /// Starts a turn-like operation: refused while one runs; the owner moves to a new
     /// epoch, as a native host's fresh open does, so work an earlier operation left
     /// unrecorded is settled from the store, never found in flight.
@@ -1052,6 +1148,7 @@ impl Host {
         if name != "rewind" {
             check_settings(&self.settings()?)
                 .map_err(|why| format!("this session's settings cannot run here: {why}"))?;
+            self.count_tasks()?;
         }
         self.store.renew_epoch().map_err(store_error)?;
         self.running = Some(name);
@@ -1111,6 +1208,9 @@ impl Host {
             {
                 return Err("`state` is a JSON merge patch: an object".to_string());
             }
+            // Finished background tasks' files go with their reports: delivered as the
+            // prompt starts, or at the end of the turn a stopped one goes on with.
+            self.offer_task_files()?;
             // A turn stopped part way goes on with the message (read after what it has);
             // a state sent with it is a step of its own just before it.
             if Driver::takes_message(&mut self.store)? {
@@ -1154,6 +1254,9 @@ impl Host {
     /// instead of sending anything again.
     pub fn resume(&mut self, until_unknown: bool) -> Result<Progress> {
         self.begin("continue")?;
+        // A completed turn continued delivers its background tasks' reports: with their
+        // files.
+        self.offer_task_files()?;
         let need = if until_unknown {
             self.driver.resume_until_unknown(&mut self.store)?
         } else {
@@ -1187,7 +1290,12 @@ impl Host {
 
     /// The first request has no earlier point to rewind to: the old store is kept
     /// aside (its unknown request stays on record there) and a fresh one restarts the
-    /// same prompt over the same files, settings and app state.
+    /// same prompt over the same files, settings and app state. The fresh store is made
+    /// whole before it takes the old one's place (`Storage::replace_store`): settings,
+    /// the spend ledger with the old store's requests of unknown outcome (at their worst
+    /// case, keyed by where it is kept) and the restarted turn's start, its prompt
+    /// included, so a crash or a failed rename never leaves the session without them
+    /// (where the place cannot, they are written into the fresh store just after).
     fn restart_first(&mut self, prompt: String) -> Result<Progress> {
         if self.store.snapshot().map_err(store_error)?.revision != 1 {
             return Err("no earlier point can be rewound to (`targets`)".into());
@@ -1216,36 +1324,69 @@ impl Host {
         // them.
         let set_aside = crate::spend::aside_calls(&mut self.view(), Some(self.facts.catalog_ref()))
             .unwrap_or_default();
+        // The held ledger, read whole from the old store (what earlier retries and
+        // removed tasks left in it included), goes on in the fresh one.
+        self.facts.spent(&self.store, false)?;
+        let metadata: Vec<(&str, Vec<u8>)> = metadata
+            .into_iter()
+            .filter_map(|(key, bytes)| Some((key, bytes?)))
+            .collect();
         let old = std::mem::replace(&mut self.store, memory_store().map_err(store_error)?);
-        let (fresh, aside) = match self.storage.set_aside(old) {
-            Ok(kept) => kept,
-            Err(error) => {
-                // Where the old store still is, the session goes on from it; otherwise
-                // this host no longer holds it.
-                match self.storage.open(false) {
-                    Ok(store) => self.store = store,
-                    Err(_) => self.detached = true,
+        let (mut next, mut refused) = (None, None);
+        let replaced = {
+            let (facts, driver, events) = (&self.facts, &mut self.driver, &self.events);
+            let mut start = Some(start);
+            let mut prepare = |fresh: &mut Store, aside: &str| -> crate::Result<()> {
+                for (key, bytes) in &metadata {
+                    fresh.set_metadata(key, bytes)?;
                 }
-                return Err(store_error(error));
-            }
+                let started = facts
+                    .keep_aside(fresh, aside, set_aside.clone())
+                    .and_then(|()| {
+                        driver::Observer::event(
+                            events.as_ref(),
+                            Event::RetryingFirst {
+                                path: std::path::Path::new(aside),
+                            },
+                        );
+                        driver.start(
+                            fresh,
+                            prompt.clone(),
+                            start.take().ok_or("the turn was started already")?,
+                            Some(StartState::Exact(carried.clone())),
+                        )
+                    });
+                match started {
+                    Ok(need) => {
+                        next = Some(need);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        refused = Some(error);
+                        Err(Error::Invalid)
+                    }
+                }
+            };
+            self.storage.replace_store(old, &mut prepare)
         };
-        self.store = fresh;
-        for (key, bytes) in metadata {
-            if let Some(bytes) = bytes {
-                self.store.set_metadata(key, &bytes).map_err(store_error)?;
+        // A fresh store's turn (or none) is not the head the driver kept, nor its ledger
+        // the one held now.
+        self.driver.begin_run();
+        if let Err(error) = replaced {
+            *lock(&self.facts.spend) = Default::default();
+            // Where the old store still is (or the fresh one, if only its rename
+            // failed), the session goes on from it; otherwise this host no longer holds
+            // it.
+            match self.storage.open(false) {
+                Ok(store) => self.store = store,
+                Err(_) => self.detached = true,
             }
+            return Err(refused.unwrap_or_else(|| store_error(error)));
         }
-        self.facts.keep_aside(&self.store, &aside, set_aside)?;
-        self.emit(Event::RetryingFirst {
-            path: std::path::Path::new(&aside),
-        });
-        self.start_state = Some(StartState::Exact(carried));
-        let outcome = self.start_turn(&prompt, start).and_then(|need| {
-            self.driver.begin_run();
-            self.advance(Some(need))
-        });
-        self.start_state = None;
-        outcome
+        let (fresh, _) = replaced.expect("checked above");
+        self.store = fresh;
+        let need = next.ok_or("the restarted turn did not start")?;
+        self.advance(Some(need))
     }
 
     /// Goes back to a rewind target, restoring its workspace and app state.
@@ -1460,6 +1601,13 @@ impl Host {
             state,
             joined,
         } = start;
+        let joined = Joined {
+            back: match state.is_some() {
+                true => vec![prompt.clone()],
+                false => joined.clone(),
+            },
+            steered: joined,
+        };
         self.start_state = state;
         match self.start_turn(&prompt, start) {
             // Until its start commits, a queued prompt (and what it joined) is held only
@@ -1472,16 +1620,16 @@ impl Host {
 
     /// What a queued prompt's start came to: once it commits the messages it joined
     /// are steered; when it fails they wait for the next turn again.
-    fn started(&mut self, next: Result<Need>, joined: Vec<String>) -> Result<Need> {
+    fn started(&mut self, next: Result<Need>, joined: Joined) -> Result<Need> {
         match next {
             Ok(need) => {
-                for text in &joined {
+                for text in &joined.steered {
                     self.emit(Event::Steered { text });
                 }
                 Ok(need)
             }
             Err(error) => {
-                driver::Inbox::return_steering(self.queue.as_ref(), joined);
+                driver::Inbox::return_steering(self.queue.as_ref(), joined.back);
                 Err(error)
             }
         }
@@ -1503,7 +1651,7 @@ impl Host {
             };
             match need {
                 Need::Continue => {}
-                Need::Summarize(need) => match self.summarize(need, vec![])? {
+                Need::Summarize(need) => match self.summarize(need, Joined::default())? {
                     Nested::Next(need) => next = Some(need),
                     Nested::Parked(progress) => return Ok(progress),
                 },
@@ -1512,6 +1660,14 @@ impl Host {
                     Nested::Parked(progress) => return Ok(progress),
                 },
                 Need::TaskWait => {
+                    if !self
+                        .driver
+                        .pending_task_reports(&mut self.store)?
+                        .is_empty()
+                    {
+                        self.offer_task_files()?;
+                        continue;
+                    }
                     self.next_work += 1;
                     self.waiting = Some((self.next_work, Waiting::Background));
                     return Ok(Progress::Waiting(vec![]));
@@ -1768,7 +1924,6 @@ impl Host {
                 let work = Work::Fetch {
                     endpoint,
                     gzip: request.encoding() == dext_core::model::Encoding::Gzip,
-                    body: request.body().to_vec(),
                 };
                 let fetch = Fetch {
                     need,
@@ -1995,9 +2150,9 @@ impl Host {
 
     /// A compaction's summary, as the native host makes it: asked of the session's model
     /// when it compacts by model (credentials first, then the request, reserved and sent
-    /// once), the reply recorded for the same history, or the digest. `joined`: the
-    /// messages a queued prompt starting with this compaction joined.
-    fn summarize(&mut self, need: Box<SummaryNeed>, joined: Vec<String>) -> Result<Nested> {
+    /// once), the reply recorded for the same history, or the digest. `joined`: what a
+    /// queued prompt starting with this compaction carries.
+    fn summarize(&mut self, need: Box<SummaryNeed>, joined: Joined) -> Result<Nested> {
         match self
             .summary_plan(&need.compact)
             .unwrap_or(SummaryPlan::Ready(None))
@@ -2074,10 +2229,7 @@ impl Host {
         if self.queue.interrupt.load(Ordering::SeqCst) {
             return self.summary_done(*wait, None);
         }
-        let (Ok(reading), Ok(body)) = (
-            super::code::Reading::new(&wait.prepared),
-            serde_json::to_vec(&wait.prepared["body"]),
-        ) else {
+        let Ok(reading) = super::code::Reading::new(&wait.prepared) else {
             return self.summary_done(*wait, None);
         };
         // Under a budget a summary that might not fit is not asked for (the digest
@@ -2109,7 +2261,6 @@ impl Host {
                 .unwrap_or_default()
                 .into(),
             gzip: false,
-            body,
         };
         Ok(self.park(Waiting::SummaryFetch(wait, Box::new(reading)), work))
     }
@@ -2175,7 +2326,7 @@ impl Host {
     fn summarized(
         &mut self,
         need: Box<SummaryNeed>,
-        joined: Vec<String>,
+        joined: Joined,
         summary: Option<String>,
     ) -> Result<Need> {
         let next = self
@@ -2444,7 +2595,7 @@ impl Host {
             .ok_or("empty task batch")?
             .request
             .intent_revision;
-        let base = self.workspace_at(base_revision)?;
+        let base = self.tree_at(base_revision)?;
         let settings = self.settings()?;
         let mut calls = Vec::with_capacity(needs.len());
         for need in needs {
@@ -2494,7 +2645,7 @@ impl Host {
                 continue;
             }
             if matches!(call.reservation, Some(AppReservation::Reserved { .. })) {
-                match self.start_child(&call.need.id, &call.need.call.input, &base, &settings) {
+                match self.start_child(&call.need.id, &call.need.call.input, &settings) {
                     Ok(child) => call.child = Some(Box::new(child)),
                     Err(why) => call.result = Some(Err(why)),
                 }
@@ -2508,7 +2659,7 @@ impl Host {
                 continue;
             };
             let input = &call.need.call.input;
-            let progress = child.run_task(input, &batch.base);
+            let progress = child.run_task(input, &batch.base, || self.files_of(&batch.base));
             match progress {
                 Ok(Progress::Waiting(more)) => works.extend(more),
                 Ok(_) => {
@@ -2529,13 +2680,37 @@ impl Host {
         Ok(Progress::Waiting(works))
     }
 
-    fn start_child(
-        &mut self,
-        id: &str,
-        input: &Value,
-        base: &Workspace,
-        settings: &Settings,
-    ) -> Result<Host> {
+    /// Under a budget, once per open (and again when a budget is set where there was
+    /// none): the spend its task sessions kept (nested ones too) joins its tree's pool,
+    /// as a native host counts every task directory, so tasks that ended before the
+    /// session last closed still count. Tasks running here in the background are
+    /// counted as they are (`count_background`), not from their stores. One whose
+    /// spend cannot be read refuses (a budget must not take it for none).
+    fn count_tasks(&mut self) -> Result<()> {
+        if self.tasks_counted || lock(&self.facts.budget).is_none() {
+            return Ok(());
+        }
+        let open: Vec<&str> = self
+            .background
+            .iter()
+            .map(|task| task.child.label())
+            .collect();
+        // A task whose store was removed counts in this session's own spend.
+        let dropped = self.dropped_keys()?;
+        count_kept_tasks(
+            self.storage.as_ref(),
+            &self.label,
+            &open,
+            &dropped,
+            &self.facts,
+        )?;
+        self.tasks_counted = true;
+        Ok(())
+    }
+
+    /// Opens (or creates) task `id`'s session; its first turn (`run_task`) reads the
+    /// base's files then.
+    fn start_child(&mut self, id: &str, input: &Value, settings: &Settings) -> Result<Host> {
         if self.facts.depth >= settings.task_policy.max_depth {
             return Err("this session reached its configured task depth limit".into());
         }
@@ -2545,7 +2720,17 @@ impl Host {
             return Err(why);
         }
         let key = task_key(id);
+        // A task whose store was removed cannot go on, nor start over in its place.
+        if self.dropped_keys()?.contains(&key) {
+            return Err(format!(
+                "task {key}'s working copy was removed to free space (its answer stays in \
+                 this thread); it cannot go on: start a new task"
+            ));
+        }
         let storage = self.storage.child(&key);
+        // Whether the task had a store before this start: one made here and cut short
+        // goes again; one from before is never removed for a start that fails.
+        let existed = self.storage.tasks().contains(&key);
         // As a native host checks a task directory before it runs again: the input
         // that created it must be this one.
         let identity = task_tool::identity(input);
@@ -2564,6 +2749,9 @@ impl Host {
                 );
             }
         }
+        // Counted while its store is closed (a background task left running opens here
+        // before this session's turn begins).
+        self.count_tasks()?;
         let depth = self.facts.depth + 1;
         let parent = Some((self.events.clone(), key.clone()));
         let catalog = self.facts.catalog.clone();
@@ -2585,22 +2773,41 @@ impl Host {
                     settings.effort = driver::Effort::parse(effort).ok_or("invalid task effort")?;
                 }
                 settings.self_edit = false;
-                Host::create_at(
+                // A making cut short (storage ran out) leaves no half-made store behind
+                // to be found later: what it got as far as goes.
+                match Host::create_at(
                     self.storage.child(&key),
                     settings,
-                    base.files.clone(),
+                    vec![],
                     catalog,
                     depth,
                     parent,
-                )?
+                ) {
+                    Ok(child) => child,
+                    Err(why) => {
+                        if !existed {
+                            let _ = self.storage.remove_task(&key);
+                        }
+                        return Err(why);
+                    }
+                }
             }
         };
         if kept.is_none() {
             let bytes = serde_json::to_vec(&identity).map_err(|e| e.to_string())?;
-            child
-                .storage
-                .keep_sidecar(TASK_SIDECAR, &bytes)
-                .map_err(store_error)?;
+            if let Err(error) = child.storage.keep_sidecar(TASK_SIDECAR, &bytes) {
+                drop(child);
+                if !existed {
+                    let _ = self.storage.remove_task(&key);
+                }
+                return Err(match error.is_disk_full() {
+                    true => format!(
+                        "the disk is full (ENOSPC), so task {key} could not start; nothing of it \
+                         was kept: free some space, then start it again"
+                    ),
+                    false => store_error(error),
+                });
+            }
         }
         child.runner = self.runner;
         // Its spend counts against this session's budget, with this session's own and
@@ -2629,16 +2836,20 @@ impl Host {
     }
 
     /// Starts (or resumes) a task session's turn: its first prompt over the base
-    /// workspace, or the turn it left unfinished.
-    fn run_task(&mut self, input: &Value, base: &Workspace) -> Result<Progress> {
+    /// workspace (`base`, its files' bytes read by `files` only then, from the parent's
+    /// store), or the turn it left unfinished.
+    fn run_task(
+        &mut self,
+        input: &Value,
+        base: &Tree,
+        files: impl FnOnce() -> Result<Vec<File>>,
+    ) -> Result<Progress> {
         if self.store.snapshot().map_err(store_error)?.revision == 0 {
             let prompt = input["prompt"].as_str().unwrap_or_default().to_string();
-            // A task created before a crash, its first turn never committed, is opened
-            // with no initial files: it starts from the base all the same.
-            let files = self
-                .initial_files
-                .take()
-                .unwrap_or_else(|| base.files.clone());
+            // Also a task created before a crash, its first turn never committed: it
+            // starts from the base all the same.
+            self.initial_files = None;
+            let files = files()?;
             self.begin("prompt")?;
             return self
                 .start_turn(
@@ -2673,17 +2884,32 @@ impl Host {
         let head = self.store.snapshot().map_err(store_error)?.revision;
         let key = format!("app:{task}");
         let revision = self.register_app_task(&key, input, head)?;
-        let base = self.workspace_at(revision)?;
-        let mut child = self.start_child(&key, input, &base, &settings)?;
-        let progress = child.run_task(input, &base);
+        let base = self.tree_at(revision)?;
+        let mut child = match self.start_child(&key, input, &settings) {
+            Ok(child) => child,
+            Err(why) => {
+                // Never began: its row ends stopped, saying why, so it is not listed as
+                // running (nothing of it is kept; started again, it begins afresh).
+                let said = crate::turn::stopped_why(&why);
+                let identity = task_tool::identity(input).to_string().into_bytes();
+                let _ = self.store.finish_task_run(
+                    &key,
+                    &identity,
+                    TaskEnd::Stopped(Some(said.as_bytes())),
+                );
+                return Err(why);
+            }
+        };
+        let progress = child.run_task(input, &base, || self.files_of(&base));
+        let label = format!("{}#{}", self.label, task_key(&key));
         let started = Started {
+            run: key,
             child: Box::new(child),
             input: input.clone(),
             base,
         };
         self.next_work += 1;
         self.waiting = Some((self.next_work, Waiting::Started(Box::new(started))));
-        let label = format!("{}#{}", self.label, task_key(&key));
         self.after_child(&label, progress)
     }
 
@@ -2699,6 +2925,18 @@ impl Host {
                 "label": format!("background tasks could not be read ({error:?})")}));
             }
         };
+        // Under a budget, what its tasks kept spent is counted first: if a store cannot be
+        // read, they are left running (said), never stopped for that, and taken up by the
+        // next turn that can read it.
+        let resumable = runs.iter().any(|run| {
+            run.queued
+                && run.state == "running"
+                && !self.background.iter().any(|task| task.run == run.task)
+        });
+        if resumable && let Err(why) = self.settings().and_then(|_| self.count_tasks()) {
+            return self.events.push(json!({"type": "nested",
+                "label": format!("background tasks not resumed yet: {why}")}));
+        }
         for run in runs {
             if !run.queued
                 || run.state != "running"
@@ -2800,8 +3038,8 @@ impl Host {
         settings: &Settings,
     ) -> Result<()> {
         let started = self
-            .workspace_at(revision)
-            .and_then(|base| Ok((self.start_child(run, input, &base, settings)?, base)));
+            .tree_at(revision)
+            .and_then(|base| Ok((self.start_child(run, input, settings)?, base)));
         let (mut child, base) = match started {
             Ok(started) => started,
             Err(why) => {
@@ -2816,7 +3054,7 @@ impl Host {
                 return Err(why);
             }
         };
-        let progress = child.run_task(input, &base);
+        let progress = child.run_task(input, &base, || self.files_of(&base));
         let task = Background {
             run: run.to_string(),
             input: input.clone(),
@@ -2871,6 +3109,15 @@ impl Host {
             (Ok(()), Ok(None)) => format!("task {key}: stopped in the background"),
         };
         self.events.push(json!({"type": "nested", "label": said}));
+        // Its files are offered now (one finishing mid-turn is reported at the turn's
+        // end, before the next prompt would offer them): once its host has let its
+        // store go, which the offer reads.
+        let answered = matches!((&kept, &ended), (Ok(()), Ok(Some(_))));
+        drop(task);
+        if answered && let Err(why) = self.offer_task_files() {
+            self.events.push(json!({"type": "nested",
+                "label": format!("task {key}: its files could not be offered ({why})")}));
+        }
     }
 
     /// Starts the app's task `task` in the background (`task_start` with `report:
@@ -2912,18 +3159,328 @@ impl Host {
     }
 
     /// The tasks this session started: `{tasks: [{task, state, queued, answer,
-    /// pending, delivered, prompt}]}` (`pending`: its session runs here in the
-    /// background now; `delivered`: its answer was read to this session; `prompt`: the
-    /// first line of what it was asked, at most 80 characters, to name it by).
-    pub fn task_list(&self) -> Result<Value> {
-        let tasks: Vec<Value> = self
+    /// pending, delivered, prompt, store, bytes, dropped, orphan}]}` (`pending`: its
+    /// session runs here in the background now; `delivered`: its answer was read to this
+    /// session; `prompt`: the first line of what it was asked, at most 80 characters, to
+    /// name it by; `store`: its store is kept here, its directory taking `bytes` (its own
+    /// tasks' included), null without one; `dropped`: its store was removed to free space
+    /// (`drop_task`'s record); `orphan`: no row of this session names it: a task
+    /// directory a task call that waited for its answer left, or one an earlier first
+    /// request left before a retry started it over, `finished` unless this session's turn
+    /// may still need it, `running` then).
+    pub fn task_list(&mut self) -> Result<Value> {
+        let runs = self.store.task_runs().map_err(store_error)?;
+        let dropped = self.dropped()?;
+        let kept = self.storage.tasks();
+        let mut tasks: Vec<Value> = runs.iter().map(|run| self.task_json(run)).collect();
+        let mut named: Vec<String> = runs.iter().map(|run| task_key(&run.task)).collect();
+        // Directories no row names, then removed tasks no row names.
+        let mut settled = None;
+        for key in &kept {
+            if named.contains(key) {
+                continue;
+            }
+            let finished = match settled {
+                Some(settled) => settled,
+                None => *settled.insert(self.settled()?),
+            };
+            let child = self.storage.child(key);
+            // Remains only once nothing may still need it: a task a turn waits for has no
+            // row and may hold no turn yet either.
+            let remains = finished && never_began(child.as_ref());
+            let prompt = child
+                .sidecar(TASK_SIDECAR)
+                .map(|identity| first_line(&identity))
+                .unwrap_or_else(|| {
+                    if remains {
+                        NEVER_BEGAN.to_string()
+                    } else {
+                        String::new()
+                    }
+                });
+            let mut orphan = orphan_json(
+                &self.label,
+                key,
+                if finished || remains {
+                    "finished"
+                } else {
+                    "running"
+                },
+                prompt,
+            );
+            if remains {
+                orphan["remains"] = json!(true);
+            }
+            tasks.push(orphan);
+            named.push(key.clone());
+        }
+        for record in &dropped {
+            let Some(key) = record["key"]
+                .as_str()
+                .filter(|key| !named.iter().any(|named| named == key))
+            else {
+                continue;
+            };
+            let prompt = record["prompt"].as_str().unwrap_or_default().to_string();
+            tasks.push(orphan_json(&self.label, key, "finished", prompt));
+        }
+        for task in &mut tasks {
+            let key = task["task"]
+                .as_str()
+                .and_then(|label| label.rsplit('#').next())
+                .unwrap_or_default()
+                .to_string();
+            let here = kept.contains(&key);
+            task["store"] = json!(here);
+            task["bytes"] = json!(here.then(|| self.storage.child(&key).size()));
+            task["dropped"] = dropped
+                .iter()
+                .find(|record| record["key"] == key.as_str())
+                .cloned()
+                .unwrap_or(Value::Null);
+        }
+        Ok(json!({ "tasks": tasks }))
+    }
+
+    /// Whether nothing of this session may still need a task's store: no operation
+    /// runs, and its head waits on no call (a task call a crash cut short goes on from
+    /// its task's store).
+    fn settled(&mut self) -> Result<bool> {
+        if self.running.is_some() {
+            return Ok(false);
+        }
+        let snapshot = self.store.snapshot().map_err(store_error)?;
+        if snapshot.revision == 0 {
+            return Ok(true);
+        }
+        let state = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
+        Ok(state.pending_effects().map_err(turn_error)?.is_empty())
+    }
+
+    /// The tasks whose stores were removed (`drop_task`), as this session's ledger
+    /// records them (`{key, task, prompt, bytes, at}`).
+    fn dropped(&self) -> Result<Vec<Value>> {
+        let Some(bytes) = self.store.metadata("usage").map_err(store_error)? else {
+            return Ok(vec![]);
+        };
+        // Only a ledger that names one is read whole.
+        if !bytes.windows(10).any(|window| window == b"\"dropped\":") {
+            return Ok(vec![]);
+        }
+        let mut ledger: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        Ok(match ledger["dropped"].take() {
+            Value::Array(records) => records,
+            _ => vec![],
+        })
+    }
+
+    /// The keys of the tasks whose stores were removed.
+    fn dropped_keys(&self) -> Result<Vec<String>> {
+        Ok(self
+            .dropped()?
+            .iter()
+            .filter_map(|record| record["key"].as_str().map(String::from))
+            .collect())
+    }
+
+    /// Task `task` of this session (the app's name, a label `tasks` gave, its registered
+    /// key, or the key of a task directory no row names) once nothing runs it or may still
+    /// need it: its directory's key, and its row.
+    fn finished_task(
+        &mut self,
+        task: &str,
+    ) -> std::result::Result<(String, Option<TaskRun>), Fault> {
+        if let Some(running) = self.running {
+            return Err(busy(format!(
+                "a {running} is running in this session; wait for it or stop it"
+            )));
+        }
+        let runs = self
             .store
             .task_runs()
-            .map_err(store_error)?
+            .map_err(|error| failed(store_error(error)))?;
+        let wanted = task.rsplit('#').next().unwrap_or(task);
+        let run = runs.into_iter().find(|run| {
+            run.task == format!("app:{task}") || task_key(&run.task) == wanted || run.task == task
+        });
+        let key = match &run {
+            Some(run) => task_key(&run.task),
+            None if wanted.len() == 20
+                && wanted
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+            {
+                wanted.to_string()
+            }
+            None => return Err(not_found(format!("no task `{task}` in this session"))),
+        };
+        let label = format!("{}#{key}", self.label);
+        if self.background.iter().any(|task| task.child.label == label) {
+            return Err(busy(format!(
+                "task {label} runs in the background; wait for it or stop it (`task_stop`)"
+            )));
+        }
+        match &run {
+            // A background task left running (its app closed) goes on with the session's
+            // next turn; an app task's left `running` goes on when the app starts it
+            // again (`task_start`). Only a finished, failed or stopped one is let go.
+            Some(run) if run.state == "running" => {
+                return Err(conflict(match run.queued {
+                    true => format!(
+                        "task {label} has not finished: it goes on when this session runs again"
+                    ),
+                    false => format!(
+                        "task {label} has not finished: it can still go on (`task_start` with \
+                         its id takes it up again)"
+                    ),
+                }));
+            }
+            None if !self.settled().map_err(failed)? => {
+                return Err(conflict(format!(
+                    "this session's turn has not finished and may still need task {label}: \
+                     continue or rewind it first"
+                )));
+            }
+            _ => {}
+        }
+        Ok((key, run))
+    }
+
+    /// Task `task`'s files as a session bundle's, its store the bundle's own (a session
+    /// of its own, to read): its store's image and its own tasks', with their sidecars.
+    /// Refused while it runs or this session may still need it (`finished_task`), and
+    /// once its store was removed.
+    pub fn task_bundle(
+        &mut self,
+        task: &str,
+    ) -> std::result::Result<(Vec<BundleFile>, String), Fault> {
+        let (key, _) = self.finished_task(task)?;
+        let label = format!("{}#{key}", self.label);
+        if self.dropped_keys().map_err(failed)?.contains(&key) {
+            return Err(not_found(format!(
+                "task {label}'s store was removed; its answer and spend stay in this session"
+            )));
+        }
+        if !self.storage.tasks().contains(&key) {
+            return Err(not_found(format!("task {label} keeps no store here")));
+        }
+        let place = self.storage.child(&key);
+        if never_began(place.as_ref()) {
+            return Err(not_found(format!(
+                "task {label} is {NEVER_BEGAN} (`task_drop`)"
+            )));
+        }
+        let store = place
+            .open(false)
+            .map_err(|error| failed(open_error(place.as_ref(), error)))?;
+        let mut files = vec![BundleFile {
+            path: bundle::STORE.into(),
+            bytes: store.image().map_err(|error| failed(store_error(error)))?,
+        }];
+        for name in [SETTINGS_SIDECAR, bundle::PACK_SESSION] {
+            if let Some(bytes) = place.sidecar(name) {
+                files.push(BundleFile {
+                    path: name.into(),
+                    bytes,
+                });
+            }
+        }
+        let mut opened = vec![];
+        bundle_tasks(place.as_ref(), "", &[], Some(&mut files), &mut opened).map_err(failed)?;
+        let state = transfer_fingerprint(&store, &opened).map_err(failed)?;
+        Ok((files, state))
+    }
+
+    /// Frees task `task`'s space for good: its store (and its own tasks') removed. Its
+    /// spend is kept in this session's first, with a record of it (`{key, task, prompt,
+    /// bytes, at}`, `at` by the app's clock), in one write: from then on it counts as
+    /// removed whatever stops the removal (a budget counts its spend once; no export
+    /// carries it; it never runs again), and what a removal cut short is finished by the
+    /// next open, or by removing it again. Its answer and the files it merged stay in
+    /// this session. Refused while a turn or a background task runs, and for a task this
+    /// session may still need (`finished_task`). `{task, dropped}`.
+    pub fn drop_task(
+        &mut self,
+        task: &str,
+        at: Option<u64>,
+        expected: Option<&str>,
+    ) -> std::result::Result<Value, Fault> {
+        if self.background_running() {
+            return Err(busy(
+                "a background task of this session is running; wait for it or stop it (`task_stop`)",
+            ));
+        }
+        let (key, run) = self.finished_task(task)?;
+        let label = format!("{}#{key}", self.label);
+        let unremoved = |error: Error| {
+            failed(format!(
+                "task {label}'s spend is kept in this session and it counts as removed, but \
+                 its files could not all be removed yet ({}); remove it again to finish",
+                store_error(error)
+            ))
+        };
+        let dropped = self.dropped().map_err(failed)?;
+        if let Some(record) = dropped
             .into_iter()
-            .map(|run| self.task_json(&run))
-            .collect();
-        Ok(json!({ "tasks": tasks }))
+            .find(|record| record["key"] == key.as_str())
+        {
+            self.storage.remove_task(&key).map_err(unremoved)?;
+            return Ok(json!({"task": label, "dropped": record}));
+        }
+        if !self.storage.tasks().contains(&key) {
+            return Err(not_found(format!("task {label} keeps no store here")));
+        }
+        let place = self.storage.child(&key);
+        // The remains of a task that never began were never saved: nothing to compare.
+        let remains = never_began(place.as_ref());
+        if let (Some(expected), false) = (expected, remains) {
+            let store = place
+                .open(false)
+                .map_err(|error| failed(store_error(error)))?;
+            let mut held = vec![];
+            bundle_tasks(place.as_ref(), "", &[], None, &mut held).map_err(failed)?;
+            let state = transfer_fingerprint(&store, &held).map_err(failed)?;
+            if state != expected {
+                return Err(conflict(
+                    "the task changed since export; save it again before freeing it",
+                ));
+            }
+        }
+        let bytes = place.size();
+        let mut calls = BTreeMap::new();
+        let mut uncertain = 0.0;
+        task_spend(
+            place.as_ref(),
+            self.facts.catalog_ref(),
+            &mut calls,
+            &mut uncertain,
+        )
+        .map_err(|why| {
+            failed(format!(
+                "the spend of task {label} cannot be read ({why}); nothing was removed"
+            ))
+        })?;
+        let prompt = match &run {
+            Some(run) => first_line(&run.input),
+            None => place
+                .sidecar(TASK_SIDECAR)
+                .map(|identity| first_line(&identity))
+                .unwrap_or_default(),
+        };
+        let record = json!({"key": key, "task": run.map(|run| run.task), "prompt": prompt,
+            "bytes": bytes, "at": at});
+        // The commit point: the spend and the record in one write, before any file goes.
+        self.facts
+            .keep_dropped(
+                &self.store,
+                &format!("tasks/{key}"),
+                kept_calls(calls, uncertain),
+                record.clone(),
+                &label,
+            )
+            .map_err(failed)?;
+        self.storage.remove_task(&key).map_err(unremoved)?;
+        Ok(json!({"task": label, "dropped": record}))
     }
 
     fn task_json(&self, run: &crate::meta::TaskRun) -> Value {
@@ -2933,19 +3490,9 @@ impl Host {
             .as_deref()
             .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
         let running = self.background.iter().any(|task| task.child.label == label);
-        let prompt: String = serde_json::from_slice::<Value>(&run.input)
-            .ok()
-            .and_then(|input| input["prompt"].as_str().map(String::from))
-            .unwrap_or_default()
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or_default()
-            .trim()
-            .chars()
-            .take(80)
-            .collect();
         json!({"task": label, "state": run.state, "queued": run.queued, "answer": answer,
-            "pending": running, "delivered": run.delivered.is_some(), "prompt": prompt})
+            "pending": running, "delivered": run.delivered.is_some(),
+            "prompt": first_line(&run.input), "orphan": false})
     }
 
     /// Task `task` (the app's name, or a label `tasks` gave) as it stands now, without
@@ -3116,7 +3663,7 @@ impl Host {
     fn task_answer(
         &mut self,
         input: &Value,
-        base: &Workspace,
+        base: &Tree,
     ) -> std::result::Result<AppAnswer, String> {
         let (revision, state) = self.head()?;
         let Phase::Stopped(stop) = state.control().phase() else {
@@ -3137,11 +3684,13 @@ impl Host {
             .find(|message| message.role == "assistant")
             .map(|message| crate::shape::text_of(&message.content))
             .unwrap_or_default();
-        let now = self.workspace_at(revision)?;
         let (writes, deletes, links, directories) = if input["files"] == "discard" {
             (vec![], vec![], vec![], vec![])
         } else {
-            changes(base, &now)
+            let now = self.tree_at(revision)?;
+            changes(base, &now, |object| {
+                self.store.read_object(SCOPE, object).map_err(store_error)
+            })?
         };
         let complete = stop == Stop::Complete;
         let mut content = said.trim().to_string();
@@ -3176,6 +3725,7 @@ impl Host {
     /// since the base are refused), then continues.
     fn tasks_done(&mut self, batch: Batch) -> Result<Progress> {
         let Batch { base, calls } = batch;
+        let before = by_digest(&base);
         for call in calls {
             let TaskCall {
                 mut need,
@@ -3189,8 +3739,8 @@ impl Host {
                 AppReservation::Settled(outcome) => Ok(outcome),
                 AppReservation::Reserved { .. } => match result {
                     Some(Ok(mut answer)) => {
-                        let current = self.workspace_at(need.request.expected_revision)?;
-                        task_tool::refuse_conflicts(&base, &current, &mut answer);
+                        let current = by_digest(&self.tree_at(need.request.expected_revision)?);
+                        task_tool::refuse_conflicts(&before, &current, &mut answer);
                         self.driver.record_app(&mut self.store, &need, answer)
                     }
                     Some(Err(why)) => {
@@ -3208,7 +3758,72 @@ impl Host {
         self.advance(None)
     }
 
-    fn workspace_at(&mut self, revision: u64) -> Result<Workspace> {
+    /// Finished background tasks' file changes, read from their own sessions and
+    /// offered to the driver before a prompt or a continue, so the report that delivers
+    /// each one's answer brings its files too (`Driver::offer_task_changes`; the driver
+    /// stages them over the head, or says why not). A task that discards its files,
+    /// one that stopped, or one whose store was freed offers none; one whose store
+    /// cannot be read says so and keeps its files.
+    fn offer_task_files(&mut self) -> Result<()> {
+        self.driver.clear_task_changes();
+        let pending = self.driver.pending_task_reports(&mut self.store)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let dropped = self.dropped_keys()?;
+        let kept = self.storage.tasks();
+        for run in pending {
+            if run.state != "finished" {
+                continue;
+            }
+            let input: Value = serde_json::from_slice(&run.input).unwrap_or(Value::Null);
+            if input["files"] == "discard" {
+                continue;
+            }
+            self.driver
+                .offer_task_changes(&run.task, Ok(driver::TaskChanges::default()));
+            let key = task_key(&run.task);
+            if dropped.contains(&key) || !kept.contains(&key) {
+                continue;
+            }
+            match self.task_file_changes(&key, &run.base) {
+                Ok(Some(Ok(changes))) if !changes.is_empty() => {
+                    self.driver.offer_task_changes(&run.task, Ok(changes));
+                }
+                Ok(Some(Err(note))) => self.driver.offer_task_changes(&run.task, Err(note)),
+                Ok(_) => {}
+                Err(why) => {
+                    self.driver.offer_task_changes(&run.task, Err(format!(
+                        "[task {key}: its files could not be read ({why}); they stay in the task]"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What finished task `key` changed of the workspace it began from (`base`, that
+    /// tree's root): read from its own store, closed again at once.
+    fn task_file_changes(
+        &mut self,
+        key: &str,
+        base: &str,
+    ) -> Result<Option<std::result::Result<driver::TaskChanges, String>>> {
+        let place = self.storage.child(key);
+        let mut child = place.read().map_err(store_error)?;
+        let Some(root) = child.head_root().map_err(store_error)?.1 else {
+            return Ok(None);
+        };
+        let now = child.tree_map(SCOPE, &root).map_err(store_error)?;
+        let base = self.store.tree_map(SCOPE, base).map_err(store_error)?;
+        driver::tree_changes(&base, &now, |object| {
+            child.read_object(SCOPE, object).map_err(store_error)
+        })
+        .map(Some)
+    }
+
+    /// The workspace tree at `revision`: its files by object digest, no bytes read.
+    fn tree_at(&mut self, revision: u64) -> Result<Tree> {
         let root = match revision {
             0 => None,
             _ => {
@@ -3218,23 +3833,25 @@ impl Host {
                     .workspace
             }
         };
-        let Some(root) = root else {
-            return Ok(Workspace::default());
-        };
-        let tree = self.store.tree_map(SCOPE, &root).map_err(store_error)?;
-        let mut files = Vec::with_capacity(tree.files.len());
-        for entry in tree.files {
-            let bytes = self
-                .store
-                .read_object(SCOPE, &entry.object)
-                .map_err(store_error)?;
-            files.push((entry.path, bytes, entry.executable));
+        match root {
+            Some(root) => self.store.tree_map(SCOPE, &root).map_err(store_error),
+            None => Ok(Tree::default()),
         }
-        Ok(Workspace {
-            files,
-            links: tree.links,
-            directories: tree.directories,
-        })
+    }
+
+    /// The files of `tree` (one of this session's) with their bytes, for a task's
+    /// first turn to start from.
+    fn files_of(&mut self, tree: &Tree) -> Result<Vec<File>> {
+        tree.files
+            .iter()
+            .map(|entry| {
+                let bytes = self
+                    .store
+                    .read_object(SCOPE, &entry.object)
+                    .map_err(store_error)?;
+                Ok((entry.path.clone(), bytes, entry.executable))
+            })
+            .collect()
     }
 
     /// The name of this session's task that is, or leads to, session `label`
@@ -3301,6 +3918,26 @@ impl Host {
             self.cancelled.extend(started.child.take_cancelled());
             progress?;
             let answer = started.child.task_answer(&started.input, &started.base)?;
+            // Its end kept in its row, as the native host keeps it (`tasks` says so).
+            let kept = match &answer {
+                AppAnswer::Result {
+                    content, failed, ..
+                } => Some(json!({"content": content, "failed": failed}).to_string()),
+                _ => None,
+            };
+            let end = match &kept {
+                Some(kept) => TaskEnd::Answered(kept.as_bytes()),
+                None => TaskEnd::Stopped(None),
+            };
+            let identity = task_tool::identity(&started.input).to_string();
+            if let Err(error) = self
+                .store
+                .finish_task_run(&started.run, identity.as_bytes(), end)
+            {
+                let key = task_key(&started.run);
+                self.events.push(json!({"type": "nested",
+                    "label": format!("task {key}: its end could not be kept ({error:?})")}));
+            }
             let AppAnswer::Result {
                 content, failed, ..
             } = answer
@@ -3311,25 +3948,26 @@ impl Host {
                 "failed": failed, "state": "finished"}));
             return Ok(Progress::Done);
         }
+        // Still going (a streamed part, more work): nothing to take yet.
+        if matches!(progress, Ok(Progress::Waiting(_) | Progress::Streaming)) {
+            return progress;
+        }
         let name = self.child_label(label).ok_or("no such task")?;
         let Some((_, Waiting::Tasks(batch))) = &mut self.waiting else {
             return Err("no task is running in this session".into());
         };
-        let index = batch
-            .calls
-            .iter()
-            .position(|call| call.child.as_ref().is_some_and(|c| c.label == name))
+        let Batch { base, calls } = &mut **batch;
+        let call = calls
+            .iter_mut()
+            .find(|call| call.child.as_ref().is_some_and(|c| c.label == name))
             .ok_or("no such task")?;
-        let base = batch.base.clone();
-        let call = &mut batch.calls[index];
         match progress {
-            Ok(Progress::Waiting(works)) => return Ok(Progress::Waiting(works)),
-            Ok(Progress::Streaming) => return Ok(Progress::Streaming),
+            Ok(Progress::Waiting(_) | Progress::Streaming) => unreachable!("returned above"),
             Ok(Progress::Done) => {
                 let mut child = call.child.take().expect("found above");
                 child.finish();
                 self.cancelled.extend(child.take_cancelled());
-                call.result = Some(child.task_answer(&call.need.call.input, &base));
+                call.result = Some(child.task_answer(&call.need.call.input, base));
             }
             Err(why) => {
                 let mut child = call.child.take().expect("found above");
@@ -3498,6 +4136,28 @@ impl Host {
         self.chunk(work, bytes)
     }
 
+    /// The body of the model request work `work` of session `label` (this one or a
+    /// task's) sends (`Work::Fetch`), while that work waits.
+    pub fn request_body_of(&mut self, label: &str, work: u64) -> Result<Vec<u8>> {
+        if label != self.label {
+            return match self.child_toward(label) {
+                Some(child) => child.request_body_of(label, work),
+                None => Err(format!("no task `{label}` is running")),
+            };
+        }
+        match &self.waiting {
+            Some((id, Waiting::Fetch(fetch))) if *id == work => match fetch.committed.effect() {
+                Effect::Model { waiting, .. } => Ok(waiting.request().body().to_vec()),
+                _ => Err("that work sends no model request".into()),
+            },
+            // The bytes `code::Reading` was made for (the same serialization).
+            Some((id, Waiting::SummaryFetch(wait, _))) if *id == work => {
+                serde_json::to_vec(&wait.prepared["body"]).map_err(|error| error.to_string())
+            }
+            _ => Err("that request is no longer waited for".into()),
+        }
+    }
+
     /// One file of the workspace that work `work` of session `label` (this one or a
     /// task's) runs a command over.
     pub fn runner_file_of(&mut self, label: &str, work: u64, object: &str) -> Result<Vec<u8>> {
@@ -3543,14 +4203,13 @@ impl Host {
         let settings = self.settings()?;
         let mut value = crate::reads::head_on(&mut self.view())?;
         let report = self.store.reconciliation().map_err(store_error)?;
-        let state = match self.store.snapshot().map_err(store_error)?.revision {
-            0 => "no turns yet".to_string(),
-            _ => match self.head()?.1.control().phase() {
-                Phase::Stopped(stop) => driver::stop_text(stop).to_string(),
-                Phase::ModelWait => "waiting for a model response (continue it)".into(),
-                Phase::ToolsWait => "running tools (continue it)".into(),
-                _ => "between steps (continue it)".into(),
-            },
+        // From the head just read (its phase and stop), not the continuation again.
+        let state = match value["phase"].as_str() {
+            Some("empty") => "no turns yet".to_string(),
+            Some("stopped") => value["stop_text"].as_str().unwrap_or_default().to_string(),
+            Some("model_wait") => "waiting for a model response (continue it)".into(),
+            Some("tools_wait") => "running tools (continue it)".into(),
+            _ => "between steps (continue it)".into(),
         };
         value["session"] = json!(self.label);
         value["provider"] = json!(settings.provider);
@@ -3590,6 +4249,13 @@ impl Host {
             value["activity"] = json!("background");
         }
         Ok(value)
+    }
+
+    /// Keeps the session's spend ledger in its store now, as `usage` does: a move
+    /// fingerprints the store's metadata (`transfer_fingerprint`), which then stays the
+    /// same when the app asks for the session's spend between its export and its seal.
+    pub fn keep_usage(&self) -> Result<()> {
+        self.facts.spent(&self.store, true).map(|_| ())
     }
 
     /// The session's spend (`usage`): the totals, by turn and by model, from the same
@@ -3642,41 +4308,279 @@ fn open_error(storage: &dyn Storage, error: Error) -> String {
                 crate::FENCE
             );
         }
-        return format!("{} (held by: {note})", store_error(error));
+        // A package owner's lock file stays if its app crashed: it is stale only once
+        // that app (the process its note names) is gone.
+        let stale = match note.starts_with("spindle-embed: ") {
+            true => format!(
+                "; if that app is no longer running (it crashed), its lock file is stale: \
+                 remove store/{0} (and store/{0}.takeover, if one is there and the app \
+                 its note names is gone too) to open the session here",
+                crate::FENCE
+            ),
+            false => String::new(),
+        };
+        return format!("{} (held by: {}){stale}", store_error(error), note.trim());
     }
     store_error(error)
 }
 
+/// Puts what each task running here in the background spent so far (nested ones too)
+/// in its tree's pool, and holds one that had no budget to `max` from now on (a task's
+/// budget is its parent's; as it starts again, it is leased so).
+fn count_background(background: &[Background], max: Option<f64>) -> Result<()> {
+    for task in background {
+        task.child.facts.spent(&task.child.store, false)?;
+        let mut budget = lock(&task.child.facts.budget);
+        if budget.is_none() {
+            *budget = max;
+        }
+        drop(budget);
+        count_background(&task.child.background, max)?;
+    }
+    Ok(())
+}
+
+/// The first line of the prompt a task's input (or identity record) holds, at most 80
+/// characters, to name it by.
+fn first_line(input: &[u8]) -> String {
+    serde_json::from_slice::<Value>(input)
+        .ok()
+        .and_then(|input| input["prompt"].as_str().map(String::from))
+        .unwrap_or_default()
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(80)
+        .collect()
+}
+
+/// A task `tasks` lists that no row of session `label` names (`task_list`).
+fn orphan_json(label: &str, key: &str, state: &str, prompt: String) -> Value {
+    json!({"task": format!("{label}#{key}"), "state": state, "queued": false,
+        "answer": null, "pending": false, "delivered": false, "prompt": prompt,
+        "orphan": true})
+}
+
+/// What a task directory that never began says for itself in a listing.
+const NEVER_BEGAN: &str = "a task that never began (its store was left half-made: storage ran \
+                           out as it started); nothing to save, free it";
+
+/// Whether `place` is what a task's start left when it was cut short (storage ran out
+/// between its store's making and its identity record, `TASK_SIDECAR`): no identity,
+/// and a store that does not open, or holds no turn. Such remains hold nothing worth
+/// a byte: no spend, nothing to bundle; they are freed like any finished task.
+fn never_began(place: &dyn Storage) -> bool {
+    if place.sidecar(TASK_SIDECAR).is_some() {
+        return false;
+    }
+    match place.read() {
+        Ok(mut store) => store
+            .snapshot()
+            .map(|snapshot| snapshot.revision == 0)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// Adds what the task sessions in `place` spent (its own store's and its tasks', nested)
+/// to `calls`, as a session keeps them once their stores are gone: one call per kind of
+/// call, way it was paid and model, its worst case (for unknown outcomes) the group's
+/// total until `kept_calls`, with no `turn` or `after` (those are the task's own); and to
+/// `uncertain` what its requests not final yet may still cost, at their worst case.
+fn task_spend(
+    place: &dyn Storage,
+    catalog: &ProviderCatalog,
+    calls: &mut BTreeMap<String, Call>,
+    uncertain: &mut f64,
+) -> Result<()> {
+    let store = match place.read() {
+        Ok(store) => store,
+        // Nothing was spent in a task that never began.
+        Err(_) if never_began(place) => return Ok(()),
+        Err(error) => return Err(open_error(place, error)),
+    };
+    let report = crate::spend::HeldLedger::default().report(
+        &mut crate::view::ReadView::from_store(&store),
+        Some(catalog),
+        None,
+        false,
+    )?;
+    drop(store);
+    let mut unknown = 0.0;
+    for call in report.calls {
+        let worst = match call.billing {
+            Billing::Unknown => call.worst * call.count as f64,
+            _ => 0.0,
+        };
+        unknown += worst;
+        let key = format!(
+            "{}/{}/{}/{}",
+            call.kind.as_str(),
+            call.billing.as_str(),
+            call.provider,
+            call.model
+        );
+        let kept = calls.entry(key.clone()).or_insert_with(|| Call {
+            key,
+            turn: None,
+            after: None,
+            usage: Default::default(),
+            usd: 0.0,
+            at: None,
+            count: 0,
+            worst: 0.0,
+            ..call.clone()
+        });
+        let add = |total: &mut u64, more: u64| *total = total.saturating_add(more);
+        add(&mut kept.count, call.count);
+        add(&mut kept.usage.input, call.usage.input);
+        add(&mut kept.usage.output, call.usage.output);
+        add(&mut kept.usage.cache_read, call.usage.cache_read);
+        add(&mut kept.usage.cache_create, call.usage.cache_create);
+        kept.usd += call.usd;
+        kept.worst += worst;
+        kept.at = kept.at.max(call.at);
+    }
+    *uncertain += (report.uncertain_usd - unknown).max(0.0);
+    for key in place.tasks() {
+        task_spend(place.child(&key).as_ref(), catalog, calls, uncertain)?;
+    }
+    Ok(())
+}
+
+/// `task_spend`'s calls as a ledger keeps them (an unknown outcome's worst case per
+/// call), with what was not final yet as one request of unknown outcome more.
+fn kept_calls(calls: BTreeMap<String, Call>, uncertain: f64) -> Vec<Call> {
+    let mut kept: Vec<Call> = calls
+        .into_values()
+        .map(|mut call| {
+            call.worst /= call.count.max(1) as f64;
+            call
+        })
+        .collect();
+    if uncertain > 0.0 {
+        kept.push(Call {
+            key: "pending".into(),
+            kind: CallKind::Parent,
+            turn: None,
+            after: None,
+            provider: String::new(),
+            model: String::new(),
+            billing: Billing::Unknown,
+            usage: Default::default(),
+            usd: 0.0,
+            at: None,
+            count: 1,
+            worst: uncertain,
+        });
+    }
+    kept
+}
+
+/// Counts the spend of the task sessions kept beside `storage` (session `label`'s),
+/// nested ones too, in `facts`' pool: all but those `open` here (and theirs) and those
+/// whose store was removed (`dropped`, their spend kept in the session's own).
+fn count_kept_tasks(
+    storage: &dyn Storage,
+    label: &str,
+    open: &[&str],
+    dropped: &[String],
+    facts: &Facts,
+) -> Result<()> {
+    for key in storage.tasks() {
+        let label = format!("{label}#{key}");
+        if open.contains(&label.as_str()) || dropped.contains(&key) {
+            continue;
+        }
+        let child = storage.child(&key);
+        facts.count_kept(&label, || {
+            child.read().map_err(|error| {
+                let why = open_error(child.as_ref(), error);
+                format!(
+                    "the spend of task {label} cannot be read for the budget ({why}); \
+                     without a budget the thread goes on"
+                )
+            })
+        })?;
+        count_kept_tasks(child.as_ref(), &label, open, &[], facts)?;
+    }
+    Ok(())
+}
+
+fn transfer_fingerprint(store: &Store, opened: &[(Box<dyn Storage>, Store)]) -> Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(
+        store
+            .transfer_fingerprint()
+            .map_err(store_error)?
+            .as_bytes(),
+    );
+    let mut tasks = opened
+        .iter()
+        .map(|(place, store)| {
+            Ok((
+                place.label(),
+                store.transfer_fingerprint().map_err(store_error)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    tasks.sort();
+    for (label, state) in tasks {
+        digest.update((label.len() as u64).to_le_bytes());
+        digest.update(label.as_bytes());
+        digest.update(state.as_bytes());
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 /// Adds the task sessions kept beside `storage` (at bundle path `prefix`) to a bundle's
-/// `files`: each store opened, imaged and kept open in `opened`, with its sidecars.
+/// `files` (when given): each store opened, imaged and kept open in `opened`, with its
+/// sidecars. Those whose store was removed (`dropped`) are left out.
 fn bundle_tasks(
     storage: &dyn Storage,
     prefix: &str,
-    files: &mut Vec<BundleFile>,
+    dropped: &[String],
+    mut files: Option<&mut Vec<BundleFile>>,
     opened: &mut Vec<(Box<dyn Storage>, Store)>,
 ) -> Result<()> {
     let mut keys = storage.tasks();
+    keys.retain(|key| !dropped.contains(key));
     keys.sort();
     for key in keys {
         let child = storage.child(&key);
-        let store = child.open(false).map_err(|error| match error {
-            Error::Locked => format!("task {key} is in use; wait for it, then export again"),
-            other => store_error(other),
-        })?;
+        let store = match child.open(false) {
+            Ok(store) => store,
+            Err(Error::Locked) => {
+                return Err(format!(
+                    "task {key} is in use; wait for it, then export again"
+                ));
+            }
+            // The remains of a task that never began hold nothing to bundle.
+            Err(_) if never_began(child.as_ref()) => continue,
+            Err(other) => return Err(store_error(other)),
+        };
         let at = format!("{prefix}tasks/{key}/");
-        files.push(BundleFile {
-            path: format!("{at}{}", bundle::STORE),
-            bytes: store.image().map_err(store_error)?,
-        });
-        for name in [SETTINGS_SIDECAR, TASK_SIDECAR, bundle::PACK_SESSION] {
-            if let Some(bytes) = child.sidecar(name) {
-                files.push(BundleFile {
-                    path: format!("{at}{name}"),
-                    bytes,
-                });
+        if let Some(files) = files.as_deref_mut() {
+            files.push(BundleFile {
+                path: format!("{at}{}", bundle::STORE),
+                bytes: store.image().map_err(store_error)?,
+            });
+            for name in [SETTINGS_SIDECAR, TASK_SIDECAR, bundle::PACK_SESSION] {
+                if let Some(bytes) = child.sidecar(name) {
+                    files.push(BundleFile {
+                        path: format!("{at}{name}"),
+                        bytes,
+                    });
+                }
             }
         }
-        bundle_tasks(child.as_ref(), &at, files, opened)?;
+        bundle_tasks(child.as_ref(), &at, &[], files.as_deref_mut(), opened)?;
         opened.push((child, store));
     }
     Ok(())
@@ -3741,8 +4645,10 @@ fn summary_reply(
                 "error": "nested model returned an unexpected tool call"});
         }
         Ok(response) => {
-            // An app signs in with a key; only the ChatGPT backend is a subscription.
-            let subscription = prepared["contract"] == RequestContract::ChatGptResponses.as_str();
+            // An app signs in with a key; only a ChatGPT plan (either route) is a
+            // subscription.
+            let subscription =
+                crate::spend::plan_paid(prepared["contract"].as_str().unwrap_or_default());
             return json!({"ok": true, "data": {"text": crate::shape::text_of(&response.blocks),
                 "usage": response.usage, "provider": prepared["provider"],
                 "model": prepared["model"], "subscription": subscription}});
@@ -3774,29 +4680,40 @@ type Changes = (
     Vec<String>,
 );
 
-/// A task's workspace changes from `base` to `now`: files written, paths removed,
-/// links and empty directories added (as the native host computes them).
-fn changes(base: &Workspace, now: &Workspace) -> Changes {
-    let before: std::collections::HashMap<&str, (&[u8], bool)> = base
+/// A task's workspace changes from `base` to `now`: files written (their bytes read
+/// with `read`, by object digest), paths removed, links and empty directories added
+/// (as the native host computes them). Objects are named by their content, so a file
+/// whose digest and mode are the base's is unchanged.
+fn changes(
+    base: &Tree,
+    now: &Tree,
+    mut read: impl FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<Changes> {
+    let before: std::collections::HashMap<&str, (&str, bool)> = base
         .files
         .iter()
-        .map(|(path, bytes, executable)| (path.as_str(), (bytes.as_slice(), *executable)))
+        .map(|entry| {
+            (
+                entry.path.as_str(),
+                (entry.object.as_str(), entry.executable),
+            )
+        })
         .collect();
     let kept: std::collections::HashSet<&str> =
-        now.files.iter().map(|(path, _, _)| path.as_str()).collect();
+        now.files.iter().map(|entry| entry.path.as_str()).collect();
     let writes = now
         .files
         .iter()
-        .filter(|(path, bytes, executable)| {
-            before.get(path.as_str()) != Some(&(bytes.as_slice(), *executable))
+        .filter(|entry| {
+            before.get(entry.path.as_str()) != Some(&(entry.object.as_str(), entry.executable))
         })
-        .cloned()
-        .collect();
+        .map(|entry| Ok((entry.path.clone(), read(&entry.object)?, entry.executable)))
+        .collect::<Result<Vec<File>>>()?;
     let mut deletes: Vec<String> = base
         .files
         .iter()
-        .filter(|(path, _, _)| !kept.contains(path.as_str()))
-        .map(|(path, _, _)| path.clone())
+        .filter(|entry| !kept.contains(entry.path.as_str()))
+        .map(|entry| entry.path.clone())
         .collect();
     let links = now
         .links
@@ -3822,7 +4739,28 @@ fn changes(base: &Workspace, now: &Workspace) -> Changes {
             .filter(|path| !now.directories.contains(path))
             .cloned(),
     );
-    (writes, deletes, links, directories)
+    Ok((writes, deletes, links, directories))
+}
+
+/// `tree` as a workspace whose files hold their object digests in place of their bytes:
+/// for comparing workspaces (`task_tool::refuse_conflicts`), which needs to know only
+/// whether two files' contents are the same, and digests name contents.
+fn by_digest(tree: &Tree) -> Workspace {
+    Workspace {
+        files: tree
+            .files
+            .iter()
+            .map(|entry| {
+                (
+                    entry.path.clone(),
+                    entry.object.clone().into_bytes(),
+                    entry.executable,
+                )
+            })
+            .collect(),
+        links: tree.links.clone(),
+        directories: tree.directories.clone(),
+    }
 }
 
 /// A probe key shaped as a token (a JWT) whose payload holds `value` at each claim's

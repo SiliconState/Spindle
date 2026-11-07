@@ -512,7 +512,9 @@ impl Session {
         }
         let mut settings = self.settings()?;
         settings.max_usd = max_usd;
-        self.save_settings(&settings)
+        self.save_settings(&settings)?;
+        // The user's budget wins over one the model queued (applied as the turn ends).
+        super::drop_pending_settings(&self.dir, Some(&["max_usd"]))
     }
 
     /// A compaction summary journaled like a nested call, in stage `summary-<command>`:
@@ -534,8 +536,8 @@ impl Session {
             driver::Journaled::Reused(reply) => return Some(reply),
             driver::Journaled::Asked => return None,
         };
-        let subscription = route.contract == RequestContract::ChatGptResponses
-            || subscription_on(self.credentials.as_ref(), route);
+        let subscription =
+            route.contract.plan_paid() || subscription_on(self.credentials.as_ref(), route);
         let body = serde_json::to_vec(&prepared["body"]).ok()?;
         let max_usd = self.settings().ok()?.max_usd;
         let catalog = provider::load_provider_catalog().ok();
@@ -1086,6 +1088,51 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn the_users_own_settings_and_budget_win_over_what_was_queued() {
+        struct Quiet;
+        impl Observer for Quiet {
+            fn event(&self, _: Event<'_>) {}
+        }
+        let root =
+            std::env::temp_dir().join(format!("spindle-settings-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut session = Session::create(&root, Settings::from_json(&json!({"provider":"local", "model":"fixture", "compaction":"digest", "max_usd":5.0})).unwrap(), vec![], Arc::new(Quiet)).unwrap();
+        // Left queued from a turn that never ended: network on, a higher budget, digest.
+        super::super::queue_settings(
+            &root,
+            &json!({"network": true, "max_usd": 10, "compaction": "model"}),
+        )
+        .unwrap();
+        // The user names network, equal to what it is: theirs wins all the same. A field
+        // they neither name nor change stays queued.
+        let settings = session.settings().unwrap();
+        session
+            .set_chosen_settings(settings.clone(), &["network"])
+            .unwrap();
+        assert_eq!(
+            super::super::pending_settings(&root),
+            Some(json!({"max_usd": 10, "compaction": "model"}))
+        );
+        // A field the user changes wins too, named or not.
+        let mut changed = settings;
+        changed.max_usd = Some(4.0);
+        session.set_chosen_settings(changed, &[]).unwrap();
+        assert_eq!(
+            super::super::pending_settings(&root),
+            Some(json!({"compaction": "model"}))
+        );
+        // A budget the user sets wins over one queued.
+        super::super::queue_settings(&root, &json!({"max_usd": 10})).unwrap();
+        session.set_budget(Some(2.0)).unwrap();
+        assert_eq!(
+            super::super::pending_settings(&root),
+            Some(json!({"compaction": "model"}))
+        );
+        drop(session);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

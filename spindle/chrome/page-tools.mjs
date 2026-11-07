@@ -28,7 +28,7 @@ export function pageSwitches(kept, access) {
   return { reading, acting: reading && kept?.acting === true };
 }
 
-const tab = { type: 'integer', description: 'A tab id from list_tabs (default: the tab the user is looking at)' };
+const tab = { type: 'integer', description: 'A tab id from list_tabs (default: the tab the user is looking at, or a new tab you opened behind it while the user wrote in Spindle, until it is shown)' };
 const ref = { type: 'string', description: 'A part of the page from page_elements, such as "kqm12" (each page names its own)' };
 
 /** Reading: page reading on is enough. `rerun: safe` (reading twice changes nothing). */
@@ -45,13 +45,16 @@ const READING = [
       'Read a web page open in Chrome: its address, title, the text the user selected on it, and its visible ' +
       'text. Reads the tab the user is looking at unless `tab` names another (an id from list_tabs). For a feed ' +
       'or list that loads as it scrolls (and drops what scrolled away), give `scroll`: one call reads while ' +
-      'scrolling down that many screens, each new line once.',
+      'scrolling down that many screens, each new line once. With `find`, only the lines that match it come ' +
+      'back (each with its neighbours), however long the page. A file of this workspace open in a Spindle tab ' +
+      '(/workspace/NAME) reads as the file shows.',
     inputSchema: {
       type: 'object',
       properties: {
         tab,
         max_chars: { type: 'integer', description: 'At most this many characters of page text (default 20000, at most 100000)' },
         scroll: { type: 'integer', minimum: 1, maximum: 30, description: 'Read while scrolling down this many screens (it moves the page, so page actions must be on)' },
+        find: { type: 'string', description: 'Only lines holding these words (case insensitive), or matching /pattern/flags' },
       },
       additionalProperties: false,
     },
@@ -64,7 +67,8 @@ const READING = [
       'The page as its parts: headings, links, buttons, fields, lists, tables and text, indented as nested, each ' +
       'part one can act on with a ref (such as kqm12) for click, type, select and scroll. Refs last while the ' +
       'page stays, and name parts of that page only: read again after it changes, and pass `tab` when acting on ' +
-      'another tab. `ref` reads only that part; `hidden` includes what is not shown.',
+      'another tab. `ref` reads only that part; `hidden` includes what is not shown; `find` keeps only the parts ' +
+      'whose line matches it (a button by its words, say), each under the parts above it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -73,6 +77,7 @@ const READING = [
         depth: { type: 'integer', description: 'How many levels of the outline to go (default 30)' },
         hidden: { type: 'boolean', description: 'Include parts that are not shown (default false)' },
         max_chars: { type: 'integer', description: 'At most this many characters (default 30000, at most 100000)' },
+        find: { type: 'string', description: 'Only parts whose line holds these words (case insensitive), or matches /pattern/flags' },
       },
       additionalProperties: false,
     },
@@ -96,6 +101,10 @@ const READING = [
   },
 ];
 
+/** What one `select` with `files` may put in a field: per file, how many, and all of
+ * them (they reach Chrome's side as base64 in one message, which Chrome caps at 64 MiB). */
+export const UPLOAD = { file: 25 * 1024 * 1024, count: 10, total: 40 * 1024 * 1024 };
+
 /** Acting: page actions on as well (Chrome's debugger). Not run again by themselves (a
  * click may not be safe to repeat), but for a picture and a wait. */
 const ACTING = [
@@ -114,7 +123,7 @@ const ACTING = [
     name: 'navigate',
     description:
       'Go to an address in a tab showing a web page (or in a new tab), or back, forward or reload; waits for ' +
-      'the page to load.',
+      'the page to load. Tabs you open (and tabs a page opens on your click) close once this turn is done.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -122,6 +131,7 @@ const ACTING = [
         action: { type: 'string', enum: ['go', 'back', 'forward', 'reload'], description: 'Default: go (to url)' },
         tab,
         new_tab: { type: 'boolean', description: 'Open url in a new tab (default false)' },
+        keep_open: { type: 'boolean', description: 'With new_tab: leave the tab open after this turn (a page the user asked to have open)' },
       },
       additionalProperties: false,
     },
@@ -161,11 +171,20 @@ const ACTING = [
   },
   {
     name: 'select',
-    description: 'Choose options of a <select> list (by ref), by their value or text.',
+    description:
+      'Choose options of a <select> list (by ref), by their value or text; or, with `files`, put files of the ' +
+      'workspace in a file field (by ref: the field, its label, or the button or drop area beside it), as if ' +
+      'the user picked them in its dialog. Many sites upload a file the moment it is chosen, and some fill the ' +
+      'form from it: put in only files the user meant to send, before typing the rest.',
     inputSchema: {
       type: 'object',
-      properties: { ref, values: { type: 'array', items: { type: 'string' } }, tab },
-      required: ['ref', 'values'],
+      properties: {
+        ref,
+        values: { type: 'array', items: { type: 'string' } },
+        files: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: UPLOAD.count, description: 'Workspace paths, such as resume.pdf' },
+        tab,
+      },
+      required: ['ref'],
       additionalProperties: false,
     },
   },
@@ -254,6 +273,26 @@ export const PAGE_TOOLS = [
   ...READING.map((tool) => ({ ...tool, rerun: 'safe' })),
   ...ACTING.map((tool) => ({ rerun: 'no', ...tool })),
 ];
+
+/** A page tool's input with its numbers as numbers: some models quote them ("tab":
+ * "2054624637"), which Chrome refuses in words that do not say why, and a model told only
+ * that tries the same again. A number field (by the tool's schema) given its number in
+ * quotes gets the number (an integer field a whole one, a number field a decimal too);
+ * anything else stays as given (Chrome's side says what is wrong). */
+export function numbersIn(tool, input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+  let fixed = null;
+  for (const [key, schema] of Object.entries(tool.inputSchema?.properties ?? {})) {
+    const value = input[key];
+    const whole = schema?.type === 'integer';
+    if (typeof value !== 'string' || !(whole || schema?.type === 'number')) continue;
+    if (!(whole ? /^\s*-?\d+\s*$/ : /^\s*-?\d+(\.\d+)?\s*$/).test(value)) continue;
+    const number = Number(value);
+    if (whole ? Number.isSafeInteger(number) : Number.isFinite(number)) (fixed ??= { ...input })[key] = number;
+  }
+  return fixed ?? input;
+}
+
 export const ACTING_NAMES = new Set(ACTING.map((tool) => tool.name));
 
 /** A page tool's answer when what it did is not known (`why`: Chrome's answer never
@@ -264,10 +303,11 @@ export function uncertain(name, why) {
   return PAGE_TOOLS.find((tool) => tool.name === name)?.rerun === 'safe' ? { error: why } : { unknown: true, content: why };
 }
 
-/** Settings, Pages, Before acting: `full` (the default) acts without asking; `auto` asks
- * before an action that sends or submits something; `ask` before every action that
- * changes a page or a tab. Observing (screenshots, scrolling, waiting, the network log)
- * never asks. */
+/** Settings, Pages, Before acting: `auto` (the default) asks before an action that
+ * sends or submits something; `ask` before every action that changes a page or a tab;
+ * `full` acts without asking. Observing (screenshots, scrolling, waiting, the network
+ * log) never asks. An install from before Auto was the default keeps Full, the default
+ * it had (background.js, as it updates). */
 export const CONFIRM_MODES = ['full', 'auto', 'ask'];
 export const ASKING_NAMES = new Set(['navigate', 'click', 'type', 'select', 'press', 'dialog', 'close_tab']);
 /** A control's words that mean a click sends, commits or spends something. */
@@ -275,11 +315,21 @@ const SENDING_WORDS = /\b(send|submit|post|publish|reply|comment|tweet|share|buy
 
 /** The mode kept with the Pages switches (anything else reads as the default). */
 export function confirmMode(kept) {
-  return CONFIRM_MODES.includes(kept?.confirm) ? kept.confirm : 'full';
+  return CONFIRM_MODES.includes(kept?.confirm) ? kept.confirm : 'auto';
+}
+
+/** The Pages record to write: `next` over the record as read (`kept`: undefined when
+ * there is none, null when it could not be read). It always names Before acting, so no
+ * record written now looks like one from before Auto was the default (which
+ * background.js turns to Full as it updates); a choice that could not be read is
+ * written as Ask, as the engine treats it. */
+export function pagesRecord(kept, next) {
+  return { ...(kept ?? {}), confirm: kept === null ? 'ask' : confirmMode(kept), ...next };
 }
 
 /** Whether `name` with `input` sends or submits something: Enter, typing with submit, a
- * page dialog accepted, or a click on a submit control or one whose words say it sends
+ * page dialog accepted, files put in a field (many sites upload them at once), or a
+ * click on a submit control or one whose words say it sends
  * (`target`: what the click lands on, from the page; null when that could not be told,
  * which counts as sending). */
 export function sends(name, input, target) {
@@ -287,6 +337,7 @@ export function sends(name, input, target) {
   // "Return" is pressed as Enter (background.js ALIASES).
   if (name === 'press') return /(^|\+)\s*((numpad)?enter|return)$/i.test(String(input?.key ?? '').trim());
   if (name === 'dialog') return input?.accept === true;
+  if (name === 'select') return Array.isArray(input?.files) && input.files.length > 0;
   // Its words, and its accessible name (an icon button labelled "Send").
   if (name === 'click') return !target || target.submits === true || SENDING_WORDS.test(target.label ?? '') || SENDING_WORDS.test(target.what ?? '');
   return false;
@@ -294,19 +345,35 @@ export function sends(name, input, target) {
 
 /** The action as the user is asked about it ("Click “Send” (button) on mail.example"). */
 export function actionText(name, input, target) {
+  // A page's or a model's quotation marks made plain (they cannot close the question's).
+  const plain = (text) => String(text ?? '').replace(/[“”«»„]/g, '"');
   const quote = (text, most = 80) => {
-    const clean = String(text ?? '').replace(/\s+/g, ' ').trim();
+    const clean = plain(text).replace(/\s+/g, ' ').trim();
     return `“${clean.length > most ? `${clean.slice(0, most - 1)}…` : clean}”`;
   };
-  const what = target?.what ?? (input?.ref ? `part ${input.ref}` : 'the page');
+  const what = plain(target?.what ?? (input?.ref ? `part ${input.ref}` : 'the page'));
+  // What the action is held to besides its name (background.js asShown): its words, when
+  // the name (cut short) does not hold them all, and where it leads.
+  const words = String(target?.words ?? '').replace(/\s+/g, ' ').trim();
+  const saying = words && !String(what).toLowerCase().includes(words.toLowerCase()) ? ` saying ${quote(words, 160)}` : '';
+  const going = target?.dest ? `, going to ${target.dest}` : '';
   const where = target?.host ? ` on ${target.host}` : '';
   // The tab an action without a part lands on, named (its title, then its site).
   const inTab = target?.tab != null ? ` in tab ${target.tab}${target.title ? ` (${quote(target.title, 60)}${target.host ? `, ${target.host}` : ''})` : target.host ? ` (${target.host})` : ''}` : '';
   switch (name) {
-    case 'click': return `${input?.double ? 'Double-click' : input?.button === 'right' ? 'Right-click' : 'Click'} ${what}${where}`;
+    case 'click': return `${input?.double ? 'Double-click' : input?.button === 'right' ? 'Right-click' : 'Click'} ${what}${saying}${where}${going}`;
     case 'type': return `Type ${quote(input?.text, 300)} into ${what}${where}${input?.submit ? ', then press Enter' : ''}`;
-    case 'select': return `Choose ${(input?.values ?? []).map((value) => quote(value, 40)).join(', ')} in ${what}${where}`;
-    case 'press': return `Press ${String(input?.key ?? '')}${inTab || where}`;
+    case 'select': {
+      if (!Array.isArray(input?.files) || !input.files.length) return `Choose ${(input?.values ?? []).map((value) => quote(value, 40)).join(', ')} in ${what}${where}`;
+      // Each file with its size, so what goes out is what the user agrees to; a name's
+      // own quotation marks made plain, so it cannot pass for the rest of the question.
+      const size = (bytes) => (bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} bytes`);
+      // `upload`: the files as the engine read them (`engine-worker.mjs` uploadOf).
+      const files = (input.upload ?? input.files.map((path) => ({ path }))).map((file) => `${quote(file.path, 80)}${file.size != null ? ` (${size(file.size)})` : ''}`);
+      return `Upload ${files.join(', ')} to ${what}${saying}${where}`;
+    }
+    // The part Enter goes to, when one has the focus (another form may submit otherwise).
+    case 'press': return `Press ${String(input?.key ?? '')}${target?.focus ? ` in ${plain(target.focus.what)}` : ''}${inTab || where}`;
     case 'navigate': {
       const action = input?.action ?? 'go';
       if (action === 'back') return `Go back a page${inTab}`;
@@ -317,7 +384,7 @@ export function actionText(name, input, target) {
     // The tab first, then what the dialog says, whole and with its own quotation marks
     // made plain, so a page's words cannot pass for the tab or the end of the question.
     case 'dialog': {
-      const says = target?.dialog?.message ? `, which says ${quote(String(target.dialog.message).replace(/[“”«»„]/g, '"'), 500)}` : '';
+      const says = target?.dialog?.message ? `, which says ${quote(target.dialog.message, 500)}` : '';
       return `${input?.accept ? 'Accept' : 'Dismiss'} the page's ${target?.dialog?.type ? `${target.dialog.type} ` : ''}dialog${inTab}${says}${input?.text ? `, answering ${quote(input.text)}` : ''}`;
     }
     case 'close_tab': return `Close tab ${input?.tab}${target?.title ? ` (${quote(target.title, 60)}${target.host ? `, ${target.host}` : ''})` : target?.host ? ` (${target.host})` : ''}`;

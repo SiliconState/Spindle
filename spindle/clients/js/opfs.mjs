@@ -44,6 +44,14 @@ const MAX_PATH = SEAL - MAGIC.length - 2 - NAMED;
 const MOVE = '\0move\0';
 /** The fd `openSync` gives a directory (synced by flushing its slots' headers). */
 const DIRECTORY = -2;
+/** Slots a pool opens with, and keeps free: when fewer are vacant after a file is
+ * named, it grows by GROW_SLOTS on its own (sync access handles open asynchronously, so
+ * growth starts ahead of need: between the files a step names, never within one). A
+ * thread's background tasks each name a few files as they start, all at once in a long
+ * turn, which is what ran a 48-slot pool dry. */
+const FIRST_SLOTS = 96;
+const LOW_WATER = 32;
+const GROW_SLOTS = 64;
 
 function failure(code, message) {
   const error = new Error(`${code}: ${message}`);
@@ -53,20 +61,30 @@ function failure(code, message) {
 
 /** Opens (creating as needed) the pool files in OPFS directory `directory`: at least
  * `slots`, and every one an earlier `grow` added. Fails if another worker holds the
- * pool. Close it when done (`close`). */
-export async function openOpfsPool({ directory = 'spindle', slots = 48 } = {}) {
+ * pool. Close it when done (`close`). The pool grows by itself once fewer than
+ * `lowWater` slots are free (0: only as `grow` is called; for a test of a pool kept
+ * small). */
+export async function openOpfsPool({ directory = 'spindle', slots = FIRST_SLOTS, lowWater = LOW_WATER } = {}) {
   const root = await navigator.storage.getDirectory();
   const dir = await root.getDirectoryHandle(directory, { create: true });
-  let count = slots;
-  for await (const name of dir.keys()) {
-    const index = /^slot-(\d+)$/.exec(name);
-    if (index) count = Math.max(count, Number(index[1]) + 1);
-  }
   let pool;
-  try {
-    pool = await openSlots(dir, 0, count);
-  } catch (error) {
-    throw failure('EBUSY', `the OPFS pool is held by another worker or tab (${error.message})`);
+  // A worker that closed the pool just now may still be letting its handles go (one
+  // of its growths still under way adds slots, and lets them go when it ends): a
+  // moment's wait, a few times (under a second: a pool truly held is said soon), before
+  // the pool is called held.
+  for (let attempt = 0; ; attempt++) {
+    let count = slots;
+    for await (const name of dir.keys()) {
+      const index = /^slot-(\d+)$/.exec(name);
+      if (index) count = Math.max(count, Number(index[1]) + 1);
+    }
+    try {
+      pool = await openSlots(dir, 0, count);
+      break;
+    } catch (error) {
+      if (attempt >= 3) throw failure('EBUSY', `the OPFS pool is held by another worker or tab (${error.message})`);
+      await new Promise((done) => setTimeout(done, 250));
+    }
   }
   let generation;
   try {
@@ -76,7 +94,7 @@ export async function openOpfsPool({ directory = 'spindle', slots = 48 } = {}) {
     for (const slot of pool) slot.handle.close();
     throw error;
   }
-  return new OpfsFs(pool, dir, generation);
+  return new OpfsFs(pool, dir, generation, lowWater);
 }
 
 /** Reads each slot's header into it (`path`, `generation`), lets go of the older of
@@ -379,6 +397,9 @@ export class OpfsFs {
   #pool;
   #dir;
   #closed = false;
+  #growing = Promise.resolve();
+  /** Set while a growth the pool started itself (`#replenish`) is under way. */
+  #replenishing = false;
   /** Why this pool takes nothing more: a rename failed after its record was written
    * (`renameSync`), so the next open finishes it from disk; null while it works. */
   #stopped = null;
@@ -392,10 +413,13 @@ export class OpfsFs {
     }
   }
   #generation;
-  constructor(pool, dir, generation = 0) {
+  /** Free slots under which the pool grows by itself (0: never). */
+  #lowWater;
+  constructor(pool, dir, generation = 0, lowWater = LOW_WATER) {
     this.#pool = pool;
     this.#dir = dir;
     this.#generation = generation;
+    this.#lowWater = lowWater;
   }
   /** The next slot generation (a later name is a newer one). */
   #next() {
@@ -439,16 +463,33 @@ export class OpfsFs {
 
   /** Adds `count` empty slots (sync access handles open asynchronously, so call it
    * between operations, before `free` runs out). */
-  async grow(count) {
-    if (!this.#dir) throw failure('EINVAL', 'this pool cannot grow');
-    if (this.#closed) throw failure('EBADF', 'the pool is closed');
-    let added;
-    try {
-      added = await openSlots(this.#dir, this.#pool.length, this.#pool.length + count);
-    } catch (error) {
-      throw failure('ENOSPC', `the OPFS pool could not grow (${error.message})`);
-    }
-    this.#pool.push(...added);
+  grow(count) {
+    const next = this.#growing.catch(() => {}).then(async () => {
+      if (!this.#dir) throw failure('EINVAL', 'this pool cannot grow');
+      if (this.#closed) throw failure('EBADF', 'the pool is closed');
+      let added;
+      try {
+        added = await openSlots(this.#dir, this.#pool.length, this.#pool.length + count);
+      } catch (error) {
+        throw failure('ENOSPC', `the OPFS pool could not grow (${error.message})`);
+      }
+      if (this.#closed) {
+        for (const slot of added) slot.handle.close();
+        throw failure('EBADF', 'the pool closed while growing');
+      }
+      this.#pool.push(...added);
+    });
+    this.#growing = next;
+    return next;
+  }
+
+  /** Grows the pool ahead of need once few slots are vacant (see LOW_WATER): started
+   * after a file is named, so the growth runs while the step goes on. A growth that
+   * fails (no room in the origin's quota) is found when the pool is full. */
+  #replenish() {
+    if (this.#replenishing || !this.#dir || this.#closed || !this.#lowWater || this.free >= this.#lowWater) return;
+    this.#replenishing = true;
+    this.grow(GROW_SLOTS).catch(() => {}).finally(() => { this.#replenishing = false; });
   }
 
   #find(path) { return this.#pool.findIndex((slot) => slot.path === path); }
@@ -471,11 +512,12 @@ export class OpfsFs {
     if (flags === 'r') return DIRECTORY;
     if (!flags.includes('w') && !flags.includes('a')) throw failure('ENOENT', path);
     const free = this.#pool.findIndex(vacant);
-    if (free < 0) throw failure('ENOSPC', 'the OPFS pool is full; open it with more slots');
+    if (free < 0) throw failure('ENOSPC', 'the OPFS pool ran out of slots before it could grow; try the step again (it grows on its own)');
     const slot = this.#pool[free];
     slot.handle.truncate(HEADER);
     writePath(slot, path, this.#next());
     slot.path = path;
+    this.#replenish();
     return free;
   }
   readSync(fd, buffer, offset, length, position) {
@@ -539,7 +581,8 @@ export class OpfsFs {
     const old = replaced >= 0 ? this.#pool[replaced] : null;
     const texts = moveRecords(from, to, this.#pool.flatMap((slot, index) => (moving.includes(slot) ? [`${index}${slot.path.slice(from.length)}`] : [])), file);
     const records = this.#pool.filter(vacant).slice(0, texts.length);
-    if (records.length < texts.length) throw failure('ENOSPC', 'the OPFS pool is full; open it with more slots');
+    if (records.length < texts.length) throw failure('ENOSPC', 'the OPFS pool ran out of slots before it could grow; try the step again (it grows on its own)');
+    this.#replenish();
     // Names an older version wrote get their check first (once), so none is cut short unseen.
     for (const slot of [...moving, ...(old ? [old] : [])]) if (!slot.sealed) seal(slot);
     // The records first. One that fails: no file was renamed, so they all go (the next

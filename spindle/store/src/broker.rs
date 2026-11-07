@@ -230,14 +230,13 @@ fn reserved_effect(
         [&request.intent.id],
         |row| Ok((crate::nonnegative_id(row, 0)?, crate::bounded_label(row, 1)?, crate::packed_blob(db, row, 2, MAX_PAYLOAD)?, crate::bounded_label(row, 3)?)),
     ).optional()?;
-    if intent
-        != Some((
-            request.intent_revision,
-            request.intent.adapter.clone(),
-            request.intent.input.clone(),
-            request.scope.clone(),
-        ))
-    {
+    // Compared in place: the input may be a whole model request.
+    if !intent.is_some_and(|(revision, adapter, input, scope)| {
+        revision == request.intent_revision
+            && adapter == request.intent.adapter
+            && input == request.intent.input
+            && scope == request.scope
+    }) {
         return Err(Error::Conflict);
     }
     crate::ownership::live_allowed(db, &request.scope)?;
@@ -261,6 +260,43 @@ fn bound_effect(db: &rusqlite::Connection, request: &DispatchRequest) -> Result<
         return Err(Error::Stale);
     }
     head_effect(db, request)
+}
+
+/// The files of a runner call (`Store::runner_file`): the call (attempt, scope and the
+/// head it was checked at) and the objects its tree holds.
+#[cfg(feature = "workspace-tools")]
+pub(crate) struct RunnerObjects {
+    attempt: String,
+    scope: String,
+    revision: u64,
+    objects: std::collections::HashSet<String>,
+}
+
+/// `pending_effect` for a call already checked whole at `expected_revision`: the head
+/// has not moved since (so its effect is as pending as it was), the epoch is still
+/// its own, and its scope is neither cancelled nor settled.
+#[cfg(feature = "workspace-tools")]
+fn still_pending(db: &rusqlite::Connection, request: &DispatchRequest) -> Result<()> {
+    crate::ownership::live_allowed(db, &request.scope)?;
+    let cancelled: bool = crate::cached_row(
+        db,
+        "SELECT EXISTS(SELECT 1 FROM cancellations WHERE scope=?1)",
+        [&request.scope],
+        |r| r.get(0),
+    )?;
+    if cancelled {
+        return Err(Error::Cancelled);
+    }
+    let epoch: u64 = crate::cached_row(db, "SELECT epoch FROM realm WHERE id=1", [], |r| {
+        crate::nonnegative_id(r, 0)
+    })?;
+    if epoch != request.owner_epoch || request.attempt.owner_epoch != epoch {
+        return Err(Error::Stale);
+    }
+    if crate::transition::scope_revision(db, &request.scope)? != request.expected_revision {
+        return Err(Error::Stale);
+    }
+    Ok(())
 }
 
 /// The still-pending obligation at the scope head that exactly matches the intent.
@@ -398,6 +434,13 @@ pub const MAX_READ_WINDOW: usize = 256 * 1024;
 #[cfg(feature = "driver")]
 pub const TURN_OUTPUT_BUDGET: usize = 256 * 1024;
 
+/// What each result keeps inline once the turn's budget is spent: a short result (a
+/// count, a file written, a line of a log) never costs a read_output round trip, and a
+/// long turn of many small steps goes on as it did; its transcript's size is then
+/// compaction's to bound, not this budget's.
+#[cfg(feature = "driver")]
+pub const TURN_OUTPUT_FLOOR: usize = 4096;
+
 /// What a host tool did (`Store::dispatch_host_workspace`).
 #[cfg(feature = "workspace-tools")]
 pub struct HostResult {
@@ -441,21 +484,32 @@ pub struct AppResult {
 
 /// Workspace changes an answer brings: files written (path, bytes, executable), paths
 /// removed (a directory's removes everything under it), links and empty directories.
+/// A task's report delivers its file changes the same way (`Driver::offer_task_changes`).
 #[cfg(feature = "driver")]
-struct Changes {
-    writes: Vec<(String, Vec<u8>, bool)>,
-    deletes: Vec<String>,
-    links: Vec<crate::workspace::Link>,
-    directories: Vec<String>,
+#[derive(Clone, Debug, Default)]
+pub struct Changes {
+    pub writes: Vec<(String, Vec<u8>, bool)>,
+    pub deletes: Vec<String>,
+    pub links: Vec<crate::workspace::Link>,
+    pub directories: Vec<String>,
 }
 
 #[cfg(feature = "driver")]
 impl Changes {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.writes.is_empty()
             && self.deletes.is_empty()
             && self.links.is_empty()
             && self.directories.is_empty()
+    }
+
+    /// How many paths change, and the bytes written.
+    pub fn count(&self) -> usize {
+        self.writes.len() + self.deletes.len() + self.links.len() + self.directories.len()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.writes.iter().map(|(_, bytes, _)| bytes.len()).sum()
     }
 }
 
@@ -1255,6 +1309,19 @@ pub fn strict_tool_refusal(name: &str, input: &serde_json::Value) -> Option<Stri
     const PATH: &str = "a path relative to /workspace (no empty, '.' or '..' parts; names up to 255 bytes, paths up to 1024)";
     let text = MAX_FILE_TOOL_TEXT / 1024;
     Some(match name {
+        // The one limit a model runs into: a long script given as a command (a heredoc
+        // of a whole file). It says what to do instead.
+        "bash"
+            if input
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|command| command.len() > 16 * 1024) =>
+        {
+            format!(
+                "bash: the command is {} KiB; at most 16 KiB. Write a long script to a file with write_file (or in parts, with edit_file), then run the file",
+                input["command"].as_str().unwrap_or_default().len() / 1024
+            )
+        }
         "bash" => format!(
             "bash input must be {{\"command\": non-empty text up to 16 KiB, \"timeout\": optional 1-{} seconds, \"max_output\": optional bytes (4096-32768)}}",
             dext_native::limits::MAX_RUN_SECS
@@ -1467,6 +1534,15 @@ const STORE_FULL_SEAL: &str = "the session store is full";
 /// The implementation label of an app tool's attempts: its definition's digest.
 pub fn app_label(helper: &str) -> String {
     format!("spindle-app-tool-v1-{helper}")
+}
+
+#[cfg(feature = "driver")]
+impl Store {
+    /// Makes the room an app answer's files need (`app_room`): false when the store is
+    /// at its limits (`STORE_FULL`).
+    pub(crate) fn make_app_room(&mut self) -> Result<bool> {
+        self.make_room(app_room())
+    }
 }
 
 #[cfg(feature = "driver")]
@@ -2066,17 +2142,31 @@ impl Store {
                         ..failed(content)
                     }
                 } else {
-                    match self.seal_tree(&stage, &base, &tree, &sealed)? {
-                        Ok(root) => Recorded {
+                    match self.seal_tree(&stage, &base, &tree, &sealed) {
+                        Ok(Ok(root)) => Recorded {
                             content,
                             success: sealed.success(),
                             root,
                             trailer: String::new(),
                         },
-                        Err(reason) => Recorded {
+                        Ok(Err(reason)) => Recorded {
                             trailer: format!("\n{reason}; {UNSEALED_RUN}"),
                             ..failed(content)
                         },
+                        // The store failed keeping its changes: what the run printed is
+                        // still its result (over the unchanged base), if the store can
+                        // record that; else the store's error stands.
+                        Err(error) => {
+                            let recorded = Recorded {
+                                trailer: format!(
+                                    "\nthe store could not keep its changes; {UNSEALED_RUN}"
+                                ),
+                                ..failed(content)
+                            };
+                            return self
+                                .record_strict(request, &call_id, &helper, &base, recorded)
+                                .map_err(|_| error);
+                        }
                     }
                 }
             }
@@ -2492,19 +2582,32 @@ impl Store {
         base: &str,
         changes: Changes,
     ) -> Result<std::result::Result<String, String>> {
-        let Changes {
-            writes,
-            deletes,
-            links,
-            directories,
-        } = changes;
-        let tree = self.tree_map(&request.scope, base)?;
         let stage = crate::artifact::Stage {
             id: request.attempt.id.clone(),
             scope: request.scope.clone(),
             owner_epoch: self.epoch,
         };
         self.adopt_stage(&stage)?;
+        self.stage_task_changes(&stage, base, changes)
+    }
+
+    /// Stages the tree at `base` with `changes` applied, in `stage` (begun or adopted
+    /// already): the new root, or why the tree cannot be kept. An app answer's changes
+    /// come here, and a background task's with its report (`Step::commit_task_report`).
+    #[cfg(feature = "driver")]
+    pub(crate) fn stage_task_changes(
+        &mut self,
+        stage: &crate::artifact::Stage,
+        base: &str,
+        changes: Changes,
+    ) -> Result<std::result::Result<String, String>> {
+        let Changes {
+            writes,
+            deletes,
+            links,
+            directories,
+        } = changes;
+        let tree = self.tree_map(&stage.scope, base)?;
         let written: std::collections::BTreeSet<String> = writes
             .iter()
             .map(|(path, _, _)| path.clone())
@@ -2532,13 +2635,13 @@ impl Store {
             .into_iter()
             .map(|link| (link.path, link.target))
             .collect();
-        self.stage_changes(&stage, &before, &drop, &files, &links)
+        self.stage_changes(stage, &before, &drop, &files, &links)
     }
 
     /// Takes over the stage an earlier owner of a reservation began (its epoch has
     /// ended, so nothing else writes to it); a stage of the current owner is left as is.
     #[cfg(feature = "driver")]
-    fn adopt_stage(&mut self, stage: &crate::artifact::Stage) -> Result<()> {
+    pub(crate) fn adopt_stage(&mut self, stage: &crate::artifact::Stage) -> Result<()> {
         let adopted = self
             .db
             .execute(
@@ -3180,7 +3283,9 @@ impl Store {
                 wait,
             } => {
                 let Some(job) = crate::jobs::get(&session, id) else {
-                    return unknown(id);
+                    // A job from before a restart: what it printed last, when kept.
+                    return crate::jobs::kept(&session, id)
+                        .map_or_else(|| unknown(id), |text| (text, true));
                 };
                 let wait = Duration::from_secs(wait);
                 let output = match offset {
@@ -3260,23 +3365,28 @@ impl Store {
         if !authorized {
             return Err(Error::Invalid);
         }
-        let bytes = self.read_object(scope, artifact)?;
-        if offset > bytes.len() {
+        // The page alone (and up to 3 bytes each side, to whole characters): the object
+        // is checked whole once on this connection, not again for every page.
+        let from = offset.saturating_sub(3);
+        let to = offset.saturating_add(limit).saturating_add(3);
+        let range = crate::artifact::object_range(&self.db, scope, artifact, from, to);
+        let (length, bytes) = self.broker_result(range)?;
+        if offset > length {
             return Err(Error::Invalid);
         }
-        let text = std::str::from_utf8(&bytes).map_err(|_| Error::Incompatible)?;
+        let continues = |at: usize| bytes.get(at - from).is_some_and(|byte| byte & 0xc0 == 0x80);
         let mut start = offset;
-        while !text.is_char_boundary(start) {
+        while start > from && start < length && continues(start) {
             start -= 1;
         }
-        let mut end = offset.saturating_add(limit).min(bytes.len());
-        while !text.is_char_boundary(end) {
+        let mut end = offset.saturating_add(limit).min(length);
+        while end < length && end < from + bytes.len() && continues(end) {
             end += 1;
         }
+        let text = std::str::from_utf8(&bytes[start - from..end - from])
+            .map_err(|_| Error::Incompatible)?;
         Ok(format!(
-            "{}\n[output bytes {start}..{end}/{}; next offset={end}]",
-            &text[start..end],
-            bytes.len()
+            "{text}\n[output bytes {start}..{end}/{length}; next offset={end}]"
         ))
     }
 
@@ -3370,26 +3480,39 @@ impl Store {
         // Every id with the prefix sorts in [prefix, prefix with its final '/' as '0'),
         // a range the intents primary key answers without a scan.
         let upper = format!("{}0", &execution[..execution.len() - 1]);
-        let mut used = 0usize;
-        let mut rows = self.db.prepare("SELECT r.result FROM receipts r JOIN attempts a ON a.id=r.attempt JOIN intents i ON i.id=a.effect WHERE i.id>=?1 AND i.id<?2 AND ?3 AND i.adapter NOT IN ('dext-model-v1','read_file','read_output','read_job','show','settings','spindle_source','spindle_install')")?;
-        let prior = rows.query_map(params![execution, upper, !paging], |r| {
-            crate::packed_blob(&self.db, r, 0, MAX_PAYLOAD)
-        })?;
-        for bytes in prior {
-            if let Ok(Block::ToolResult { content, .. }) = serde_json::from_slice::<Block>(&bytes?)
-            {
-                used = used.saturating_add(content.len());
+        // What the turn's results used so far, kept as a running total on this
+        // connection: only receipts recorded since the last count (rows after `through`;
+        // receipts are never removed) are read, not every earlier one again.
+        let (mut used, mut through) = match &self.turn_output {
+            Some((prefix, through, used)) if *prefix == execution => (*used, *through),
+            _ => (0, 0),
+        };
+        if !paging {
+            let mut rows = self.db.prepare_cached("SELECT r.rowid,r.result FROM receipts r JOIN attempts a ON a.id=r.attempt JOIN intents i ON i.id=a.effect WHERE i.id>=?1 AND i.id<?2 AND r.rowid>?3 AND i.adapter NOT IN ('dext-model-v1','read_file','read_output','read_job','show','settings','spindle_source','spindle_install')")?;
+            let mut prior = rows.query(params![execution, upper, through])?;
+            while let Some(row) = prior.next()? {
+                through = through.max(row.get(0)?);
+                let bytes = crate::packed_blob(&self.db, row, 1, MAX_PAYLOAD)?;
+                if let Ok(Block::ToolResult { content, .. }) =
+                    serde_json::from_slice::<Block>(&bytes)
+                {
+                    used = used.saturating_add(content.len());
+                }
             }
+            drop(prior);
+            drop(rows);
+            self.turn_output = Some((execution.clone(), through, used));
         }
-        drop(rows);
         let cap = if let Some(cap) = app_cap {
             cap
         } else if paging {
             usize::MAX
         } else {
-            requested
-                .clamp(4096, 32768)
-                .min(TURN_OUTPUT_BUDGET.saturating_sub(used))
+            requested.clamp(4096, 32768).min(
+                TURN_OUTPUT_BUDGET
+                    .saturating_sub(used)
+                    .max(TURN_OUTPUT_FLOOR),
+            )
         };
         let artifact = if content.len() + trailer.len() > cap {
             let stored = self
@@ -3605,26 +3728,39 @@ impl Store {
     }
 
     /// One file of a reserved runner call's workspace, by its tree entry's object.
+    /// The call is checked whole (its effect still pending at the head) and its tree
+    /// decoded once; each later file of the same call checks only what can change
+    /// without a new head: the epoch, cancellation and ownership, and that the head has
+    /// not moved.
     #[cfg(feature = "workspace-tools")]
     pub fn runner_file(&mut self, request: &DispatchRequest, object: &str) -> Result<Vec<u8>> {
         if self.paused {
             return Err(Error::Paused);
         }
         validate_request(request)?;
-        pending_effect(&self.db, request)?;
-        let base = self.strict_base(request)?;
-        // The tree is checked and decoded once per call, not again for each file.
-        let known = matches!(&self.runner_objects,
-            Some((scope, root, _)) if *scope == request.scope && *root == base);
-        if !known {
+        let known = self.runner_objects.as_ref().is_some_and(|known| {
+            known.attempt == request.attempt.id
+                && known.scope == request.scope
+                && known.revision == request.expected_revision
+        });
+        if known {
+            still_pending(&self.db, request)?;
+        } else {
+            self.runner_objects = None;
+            pending_effect(&self.db, request)?;
+            let base = self.strict_base(request)?;
             let tree = self.tree_map(&request.scope, &base)?;
-            let objects = tree.files.into_iter().map(|entry| entry.object).collect();
-            self.runner_objects = Some((request.scope.clone(), base, objects));
+            self.runner_objects = Some(RunnerObjects {
+                attempt: request.attempt.id.clone(),
+                scope: request.scope.clone(),
+                revision: request.expected_revision,
+                objects: tree.files.into_iter().map(|entry| entry.object).collect(),
+            });
         }
         if !self
             .runner_objects
             .as_ref()
-            .is_some_and(|(_, _, objects)| objects.contains(object))
+            .is_some_and(|known| known.objects.contains(object))
         {
             return Err(Error::Invalid);
         }

@@ -4,8 +4,8 @@
 // needs page reading on; acting needs page actions on as well (chrome.debugger: clicks,
 // keys and typing reach the page as the user's would, and a tab's network can be
 // watched).
-import { ACTING_NAMES, BROWSER, PAGE_ACCESS, PICTURE_ACCESS, pageSwitches, uncertain } from './page-tools.mjs';
-import { CHANNEL, read, startEngine, write } from './shared.mjs';
+import { ACTING_NAMES, BROWSER, PAGE_ACCESS, PICTURE_ACCESS, pageSwitches, pagesRecord, uncertain } from './page-tools.mjs';
+import { REQUESTS, answersFor, read, startEngine, write } from './shared.mjs';
 
 // (A browser without the side panel API still runs the rest.)
 chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
@@ -13,10 +13,20 @@ chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true }).catch(() =>
 // The switches are kept from the first start: off on a new install. Builds before the
 // switches were Spindle's took page reading to be Chrome's access to sites, so a user
 // updating from one who had it keeps it (once: the record exists from then on).
+// Before acting is Auto unless chosen; an install from when the default was Full keeps
+// Full as it updates (its switches never named a mode), so nothing it did unasked starts
+// asking. A new install asks before what sends or submits.
+const UNREAD = Symbol('unread');
 chrome.runtime.onInstalled.addListener(async ({ reason }) => {
-  if (await read('kv', 'pages').catch(() => null)) return;
+  // A read that fails changes nothing (a missing record reads as undefined).
+  const kept = await read('kv', 'pages').catch(() => UNREAD);
+  if (kept === UNREAD) return;
+  if (kept) {
+    if (reason === 'update' && !kept.confirm) await write('kv', 'pages', { ...kept, confirm: 'full' }).catch(() => {});
+    return;
+  }
   const access = reason === 'update' && (await chrome.permissions.contains({ origins: PAGE_ACCESS }));
-  await write('kv', 'pages', { reading: access, acting: false }).catch(() => {});
+  await write('kv', 'pages', { reading: access, acting: false, confirm: 'auto' }).catch(() => {});
 });
 
 // Pages a thread made show in preview.html (page.mjs), served from here as packaged, with
@@ -95,11 +105,12 @@ async function pdf(url) {
 }
 
 /** `op`'s answer once the engine runs (started here if it is not: it may be starting).
- * The channel is open only while this asks: every page's answers go through it, a file's
- * bytes included, and this worker takes none it did not ask for. */
+ * Asked on the engine's request channel and answered on a channel of this call's own
+ * (open only while it asks), so a file's bytes reach this worker alone. */
 async function fromEngine(op, args) {
-  const engine = new BroadcastChannel(CHANNEL);
   const me = `worker-${crypto.randomUUID()}`;
+  const requests = new BroadcastChannel(REQUESTS);
+  const engine = new BroadcastChannel(answersFor(me));
   const waiting = new Map();
   let asked = 0;
   engine.onmessage = ({ data }) => {
@@ -117,7 +128,7 @@ async function fromEngine(op, args) {
       reject(Object.assign(new Error("Spindle's engine did not answer"), { kind: 'timeout' }));
     }, timeout);
     waiting.set(id, { resolve, reject, timer });
-    engine.postMessage({ to: 'engine', from: me, id, op: what, args: given });
+    requests.postMessage({ to: 'engine', from: me, id, op: what, args: given });
   });
   try {
     await startEngine();
@@ -133,6 +144,7 @@ async function fromEngine(op, args) {
   } finally {
     for (const { timer } of waiting.values()) clearTimeout(timer);
     engine.close();
+    requests.close();
   }
 }
 
@@ -171,6 +183,12 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     letGo().catch(() => {});
     return false;
   }
+  // A panel says until when the user writes in its message box (0: no longer).
+  if (message?.type === 'typing' && sender.url?.startsWith(chrome.runtime.getURL(''))) {
+    const until = Math.min(Number(message.until) || 0, Date.now() + TYPING_MAX_MS);
+    chrome.storage.session.set({ [TYPING]: until }).catch(() => {});
+    return false;
+  }
   // Only the engine's document asks for tools (no page's content, no other extension).
   if (sender.tab || sender.url !== chrome.runtime.getURL('engine.html')) return false;
   if (message?.type === 'page_tool_cancel') {
@@ -178,8 +196,14 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     if (control) control.cancelled = true;
     return false;
   }
+  // A thread's turn is done (or the thread deleted): the tabs Spindle opened for it close.
+  if (message?.type === 'tabs_done') {
+    closeOpened(String(message.thread ?? ''), { tasks: Boolean(message.tasks) }).catch((error) => console.warn('Spindle: tabs it opened:', error));
+    return false;
+  }
   if (message?.type !== 'page_tool') return false;
-  run(message.name, message.input ?? {}, message.call, message.allowed).then(reply, (error) => reply({ error: String(error?.message ?? error) }));
+  const owner = typeof message.thread === 'string' && message.thread ? { thread: message.thread, task: Boolean(message.task) } : null;
+  run(message.name, message.input ?? {}, message.call, message.allowed, owner).then(reply, (error) => reply({ error: String(error?.message ?? error) }));
   return true;
 });
 
@@ -188,21 +212,35 @@ const OFF =
 const NO_ACTIONS =
   'Spindle may not act on pages: page actions are off. The user can turn them on in the Spindle panel (Settings, Pages).';
 
-async function run(name, input, call = crypto.randomUUID(), allowed = null) {
+async function run(name, input, call = crypto.randomUUID(), allowed = null, owner = null) {
   const work = TOOLS[name];
   if (!work) return { error: `there is no page tool ${name}` };
+  // A tab named otherwise than by its number (Chrome would refuse it in words that do not
+  // say why; a whole number in quotes was made the number before it came here).
+  if (input?.tab != null && !Number.isInteger(input.tab)) return { error: `tab is a tab's number from list_tabs, such as 2054624637, not ${JSON.stringify(input.tab).slice(0, 40)}; nothing was done` };
   // `acted`: input reached the page, or Chrome was told to move or close a tab.
   // `allowed`: what the user was shown when asked before this action (`asAllowed`).
-  const control = { until: Date.now() + TOOL_MS, cancelled: false, acted: false, allowed };
+  // `owner`: the thread (and whether a task of it) the call is for: tabs it opens are its.
+  const control = { until: Date.now() + TOOL_MS, cancelled: false, acted: false, allowed, owner };
   calls.set(call, control);
+  const began = Date.now();
+  let tab = Number.isInteger(input?.tab) ? input.tab : null;
+  // A window its page opens on this action is the thread's: new tabs are watched for.
+  const watched = Boolean(owner) && OPENING.has(name);
+  if (watched) {
+    opening += 1;
+    watchTabs();
+  }
   try {
-    return await deadline((async () => {
+    const result = await deadline((async () => {
       if (!(await reading())) return { error: OFF };
       const viewing = name === 'navigate' && typeof input?.url === 'string' && input.url.startsWith(chrome.runtime.getURL('view.html?'));
       if (ACTING_NAMES.has(name) && !viewing && name !== 'screenshot' && !(await acting())) return { error: NO_ACTIONS };
       check(control);
       return work(input, control);
     })(), TOOL_MS, 'the page tool');
+    tab = result?.details?.tab ?? tab;
+    return result;
   } catch (error) {
     // A failure once the tool began acting does not say the action did not happen: its
     // outcome is unknown (checked rather than repeated), unless the tool is safe to
@@ -213,6 +251,12 @@ async function run(name, input, call = crypto.randomUUID(), allowed = null) {
   } finally {
     control.cancelled = true;
     calls.delete(call);
+    // A tab the page opened on this action (a link to a new tab, say) is the thread's too.
+    if (watched) {
+      opening -= 1;
+      if (control.acted && tab != null) actions.push({ owner, tab, from: began, to: Date.now() + OPENED_GRACE_MS });
+      claimOpened();
+    }
   }
 }
 
@@ -237,8 +281,12 @@ function deadline(work, ms, what) {
 }
 
 /** The tab the user is looking at: the active one of the last focused window. Spindle's
- * own page open in a tab is not it; then another window's active tab is. */
-async function lookedAt() {
+ * own page open in a tab is not it; then another window's active tab is. For the thread
+ * of `control`, a tab it opened behind the one showing (`quietTab`) is, until shown: a
+ * tool without a `tab` goes on there, as it would on a tab Spindle opened in front. */
+async function lookedAt(control = null) {
+  const behind = await quietTab(control?.owner);
+  if (behind) return behind;
   const own = (tab) => (tab.url ?? tab.pendingUrl ?? '').startsWith(chrome.runtime.getURL(''));
   const window = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }).catch(() => null);
   if (window) {
@@ -251,8 +299,8 @@ async function lookedAt() {
 
 /** The tab a tool works on (`id`, or the one the user is looking at), which must show a
  * web page Chrome lets extensions into. */
-async function pageTab(id) {
-  const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt();
+async function pageTab(id, control = null) {
+  const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt(control);
   if (!tab) throw new Error(id != null ? `there is no tab ${id}` : 'no tab is open');
   if (!tab.url) throw new Error(`${BROWSER} gives Spindle no access to tab ${tab.id} (a new tab, a blank page or a browser page)`);
   if (!/^https?:/.test(tab.url)) throw new Error(`${BROWSER} does not let extensions into ${new URL(tab.url).protocol} pages`);
@@ -267,14 +315,14 @@ const webTab = (tab) => /^https?:/.test(tab?.url ?? '') || tab?.url === 'about:b
  * A tab showing a dialog answers nothing until the dialog is answered: said at once. */
 async function page(tabId, op, args = {}, control) {
   if (!(await reading())) throw new Error(OFF);
-  if (['point', 'caret', 'select', 'scroll'].includes(op) && !(await acting())) throw new Error(NO_ACTIONS);
-  if (['caret', 'select', 'scroll'].includes(op)) await refuseVetoed(tabId);
+  if (['point', 'caret', 'select', 'scroll', 'file_part', 'files'].includes(op) && !(await acting())) throw new Error(NO_ACTIONS);
+  if (['caret', 'select', 'scroll', 'files'].includes(op)) await refuseVetoed(tabId);
   check(control);
   refuseWhileDialog(tabId);
   // `point` only measures; these change the page, unless it refuses first (then this
   // changed nothing, and the call stands as it did).
   const was = control?.acted;
-  if (control && ['caret', 'select', 'scroll'].includes(op)) control.acted = true;
+  if (control && ['caret', 'select', 'scroll', 'files'].includes(op)) control.acted = true;
   const [answer] = await deadline(
     chrome.scripting.executeScript({ target: { tabId }, func: inPage, args: [op, { ...args, expires: control?.until }], injectImmediately: true }),
     DEADLINE_MS, `tab ${tabId}`,
@@ -297,8 +345,8 @@ async function whereNow(tabId) {
 }
 
 /** Once a page reacts: a moment, and the load an action started, if it started one. */
-async function settle(tabId, ms = 10_000, control) {
-  await pause(400);
+async function settle(tabId, ms = 10_000, control, moment = 400) {
+  await pause(moment);
   check(control);
   const until = Date.now() + ms;
   while (Date.now() < until && !dialogs.has(tabId)) {
@@ -311,46 +359,154 @@ async function settle(tabId, ms = 10_000, control) {
 
 // ---- Reading -----------------------------------------------------------------------
 
-async function listTabs() {
+async function listTabs(input, control) {
   const tabs = await chrome.tabs.query({ windowType: 'normal' });
   const seen = await lookedAt();
+  const behind = await quietTab(control?.owner);
   const lines = tabs.map((tab) => {
-    const mark = tab.id === seen?.id ? ' (the user is looking at it)' : '';
+    const mark = tab.id === seen?.id ? ' (the user is looking at it)'
+      : tab.id === behind?.id ? ' (yours, behind the one showing: tools without a tab act on it)' : '';
     return `tab ${tab.id}${mark}: ${tab.url ? `${tab.title || '(untitled)'} <${tab.url}>` : '(no access)'}`;
   });
   return { content: lines.join('\n'), details: { tabs: tabs.length } };
 }
 
-async function readPage({ tab: id, max_chars: max, scroll: screens }, control) {
-  const tab = await pageTab(id);
-  refuseWhileDialog(tab.id);
+async function readPage({ tab: id, max_chars: max, scroll: screens, find }, control) {
   const limit = Math.min(Math.max(Number(max) || 20000, 1000), 100000);
-  if (screens) return readScrolling(tab, limit, screens, control);
-  // Cut in the page: a huge page's text never crosses over whole.
+  // A file of a thread's workspace open in Spindle's own tab (view.html), named or
+  // looked at: read as the file, Chrome keeping extensions out of their own pages or not.
+  const own = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt(control).catch(() => null);
+  const view = viewed(own);
+  if (view) return readView(own, view, limit, find);
+  const tab = await pageTab(id, control);
+  refuseWhileDialog(tab.id);
+  if (screens) return readScrolling(tab, limit, screens, control, find);
+  // Cut in the page: a huge page's text never crosses over whole (not when lines are
+  // looked for: the whole text is searched, and only the matches cross).
   const [{ result }] = await deadline(chrome.scripting.executeScript({
     target: { tabId: tab.id },
-    args: [limit],
+    args: [find ? 4 * 1024 * 1024 : limit],
     func: (limit) => {
       const text = document.body?.innerText ?? '';
       const selection = String(getSelection() ?? '');
       return { url: location.href, title: document.title, selection: selection.slice(0, 10000), text: text.slice(0, limit), total: text.length };
     },
   }), DEADLINE_MS, `tab ${tab.id}`);
-  const more = result.total - result.text.length;
-  const text = more > 0 ? `${result.text}\n[${more} more characters: ask again with a larger max_chars]` : result.text;
   const lines = [`Address: ${result.url}`, `Title: ${result.title}`];
   if (result.selection.trim()) lines.push(`Selected text: ${result.selection}`);
+  if (find) return { content: `${lines.join('\n')}\n\n${matchingLines(result.text, find, limit)}`, details: { tab: tab.id, url: result.url, title: result.title } };
+  const more = result.total - result.text.length;
+  const text = more > 0 ? `${result.text}\n[${more} more characters: ask again with a larger max_chars]` : result.text;
   return { content: `${lines.join('\n')}\n\n${text}`, details: { tab: tab.id, url: result.url, title: result.title } };
+}
+
+/** A tab showing a file of a thread's workspace in Spindle's own page (view.html):
+ * the thread and the path; null for any other tab. */
+function viewed(tab) {
+  const url = String(tab?.url ?? '');
+  if (!url.startsWith(chrome.runtime.getURL('view.html?'))) return null;
+  const params = new URL(url).searchParams;
+  const thread = params.get('thread') ?? '';
+  const path = params.get('path') ?? '';
+  return /^[0-9a-f]{16}$/.test(thread) && path ? { thread, path } : null;
+}
+
+/** Files a workspace tab shows that have no text to read. */
+const PICTURED = /\.(png|jpe?g|gif|webp|svg|avif|bmp|ico|apng|pdf|docx|docm|xlsx|xlsm|pptx|pptm|mp4|m4v|webm|ogv|mov|mp3|m4a|aac|wav|ogg|oga|opus|flac)$/i;
+
+/** The text of the workspace file a tab shows: what its preview frame shows (the page
+ * drawn, scripts run as the user let them), when Chrome lets a script into Spindle's
+ * own page; else the file itself, a page's markup stripped to its text. */
+async function readView(tab, { thread, path }, limit, find) {
+  let text = null;
+  let how = 'as the preview shows it';
+  try {
+    const [{ result }] = await deadline(chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      args: [find ? 4 * 1024 * 1024 : limit],
+      func: (most) => {
+        const body = document.querySelector('iframe')?.contentDocument?.body;
+        const text = body?.innerText;
+        return typeof text === 'string' && text.trim() ? { text: text.slice(0, most), total: text.length } : null;
+      },
+    }), DEADLINE_MS, `tab ${tab.id}`);
+    if (result) text = result;
+  } catch {
+    // Chrome keeps scripts out of extension pages here: the file itself is read.
+  }
+  if (!text) {
+    if (PICTURED.test(path)) {
+      return { error: `${path} is no text (a picture, a document or media): with bash in the browser Linux, \`spindle model --image ${path} "QUESTION"\` has a model look at a picture` };
+    }
+    const { bytes } = await fromEngine('read', { id: thread, path });
+    let whole = new TextDecoder().decode(bytes);
+    if (/\.(html?|xml|svg)$/i.test(path)) {
+      whole = whole.replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, ' ').replace(/<br\s*\/?>|<\/(p|div|li|tr|h[1-6]|section|article|header|footer|pre|blockquote)>/gi, '\n')
+        .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+        .replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    }
+    text = { text: whole.slice(0, find ? 4 * 1024 * 1024 : limit), total: whole.length };
+    how = 'the file itself';
+  }
+  const lines = [`Address: ${tab.url}`, `Title: ${tab.title || path}`, `Workspace file: ${path} (${how})`];
+  if (find) return { content: `${lines.join('\n')}\n\n${matchingLines(text.text, find, limit)}`, details: { tab: tab.id, url: tab.url, title: tab.title } };
+  const more = text.total - text.text.length;
+  const body = more > 0 ? `${text.text}\n[${more} more characters: ask again with a larger max_chars, or read the file with read_file]` : text.text;
+  return { content: `${lines.join('\n')}\n\n${body}`, details: { tab: tab.id, url: tab.url, title: tab.title } };
+}
+
+/** What `find` (a page tool's) matches: `/pattern/flags` as a regular expression (case
+ * insensitive unless its flags say), anything else as words, case insensitive. */
+function matcherOf(find) {
+  const text = String(find ?? '');
+  const pattern = /^\/(.+)\/([a-z]*)$/s.exec(text);
+  if (pattern) {
+    try {
+      const flags = pattern[2].includes('i') ? pattern[2] : `${pattern[2]}i`;
+      const regexp = new RegExp(pattern[1], flags);
+      return (line) => regexp.test(line);
+    } catch {
+      // Not a regular expression Chrome takes: looked for as words.
+    }
+  }
+  const needle = text.toLowerCase();
+  return (line) => line.toLowerCase().includes(needle);
+}
+
+/** The lines of `text` that `find` matches, each with the line before and after it
+ * (runs apart marked by a lone ellipsis), within `limit` characters. */
+function matchingLines(text, find, limit) {
+  const matches = matcherOf(find);
+  const lines = text.split('\n');
+  const hits = [];
+  lines.forEach((line, at) => { if (line.trim() && matches(line)) hits.push(at); });
+  if (!hits.length) return `[no line matches ${JSON.stringify(String(find))}]`;
+  const keep = new Set();
+  for (const at of hits) for (const near of [at - 1, at, at + 1]) if (near >= 0 && near < lines.length && lines[near].trim()) keep.add(near);
+  const out = [];
+  let last = -2;
+  let size = 0;
+  for (const at of [...keep].sort((a, b) => a - b)) {
+    if (at !== last + 1 && out.length) out.push('…');
+    size += lines[at].length + 1;
+    if (size > limit) {
+      out.push(`[more matches past ${limit} characters: ask with a larger max_chars, or a narrower find]`);
+      break;
+    }
+    out.push(lines[at]);
+    last = at;
+  }
+  return `[${hits.length} matching line${hits.length === 1 ? '' : 's'}, each with its neighbours]\n${out.join('\n')}`;
 }
 
 /** The text of a page that loads as it scrolls (and drops what scrolled away), read
  * while scrolling down `screens` times: each new line once, in order, until the page
  * stops growing, the screens are done or `limit` characters are in. */
-async function readScrolling(tab, limit, screens, control) {
+async function readScrolling(tab, limit, screens, control, find = null) {
   if (!(await acting())) {
     return { error: 'reading while scrolling moves the page, so it needs page actions on (Settings, Pages); read_page without scroll reads what shows now' };
   }
-  const most = Math.min(Math.max(Math.round(Number(screens)) || 1, 1), 30);
+  const screensMost = Math.min(Math.max(Math.round(Number(screens)) || 1, 1), 30);
   // What was read by then is the answer: the tool's own deadline (30 s) is not far off.
   const until = Date.now() + SCROLL_MS;
   let late = false;
@@ -371,9 +527,11 @@ async function readScrolling(tab, limit, screens, control) {
     }), DEADLINE_MS, `tab ${tab.id}`);
     last = result;
     let added = 0;
+    // Looking for lines: what scrolls by is all kept (the matches alone are answered).
+    const most = find ? 4 * 1024 * 1024 : limit;
     for (const line of result.text.split('\n')) {
       const key = line.trim();
-      if (!key || seen.has(key) || chars >= limit) continue;
+      if (!key || seen.has(key) || chars >= most) continue;
       seen.add(key);
       kept.push(line);
       chars += line.length + 1;
@@ -381,7 +539,7 @@ async function readScrolling(tab, limit, screens, control) {
     }
     // Two screens that bring nothing new: the end of what loads.
     quiet = added ? 0 : quiet + 1;
-    if (scrolled >= most || quiet >= 2 || chars >= limit) break;
+    if (scrolled >= screensMost || quiet >= 2 || chars >= most) break;
     if (Date.now() > until) {
       late = true;
       break;
@@ -391,29 +549,30 @@ async function readScrolling(tab, limit, screens, control) {
     // What a feed loads as it scrolls takes a moment to come.
     await pause(900);
   }
-  const why = chars >= limit ? `stopped at ${limit} characters (ask with a larger max_chars for more)`
+  const why = chars >= most ? `stopped at ${most} characters (ask with a larger max_chars for more)`
     : quiet >= 2 ? 'the page stopped bringing new text'
     : late ? `scrolled ${scrolled} screen${scrolled === 1 ? '' : 's'} in the time a call has (call again for more)`
     : `scrolled ${scrolled} screen${scrolled === 1 ? '' : 's'}`;
-  const text = kept.join('\n').slice(0, limit);
+  const text = find ? matchingLines(kept.join('\n'), find, limit) : kept.join('\n').slice(0, limit);
   return {
     content: `Address: ${last.url}\nTitle: ${last.title}\nRead while scrolling down (${why}; each line once):\n\n${text}`,
     details: { tab: tab.id, url: last.url, title: last.title, scrolled },
   };
 }
 
-async function pageElements({ tab: id, ref, depth, hidden, max_chars: max }, control) {
-  const tab = await pageTab(id);
+async function pageElements({ tab: id, ref, depth, hidden, max_chars: max, find }, control) {
+  const tab = await pageTab(id, control);
   const parts = await page(tab.id, 'parts', {
     ref, hidden: Boolean(hidden),
     depth: Math.min(Math.max(Number(depth) || 30, 1), 80),
     max: Math.min(Math.max(Number(max) || 30000, 2000), 100000),
+    ...(find != null && String(find) && { find: String(find).slice(0, 500) }),
   }, control);
   return { content: `Address: ${parts.url}\nTitle: ${parts.title} (tab ${tab.id})\n\n${parts.text}`, details: { tab: tab.id, url: parts.url } };
 }
 
 async function pageHtml({ tab: id, ref, scripts, max_chars: max }, control) {
-  const tab = await pageTab(id);
+  const tab = await pageTab(id, control);
   const html = await page(tab.id, 'html', { ref, scripts: Boolean(scripts), max: Math.min(Math.max(Number(max) || 50000, 1000), 200000) }, control);
   const more = html.total - html.text.length;
   return { content: `${html.text}${more > 0 ? `\n[${more} more characters: ask again with a larger max_chars, or a ref]` : ''}`, details: { tab: tab.id } };
@@ -423,12 +582,20 @@ async function pageHtml({ tab: id, ref, scripts, max_chars: max }, control) {
  * let Spindle picture pages (no debugger); any tab through Chrome's debugger (page
  * actions on). */
 async function screenshot({ tab: id }, control) {
-  const tab = await pageTab(id);
+  // Chrome pictures no extension page, its own debugger refused there too: a file of
+  // the workspace shown in Spindle's tab (named, or looked at) is read, not pictured.
+  const own = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt(control).catch(() => null);
+  const view = viewed(own);
+  if (view) return { error: `${BROWSER} does not picture extension pages, so tab ${own.id} (${view.path} from the workspace) cannot be pictured; read_page on it gives the file's text as shown, and read_file the file` };
+  const tab = await pageTab(id, control);
   refuseWhileDialog(tab.id);
   let base64;
   if (tab.active && (await chrome.permissions.contains({ origins: PICTURE_ACCESS }))) {
     check(control);
     const url = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 75 });
+    // Chrome pictures whatever its window shows: still this tab's web page, or nothing.
+    const [shown] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+    if (shown?.id !== tab.id || !/^https?:/.test(shown.url ?? '')) throw new Error(`tab ${tab.id} stopped showing in its window while it was pictured: try again`);
     base64 = url.slice(url.indexOf(',') + 1);
   } else if (await acting()) {
     ({ data: base64 } = await cdp(tab.id, 'Page.captureScreenshot', { format: 'jpeg', quality: 75 }, control));
@@ -452,15 +619,17 @@ async function screenshot({ tab: id }, control) {
 
 // ---- Acting ------------------------------------------------------------------------
 
-async function navigate({ url, action = 'go', tab: id, new_tab: fresh }, control) {
+async function navigate({ url, action = 'go', tab: id, new_tab: fresh, keep_open: keep }, control) {
   check(control);
   // A file of the thread's workspace (the engine names its page): opened in a tab of its
   // own for the user, never in place of a page.
   if (typeof url === 'string' && url.startsWith(chrome.runtime.getURL('view.html?'))) {
     const path = new URL(url).searchParams.get('path') ?? '';
     control.acted = true;
-    const tab = await chrome.tabs.create({ url, active: true });
-    return { content: `Opened ${path} from the workspace in a tab for the user (tab ${tab.id}).`, details: { tab: tab.id } };
+    // For the user to read (nothing acts on it after): behind while they write in Spindle.
+    const quiet = await typing();
+    const tab = await chrome.tabs.create({ url, active: !quiet });
+    return { content: `Opened ${path} from the workspace in a tab for the user (tab ${tab.id}${quiet ? `,${QUIET_SAID}` : ''}).`, details: { tab: tab.id } };
   }
   if (url != null) {
     let address;
@@ -473,12 +642,22 @@ async function navigate({ url, action = 'go', tab: id, new_tab: fresh }, control
   }
   if (action === 'go' && !url) return { error: 'give the url to go to' };
   let tab;
+  let quiet = false;
   if (fresh) {
     if (!url) return { error: 'a new tab needs a url' };
     control.acted = true;
-    tab = await chrome.tabs.create({ url, active: true });
+    // Behind only for a thread, which goes on in it (`quietTab`): a call of no thread's
+    // would go on in the tab the user looks at instead.
+    quiet = Boolean(control.owner) && await typing();
+    tab = await chrome.tabs.create({ url, active: !quiet });
+    if (control.owner) {
+      await noteOpened(tab.id, { ...control.owner, keep: keep === true });
+      // The thread's tab behind, or none (one opened in front is the one looked at).
+      const key = quietKey(control.owner);
+      await (quiet ? chrome.storage.session.set({ [key]: tab.id }) : chrome.storage.session.remove(key)).catch(() => {});
+    }
   } else {
-    tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt();
+    tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt(control);
     if (!tab) return { error: id != null ? `there is no tab ${id}` : 'no tab is open' };
     if (!webTab(tab)) return { error: `tab ${tab.id} does not show a web page Spindle may move (a new tab, a browser or extension page): open the address with new_tab` };
     return onTab(tab.id, async () => {
@@ -500,7 +679,7 @@ async function navigate({ url, action = 'go', tab: id, new_tab: fresh }, control
     });
   }
   await settle(tab.id, 20_000, control);
-  return { content: await whereNow(tab.id), details: { tab: tab.id } };
+  return { content: `${await whereNow(tab.id)}${quiet ? `\n(Opened as tab ${tab.id}${QUIET_SAID}: tools without a tab act on it.)` : ''}`, details: { tab: tab.id } };
 }
 
 /** A press and release of `button` at `at` (count: a double click is two). */
@@ -521,13 +700,20 @@ async function aim(tabId, ref, control) {
   check(control);
   await attach(tabId);
   await pause(60);
-  return page(tabId, 'point', { ref, ...(control?.allowed?.what && { what: control.allowed.what }) }, control);
+  return page(tabId, 'point', { ref, ...shownOf(control) }, control);
 }
+
+/** What the user was shown of a part when asked before acting on it (its description,
+ * its words and where it leads), for the page to check it still is that. */
+const shownOf = (control) => {
+  const allowed = control?.allowed;
+  return allowed?.what ? { what: allowed.what, words: allowed.words, dest: allowed.dest } : {};
+};
 
 /** What `ref` is (its description, whether a click on it submits a form, its words) and
  * where (the tab's site): read from the page, nothing done to it. */
 async function target({ ref, tab: id }, control) {
-  const tab = await pageTab(id);
+  const tab = await pageTab(id, control);
   const found = await page(tab.id, 'target', { ref }, control);
   return { content: found.what, details: { ...found, host: new URL(tab.url).host, tab: tab.id } };
 }
@@ -535,18 +721,22 @@ async function target({ ref, tab: id }, control) {
 /** Which tab an action without a `tab` would land on now (the one the user is looking
  * at), and its site and title, so a question asked before it acts names that tab and the
  * action stays there whatever the user looks at by the time they answer. */
-async function tabOf({ tab: id }) {
-  const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt();
+async function tabOf({ tab: id, focus: withFocus }, control) {
+  const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt(control);
   if (!tab) return { error: id != null ? `there is no tab ${id}` : 'no tab is open' };
   // The page it shows (so the action, once allowed, lands on that page or not at all),
   // and a dialog open on it (so the question says what the dialog asks).
   const document = /^https?:/.test(tab.url ?? '') ? await documentOf(tab.id) : null;
   const open = dialogs.get(tab.id);
+  // The part with the focus (where a key such as Enter goes; null: none), when the page
+  // says (undefined: it could not be asked).
+  const focus = document && withFocus ? await deadline(page(tab.id, 'focused'), 5_000, `tab ${tab.id}`).catch(() => undefined) : undefined;
   return {
     content: `tab ${tab.id}`,
     details: {
       tab: tab.id, host: hostOf(tab.url), url: withoutPart(tab.url), title: tab.title ?? '',
       ...(document && { document }), ...(open && { dialog: { id: open.id, type: open.type, message: open.message } }),
+      ...(focus !== undefined && { focus }),
     },
   };
 }
@@ -599,11 +789,39 @@ async function asAllowed(tabId, control) {
   const document = allowed.document ? await documentOf(tabId) : null;
   if (document) {
     if (document !== allowed.document) throw new Error(`tab ${tabId} shows another page than the one the user allowed this on (it reloaded or moved on since), ${notDone}`);
-    return;
-  }
-  if (allowed.url != null && withoutPart(tab.url) !== allowed.url) {
+  } else if (allowed.url != null && withoutPart(tab.url) !== allowed.url) {
     throw new Error(`tab ${tabId} is at another address than the one the user allowed this on (it moved on since), ${notDone}`);
   }
+  // A key goes to the part with the focus: the one the user was shown having it (Enter
+  // in another form submits that form).
+  if ('focus' in allowed) {
+    const focus = await page(tabId, 'focused', {}, control).catch(() => undefined);
+    if (focus === undefined || (focus?.ref ?? null) !== allowed.focus) {
+      const now = focus === undefined ? 'Spindle could not tell where it is now' : focus === null ? 'no part has it now' : `it is on ${focus.what} now`;
+      throw new Error(`the focus on tab ${tabId} is not where it was when the user allowed this (${now}), ${notDone}`);
+    }
+  }
+}
+
+/** Runs `work` (a click, a key) with Chrome catching any file dialog it opens at once (a
+ * button that opens its hidden file field): the dialog is the user's computer's, which
+ * Spindle cannot fill and which would hold the window. Caught only while the work goes
+ * and the moment `settle` waits first, so the user's own clicks there open theirs; best
+ * effort (a Chrome that will not catch them acts as before). Says what was caught. */
+async function catching(tabId, work, control) {
+  choosers.delete(tabId);
+  await cdp(tabId, 'Page.setInterceptFileChooserDialog', { enabled: true }, control).catch(() => {});
+  try {
+    await work();
+    await pause(400);
+  } finally {
+    // Not waited for past a moment: a page dialog the work opened holds the page (and
+    // this command, which goes through once the dialog is answered).
+    await deadline(chrome.debugger.sendCommand({ tabId }, 'Page.setInterceptFileChooserDialog', { enabled: false }), 1_000, `tab ${tabId}`).catch(() => {});
+  }
+  return choosers.delete(tabId)
+    ? ': it opened a file dialog, which Spindle caught (nothing was chosen): put workspace files in its file field with select (its ref, files)'
+    : '';
 }
 
 /** Something else lies over the target: nothing is clicked or typed there. */
@@ -612,26 +830,29 @@ const coveredError = (at, ref) => ({
 });
 
 async function click({ ref, tab: id, double, button = 'left' }, control) {
-  const tab = await pageTab(id);
+  const tab = await pageTab(id, control);
   return onTab(tab.id, async () => {
     refuseWhileDialog(tab.id);
     const at = await aim(tab.id, ref, control);
     if (at.covered) return coveredError(at, ref);
-    await mouse(tab.id, at, button, double ? 2 : 1, control);
-    await settle(tab.id, 10_000, control);
-    return { content: `Clicked ${at.what} [${ref}]. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
+    // Its dialog is the user's computer's, which Spindle cannot fill (and which holds the
+    // window until someone does).
+    if (at.file) return { error: `${at.what} [${ref}] opens a file dialog, which Spindle cannot fill: put workspace files in it with select (ref ${ref}, files)` };
+    const caught = await catching(tab.id, () => mouse(tab.id, at, button, double ? 2 : 1, control), control);
+    await settle(tab.id, 10_000, control, 0);
+    return { content: `Clicked ${at.what} [${ref}]${caught}. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
   });
 }
 
 async function type(input, control) {
-  const tab = await pageTab(input.tab);
+  const tab = await pageTab(input.tab, control);
   return onTab(tab.id, () => typeInto(tab, input, control));
 }
 
 async function typeInto(tab, { ref, text, clear, submit }, control) {
   refuseWhileDialog(tab.id);
   const at = await aim(tab.id, ref, control);
-  if (!at.field) return { error: `${at.what} [${ref}] is not a field one types into` };
+  if (!at.field) return { error: `${at.what} [${ref}] is not a field one types into${at.file ? ': put workspace files in it with select (files)' : ''}` };
   if (at.covered) return coveredError(at, ref);
   await mouse(tab.id, at, 'left', 1, control);
   // After what the field holds (the click may have put the caret anywhere), or over it.
@@ -645,19 +866,59 @@ async function typeInto(tab, { ref, text, clear, submit }, control) {
   return { content: `Typed into ${at.what} [${ref}]${submit ? ' and pressed Enter' : ''}.${holds} ${await whereNow(tab.id)}`, details: { tab: tab.id } };
 }
 
-async function select({ ref, values, tab: id }, control) {
-  const tab = await pageTab(id);
+async function select({ ref, values, upload, tab: id }, control) {
+  const tab = await pageTab(id, control);
+  // `upload`: the files, as the engine read them from the thread's workspace.
+  if (Array.isArray(upload)) return onTab(tab.id, () => uploadIn(tab, ref, upload, control));
+  if (!Array.isArray(values)) return { error: 'give values to choose, or files to put in a file field' };
   return onTab(tab.id, () => selectIn(tab, ref, values, control));
 }
 
 async function selectIn(tab, ref, values, control) {
-  const chosen = await page(tab.id, 'select', { ref, values: values.map(String), ...(control?.allowed?.what && { what: control.allowed.what }) }, control);
+  const chosen = await page(tab.id, 'select', { ref, values: values.map(String), ...shownOf(control) }, control);
   await settle(tab.id, 5_000, control);
   return { content: `Chose ${chosen.map((text) => JSON.stringify(text)).join(', ')} in [${ref}]. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
 }
 
+/** Base64 characters a call takes into the page (a multiple of 4, so each decodes alone). */
+const PART = 4 * 1024 * 1024;
+
+/** Puts files in the file field at (or beside) `ref`, as if the user picked them in its
+ * dialog: their bytes go into the page in parts, then into the field at once. */
+async function uploadIn(tab, ref, upload, control) {
+  refuseWhileDialog(tab.id);
+  // The debugger on the tab first (refused, nothing goes in): a dialog the page opens
+  // as it takes the files (a file too large, say) is then seen and said, as after any
+  // action.
+  check(control);
+  await attach(tab.id);
+  const key = crypto.randomUUID();
+  let first = true;
+  try {
+    for (const [index, file] of upload.entries()) {
+      const text = String(file.base64 ?? '');
+      for (let at = 0; at === 0 || at < text.length; at += PART) {
+        await page(tab.id, 'file_part', { key, index, first, data: text.slice(at, at + PART) }, control);
+        first = false;
+      }
+    }
+  } catch (error) {
+    // Cut off before the field took them: what went in leaves the page (best effort).
+    await page(tab.id, 'file_part', { key, index: 0, first: true, data: '', drop: true }).catch(() => {});
+    throw error;
+  }
+  const files = upload.map(({ name, type, size }) => ({ name: String(name), type: String(type ?? ''), size: Number(size) }));
+  // Still attached however long the parts took (an idle debugger is let go at 20 s).
+  await attach(tab.id);
+  keepAttached(tab.id);
+  const put = await page(tab.id, 'files', { ref, key, files, ...shownOf(control) }, control);
+  await settle(tab.id, 5_000, control);
+  const field = put.field === ref ? `[${ref}]` : `[${put.field}] (the file field of [${ref}])`;
+  return { content: `Put ${put.put.join(', ')} in ${put.what} ${field}. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
+}
+
 async function press({ key: name, tab: id }, control) {
-  const tab = await pageTab(id);
+  const tab = await pageTab(id, control);
   return onTab(tab.id, async () => {
     refuseWhileDialog(tab.id);
     await asAllowed(tab.id, control);
@@ -668,14 +929,15 @@ async function press({ key: name, tab: id }, control) {
       await attach(tab.id);
       await asAllowed(tab.id, control);
     }
-    await key(tab.id, name, control);
-    await settle(tab.id, 5_000, control);
-    return { content: `Pressed ${name}. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
+    // Enter or Space on a file field or its button opens a file dialog as a click does.
+    const caught = await catching(tab.id, () => key(tab.id, name, control), control);
+    await settle(tab.id, 5_000, control, 0);
+    return { content: `Pressed ${name}${caught}. ${await whereNow(tab.id)}`, details: { tab: tab.id } };
   });
 }
 
 async function scroll({ ref, to = 'down', tab: id }, control) {
-  const tab = await pageTab(id);
+  const tab = await pageTab(id, control);
   const at = await onTab(tab.id, () => page(tab.id, 'scroll', { ref, to }, control));
   const where = `${Math.round(at.y)} of ${Math.round(at.height)} pixels down, ${Math.round(at.view)} shown`;
   return { content: `${ref ? `Scrolled [${ref}] into view` : `Scrolled ${at.pane ? `${at.pane} ` : ''}${to}`}: ${where}.`, details: { tab: tab.id } };
@@ -683,7 +945,7 @@ async function scroll({ ref, to = 'down', tab: id }, control) {
 
 async function waitFor({ text, selector, gone, seconds, tab: id }, control) {
   if (!text && !selector) return { error: 'give text or a selector to wait for' };
-  const tab = await pageTab(id);
+  const tab = await pageTab(id, control);
   const limit = Math.min(Math.max(Number(seconds) || 10, 0.5), 25) * 1000;
   const until = Date.now() + limit;
   const what = text ? JSON.stringify(text) : selector;
@@ -705,7 +967,7 @@ async function waitFor({ text, selector, gone, seconds, tab: id }, control) {
 }
 
 async function dialog({ accept, text, tab: id }, control) {
-  const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt();
+  const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt(control);
   if (!tab) return { error: id != null ? `there is no tab ${id}` : 'no tab is open' };
   const open = dialogs.get(tab.id);
   if (!open) return { error: `no dialog is open on tab ${tab.id}` };
@@ -726,6 +988,187 @@ async function closeTab({ tab: id }, control) {
   control.acted = true;
   await chrome.tabs.remove(id);
   return { content: `Closed tab ${id} (${tab.title || tab.url || 'untitled'}).` };
+}
+
+// ---- Tabs Spindle opened ------------------------------------------------------------
+
+/** Tabs Spindle opened for a thread's work: with navigate's new_tab, or by a page on
+ * Spindle's click, key press or choice there (a link to a new tab, say). Kept in
+ * Chrome's session storage, one key per tab (`opened:<tab>` -> {thread, task, keep}), so
+ * a resting service worker still knows them; each closes once its thread's turn is done
+ * (`closeOpened`), unless the model kept it open for the user (`keep_open`) or the user
+ * pinned it. Files of a workspace opened for the user to read are not among them. */
+const OPENED = 'opened:';
+/** Until when the user writes in a Spindle panel's message box (said by panel.mjs): tabs
+ * Spindle opens meanwhile open behind the one showing, as Chrome gives the keys to a tab
+ * it shows, which would take them from the box mid-word. */
+const TYPING = 'typing';
+/** How far ahead a panel's word holds at most (a panel closed mid-word holds no longer). */
+const TYPING_MAX_MS = 60_000;
+/** A tab a thread opened behind the one showing (`quiet:THREAD`, `:task` for its tasks'). */
+const QUIET = 'quiet:';
+const QUIET_SAID = ' behind the one showing, as the user is writing in Spindle';
+const quietKey = (owner) => `${QUIET}${owner.thread}${owner.task ? ':task' : ''}`;
+
+/** Whether the user is writing in a Spindle panel now. */
+async function typing() {
+  const { [TYPING]: until = 0 } = await chrome.storage.session.get(TYPING).catch(() => ({}));
+  return Date.now() < until;
+}
+
+/** The tab `owner` (a thread, or its tasks) opened behind the one showing, while it is
+ * there and still not shown; shown since, or gone, it is let go of. */
+async function quietTab(owner) {
+  if (!owner?.thread) return null;
+  const key = quietKey(owner);
+  const { [key]: id } = await chrome.storage.session.get(key).catch(() => ({}));
+  if (!Number.isInteger(id)) return null;
+  const tab = await chrome.tabs.get(id).catch(() => null);
+  if (tab && !tab.active) return tab;
+  await chrome.storage.session.remove(key).catch(() => {});
+  return null;
+}
+/** How long after an action a window its page opens still counts as the action's. */
+const OPENED_GRACE_MS = 3000;
+/** The tools whose action may have a page open a tab. */
+const OPENING = new Set(['click', 'press', 'type', 'select', 'dialog']);
+/** Recent actions (`{owner, tab, from, to}`), windows pages Spindle's debugger holds said
+ * they open (`{source, url, at}`: Page.windowOpen), and tabs Chrome made (`{tab, url,
+ * at}`), matched by `claimOpened`; each forgotten after `RECENT_MS`. (A tab's
+ * openerTabId does not say: Chrome gives the tab active at the time, not the page.) */
+const actions = [];
+const opens = [];
+const born = [];
+const RECENT_MS = 30_000;
+/** How far apart a page's word that it opens a window and the tab Chrome makes for it
+ * may come. */
+const MATCH_MS = 5000;
+/** How long a tab made with no address yet is waited on for Chrome to say it. */
+const ADDRESS_WAIT_MS = 1500;
+/** Opening actions under way: tabs are watched while any is, and until no window one
+ * of them may have opened can still come (`watchEnd` ends it then). */
+let opening = 0;
+let watchEnd = null;
+/** Records being written: `closeOpened` waits for them. */
+const noting = new Set();
+
+function noteOpened(tabId, owner) {
+  const write = chrome.storage.session.set({ [`${OPENED}${tabId}`]: { thread: owner.thread, task: Boolean(owner.task), keep: Boolean(owner.keep) } }).catch(() => {});
+  noting.add(write);
+  write.finally(() => noting.delete(write));
+  return write;
+}
+
+/** A tab Chrome made for a window a page opened during (or just after) one of Spindle's
+ * actions on that page: the action's thread's. */
+function claimOpened() {
+  const now = Date.now();
+  for (const list of [actions, opens, born]) {
+    for (let at = list.length - 1; at >= 0; at--) if ((list[at].to ?? list[at].at) < now - RECENT_MS) list.splice(at, 1);
+  }
+  for (let at = born.length - 1; at >= 0; at--) {
+    const made = born[at];
+    let by = null;
+    // The same address (a window opened with none is a blank page). A tab whose address
+    // Chrome does not say is never matched: it may be the user's own new tab, whose
+    // address (chrome://newtab) is hidden from extensions; left open is the safe side.
+    const open = opens.find((one) => Math.abs(one.at - made.at) <= MATCH_MS && made.url === (one.url || 'about:blank')
+      && (by = actions.find((action) => action.tab === one.source && one.at >= action.from && one.at <= action.to)));
+    if (!open) continue;
+    born.splice(at, 1);
+    opens.splice(opens.indexOf(open), 1);
+    noteOpened(made.tab, by.owner);
+  }
+  // Watched no longer than needed: while the service worker is up, each event a listener
+  // takes keeps it up, and tabs change all day.
+  clearTimeout(watchEnd);
+  watchEnd = null;
+  if (opening) return;
+  const until = Math.max(0, ...actions.map((action) => action.to + MATCH_MS));
+  if (until > now) watchEnd = setTimeout(claimOpened, until - now + 50);
+  else unwatchTabs();
+}
+
+/** New tabs, watched only while a thread's action may open one, a few seconds at a time
+ * (never the whole day: a listener added here does not wake a resting service worker for
+ * each tab the user opens, and is taken off again by `claimOpened`). */
+function tabMade(tab) {
+  if (tab.id == null) return;
+  const made = { tab: tab.id, url: tab.pendingUrl || tab.url || '', at: Date.now() };
+  born.push(made);
+  if (!made.url) {
+    // Made before its first address was set (a link's new tab is): Chrome says it once
+    // the tab starts loading, or it is looked at once more after a moment.
+    made.known = new Promise((resolve) => { made.found = resolve; });
+    setTimeout(() => chrome.tabs.get(made.tab).then((now) => addressed(made.tab, now.pendingUrl || now.url), () => addressed(made.tab)), ADDRESS_WAIT_MS);
+  }
+  claimOpened();
+}
+function addressed(tabId, url = '') {
+  const made = born.find((one) => one.tab === tabId && one.found);
+  if (!made) return;
+  if (url) made.url = url;
+  made.found();
+  delete made.found;
+  claimOpened();
+}
+function tabChanged(tabId, change, tab) {
+  const url = tab?.pendingUrl || tab?.url || change?.url;
+  if (url) addressed(tabId, url);
+}
+let watching = false;
+function watchTabs() {
+  if (watching) return;
+  watching = true;
+  chrome.tabs.onCreated.addListener(tabMade);
+  chrome.tabs.onUpdated?.addListener(tabChanged);
+}
+function unwatchTabs() {
+  if (!watching || born.some((made) => made.found)) return;
+  watching = false;
+  chrome.tabs.onCreated.removeListener(tabMade);
+  chrome.tabs.onUpdated?.removeListener(tabChanged);
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => { chrome.storage.session.remove(`${OPENED}${tabId}`).catch(() => {}); });
+
+/** Closes the tabs Spindle opened for `thread`: its turns' (`tasks`: its background
+ * tasks' too). Each is forgotten; one the model kept open for the user, one the user
+ * pinned, or one no longer showing a web page is left open. */
+async function closeOpened(thread, { tasks = false } = {}) {
+  if (!thread) return;
+  // A tab made just now whose address Chrome has yet to say, and records being written,
+  // may be this turn's: waited on (a moment at most).
+  const pending = born.filter((made) => made.found).map((made) => made.known);
+  if (pending.length) await Promise.race([Promise.all(pending), pause(ADDRESS_WAIT_MS + 500)]);
+  await Promise.allSettled([...noting]);
+  const kept = await chrome.storage.session.get(null);
+  const mine = Object.entries(kept).filter(([key, owner]) => key.startsWith(OPENED) && owner?.thread === thread && (tasks || !owner.task));
+  if (!mine.length) return;
+  await chrome.storage.session.remove(mine.map(([key]) => key));
+  let closing = [];
+  for (const [key, owner] of mine) {
+    if (owner.keep) continue;
+    const tab = await chrome.tabs.get(Number(key.slice(OPENED.length))).catch(() => null);
+    // A web page, or one still loading its first (its address pending until then).
+    if (!tab || tab.pinned || !(webTab(tab) || (!tab.url && /^https?:/.test(tab.pendingUrl ?? '')))) continue;
+    closing.push(tab);
+  }
+  // A browser window holding only these keeps its active one: closing them all would
+  // close the window (and the panel beside it). A popup a page opened goes whole.
+  for (const windowId of new Set(closing.map((tab) => tab.windowId))) {
+    if ((await Promise.resolve(chrome.windows?.get(windowId)).catch(() => null))?.type === 'popup') continue;
+    const all = await chrome.tabs.query({ windowId }).catch(() => []);
+    const here = closing.filter((tab) => tab.windowId === windowId);
+    if (all.length > here.length) continue;
+    const stays = here.find((tab) => tab.active) ?? here[0];
+    closing = closing.filter((tab) => tab !== stays);
+  }
+  closing = closing.map((tab) => tab.id);
+  if (closing.length) await chrome.tabs.remove(closing).catch(async () => {
+    // One already gone takes the others' close with it: each on its own then.
+    for (const id of closing) await chrome.tabs.remove(id).catch(() => {});
+  });
 }
 
 // ---- Chrome's debugger: input as the user's, dialogs, and a tab's network ------------
@@ -777,6 +1220,8 @@ function onTab(tabId, work) {
  * that dialog only); callers waiting for one. */
 const dialogs = new Map();
 const dialogWaiters = new Map();
+/** Tabs where a click opened a file dialog Chrome caught (`click`). */
+const choosers = new Set();
 /** Tabs whose network is watched -> their requests, oldest first, by entry id. */
 const watched = new Map();
 const MAX_REQUESTS = 500;
@@ -796,6 +1241,9 @@ async function attach(tabId) {
       } catch (error) {
         // Spindle's own earlier attach (before this worker last rested) still holds.
         if (!/already attached/i.test(error.message)) throw new Error(`${BROWSER} would not let Spindle act on tab ${tabId}: ${error.message}`);
+        // A click that worker cut off may have left Chrome catching file dialogs there:
+        // off again (not waited for past a moment: a page dialog may hold the page).
+        await deadline(chrome.debugger.sendCommand({ tabId }, 'Page.setInterceptFileChooserDialog', { enabled: false }), 1_000, `tab ${tabId}`).catch(() => {});
       }
       attached.set(tabId, setTimeout(() => idleDetach(tabId), 20_000));
       // Dialogs are said as they open (an action waiting on one would wait forever).
@@ -813,8 +1261,7 @@ async function cdp(tabId, method, params = {}, control) {
   check(control);
   // Input and a dialog's answer act on the page; a picture or the network only look.
   if (control && /^Input\.|^Page\.handleJavaScriptDialog$/.test(method)) control.acted = true;
-  clearTimeout(attached.get(tabId));
-  attached.set(tabId, watched.has(tabId) ? null : setTimeout(() => idleDetach(tabId), 20_000));
+  keepAttached(tabId);
   // A dialog the command opened ends the wait for it (it answers once the dialog is).
   let opened;
   const dialogOpened = new Promise((resolve) => {
@@ -830,11 +1277,18 @@ async function cdp(tabId, method, params = {}, control) {
   }
 }
 
+/** The debugger stays on `tabId` for another idle while (none while its network is watched). */
+function keepAttached(tabId) {
+  clearTimeout(attached.get(tabId));
+  attached.set(tabId, watched.has(tabId) ? null : setTimeout(() => idleDetach(tabId), 20_000));
+}
+
 function forget(tabId) {
   clearTimeout(attached.get(tabId));
   attached.delete(tabId);
   watched.delete(tabId);
   dialogs.delete(tabId);
+  choosers.delete(tabId);
 }
 
 function detach(tabId) {
@@ -864,12 +1318,18 @@ chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
   if (reason === 'canceled_by_user') veto(tabId).catch(() => {});
 });
 chrome.debugger.onEvent.addListener(({ tabId }, method, params) => {
-  if (method === 'Page.javascriptDialogOpening') {
+  if (method === 'Page.fileChooserOpened') {
+    choosers.add(tabId);
+  } else if (method === 'Page.javascriptDialogOpening') {
     dialogs.set(tabId, { id: crypto.randomUUID(), type: params.type, message: String(params.message ?? '').slice(0, 500), at: Date.now() });
     for (const resolve of dialogWaiters.get(tabId) ?? []) resolve();
     dialogWaiters.delete(tabId);
   } else if (method === 'Page.javascriptDialogClosed') {
     dialogs.delete(tabId);
+  } else if (method === 'Page.windowOpen') {
+    // A link to a new tab, window.open...: its tab is the thread's if Spindle's action did it.
+    opens.push({ source: tabId, url: String(params.url ?? ''), at: Date.now() });
+    claimOpened();
   } else {
     recordNetwork(tabId, method, params);
   }
@@ -895,7 +1355,7 @@ chrome.permissions.onRemoved.addListener(async ({ origins = [] }) => {
   if (origins.some((origin) => PAGE_ACCESS.includes(origin))) {
     // Before acting (`confirm`) is the user's choice for when actions come back: kept.
     const kept = await read('kv', 'pages').catch(() => null);
-    await write('kv', 'pages', { ...(kept ?? {}), reading: false, acting: false }).catch(() => {});
+    await write('kv', 'pages', pagesRecord(kept, { reading: false, acting: false })).catch(() => {});
   }
   await letGo().catch(() => {});
 });
@@ -933,13 +1393,13 @@ function recordNetwork(tabId, method, params) {
 async function network({ action, tab: id, filter, body }, control) {
   if (action === 'stop') {
     // Whatever the tab shows now (it may have left the web).
-    const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt();
+    const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt(control);
     if (!tab) return { error: id != null ? `there is no tab ${id}` : 'no tab is open' };
     if (watched.has(tab.id)) await cdp(tab.id, 'Network.disable', {}, control).catch(() => {});
     detach(tab.id);
     return { content: `Stopped watching tab ${tab.id}'s network.` };
   }
-  const tab = await pageTab(id);
+  const tab = await pageTab(id, control);
   if (action === 'start') {
     const log = watched.get(tab.id) ?? new Map();
     watched.set(tab.id, log);
@@ -1049,6 +1509,7 @@ function inPage(op, args) {
     const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
     return flat.length > most ? `${flat.slice(0, most - 1)}…` : flat;
   };
+  const isFile = (element) => element?.tagName === 'INPUT' && element.type === 'file';
   const refOf = (element) => {
     let ref = state.ids.get(element);
     if (!ref) {
@@ -1071,12 +1532,22 @@ function inPage(op, args) {
   };
   const shown = (element) => {
     if (element.closest('[aria-hidden="true"], [hidden]')) return false;
-    const style = getComputedStyle(element);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+    // checkVisibility (Chrome 105 and later) answers without a style computation of
+    // its own; an element with no box of its own (display: contents) is looked at.
+    let style = null;
+    if (typeof element.checkVisibility === 'function') {
+      if (!element.checkVisibility({ visibilityProperty: true })) {
+        style = getComputedStyle(element);
+        if (style.display !== 'contents' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+      }
+    } else {
+      style = getComputedStyle(element);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+    }
     const box = element.getBoundingClientRect();
-    return box.width > 0 || box.height > 0 || style.display === 'contents' || element.childElementCount > 0;
+    return box.width > 0 || box.height > 0 || element.childElementCount > 0 || (style ?? getComputedStyle(element)).display === 'contents';
   };
-  const INPUTS = { checkbox: 'checkbox', radio: 'radio', button: 'button', submit: 'button', reset: 'button', image: 'button', file: 'button', range: 'slider', search: 'searchbox', number: 'spinbutton', hidden: null };
+  const INPUTS = { checkbox: 'checkbox', radio: 'radio', button: 'button', submit: 'button', reset: 'button', image: 'button', file: 'file', range: 'slider', search: 'searchbox', number: 'spinbutton', hidden: null };
   const TAGS = {
     BUTTON: 'button', SELECT: 'combobox', TEXTAREA: 'textbox', IMG: 'img', H1: 'heading', H2: 'heading', H3: 'heading',
     H4: 'heading', H5: 'heading', H6: 'heading', NAV: 'navigation', MAIN: 'main', HEADER: 'banner', FOOTER: 'contentinfo',
@@ -1094,9 +1565,9 @@ function inPage(op, args) {
     if (element.hasAttribute('onclick') || (element.hasAttribute('tabindex') && element.tabIndex >= 0)) return 'clickable';
     return null;
   };
-  const ACTIONABLE = new Set(['link', 'button', 'textbox', 'searchbox', 'checkbox', 'radio', 'combobox', 'slider', 'option', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'switch', 'listbox', 'spinbutton', 'treeitem', 'clickable']);
+  const ACTIONABLE = new Set(['link', 'button', 'file', 'textbox', 'searchbox', 'checkbox', 'radio', 'combobox', 'slider', 'option', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'switch', 'listbox', 'spinbutton', 'treeitem', 'clickable']);
   // Parts with nothing to act on inside them (the others are read into when they hold any).
-  const LEAVES = new Set(['button', 'textbox', 'searchbox', 'checkbox', 'radio', 'option', 'slider', 'spinbutton', 'switch', 'menuitemcheckbox', 'menuitemradio', 'img']);
+  const LEAVES = new Set(['button', 'file', 'textbox', 'searchbox', 'checkbox', 'radio', 'option', 'slider', 'spinbutton', 'switch', 'menuitemcheckbox', 'menuitemradio', 'img']);
   const NAMED_BY_TEXT = new Set(['link', 'button', 'heading', 'option', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'cell', 'columnheader', 'switch', 'treeitem', 'clickable', 'checkbox', 'radio']);
   const FIELDS = new Set(['textbox', 'searchbox', 'spinbutton', 'combobox']);
   const nameOf = (element, role) => {
@@ -1144,6 +1615,12 @@ function inPage(op, args) {
     else if (FIELDS.has(role) || role === 'slider') {
       if ('value' in element) facts.push(`value="${element.type === 'password' ? '•'.repeat(Math.min(element.value.length, 8)) : clean(element.value, 80)}"`);
     }
+    if (isFile(element)) {
+      if (element.accept) facts.push(`accepts="${clean(element.accept, 80)}"`);
+      if (element.multiple) facts.push('multiple');
+      facts.push(element.files?.length ? `holds="${clean([...element.files].map((file) => file.name).join(', '), 120)}"` : 'empty');
+      if (!shown(element)) facts.push('hidden');
+    }
     if (element.required) facts.push('required');
     if (role === 'link') {
       const href = hrefOf(element);
@@ -1166,6 +1643,30 @@ function inPage(op, args) {
   const editable = (element) =>
     element.isContentEditable || element.tagName === 'TEXTAREA' ||
     (element.tagName === 'INPUT' && !['checkbox', 'radio', 'button', 'submit', 'reset', 'image', 'file', 'range', 'color', 'hidden'].includes(element.type));
+  // The file field a part stands for: itself, the field its label names, or the one file
+  // field in it or a few levels around it (a styled button beside its hidden field),
+  // never a guess between two.
+  const fileFieldOf = (element) => {
+    if (isFile(element)) return element;
+    const label = element.closest?.('label');
+    if (label && isFile(label.control)) return label.control;
+    for (let at = element, up = 0; at && up < 4; at = at.parentElement, up += 1) {
+      const found = at.querySelectorAll('input[type="file"]');
+      if (found.length) return found.length === 1 ? found[0] : null;
+    }
+    return null;
+  };
+  // A part's words, as the user is shown them when asked (a field's are not what it
+  // holds, which changes as it is typed in), and where it leads: a link's address, or the
+  // address a submit button sends its form to, as the page wrote them (not resolved
+  // against the page's own address, which a page may change as it goes).
+  const wordsOf = (element) => (editable(element) ? '' : clean(element.innerText || (element.type === 'password' ? '' : element.value) || element.getAttribute('aria-label') || element.title || '', 300));
+  const destOf = (element) => {
+    const link = element.closest?.('a[href], area[href]');
+    if (link) return link.getAttribute('href');
+    if (!element.form || (element.type !== 'submit' && element.type !== 'image')) return null;
+    return element.getAttribute('formaction') ?? element.form.getAttribute('action') ?? '';
+  };
 
   try {
     if (op === 'parts') {
@@ -1173,12 +1674,50 @@ function inPage(op, args) {
       let size = 0;
       let cut = false;
       let deeper = false;
-      const emit = (indent, text) => {
+      const put = (indent, text) => {
         if (cut) return;
         const line = `${'  '.repeat(indent)}- ${text}`;
         size += line.length + 1;
         if (size > args.max) cut = true;
         else lines.push(line);
+      };
+      // `find`: only the parts whose line matches (`/pattern/flags` as a regular
+      // expression, else words, case insensitive), each under the parts above it (the
+      // last line at each level above, once), so a match keeps its place in the page.
+      let matcher = null;
+      if (args.find) {
+        const pattern = /^\/(.+)\/([a-z]*)$/s.exec(args.find);
+        if (pattern) {
+          try {
+            const regexp = new RegExp(pattern[1], pattern[2].includes('i') ? pattern[2] : `${pattern[2]}i`);
+            matcher = (text) => regexp.test(text);
+          } catch {
+            matcher = null;
+          }
+        }
+        if (!matcher) {
+          const needle = String(args.find).toLowerCase();
+          matcher = (text) => text.toLowerCase().includes(needle);
+        }
+      }
+      const trail = [];
+      let matches = 0;
+      const emit = (indent, text) => {
+        if (cut) return;
+        if (!matcher) return put(indent, text);
+        trail.length = indent + 1;
+        trail[indent] = { text, shown: false };
+        if (!matcher(text)) return;
+        matches += 1;
+        for (let level = 0; level < indent; level += 1) {
+          const above = trail[level];
+          if (above && !above.shown) {
+            above.shown = true;
+            put(level, above.text);
+          }
+        }
+        trail[indent].shown = true;
+        put(indent, text);
       };
       // Depth counts the outline's levels (wrappers without a part of their own do not);
       // a guard keeps pathological nesting from overflowing.
@@ -1197,7 +1736,8 @@ function inPage(op, args) {
             continue;
           }
           if (child.nodeType !== Node.ELEMENT_NODE || ['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'LINK', 'META'].includes(child.tagName)) continue;
-          if (!args.hidden && !shown(child)) continue;
+          // A file field hidden behind a styled button still shows: it is what takes files.
+          if (!args.hidden && !shown(child) && !isFile(child)) continue;
           if (child.tagName === 'IFRAME' || child.tagName === 'FRAME') {
             emit(indent, `frame "${clean(child.title || child.src, 80)}" (its inside is not read)`);
             continue;
@@ -1227,22 +1767,31 @@ function inPage(op, args) {
       if (args.ref) emit(0, `${describe(root)} [${args.ref}]`);
       if (root) walk(root, args.ref ? 1 : 0, 0);
       if (deeper) lines.push(`[parts nested deeper than ${args.depth} levels left out: read them with a ref, or a larger depth]`);
-      if (cut) lines.push('[more of the page: ask with a ref, a lower depth or a larger max_chars]');
+      if (cut) lines.push(matcher ? '[more matches: ask with a narrower find, a ref or a larger max_chars]' : '[more of the page: ask with a ref, a lower depth or a larger max_chars]');
+      if (matcher) lines.unshift(matches ? `[${matches} part${matches === 1 ? '' : 's'} match ${JSON.stringify(args.find)}, each under the parts above it]` : `[no part matches ${JSON.stringify(args.find)}]`);
       return { value: { url: location.href, title: document.title, text: lines.join('\n') || '(nothing shown)' } };
     }
     // A part the user was asked about is acted on only while it is what they were shown:
-    // its role and words, numbers and punctuation aside (a count or a time it shows may
-    // change on its own; "Save draft" becoming "Send", or an icon "➤" becoming "🗑", may
-    // not).
-    const gist = (text) => String(text).toLowerCase().replace(/[\p{N}\p{P}]+/gu, ' ').replace(/\s+/g, ' ').trim();
+    // its role and name, its words (numbers included: "Pay $10" becoming "Pay $10000" is
+    // another action, and a count that changed only asks again) and where it leads.
+    const gist = (text) => String(text ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
     const asShown = (element) => {
-      if (args.what && gist(describe(element)) !== gist(args.what)) {
-        throw new Error(`[${args.ref}] is now ${describe(element)}, not the ${args.what} the user allowed this on, so it was not done; it can be asked about again`);
-      }
+      if (!args.what) return element;
+      const now = describe(element);
+      const changed = gist(now) !== gist(args.what) ? `${now}, not the ${args.what}`
+        : args.words != null && gist(wordsOf(element)) !== gist(args.words) ? `${now} saying ${JSON.stringify(wordsOf(element))}, not ${JSON.stringify(args.words)} as`
+        : args.dest !== undefined && destOf(element) !== args.dest ? `${now} leading to ${destOf(element) ?? 'nowhere'}, not ${args.dest ?? 'nowhere'} as`
+        : null;
+      if (changed) throw new Error(`[${args.ref}] is now ${changed} the user allowed this on, so it was not done; it can be asked about again`);
       return element;
     };
     if (op === 'point') {
       const element = asShown(elementOf(args.ref));
+      // A file field (or its label) opens a file dialog: said before it is measured (a
+      // hidden one takes no room), nothing scrolled.
+      if (isFile(element) || (element.tagName === 'LABEL' && isFile(element.control))) {
+        return { value: { what: describe(element), covered: null, field: false, file: true } };
+      }
       element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
       // The first of its boxes that is on screen (a link wrapping two lines has two).
       const boxes = [...element.getClientRects()].filter((box) => box.width && box.height);
@@ -1255,7 +1804,7 @@ function inPage(op, args) {
       const top = (typeof tree.elementFromPoint === 'function' ? tree : document).elementFromPoint(x, y);
       const own = top && (top === element || element.contains(top) || (top instanceof HTMLLabelElement && top.control === element));
       const covered = top && !own ? describe(top) : null;
-      return { value: { x, y, what: describe(element), covered, field: editable(element) } };
+      return { value: { x, y, what: describe(element), covered, field: editable(element), file: false } };
     }
     if (op === 'caret') {
       const element = elementOf(args.ref);
@@ -1285,7 +1834,56 @@ function inPage(op, args) {
       // A field's words are its label, never what it holds when that is a password.
       const value = element.type === 'password' ? '' : element.value;
       const label = clean(element.innerText || value || element.getAttribute('aria-label') || element.title || '', 120);
-      return { value: { what: describe(element), submits, label } };
+      return { value: { what: describe(element), submits, label, words: wordsOf(element), dest: destOf(element) } };
+    }
+    if (op === 'focused') {
+      let element = document.activeElement;
+      while (element?.shadowRoot?.activeElement) element = element.shadowRoot.activeElement;
+      if (!element || element === document.body || element === document.documentElement) return { value: null };
+      return { value: { ref: refOf(element), what: describe(element) } };
+    }
+    // A file's bytes come in parts (`first`: a new upload, so what an earlier one left goes).
+    if (op === 'file_part') {
+      if (args.first || !state.uploads) state.uploads = new Map();
+      if (args.drop) return { value: true };
+      if (!state.uploads.has(args.key)) state.uploads.set(args.key, []);
+      (state.uploads.get(args.key)[args.index] ??= []).push(String(args.data));
+      return { value: true };
+    }
+    if (op === 'files') {
+      const parts = state.uploads?.get(args.key) ?? [];
+      state.uploads?.delete(args.key);
+      const element = asShown(elementOf(args.ref));
+      const field = fileFieldOf(element);
+      if (!field) throw new Error(`${describe(element)} [${args.ref}] has no one file field in or beside it: read page_elements (file fields show there; one inside a hidden part shows with hidden: true) and give the field's ref`);
+      if (field.disabled) throw new Error(`${describe(field)} is disabled`);
+      if (args.files.length > 1 && !field.multiple) throw new Error(`${describe(field)} takes one file`);
+      const rules = field.accept.split(',').map((rule) => rule.trim().toLowerCase()).filter(Boolean);
+      // A type Spindle does not know (none) is not held against a rule naming one.
+      const takes = (file) => !rules.length || rules.some((rule) => (rule.startsWith('.') ? file.name.toLowerCase().endsWith(rule)
+        : !file.type || (rule.endsWith('/*') ? file.type.startsWith(rule.slice(0, -1)) : rule === file.type)));
+      const refused = args.files.find((file) => !takes(file));
+      if (refused) throw new Error(`${describe(field)} takes ${field.accept}, not ${refused.name}`);
+      const decode = (text) => {
+        const binary = atob(text);
+        const bytes = new Uint8Array(binary.length);
+        for (let at = 0; at < binary.length; at += 1) bytes[at] = binary.charCodeAt(at);
+        return bytes;
+      };
+      const chosen = new DataTransfer();
+      args.files.forEach((file, index) => {
+        const made = new File((parts[index] ?? []).map(decode), file.name, { type: file.type });
+        if (made.size !== file.size) throw new Error(`${file.name} did not reach the page whole`);
+        chosen.items.add(made);
+      });
+      field.files = chosen.files;
+      // The page hears it as a pick once this script has returned (a handler that opens
+      // a dialog then holds the page, not this script).
+      setTimeout(() => {
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+      }, 0);
+      return { value: { what: describe(field), field: refOf(field), put: [...chosen.files].map((file) => `${file.name} (${file.size} bytes)`) } };
     }
     if (op === 'value') {
       const element = elementOf(args.ref);

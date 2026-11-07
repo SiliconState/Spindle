@@ -197,6 +197,9 @@ pub struct Settings {
     pub effort: Effort,
     /// How older history is compacted when it outgrows the model's window.
     pub compaction: Compaction,
+    /// Compact once history passes about this many tokens, even when the model's window
+    /// holds more (a smaller history costs less per request); None: at the window only.
+    pub compact_tokens: Option<u64>,
     /// Dollar budget for the thread (None: unlimited). A model request whose worst case
     /// would take the thread's spend past it is not sent; nested calls count too.
     pub max_usd: Option<f64>,
@@ -467,7 +470,44 @@ pub enum StartState {
     Exact(Vec<u8>),
 }
 
+/// `compact_tokens` a new session starts with: requests stay far below the largest
+/// windows (each one sends the whole history again).
+pub const COMPACT_TOKENS: u64 = 256_000;
+/// The fewest `compact_tokens` a session can set (and the most).
+pub const COMPACT_TOKENS_RANGE: std::ops::RangeInclusive<u64> = 16_000..=100_000_000;
+
+/// The history bytes a budget of `tokens` keeps: about 2.4 bytes per token (a
+/// conservative reading of the stored history's size in tokens).
+pub fn token_bytes(tokens: u64) -> usize {
+    usize::try_from(tokens.saturating_mul(3) / 10 * 8).unwrap_or(usize::MAX)
+}
+
+/// `compact_tokens` as JSON gives it: a count in range, or None for 0 or null.
+pub fn compact_tokens(value: &Value) -> Result<Option<u64>> {
+    match value {
+        Value::Null => Ok(None),
+        value => match value.as_u64() {
+            Some(0) => Ok(None),
+            Some(tokens) if COMPACT_TOKENS_RANGE.contains(&tokens) => Ok(Some(tokens)),
+            _ => Err(format!(
+                "`compact_tokens` must be {}-{} tokens, or 0 or null for the model's window",
+                COMPACT_TOKENS_RANGE.start(),
+                COMPACT_TOKENS_RANGE.end()
+            )),
+        },
+    }
+}
+
 impl Settings {
+    /// The history a request keeps before older turns are compacted: the route's
+    /// `window` budget (bytes), or less where `compact_tokens` asks for less.
+    pub fn history_budget(&self, window: usize) -> usize {
+        match self.compact_tokens {
+            Some(tokens) => window.min(token_bytes(tokens)),
+            None => window,
+        }
+    }
+
     pub fn from_json(value: &Value) -> Result<Self> {
         if !value.is_object() {
             return Err("stored settings must be an object".into());
@@ -518,6 +558,8 @@ impl Settings {
         if !value["instructions"].is_null() && !value["instructions"].is_string() {
             return Err("stored settings: `instructions` must be text".into());
         }
+        let compact_tokens = compact_tokens(&value["compact_tokens"])
+            .map_err(|error| format!("stored settings: {error}"))?;
         let settings = Self {
             provider: value["provider"].as_str().unwrap_or_default().into(),
             model: value["model"].as_str().unwrap_or_default().into(),
@@ -544,6 +586,7 @@ impl Settings {
                 .as_str()
                 .and_then(Compaction::parse)
                 .unwrap_or_default(),
+            compact_tokens,
             max_usd: value["max_usd"]
                 .as_f64()
                 .filter(|max| max.is_finite() && *max >= 0.0),
@@ -615,6 +658,10 @@ impl Settings {
         }
         if self.runner != Runner::None {
             value["runner"] = json!(self.runner.as_str());
+        }
+        // Written only when set: a session without it reads as it always did.
+        if let Some(tokens) = self.compact_tokens {
+            value["compact_tokens"] = json!(tokens);
         }
         Ok(value)
     }

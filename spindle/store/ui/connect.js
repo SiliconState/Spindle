@@ -10,7 +10,7 @@
   async function post(path, body) {
     const response = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Spindle': '1'}, body: JSON.stringify(body)});
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || `The host answered ${response.status}.`);
+    if (!response.ok) throw Object.assign(new Error(data.error || `The host answered ${response.status}.`), {status: response.status});
     return data;
   }
   function asking() { $('connect-pair').hidden = true; $('connect-ask').hidden = false; $('allow').focus(); }
@@ -22,11 +22,18 @@
     try { await post('/api/pair', {key: $('pair-key').value}); $('pair-key').value = ''; asking(); }
     catch (error) { $('pair-error').textContent = error.message; }
   };
+  // A name already connected: the host says what allowing would replace, and a second
+  // Allow confirms it.
+  let replace = false;
   async function answer(allow) {
     const buttons = [$('allow'), $('deny')];
     for (const button of buttons) button.disabled = true;
-    try { const {redirect} = await post('/api/connect', {...ask, allow}); location.replace(redirect); }
-    catch (error) { $('connect-error').textContent = error.message; for (const button of buttons) button.disabled = false; }
+    try { const {redirect} = await post('/api/connect', {...ask, allow, replace}); location.replace(redirect); }
+    catch (error) {
+      $('connect-error').textContent = error.message;
+      if (error.status === 409 && allow) { replace = true; $('allow').textContent = 'Replace'; }
+      for (const button of buttons) button.disabled = false;
+    }
   }
   $('allow').onclick = () => answer(true);
   $('deny').onclick = () => answer(false);

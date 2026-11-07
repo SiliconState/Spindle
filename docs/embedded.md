@@ -125,8 +125,8 @@ message, and API faults use the fault's kind.
 | `Embedded.setRunner(identity)` / `setAppRunner(identity)` | Bind the remote runner's or the app runner's sandbox identity (64 hex digits, or `null`) |
 | `Embedded.setHttpGrants(json)` | The sites script `http()` calls may reach |
 | `Embedded.ownSession(dir, release)` | OPFS: the app holds `dir`'s Web Lock; `release` gives it back |
-| `Embedded.exportSession(dir, keep, settings, whole)` / `importSession(dir, bytes)` | Session bundles (see [Moving sessions](#moving-sessions)) |
-| `Embedded.checkBundle(bytes)` | Checks a bundle as an import would, writing nothing; returns JSON `{head, identity, files}` |
+| `Embedded.exportSession(dir, keep, settings, whole)` / `importSession(dir, bytes)` | Session bundles; the JS client defaults to copy (see [Moving sessions](#moving-sessions)) |
+| `Embedded.checkBundle(bytes)` | Checks a bundle as an import would, writing nothing; returns JSON `{head, identity, files, sourceState}` |
 | `Embedded.catalog()` / `efforts(provider, model)` | The catalog in use (no credentials); the effort levels a route accepts |
 | `installNodeFs(fs, platform)` | Gives the VFS its `fs` and registers it (see [Node storage](#node-and-electron-storage)) |
 | `nodeLockHolder(database)` | What a store's lock file says about its owner |
@@ -229,7 +229,7 @@ overlap, and each returns a Promise of its result. `prompt`, `resume`, `retry`,
 | `resume(dir, { expectedHead, until })` | `continue` |
 | `retry(dir, { expectedHead })`, `rewind(dir, revision, { expectedHead })` | `retry`, `rewind` |
 | `stop(dir)`, `steer(dir, text, { now })` | `stop`, `steer` (`now` asks for queued messages to be read now, cutting a streaming reply) |
-| `history(dir, revision, { from })`, `targets(dir, { limit })` | `history`, `targets` (default limit 48, clamped to 1-8192) |
+| `history(dir, revision, { from })`, `targets(dir, { limit, until })` | `history`, `targets` (default limit 48, clamped to 1-8192; `until: 'settled'` searches back to a completed turn) |
 | `files(dir, revision)`, `read(dir, path, revision)` | `files`; `read` returns a `Uint8Array` |
 | `settings(dir, changes)` | `settings` |
 | `state(dir, revision)`, `setState(dir, patch, { expectedHead })` | `state`, `state_set` |
@@ -239,8 +239,9 @@ overlap, and each returns a Promise of its result. `prompt`, `resume`, `retry`,
 | `taskStart(dir, task, prompt, options)` | `task_start`, with `report: 'wait'` or `'queue'` |
 | `tasks(dir)`, `taskWait(dir, task)`, `taskStop(dir, task)` | Task listing, current state (does not wait), and cancellation |
 | `compactSession(dir)` | Method `compact`: returns free store pages to disk; `{session, before, after, stores}` |
-| `exportSession(dir, { keep, settings, whole })` | A session bundle as a `Uint8Array` (see [Moving sessions](#moving-sessions)) |
-| `checkBundle(bytes)` | Synchronously checks the bundle whole, writing nothing; `{head, identity, files}` |
+| `exportSession(dir, { keep, settings, whole })`, `sealSession(dir, checked)` | A bundle as bytes, or a separate seal checked against that bundle's source fingerprint (see [Moving sessions](#moving-sessions)) |
+| `exportTask(dir, task)`, `dropTask(dir, task, { expectedState })` | Export a finished task, then free its store only if its fingerprint still matches; the report and counted spend stay |
+| `checkBundle(bytes)` | Synchronously checks the bundle whole, writing nothing; `{head, identity, files, sourceState}` |
 | `importSession(dir, bytes)` | Continues a bundle as `dir`; resolves with the status plus `imported` and `fit` |
 | `tool(definition)` | Registers an app tool (the same shape as the stdio client's; see [clients.md](clients.md#app-tools)) |
 | `connectRunner(kind, runner)` | Connects (or with `null`, disconnects) the `'app'` or `'remote'` runner and binds the sandbox identity it declares |
@@ -406,7 +407,9 @@ Every store is opened through `Store::from_connection` behind a guard that is re
 only after SQLite has closed. The store runs SQLite in exclusive locking mode with a
 zero busy timeout, so one connection uses a database at a time. Schema 19 migrates
 in place to schema 20, which packs workspace objects; older schemas need a native
-open first. Every store sets `journal_size_limit` to 16 MiB: after a checkpoint
+open first. Schema 20 stores widen atomically to 21 only when a step publishes more
+than eight intents (at most 256); both schemas are read as they are. Older binaries cannot read
+that widened store. Every store sets `journal_size_limit` to 16 MiB: after a checkpoint
 consumes a grown WAL, the file is truncated back to that limit rather than keeping
 its peak size.
 
@@ -434,10 +437,12 @@ through the VFS.
   a whole one, never an empty one. The file system must support hard links: there is
   no in-place fallback. The lock file is removed when the store closes after SQLite. A second owner (another client,
   another process or a native host) is refused, and its call fails with "another spindle
-  process or connection is using this session's store; ... (held by: <note>)". A lock
-  file left
-  by a crashed owner is never taken over automatically, because nothing can tell a dead
-  app from a live one. The session stays refused until an operator deletes the file.
+  process or connection is using this session's store; ... (held by: <note>)".
+  `nodeClient` supplies Linux owners with boot ID, PID namespace and process-start
+  time as well as PID and hostname. A crashed lock is reclaimed only in the same boot
+  and namespace when that exact process is gone (a reused PID has a different start
+  time). Other platforms, older notes and ambiguous owners remain refused until an
+  operator settles the lock. Native hosts still never reclaim embedded-owner fences.
   A native host writes no metadata into a store the package holds or a session sealed
   as moved, even after the package's SQLite connection has closed for a compaction.
 - **Other details.** Temporary files are not supported (SQLite's `temp_store` stays in
@@ -464,7 +469,7 @@ which are opened asynchronously and exclusively.
 and presents them as the synchronous `node:fs` calls the VFS makes. The same VFS then
 runs over that pool.
 
-- `openOpfsPool({ directory = 'spindle', slots = 48 })` opens or creates
+- `openOpfsPool({ directory = 'spindle', slots = 96, lowWater = 32 })` opens or creates
   `slot-<n>` files in that OPFS directory: at least `slots` of them, plus every slot an
   earlier `grow` added. It fails with `EBUSY` while another worker or tab holds the
   pool. It then reads every slot's header and settles what a crash left (see below).
@@ -481,7 +486,9 @@ runs over that pool.
   making progress fails with `EIO`, and a header read short fails the open), and each
   header write is flushed. `fsyncSync` is the handle's `flush()`. When no slot is free,
   opening a new file fails with `ENOSPC`. `free` counts the slots that hold no file (a
-  `lost` slot is not free), and `grow(count)` adds slots between operations.
+  `lost` slot is not free). Below `lowWater`, allocation schedules 64 more slots;
+  `lowWater: 0` disables automatic growth. `grow(count)` serializes explicit growth,
+  pool opening is serialized too, and closing during growth releases its new handles.
 - **Headers cut short.** A slot keeps its mark in every header written over it, so a
   header cut short, by a write that stopped part way or by power lost while the disk
   wrote only some of its sectors, fails its check: it is told from a whole one and
@@ -731,7 +738,8 @@ most 4096 files, and each sidecar is at most 4 MiB (`session.json` and `task.jso
 JSON). Reading checks the framing, then the manifest and the layout it describes
 (every path, none twice, the session's own store, each sidecar beside a store) before
 any file is taken, then every digest and every store (as a full check would); stores
-use schema 20 or schema 19, which migrates on open. Each `session.json` is rebuilt
+use schema 20 or 21, or an individual schema-19 store which migrates on open. The
+bundle manifest must name 20 or 21; a manifest naming 19 is refused. Each `session.json` is rebuilt
 from its store's own settings, and settings over 4 MiB are refused before they are
 kept. The package reads a bundle in memory, and all of this happens before it writes
 any file. A native host instead unpacks the bundle into a private staging directory
@@ -740,15 +748,22 @@ and checks it there, holding neither the bundle's files nor any store in memory 
 place's store after its sidecars and the session's own store last, so an import cut
 short leaves no session behind.
 
-`exportSession(dir, { keep, settings, whole })` is refused while an operation or
-background task runs. A move checks every store record before sealing. A copy
+`exportSession(dir, { keep = true, settings, whole })` copies by default and is
+refused while an operation or background task runs. For a move, first retain the
+bytes durably and read them back, then call
+`sealSession(dir, {expectedHead, expectedState})` using `bundleFacts(bytes).head`
+and `.sourceState`. A changed identity, head, settings, usage, task registry or
+child store refuses the seal. A read of usage alone does not change its fingerprint.
+`keep: false` exports and seals in one call; losing its returned bytes can leave
+only the sealed source, so this is not a safe substitute for durable retention.
+Native/HTTP exports still move by default, having written and checked their file first.
+A move checks every store record before sealing. A copy
 (`keep: true`) checks pages, schema and bundle facts; importing always checks every
 record. `whole: true` makes a copy do the full check too, for a backup the app may
-need to return to. It images
-the session's store and every task store (opening each, so nothing else runs it
-meanwhile) and writes the bundle. Unless `keep` is set, the session then moves: its
-place is sealed first (if sealing fails, nothing moves and no bundle is returned), its
-tasks' places are sealed on a best-effort basis, and the session closes in this app.
+need to return to. It images the session's store and every task store (opening each,
+so nothing else runs it meanwhile) and writes the bundle. With `keep: false`, the
+session's place is sealed first (if sealing fails, no bundle is returned), its tasks'
+places are sealed on a best-effort basis, and the session closes in this app.
 `settings` change only the bundle's copy, for the host it goes to. That includes
 settings this package refuses, such as `builtin_tools: 'all'`. The keys must be
 session settings, and `provider` and `model` must be named together.
@@ -758,13 +773,24 @@ with `conflict`). It writes the files in bundle order, opens the session (the sa
 session, with its identity, history and unknown outcomes), and resolves with its
 status plus `imported: {head, identity, files}` and `fit: {changes, notes, refused}`.
 `fit` changes nothing itself. `checkBundle(bytes)` performs the same whole check
-without importing or writing files, returning `{head, identity, files}`.
+without importing or writing files, returning `{head, identity, files, sourceState}`.
 
 On the native side, bundles are made and continued with
 `spindle --dir DIR export-session FILE [--keep]` and
 `spindle --dir NEW import-session FILE`, or with the API methods `export_session` and
 `import_session` ([cli.md](cli.md), [API.md](API.md)). Keeping a copy (`keep`) leaves
 two usable copies of one session. Continue only one of them.
+
+### Freeing task stores
+
+`exportTask(dir, task)` returns a finished task as its own fully checked session
+bundle. After retaining and reading those bytes, `dropTask(dir, task,
+{expectedState: bundleFacts(bytes).sourceState})` frees its directory. The report
+and answer stay; its spend moves into the parent's ledger once, before removal.
+A changed fingerprint refuses removal. Without `expectedState`, no saved-copy
+comparison is made. Interrupted removal is swept on the next open. Running or
+still-needed tasks are refused. Feature: `task_storage`; method `task_drop` takes
+`{dir, task, at, expected_state}` (`at` is Unix seconds from the app's clock).
 
 ### In-place moves (Node)
 
@@ -785,7 +811,7 @@ package cannot see a native host's flock, so a native owner also holds this file
 
 | Fence note begins with | Written by | Effect |
 | --- | --- | --- |
-| `spindle-embed: ` | A package owner (Node) while the store is open | Every other owner is refused. A crashed owner's fence is never taken over, by the package or by a native host |
+| `spindle-embed: ` | A package owner (Node) while the store is open | Other owners are refused; Linux `nodeClient` may reclaim a provably dead same-boot, same-PID-namespace owner. Native hosts and ambiguous checks refuse it. |
 | `spindle-native ` | A native owner while it holds the store | The package is refused. A native host takes over a fence left by a native owner that is gone (its flock is free) |
 | `spindle-moved: ` | An export without `keep` | Every host refuses this copy, saying the session moved and quoting the note. Deleting the fence makes this copy the session again, which is an operator's choice |
 
@@ -814,7 +840,10 @@ key without the claim is refused before anything is reserved), or adds the heade
 An app that signs its user in to ChatGPT (an OAuth sign-in, as Spindle for Browser does)
 returns the access token as the key; refreshing it is the app's, before it answers
 `credentials`. Anthropic's subscription sign-in is not supported here: an Anthropic key
-goes in `x-api-key`. The package receives only `{kind: 'authorized'}`. For the
+goes in `x-api-key`. The package receives only `{kind: 'authorized'}`. Its default `codex-signin` feature
+also exposes the legacy `chatgpt` profile; `--no-default-features` leaves that profile
+out, not the `chatgpt-plan` contract or OpenAI's Sign in with ChatGPT profile. Sign-in
+and token refresh remain the app's responsibility. For the
 `anthropic-messages` contract the client also sends
 `anthropic-dangerous-direct-browser-access: true`, which that API requires of requests
 that carry an `Origin`. The catalog the package returns holds no credentials, and
@@ -829,7 +858,7 @@ model writes the summary, which is another authorized and fetched request; the d
 stands in when it fails), `isolation: 'auto'`, `effort: 'default'` and `runner:
 'none'`. `create` and `settings` accept `provider`, `model`, `network`, `isolation`,
 `effort`, `compaction`, `tools`, `builtin_tools`, `instructions`, `resend_unknown`,
-`tasks`, `runner` and `max_usd`, plus `toolchain` and `sources` only in their cleared
+`tasks`, `runner`, `compact_tokens` and `max_usd`, plus `toolchain` and `sources` only in their cleared
 forms (`false`, `[]`).
 `network` is passed to the runner as the session's grant.
 
@@ -884,10 +913,13 @@ tasks. After an app restart, the next turn reattaches them; reads do not. Unknow
 requests are never resent: such a child stops and reports why. Starting the same
 task id again requires matching input, resumes a stopped child and does not rerun
 a finished one. Depth, model policy, route and effort are checked before retention.
-Under a budget, child settings may narrow the parent's cap, and all open hosts of
+Under a budget, child settings may narrow the parent's cap. Open hosts of
 the task tree share spend and worst-case in-flight reservations, including nested
-calls and summaries. After a restart, earlier child spend counts in its own store
-only. Sources: [`host.rs`](../spindle/store/src/embedded/host.rs) and
+calls and summaries. On reopen, retained task stores are counted recursively before
+new work; unreadable task spend refuses a budgeted run rather than counting as zero.
+Changing from no budget to a budget also counts earlier task spend. A finished task's
+store can be exported with `exportTask` and freed with `dropTask`; its retained spend
+then stays in the parent's ledger, counted once. Sources: [`host.rs`](../spindle/store/src/embedded/host.rs) and
 [`env.rs`](../spindle/store/src/embedded/env.rs).
 
 Other limits that follow from the code:
@@ -896,10 +928,12 @@ Other limits that follow from the code:
   packs never become active.
 - Providers that sign in by transforming the key are refused (a ChatGPT sign-in's
   account header is filled from the token's claim; see [Credentials](#credentials)).
-- The Node VFS has no temporary files, and a lock file left by a crashed owner needs
-  an operator to remove it.
-- OPFS storage needs a Dedicated Worker. A pool belongs to one worker at a time and
-  holds as many files as it has slots. A session leaves OPFS only by bundle.
+- The Node VFS has no temporary files. Linux `nodeClient` may reclaim a crashed
+  owner's lock only when its boot, PID namespace and process-start identity match
+  and the recorded process is gone; ambiguous locks still need operator review.
+- OPFS storage needs a Dedicated Worker. A pool belongs to one worker at a time;
+  it grows asynchronously when free slots run low. A synchronous allocation can
+  still fail with `ENOSPC` before growth finishes. A session leaves OPFS only by bundle.
 - Memory sessions do not outlive the client.
 - Remote runs need a `spindle serve` host with a sandbox. Their workspaces are limited
   to 48 MiB and their timeouts to 1800 seconds.

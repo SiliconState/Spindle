@@ -7,16 +7,41 @@ use std::path::Path;
 use std::time::Duration;
 
 const APP_ID: i64 = 0x53504e44;
-const SCHEMA: i64 = 20;
-/// Older schemas that migrate in place on open: 14 kept every value uncompressed, 15
-/// compressed each value on its own; 16 added shared chunks, a validation watermark
-/// and recorded provider refusals; 17 adds app state and the open/crash record; 20
-/// keeps objects deflated where that pays (`artifact::pack`).
+/// The newest schema this build reads and writes (`CAPABILITIES.schema`). 21 has the
+/// tables of 20 (`PREVIOUS_SCHEMA`); a store moves to it in the transaction that first
+/// commits a step of more than `transition::NARROW_EFFECTS` intents (`widen`), which
+/// builds of schema 20 cannot read: they refuse it by its number, as a newer schema.
+const SCHEMA: i64 = 21;
+/// Older schemas that migrate in place on open (to `PREVIOUS_SCHEMA`): 14 kept every
+/// value uncompressed, 15 compressed each value on its own; 16 added shared chunks, a
+/// validation watermark and recorded provider refusals; 17 adds app state and the
+/// open/crash record; 20 keeps objects deflated where that pays (`artifact::pack`).
 const LEGACY_SCHEMAS: [i64; 6] = [14, 15, 16, 17, 18, 19];
-/// The schema before this one. Stores, images and bundles of it are also read where a
-/// native open alone migrated older ones (from a connection, from an image, an import):
-/// each is brought to this schema in place as it opens.
-pub(crate) const PREVIOUS_SCHEMA: i64 = 19;
+/// The schema before this one, which stores are created and migrated at and keep while
+/// no step holds more than `transition::NARROW_EFFECTS` intents, so builds of schema 20
+/// still open them (and `spindle rollback` to one stays possible). Its stores, images
+/// and bundles are read as they are, wherever this build reads its own.
+pub(crate) const PREVIOUS_SCHEMA: i64 = 20;
+/// The schema before that. Stores and images of it are also read where a native open
+/// alone migrated older ones (from a connection, from an image, an import): each is
+/// brought to `PREVIOUS_SCHEMA` in place as it opens.
+const MIGRATED_SCHEMA: i64 = 19;
+
+/// Whether `schema` is one this build reads as it is: this one or the one before.
+fn current_schema(schema: i64) -> bool {
+    schema == SCHEMA || schema == PREVIOUS_SCHEMA
+}
+
+/// Moves the store to `SCHEMA`, in the caller's transaction, if it is not there yet:
+/// called where a step of more than `transition::NARROW_EFFECTS` intents is committed
+/// (or found on open), which builds of `PREVIOUS_SCHEMA` refuse to read.
+pub(crate) fn widen(db: &Connection) -> Result<()> {
+    let schema: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema != SCHEMA {
+        db.pragma_update(None, "user_version", SCHEMA)?;
+    }
+    Ok(())
+}
 /// Copy of a schema-14 store taken before migrating it, beside `authority.sqlite`.
 pub const LEGACY_BACKUP: &str = "authority.v14.sqlite";
 /// Tables schema 16 added; an older store gets them when it migrates.
@@ -111,9 +136,13 @@ const STATEMENTS: usize = 64;
 /// The most of a write-ahead log SQLite keeps once a checkpoint has taken it in: after one
 /// large transaction (a migration, a big import) the log is truncated back to this.
 const WAL_KEPT: i64 = 16 * 1024 * 1024;
-/// Largest logical proposal record: its continuation and up to eight intent inputs.
-pub(crate) const MAX_CANONICAL: usize =
-    (1 + transition::MAX_EFFECTS) * (MAX_PAYLOAD + 4) + (1 + 4 + transition::MAX_STATE) + 4096;
+/// Largest logical proposal record: its continuation, its intents (their inputs copy
+/// what the continuation holds, so together they are at most `MAX_PAYLOAD`: see
+/// `turn::new_intents`; each id and adapter a label) and the app state.
+pub(crate) const MAX_CANONICAL: usize = 2 * (MAX_PAYLOAD + 4)
+    + transition::MAX_EFFECTS * (3 * 4 + 2 * 128)
+    + (1 + 4 + transition::MAX_STATE)
+    + 4096;
 /// Revisions (and admissions) one store holds. Steps store only what changed (shared
 /// chunks), and opening checks only steps newer than its last full check.
 pub const MAX_ADMISSIONS: i64 = 1 << 20;
@@ -516,10 +545,14 @@ pub struct Store {
     /// Session-pack ledger records this handle has read or written.
     #[cfg(feature = "dext-strict-workspace")]
     pack_ledger: pack_runtime::Ledger,
-    /// The files a runner call runs over (its scope, base root and their objects),
-    /// checked once on this connection: a runner reads them one by one.
+    /// The files a runner call runs over, checked once on this connection with the
+    /// call itself: a runner reads them one by one.
     #[cfg(feature = "workspace-tools")]
-    runner_objects: Option<(String, String, std::collections::HashSet<String>)>,
+    runner_objects: Option<broker::RunnerObjects>,
+    /// The output a turn's tool results used so far (`record_sealed`): its effect-id
+    /// prefix, the newest receipt row counted and the total.
+    #[cfg(feature = "driver")]
+    turn_output: Option<(String, i64, usize)>,
 }
 
 fn valid_label(value: &str) -> bool {
@@ -547,6 +580,23 @@ fn packed_blob(
     match row.get_ref(column)? {
         rusqlite::types::ValueRef::Blob(bytes) if bytes.len() <= codec::stored_bound(bound) => {
             codec::load(db, bytes, bound).map_err(|_| rusqlite::Error::InvalidQuery)
+        }
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+/// The first `want` logical bytes of a compressed column (`codec::load_prefix`).
+#[cfg(feature = "dext-turn")]
+fn packed_prefix(
+    db: &Connection,
+    row: &rusqlite::Row<'_>,
+    column: usize,
+    bound: usize,
+    want: usize,
+) -> rusqlite::Result<Vec<u8>> {
+    match row.get_ref(column)? {
+        rusqlite::types::ValueRef::Blob(bytes) if bytes.len() <= codec::stored_bound(bound) => {
+            codec::load_prefix(db, bytes, bound, want).map_err(|_| rusqlite::Error::InvalidQuery)
         }
         _ => Err(rusqlite::Error::InvalidQuery),
     }
@@ -800,7 +850,10 @@ fn validate_schema(db: &Connection, from: i64) -> Result<()> {
     Ok(())
 }
 
-fn validate_row_types(db: &Connection) -> Result<()> {
+/// Every row's column types and label shapes. `since`: the (revision, receipt row)
+/// watermark the last open validated (`validated`); rows of the append-only tables at
+/// or below it were checked then and never change, so only newer ones are (None: all).
+fn validate_row_types(db: &Connection, since: Option<(i64, i64)>) -> Result<()> {
     // Fixed schema identifiers only; never interpolate caller-controlled SQL.
     let tables = [
         ("realm", "id epoch lineage", "", "", ""),
@@ -894,6 +947,15 @@ fn validate_row_types(db: &Connection) -> Result<()> {
         ),
     ];
     for (table, integers, labels, blobs, optional_labels) in tables {
+        // Each table's newer rows, by the key the watermark bounds.
+        let newer = match (since, table) {
+            (
+                Some((revision, _)),
+                "revisions" | "proposals" | "consumed" | "intents" | "applied_receipts",
+            ) => Some(("revision", revision)),
+            (Some((_, receipt)), "receipts") => Some(("rowid", receipt)),
+            _ => None,
+        };
         let mut checks = Vec::new();
         for column in integers.split_whitespace() {
             checks.push(format!("typeof({column})!='integer'"));
@@ -926,12 +988,14 @@ fn validate_row_types(db: &Connection) -> Result<()> {
                 },
             );
         }
+        // Unbounded: `0>-1`, true for every row.
+        let (key, after) = newer.unwrap_or(("0", -1));
         let invalid: bool = db.query_row(
             &format!(
-                "SELECT EXISTS(SELECT 1 FROM {table} WHERE {})",
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE {key}>?1 AND ({}))",
                 checks.join(" OR ")
             ),
-            [],
+            [after],
             |row| row.get(0),
         )?;
         if invalid {
@@ -939,6 +1003,18 @@ fn validate_row_types(db: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The watermark `validated` holds, checked first (its own row types): what the last
+/// open validated.
+fn validated_since(db: &Connection) -> Result<(i64, i64)> {
+    db.query_row(
+        "SELECT revision,receipt FROM validated WHERE id=1 AND typeof(revision)='integer' AND typeof(receipt)='integer' AND revision>=0 AND receipt>=0",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()?
+    .ok_or(Error::Incompatible)
 }
 
 /// How every SQLite database file begins.
@@ -1038,18 +1114,18 @@ fn image_checks(db: &Connection, whole: bool) -> Result<ImageFacts> {
     db.pragma_update(None, "trusted_schema", "OFF")?;
     let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
     let schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    // An image this build took of its own store (`image_facts`) is always this schema;
-    // one from elsewhere may be the previous one, which the open migrates.
-    if app != APP_ID || (schema != SCHEMA && !(whole && schema == PREVIOUS_SCHEMA)) {
+    // An image this build took of its own store (`image_facts`) is always of a schema
+    // it reads as it is; one from elsewhere may be older, which the open migrates.
+    if app != APP_ID || !(current_schema(schema) || (whole && schema == MIGRATED_SCHEMA)) {
         return Err(Error::Incompatible);
     }
     validate_schema(db, schema)?;
     check_pages(db)?;
-    if schema != SCHEMA {
+    if schema == MIGRATED_SCHEMA {
         // Rows kept as they are are valid at this schema: only the column is needed.
-        artifact::upgrade(db, false)?;
+        artifact::upgrade(db)?;
     }
-    validate_row_types(db)?;
+    validate_row_types(db, None)?;
     if whole {
         validate_all(db, true)?;
     }
@@ -1064,6 +1140,14 @@ fn image_checks(db: &Connection, whole: bool) -> Result<ImageFacts> {
         identity: identity.iter().map(|byte| format!("{byte:02x}")).collect(),
         settings: meta::get(db, "settings")?,
     })
+}
+
+/// Whether the store's last owner recorded a clean close (`opens.closed`).
+fn closed_cleanly(db: &Connection) -> bool {
+    db.query_row("SELECT closed FROM opens WHERE id=1", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .is_ok_and(|closed| closed == 1)
 }
 
 fn check_pages(db: &Connection) -> Result<()> {
@@ -1133,9 +1217,15 @@ fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
     }
     meta::validate(db)?;
     meta::validate_tasks(db)?;
-    transition::validate_storage(db, since, receipts_since)?;
-    let mut details = db.prepare("SELECT value FROM app_details")?;
-    let mut rows = details.query([])?;
+    transition::validate_storage(db, since, receipts_since, full)?;
+    // App details are written with their receipt: on open, those recorded since the
+    // last one.
+    let mut details = db.prepare(if full {
+        "SELECT value FROM app_details WHERE ?1 IS NOT NULL"
+    } else {
+        "SELECT d.value FROM app_details d JOIN receipts q ON q.attempt=d.attempt WHERE q.rowid>?1"
+    })?;
+    let mut rows = details.query([receipts_since])?;
     while let Some(row) = rows.next()? {
         let bytes = packed_blob(db, row, 0, transition::MAX_STATE)?;
         #[cfg(feature = "dext-turn")]
@@ -1147,7 +1237,7 @@ fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
     drop(details);
     artifact::validate_storage(db, full)?;
     ownership::validate_storage(db)?;
-    rewind::validate_storage(db)?;
+    rewind::validate_storage(db, since)?;
     Ok(db.query_row(
         "SELECT (SELECT revision FROM head WHERE id=1),(SELECT coalesce(max(rowid),0) FROM receipts)",
         [],
@@ -1165,9 +1255,9 @@ const PACKED_COLUMNS: [(&str, &str, &str, usize); 5] = [
 ];
 
 /// An older schema -> this one: re-encodes every large value in place (chunked and
-/// shared) when `from` is older than 16, adds the tables each later schema brought,
-/// packs every object (`artifact::upgrade`) and validates every record, in one
-/// transaction, after copying the store to `backup_name(from)`. Values and objects are
+/// shared) when `from` is older than 16, adds the tables each later schema brought
+/// and validates every record, in one transaction, after copying the store to
+/// `backup_name(from)`; then packs its objects a batch at a time (`pack_unpacked`). Values and objects are
 /// only re-encoded, never changed, so the validation sees exactly the data the old
 /// schema held.
 fn migrate_legacy(db: &mut Connection, root: &Path, from: i64) -> Result<()> {
@@ -1211,7 +1301,7 @@ fn migrate_legacy(db: &mut Connection, root: &Path, from: i64) -> Result<()> {
         tx.execute_batch(TABLES_19)?;
         initialize_identity(&tx)?;
     }
-    artifact::upgrade(&tx, true)?;
+    artifact::upgrade(&tx)?;
     // 16 already stores values packed; older schemas re-encode each one.
     let packed = if from < 16 { &PACKED_COLUMNS[..] } else { &[] };
     for (table, key, column, bound) in packed {
@@ -1236,10 +1326,10 @@ fn migrate_legacy(db: &mut Connection, root: &Path, from: i64) -> Result<()> {
             )?;
         }
     }
-    tx.pragma_update(None, "user_version", SCHEMA)?;
+    tx.pragma_update(None, "user_version", PREVIOUS_SCHEMA)?;
     // Every record is validated before the migration commits: a store that fails stays
     // as it was (the old build still opens it), never half-way at the new schema.
-    validate_row_types(&tx)?;
+    validate_row_types(&tx, None)?;
     let (revision, receipt) = validate_all(&tx, true)?;
     execute_one(
         &tx,
@@ -1247,9 +1337,11 @@ fn migrate_legacy(db: &mut Connection, root: &Path, from: i64) -> Result<()> {
         params![revision, receipt],
     )?;
     tx.commit()?;
-    // Hand the space the uncompressed values and objects held back to the filesystem,
-    // once. Best effort: the migration is committed, and a full temp directory must not
-    // refuse it.
+    // Objects are packed after the commit, in small transactions (rows left as they
+    // are stay valid), then the space the uncompressed values and objects held is
+    // handed back to the filesystem, once. Best effort, both: the migration is
+    // committed, and a full disk or temp directory must not refuse the store.
+    let _ = artifact::pack_unpacked(db);
     let _ = db.execute_batch("VACUUM");
     Ok(())
 }
@@ -1345,7 +1437,7 @@ fn create_store(root: &Path) -> Result<()> {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         initialize_realm(&tx)?;
         tx.pragma_update(None, "application_id", APP_ID)?;
-        tx.pragma_update(None, "user_version", SCHEMA)?;
+        tx.pragma_update(None, "user_version", PREVIOUS_SCHEMA)?;
         tx.commit()?;
         // Closing folds the WAL into the database file; either way both are synced.
         db.close().map_err(|(_, error)| error)?;
@@ -1493,12 +1585,13 @@ impl Store {
         )?;
         let fresh = app == 0 && schema == 0 && tables == 0;
         let legacy = !fresh && app == APP_ID && LEGACY_SCHEMAS.contains(&schema);
-        if (fresh && !created) || (!fresh && (app != APP_ID || (schema != SCHEMA && !legacy))) {
+        if (fresh && !created) || (!fresh && (app != APP_ID || !(current_schema(schema) || legacy)))
+        {
             return Err(Error::Incompatible);
         }
         db.pragma_update(None, "trusted_schema", "OFF")?;
         if !fresh {
-            validate_schema(&db, if legacy { schema } else { SCHEMA })?;
+            validate_schema(&db, schema)?;
         }
         let mode: String = db.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         db.pragma_update(None, "journal_size_limit", WAL_KEPT)?;
@@ -1519,7 +1612,7 @@ impl Store {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             initialize_realm(&tx)?;
             tx.pragma_update(None, "application_id", APP_ID)?;
-            tx.pragma_update(None, "user_version", SCHEMA)?;
+            tx.pragma_update(None, "user_version", PREVIOUS_SCHEMA)?;
             tx.commit()?;
         }
         Self::take_over(OwnedConnection { db, owner: lock }, Some(root))
@@ -1528,9 +1621,10 @@ impl Store {
     /// The host must retain exclusive ownership of this database for the returned
     /// handle's lifetime. Dropping `owner` releases that exclusion only after SQLite
     /// closes. This contract is not implemented by SQLite's no-lock WASI VFS.
-    /// Existing stores must use the current schema or the one before
-    /// (`PREVIOUS_SCHEMA`, migrated in place); older migrations and backups remain a
-    /// native-path operation. Persistent VFS sync semantics are host-owned.
+    /// Existing stores must use a schema this build reads as it is (`SCHEMA`,
+    /// `PREVIOUS_SCHEMA`) or the one before (`MIGRATED_SCHEMA`, migrated in place); older
+    /// migrations and backups remain a native-path operation. Persistent VFS sync
+    /// semantics are host-owned.
     pub fn from_connection(
         db: Connection,
         profile: ConnectionProfile,
@@ -1608,13 +1702,19 @@ impl Store {
                         ..
                     }
             );
-        let previous = !fresh && schema == PREVIOUS_SCHEMA;
-        if fresh != create || (!fresh && (app != APP_ID || (schema != SCHEMA && !previous))) {
+        let previous = !fresh && schema == MIGRATED_SCHEMA;
+        if fresh != create || (!fresh && (app != APP_ID || !(current_schema(schema) || previous))) {
             return Err(Error::Incompatible);
         }
         if !fresh {
             validate_schema(db, schema)?;
-            check_pages(db)?;
+            // Every page is checked before a migration and after an owner stopped
+            // without closing the store (crashed, its host evicted mid-write); a store
+            // closed cleanly was whole then, and SQLite checks each page it reads. An
+            // image was checked whole by `from_image`.
+            if !image && (previous || !closed_cleanly(db)) {
+                check_pages(db)?;
+            }
         }
         let journal = match profile {
             ConnectionProfile::Memory => "MEMORY",
@@ -1643,7 +1743,7 @@ impl Store {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             initialize_realm(&tx)?;
             tx.pragma_update(None, "application_id", APP_ID)?;
-            tx.pragma_update(None, "user_version", SCHEMA)?;
+            tx.pragma_update(None, "user_version", PREVIOUS_SCHEMA)?;
             tx.commit()?;
         }
         if previous && image {
@@ -1651,27 +1751,47 @@ impl Store {
             // its owner: its rows stay as they are (valid at this schema), only new ones
             // are packed, so memory never holds every object rewritten twice.
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            artifact::upgrade(&tx, false)?;
-            tx.pragma_update(None, "user_version", SCHEMA)?;
+            artifact::upgrade(&tx)?;
+            tx.pragma_update(None, "user_version", PREVIOUS_SCHEMA)?;
             tx.commit()?;
         } else if previous {
             // In place, in one transaction that checks every record before it commits,
             // as a native migration does (without its copy: a store that fails stays as
-            // it was). The space packed objects give back is reused by later writes; a
-            // VACUUM would hold a second copy of the store in memory.
+            // it was); its objects are packed after, a batch per transaction, so no
+            // journal holds them all (best effort: rows left as they are stay valid).
+            // The space packed objects give back is reused by later writes; a VACUUM
+            // would hold a second copy of the store in memory.
+            let closed = closed_cleanly(db);
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            artifact::upgrade(&tx, true)?;
-            tx.pragma_update(None, "user_version", SCHEMA)?;
-            validate_row_types(&tx)?;
-            let (revision, receipt) = validate_all(&tx, true)?;
-            execute_one(
-                &tx,
-                "UPDATE validated SET revision=?1,receipt=?2 WHERE id=1",
-                params![revision, receipt],
-            )?;
+            Self::migrate_previous(&tx)?;
             tx.commit()?;
+            let _ = artifact::pack_unpacked(db);
+            // Packed: the store is as whole as its last owner left it.
+            execute_one(
+                db,
+                "UPDATE opens SET closed=?1 WHERE id=1",
+                [i64::from(closed)],
+            )?;
         }
         Self::take_over(pending, None)
+    }
+
+    /// The in-place migration of a `MIGRATED_SCHEMA` store in `tx`, every record checked
+    /// before it commits. Its objects are packed after it, in many transactions: until
+    /// then the store reads as one whose owner stopped without closing it, so a migration
+    /// cut off there has every page checked by the next open.
+    fn migrate_previous(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+        artifact::upgrade(tx)?;
+        tx.pragma_update(None, "user_version", PREVIOUS_SCHEMA)?;
+        execute_one(tx, "UPDATE opens SET closed=0 WHERE id=1", [])?;
+        validate_row_types(tx, None)?;
+        let (revision, receipt) = validate_all(tx, true)?;
+        execute_one(
+            tx,
+            "UPDATE validated SET revision=?1,receipt=?2 WHERE id=1",
+            params![revision, receipt],
+        )?;
+        Ok(())
     }
 
     fn take_over(mut pending: OwnedConnection, root: Option<&Path>) -> Result<Self> {
@@ -1680,7 +1800,7 @@ impl Store {
         // every store, opened natively or from a connection, takes over here.
         db.set_prepared_statement_cache_capacity(STATEMENTS);
         let (epoch, crashes) = (|| -> Result<(u64, u64)> {
-            validate_row_types(db)?;
+            validate_row_types(db, Some(validated_since(db)?))?;
             let realm_rows: i64 = db.query_row("SELECT count(*) FROM realm", [], |r| r.get(0))?;
             let invalid: i64 = db.query_row(
             "SELECT count(*) FROM admissions WHERE sequence<=0 OR lineage<0 OR admitted_epoch<=0 OR admitted_epoch>(SELECT epoch FROM realm WHERE id=1) OR length(payload)>?1 OR length(scope) NOT BETWEEN 1 AND 128 OR length(command_id) NOT BETWEEN 1 AND 128 OR length(kind) NOT BETWEEN 1 AND 128",
@@ -1719,6 +1839,18 @@ impl Store {
                 "UPDATE validated SET revision=?1,receipt=?2 WHERE id=1",
                 params![revision, receipt],
             )?;
+            // A step wider than schema 20 holds, written by a build that did not move the
+            // store on (`widen`): moved now, so builds of 20 refuse it by its number.
+            let schema: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            if schema == PREVIOUS_SCHEMA
+                && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM intents WHERE position>=?1)",
+                    [transition::NARROW_EFFECTS as i64],
+                    |r| r.get(0),
+                )?
+            {
+                widen(&tx)?;
+            }
             // An owner that stopped without closing the store (killed, crashed, its host
             // evicted) at the head this open finds again made no progress: count it.
             let head: i64 =
@@ -1757,6 +1889,8 @@ impl Store {
             pack_ledger: pack_runtime::Ledger::default(),
             #[cfg(feature = "workspace-tools")]
             runner_objects: None,
+            #[cfg(feature = "driver")]
+            turn_output: None,
         })
     }
 
@@ -1880,12 +2014,22 @@ impl Store {
     }
 
     /// The full check `doctor` runs: every database page, then every record including
-    /// those an earlier open already validated.
+    /// those an earlier open already validated (their column types and label shapes
+    /// too, which an open checks only above its watermark).
+    /// The schema this store is at (20, or 21 once a step made more tool calls than 20
+    /// allows).
+    pub fn schema(&self) -> Result<i64> {
+        Ok(self
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
     pub fn check_integrity(&mut self) -> Result<()> {
         if self.paused {
             return Err(Error::Paused);
         }
         check_pages(&self.db)?;
+        validate_row_types(&self.db, None)?;
         validate_all(&self.db, true).map(|_| ())
     }
 
@@ -1991,5 +2135,56 @@ impl Store {
         let admission = admit_in_transaction(&tx, self.epoch, command)?;
         tx.commit()?;
         Ok(admission)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Owned;
+    impl OwnerExclusion for Owned {}
+
+    /// A migration from a connection commits its records, then packs objects in many
+    /// transactions: cut off between them, the store reads as one whose owner stopped
+    /// without closing it, so the next open checks every page (and counts the stop); a
+    /// migration that finishes counts none.
+    #[test]
+    fn a_migration_cut_off_while_packing_reads_as_not_closed() {
+        let path =
+            std::env::temp_dir().join(format!("spindle-cut-migration-{}.sqlite", process_id()));
+        let profile = |initialization| ConnectionProfile::Persistent {
+            journal: JournalMode::Delete,
+            initialization,
+        };
+        let open = |initialization| {
+            Store::from_connection(
+                Connection::open(&path).unwrap(),
+                profile(initialization),
+                Owned,
+            )
+            .unwrap()
+        };
+        // A store closed cleanly at the head it opened at, as the previous build left it.
+        let previous = || {
+            let _ = std::fs::remove_file(&path);
+            drop(open(Initialization::Create));
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch("ALTER TABLE objects DROP COLUMN size; PRAGMA user_version=19;")
+                .unwrap();
+            assert!(closed_cleanly(&db));
+            db
+        };
+        drop(previous());
+        assert_eq!(open(Initialization::Open).crashes(), 0);
+        let mut db = previous();
+        let tx = db.transaction().unwrap();
+        Store::migrate_previous(&tx).unwrap();
+        tx.commit().unwrap();
+        // Cut off here, before its objects are packed.
+        assert!(!closed_cleanly(&db));
+        drop(db);
+        assert_eq!(open(Initialization::Open).crashes(), 1);
+        std::fs::remove_file(&path).unwrap();
     }
 }

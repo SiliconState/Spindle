@@ -457,6 +457,11 @@ pub fn recent_targets(dir: &Path) -> Result<Vec<Value>> {
     crate::reads::targets_on(&mut view(dir)?)
 }
 
+/// Where a stopped turn can go on from (`reads::turn_on`).
+pub fn turn_targets(dir: &Path) -> Result<Value> {
+    crate::reads::turn_on(&mut view(dir)?)
+}
+
 fn no_revision(revision: Option<u64>) -> String {
     match revision {
         Some(revision) => format!("revision {revision} is not a committed revision"),

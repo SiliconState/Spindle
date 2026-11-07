@@ -60,7 +60,8 @@ $('export').onclick = async () => {
   link.href = URL.createObjectURL(new Blob([reply.result.bytes]));
   link.download = name;
   link.click();
-  log(`moved the session into ${name} (${reply.result.bytes.length} bytes); this copy is sealed\n`, 'note');
+  log(`copied the session into ${name} (${reply.result.bytes.length} bytes); this session stays here\n`, 'note');
+  setTimeout(() => URL.revokeObjectURL(link.href), 60_000);
 };
 $('import').onchange = async () => {
   const file = $('import').files[0];

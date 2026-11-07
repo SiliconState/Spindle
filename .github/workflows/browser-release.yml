@@ -84,6 +84,8 @@ jobs:
           # from sources with no changes.
           SPINDLE_BROWSER="$(command -v google-chrome)" \
             node chrome/tests/review_browser.mjs "$RUNNER_TEMP/spindle-browser"
+          SPINDLE_BROWSER="$(command -v google-chrome)" \
+            node chrome/tests/signin_vault.mjs "$RUNNER_TEMP/spindle-browser"
           node --expose-gc chrome/tests/engine_renew.mjs "$RUNNER_TEMP/spindle-browser/web"
           node -e '
             const build = require(process.argv[1]);
@@ -107,6 +109,8 @@ jobs:
           unzip -q "$RUNNER_TEMP/$STORE_ASSET" -d "$RUNNER_TEMP/spindle-browser-store"
           SPINDLE_BROWSER="$(command -v google-chrome)" \
             node chrome/tests/extension_real.mjs "$RUNNER_TEMP/spindle-browser-store" --scripted
+          SPINDLE_BROWSER="$(command -v google-chrome)" \
+            node chrome/tests/signin_vault.mjs "$RUNNER_TEMP/spindle-browser-store"
           node -e '
             const build = require(process.argv[1]);
             if (build.version !== process.env.VERSION || build.edition !== "store") throw new Error(`build.json says ${build.version} ${build.edition}`);
@@ -135,7 +139,7 @@ jobs:
 
           This build runs commands in the browser Linux on v86. The faster wasm Linux is in builds made from source with \`SPINDLE_WASM_LINUX\` ([how](https://github.com/$GITHUB_REPOSITORY/blob/main/docs/browser-linux.md#building-the-images)).
 
-          \`$STORE_ASSET\` is the Chrome Web Store's build of this tag: the same extension, with ChatGPT signing in only through OpenAI's Sign in with ChatGPT (builds from source also offer ChatGPT through the Codex CLI's sign-in).
+          \`$STORE_ASSET\` is the Chrome Web Store's build of this tag: the same extension, with ChatGPT signing in only through OpenAI's Sign in with ChatGPT (the other zip and builds from source also offer ChatGPT through the Codex CLI's sign-in).
 
           The zip's THIRD-PARTY.md lists the other software it carries, with licenses and sources.
           EOF

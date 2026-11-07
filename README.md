@@ -2,12 +2,13 @@
 
 **An agent that lives wherever you work.**
 
-Spindle is a durable, embeddable agent engine. Every step of a session is a committed
-revision of the conversation, the workspace files and the app state together, so a run that
-is killed resumes where it stopped, a model request is never sent twice by accident, and
-going back restores all three at once. The same core, with the same rules and the same
-session format, runs as a native binary or compiled to WebAssembly inside another program,
-which is what lets it live in a terminal, on a server, inside your app or in a browser.
+Spindle is a durable, embeddable agent engine. Each committed revision holds the
+conversation, workspace files and app state together, and rewind restores all three.
+After a killed run, recorded results are reused and unknown outcomes are reported,
+not resent without retry consent. Uncommitted streaming output may be lost. The same
+core, with the same rules and session format, runs as a native binary or as
+WebAssembly inside another program: in a terminal, on a server, in your app or in
+a browser.
 
 Website: [siliconstate.github.io/Spindle](https://siliconstate.github.io/Spindle/).
 
@@ -21,7 +22,8 @@ Spindle's core is two layers of this repository:
 - **The engine crates** ([`dext-engine/`](dext-engine)): model and turn types, transcripts,
   the provider catalog and its request formats, and the strict command runner.
 - **Spindle** ([`spindle/store`](spindle/store)): the SQLite store that commits every step,
-  and the decision driver that says what a turn needs next, with no network and no clock.
+  and the decision driver that says what a turn needs next, without performing network,
+  process execution or timer waits.
 
 Something has to carry out what the driver asks for (send a model request, run a command,
 answer an app's tool). That is the host, and there are two:
@@ -143,6 +145,12 @@ Interrupted? `spindle --dir ../demo continue`. The web UI:
 (a phone reaches it through a reverse proxy,
 [docs/host.md](docs/host.md#remote-access-through-a-reverse-proxy)). Full walkthrough:
 [docs/getting-started.md](docs/getting-started.md).
+
+**Current source and released zip.** The source includes OpenAI's Sign in with
+ChatGPT and keeps **ChatGPT (Codex)** in the source/GitHub edition. The store edition
+(`SPINDLE_STORE=1`) omits the legacy Codex client. The released 0.1.7 zip below
+predates these and other source changes; build from source until the next version
+is published. A new release needs a new manifest version and matching tag.
 
 **Spindle for Browser 0.1.7.** Download `spindle-browser-0.1.7.zip` from the
 [latest release](https://github.com/SiliconState/Spindle/releases/latest), unzip it, and load

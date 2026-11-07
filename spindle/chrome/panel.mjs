@@ -2,15 +2,16 @@
 // offscreen document's worker) runs them, and this page asks it over the channel and
 // draws what it reports. Closing the panel never stops a turn.
 import { fileTree, markdown, size } from './text.js';
-import { BROWSER, PAGE_ACCESS, PICTURE_ACCESS, confirmMode, pageSwitches } from './page-tools.mjs';
+import { BROWSER, PAGE_ACCESS, PICTURE_ACCESS, confirmMode, pageSwitches, pagesRecord } from './page-tools.mjs';
+import { bundleFacts } from './clients/embedded.mjs';
 import { zip } from './zip.mjs';
 import { BUNDLE_MOST } from './host-moves.mjs';
-import { FRAMED, containment, documentFrame, kindOf, pageOf, pdfShows, pictureBlob, previewFrame, previewNote, saveFile, svgPage, typeOf } from './page.mjs';
+import { FRAMED, containment, documentFrame, downloadName, kindOf, pageOf, pdfShows, pictureBlob, previewFrame, previewNote, saveFile, svgPage, typeOf } from './page.mjs';
 import { MAX_DOCUMENT, documentPage } from './documents.mjs';
 import { mdNodes } from './markdown.mjs';
-import { CHANNEL, accessFor, keepPreviewChoice, keysOf, merge, previewChoice, read, remove, startEngine, take, write } from './shared.mjs';
-import { connectInTab, flowOf, signInInTab, signInSites } from './signin.mjs';
-import { clock, describe, duration, elapsed, isScratch, isSpan, partsFrom, retried, shownName, tabsFrom, taskTitle } from './steps.mjs';
+import { CHANNEL, accessFor, keepPreviewChoice, keysOf, merge, previewChoice, read, remove, startEngine, take, write, REQUESTS, answersFor } from './shared.mjs';
+import { CHATGPT_USAGE, connectInTab, flowOf, planSignIn, signInInTab, signInSites } from './signin.mjs';
+import { clock, describe, duration, elapsed, isNotes, isScratch, isSpan, partsFrom, retried, shownName, tabsFrom, taskTitle } from './steps.mjs';
 
 const $ = (id) => document.getElementById(id);
 // What the panel's page says of the browser names the one it runs in (Edge, Brave or
@@ -192,6 +193,9 @@ let knownParts = new Map();
 
 const me = crypto.randomUUID();
 const channel = new BroadcastChannel(CHANNEL);
+// Requests go to the engine alone, and its answers come back to this page alone.
+const requests = new BroadcastChannel(REQUESTS);
+const answers = new BroadcastChannel(answersFor(me));
 const waiting = new Map();
 let next = 0;
 /** The engine's last snapshot (catalog, threads, info), null until it answers. */
@@ -199,7 +203,7 @@ let engine = null;
 
 /** How long an answer may take: moving whole sessions, and freeing space (a whole
  * store read, written and checked; a moved thread's file checked whole), longer. */
-const PATIENCE = { export: 300_000, import: 300_000, catalog: 120_000, compact: 600_000, freeSealed: 300_000, toHost: 300_000, hostConnect: 120_000 };
+const PATIENCE = { export: 300_000, import: 300_000, earlierOpen: 300_000, catalog: 120_000, compact: 600_000, freeSealed: 300_000, toHost: 300_000, hostConnect: 120_000 };
 
 function ask(op, args = {}, timeout = PATIENCE[op] ?? 60_000) {
   const id = ++next;
@@ -207,11 +211,17 @@ function ask(op, args = {}, timeout = PATIENCE[op] ?? 60_000) {
     const timer = setTimeout(() => {
       waiting.delete(id);
       reject(Object.assign(new Error("Spindle's engine did not answer"), { kind: 'timeout' }));
-      // Past the first contact, silence means the engine stopped working.
-      if (engine) banner("Spindle's engine is not answering.", [['Restart engine', restartEngine]]);
+      // Past the first contact, silence means the engine stopped working, unless it still
+      // answers a ping (freeing space holds it for minutes): then it is only busy.
+      if (engine && op !== 'ping') {
+        ask('ping', {}, 5_000).then(
+          () => toast('Spindle is busy (freeing space, say); try again in a moment.'),
+          () => banner("Spindle's engine is not answering.", [['Restart engine', askRestartEngine]]),
+        );
+      }
     }, timeout);
     waiting.set(id, { resolve, reject, timer });
-    channel.postMessage({ to: 'engine', from: me, id, op, args });
+    requests.postMessage({ to: 'engine', from: me, id, op, args });
   });
 }
 
@@ -274,6 +284,8 @@ channel.onmessage = ({ data }) => {
     else connect();
   }
 };
+// Answers come on this page's own channel; events on the shared one.
+answers.onmessage = (event) => channel.onmessage(event);
 
 
 let connecting = null;
@@ -291,7 +303,7 @@ function connect() {
         if (attempt === 0) await startEngine().catch((failed) => banner(`Spindle's engine could not start: ${failed.message}`));
       }
     }
-    if (!engine) banner("Spindle's engine is not answering.", [['Restart engine', restartEngine]]);
+    if (!engine) banner("Spindle's engine is not answering.", [['Restart engine', askRestartEngine]]);
   })().finally(() => { connecting = null; });
   return connecting;
 }
@@ -299,6 +311,14 @@ function connect() {
 async function restartEngine() {
   await chrome.offscreen.closeDocument().catch(() => {});
   engineRestarted();
+}
+
+/** Restarts the engine once the user agrees, when that cuts running threads off (as
+ * Settings asks). */
+async function askRestartEngine() {
+  const busy = [...threads.values()].filter((thread) => thread.state === 'running' && !thread.home).length;
+  if (busy && !(await confirmed('Restart the engine?', `${busy} browser thread(s) are running. Restarting cuts them off; each can be retried after. Threads on your host keep running there.`, 'Restart'))) return;
+  await restartEngine();
 }
 
 // ---- State -----------------------------------------------------------------------
@@ -565,6 +585,14 @@ function threadRow(thread, last) {
 /** A small menu under `button`: [label, icon, run, class] each. */
 function rowMenu(button, entries) {
   const menu = $('row-menu');
+  // In the open dialog its button is in (Settings, say): a modal dialog makes all
+  // outside it inert, so a menu left outside showed on top but took no click.
+  const home = button.closest('dialog[open]') ?? document.body;
+  if (menu.parentElement !== home) {
+    if (menu.matches(':popover-open')) menu.hidePopover();
+    home.append(menu);
+  }
+  menu.setAttribute('aria-label', home === document.body ? 'Thread actions' : 'Actions');
   menu.replaceChildren(...entries.map(([label, name, run, cls]) => {
     const entry = el('button', cls ?? '');
     entry.type = 'button';
@@ -806,6 +834,16 @@ function resultText(content) {
   return JSON.stringify(content ?? '');
 }
 
+/** Whether the conversation follows its end as it grows. Only the user stops it, by
+ * scrolling up away from the end; scrolling back near it, Latest, a message they send, or
+ * a forced scroll (a thread opened) starts it again. What is added never stops it:
+ * measured after a tall preview had come in at once, the end was out of reach, so the
+ * conversation stayed behind (and a preview left on screen looked read, `readingAt`). */
+let following = true;
+/** Where the conversation was scrolled to when last seen (a smaller one is the user's
+ * scrolling up). */
+let scrolledTo = 0;
+
 /** Paths the last turn shown so far wrote with its file tools (each has its card), and
  * those cards (the last turn's open their previews; earlier ones wait to be asked). */
 let turnPaths = new Set();
@@ -863,8 +901,10 @@ function renderHistory({ thread, history, running, bundle, moving, away }, { fro
     if (bundle) {
       // A real link, so the click itself saves it (Chrome holds back a second
       // download a page starts on its own).
-      ask('bundle', { id: thread.id }).then((kept) => {
-        if (current !== thread.id) return;
+      // Read here, from the extension's own storage: not asked of the engine (its answer
+      // would go through the engine's memory first).
+      read('bundles', thread.id).then((kept) => {
+        if (current !== thread.id || !kept?.bytes) return;
         dropKept();
         keptUrl = URL.createObjectURL(new Blob([kept.bytes], { type: 'application/octet-stream' }));
         const again = el('a', 'button-like wide', 'Save the file again');
@@ -890,7 +930,7 @@ function renderHistory({ thread, history, running, bundle, moving, away }, { fro
     const prompts = messages.flatMap((message, index) => (isPrompt(message) ? [index] : []));
     if (prompts.length > TAIL_TURNS) {
       start = prompts[prompts.length - TAIL_TURNS];
-      box.append(earlierButton(thread, messages.slice(0, start)));
+      box.append(earlierButton(thread, start));
     }
   }
   // One workspace card, for the workspace as it is now: an earlier one goes.
@@ -899,6 +939,8 @@ function renderHistory({ thread, history, running, bundle, moving, away }, { fro
   sweepPlayers();
   turnPaths = new Set();
   turnCards = [];
+  selfShown = null;
+  showing.clear();
   const pictures = renderMessages(box, thread, messages.slice(start), from + start, { running, main: true });
   const end = el('i', 'history-end');
   end.hidden = true;
@@ -906,8 +948,9 @@ function renderHistory({ thread, history, running, bundle, moving, away }, { fro
   shown.total = history.total ?? from + messages.length;
   shown.turnFrom = null;
   shown.compacted = false;
-  // The last turn's pages, pictures and Markdown open (a few: each page is a frame).
-  turnCards.filter((card) => card.preview && card.isConnected).slice(-3).forEach((card) => card.preview());
+  // The last turn's pictures show (a few); its pages and Markdown files stay folded, to
+  // open on demand (they showed while the turn worked on them).
+  turnCards.filter((card) => card.preview && card.isConnected && kindOf(card.dataset.path) === 'picture').slice(-3).forEach((card) => card.preview());
   pictures.slice(-4).forEach((card) => card.preview());
   // Once no turn runs: the workspace, just above the turn's final answer (at the end when
   // the turn ended without one). It marks what the turn made or changed.
@@ -957,6 +1000,7 @@ function renderMessages(box, thread, messages, offset, { running = false, revisi
             shown.prompts.push(at);
             turnPaths = new Set();
             turnCards = [];
+            selfShown = null;
           }
           pictures.push(...picturesWith(thread.id, block.text, box));
         }
@@ -1026,16 +1070,18 @@ function stepsIn(box, open = false) {
   return steps;
 }
 
-/** Opens or shuts a step group without counting it as the user's doing. */
+/** Opens or shuts a step group without counting it as the user's doing. Shut, the run
+ * is done with: the previews its steps opened on their own fold with it. */
 function setOpen(group, open) {
   group.wanted = open;
   group.open = open;
+  if (!open) for (const card of group.parentElement?.querySelectorAll('.file-card') ?? []) card.unpreview?.();
 }
 
 /** A run of steps says what it holds: how many (or which runs now), how many were retried
  * (a failed one done again successfully later) and failed, as icons with numbers, and,
  * done, how long it took on the clock. Repeats of a step merge into its row, and a long
- * run shows its first rows (a running one its last) until asked for the rest. */
+ * run shows its last rows until asked for the earlier ones (`foldLong`). */
 function updateSteps(steps) {
   const cards = [...steps.list.children].filter((child) => child.classList.contains('tool'));
   if (!cards.length) return;
@@ -1127,8 +1173,10 @@ function mergeRepeats(steps) {
 /** Rows a long run shows until the rest is asked for. */
 const ROWS_SHOWN = 12;
 
-/** A long run of steps shows its first rows (a running one, its last) and a row saying how
- * many more there are. */
+/** A long run of steps shows its last rows, the newest, and above them a row saying how
+ * many earlier ones there are. Always the earlier ones: whether a step is running at the
+ * moment (none is while the model thinks between steps) never turns the fold around, so
+ * the newest rows stay in sight through the run and after it. */
 function foldLong(steps) {
   for (const old of steps.list.querySelectorAll(':scope > .group-more')) old.remove();
   const rows = [];
@@ -1137,39 +1185,71 @@ function foldLong(steps) {
     else if (rows.length) rows.at(-1).push(child);
     else rows.push([child]);
   }
-  const running = steps.classList.contains('running');
   const folded = steps.dataset.all !== '1' && rows.length > ROWS_SHOWN + 3;
-  const hidden = new Set(!folded ? [] : running ? rows.slice(0, rows.length - ROWS_SHOWN) : rows.slice(ROWS_SHOWN));
+  const hidden = new Set(folded ? rows.slice(0, rows.length - ROWS_SHOWN) : []);
   for (const row of rows) for (const child of row) child.classList.toggle('beyond', hidden.has(row));
   if (!hidden.size) return;
   const n = [...hidden].flat().filter((child) => child.classList.contains('tool')).length;
-  const more = el('button', `group-more${running ? ' top' : ''}`);
+  const more = el('button', 'group-more top');
   more.type = 'button';
   const arrow = icon('down', 14);
-  if (running) arrow.style.transform = 'rotate(180deg)';
-  more.append(arrow, el('span', '', `${n} ${running ? 'earlier' : 'more'} step${n === 1 ? '' : 's'}`));
+  arrow.style.transform = 'rotate(180deg)';
+  more.append(arrow, el('span', '', `${n} earlier step${n === 1 ? '' : 's'}`));
   more.onclick = () => {
     steps.dataset.all = '1';
     foldLong(steps);
   };
-  if (running) steps.list.prepend(more);
-  else steps.list.append(more);
+  steps.list.prepend(more);
 }
 
 /** The button that draws the earlier part of a long history (`messages`, from its
  * first) in its place. */
-function earlierButton(thread, messages) {
-  const button = el('button', 'earlier-button wide', `Show ${messages.length} earlier messages`);
+/** The first `count` messages, read when asked for (not held meanwhile: a long thread's
+ * early history can be most of its size). */
+/** A button that shows (then hides, and shows again) a part of the history read on
+ * demand: `load()` fills a section once, the button then toggles it. */
+function foldingButton(cls, showing, hiding, load) {
+  const button = el('button', cls, showing);
   button.type = 'button';
-  button.onclick = () => {
-    const part = document.createDocumentFragment();
-    renderMessages(part, thread, messages, 0);
+  const section = el('section', 'earlier');
+  let loaded = false;
+  button.onclick = async () => {
+    if (loaded) {
+      section.hidden = !section.hidden;
+      button.textContent = section.hidden ? showing : hiding;
+      button.setAttribute('aria-expanded', String(!section.hidden));
+      return;
+    }
+    button.disabled = true;
+    try {
+      const filled = await load(section);
+      if (!filled) return;
+      loaded = true;
+      // Before the button, unless `load` placed it (a compaction's go before its notice).
+      if (!section.isConnected) button.before(section);
+      button.textContent = hiding;
+      button.setAttribute('aria-expanded', 'true');
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  };
+  button.setAttribute('aria-expanded', 'false');
+  return button;
+}
+
+function earlierButton(thread, count) {
+  return foldingButton('earlier-button wide', `Show ${count} earlier messages`, `Hide ${count} earlier messages`, async (section) => {
+    const data = await ask('open', { id: thread.id });
+    if (current !== thread.id) return false;
+    const messages = (data.history?.messages ?? []).slice(0, count);
+    renderMessages(section, thread, messages, 0);
     shown.prompts = [...messages.flatMap((message, index) => (isPrompt(message) ? [index] : [])), ...shown.prompts];
-    button.replaceWith(part);
     // Its tasks' cards and reports, as the thread's tasks were last read.
     renderTasks(thread.id, taskList);
-  };
-  return button;
+    return true;
+  });
 }
 
 /** Where a compaction folded earlier messages into a summary: says so, shows the summary
@@ -1180,25 +1260,15 @@ function compactionNode(thread, text, revision) {
   node.append(el('p', '', "Earlier messages were folded into a summary so this thread fits its model's context. The model goes on from the summary; the workspace is as it was."));
   const summary = el('details');
   summary.append(el('summary', '', 'The summary'), el('pre', 'summary-text', text.slice(text.indexOf('\n') + 1).trim()));
-  const show = el('button', '', 'Show the earlier messages');
-  show.type = 'button';
-  show.onclick = async () => {
-    show.disabled = true;
-    show.textContent = 'Reading…';
-    try {
-      const earlier = await ask('earlier', { id: thread.id, revision });
-      const section = el('section', 'earlier');
-      section.append(el('span', 'role-label', 'BEFORE THE SUMMARY'));
-      renderMessages(section, thread, earlier.history.messages ?? [], 0, { revision: earlier.revision });
-      node.before(section);
-      show.remove();
-      renderTasks(thread.id, taskList);
-    } catch (error) {
-      show.disabled = false;
-      show.textContent = 'Show the earlier messages';
-      toast(error.message);
-    }
-  };
+  // The messages go before the notice (where they were); the button stays in it.
+  const show = foldingButton('', 'Show the earlier messages', 'Hide the earlier messages', async (section) => {
+    const earlier = await ask('earlier', { id: thread.id, revision });
+    section.append(el('span', 'role-label', 'BEFORE THE SUMMARY'));
+    renderMessages(section, thread, earlier.history.messages ?? [], 0, { revision: earlier.revision });
+    node.before(section);
+    renderTasks(thread.id, taskList);
+    return true;
+  });
   node.append(summary, show);
   return node;
 }
@@ -1456,7 +1526,7 @@ function toolCard(name, input, id = null, live = false) {
   full.hidden = true;
   if (command) {
     const box = el('div', 'tool-input');
-    box.append(el('pre', 'input', command), copyButton(() => command, name === 'bash' ? 'Copy the command' : name === 'write_file' ? 'Copy what it wrote' : 'Copy the input'));
+    box.append(name === 'edit_file' && typeof input?.old_string === 'string' ? editDiff(input) : el('pre', 'input', command), copyButton(() => command, name === 'bash' ? 'Copy the command' : name === 'write_file' ? 'Copy what it wrote' : name === 'edit_file' ? 'Copy the change' : 'Copy the input'));
     full.append(box);
   }
   actions.append(copyButton(() => command ?? card.resultText ?? '', command ? (name === 'bash' ? 'Copy the command' : name === 'write_file' ? 'Copy what it wrote' : 'Copy the input') : 'Copy its output'));
@@ -1484,6 +1554,19 @@ function toolCard(name, input, id = null, live = false) {
   });
   relabel(card);
   return card;
+}
+
+/** An edit as a diff: the file's path, then the lines it replaced (marked -) and the
+ * lines it put there (marked +), each tinted, so what changed reads at a glance. */
+function editDiff(input) {
+  const pre = el('pre', 'input diff');
+  pre.append(el('span', 'diff-path', `${input.path ?? ''}\n\n`));
+  const lines = (text, mark, cls) => {
+    for (const line of String(text).split('\n')) pre.append(el('span', cls, `${mark} ${line}\n`));
+  };
+  lines(input.old_string, '-', 'diff-del');
+  lines(input.new_string ?? '', '+', 'diff-ins');
+  return pre;
 }
 
 /** What a step was given, to read: a command as it is; what a file tool wrote, as text
@@ -1766,6 +1849,7 @@ function onEvent(id, event) {
       break;
     }
     case 'tool_result': {
+      stepTaken();
       const card = pendingCards.shift();
       if (card) {
         settle(card, event.content, event.failed);
@@ -1776,6 +1860,7 @@ function onEvent(id, event) {
       break;
     }
     case 'tool_refused': {
+      stepTaken();
       const card = pendingCards.shift();
       if (card) settle(card, `refused: ${event.reason}`, true);
       if (card?.block) taskCalled(id, card.block, `refused: ${event.reason}`);
@@ -1849,16 +1934,56 @@ const readBytes = async (id, path) => (await ask('read', { id, path })).bytes;
 const workspacePath = (raw) => typeof raw !== 'string' ? null
   : raw.startsWith('/workspace/') ? raw.slice('/workspace/'.length) : raw.startsWith('./') ? raw.slice(2) : raw;
 const viewUrl = (id, path) => chrome.runtime.getURL(`view.html?thread=${encodeURIComponent(id)}&path=${encodeURIComponent(path)}`);
-/** Kinds that show themselves when a step writes them (and sit below its run of steps). */
+/** Kinds that sit below the run of steps that wrote them, in sight. */
 const PRESENTED = new Set(['page', 'picture', 'markdown', 'document']);
+/** Of those, the kinds that show themselves while the turn works on them (a page does
+ * not: the thread opens it in a tab when it means to show it, and the eye opens it
+ * here). One at a time: a file written next folds the one before it, as do the run's end
+ * and the turn moving on (`SHOWN_FOR` steps later); one the user opened or shut stays as
+ * they left it. The thread's own notes (`isNotes`) are neither presented nor shown:
+ * their card sits in the run after the step that wrote them, folded. */
+const SELF_SHOWING = new Set(['picture', 'markdown', 'document']);
+/** The card whose preview the running turn opened last (`wroteFile`). */
+let selfShown = null;
+/** How many steps after its own a preview the running turn opened stays open: by then the
+ * turn has moved on from it (a run with no words between its steps can go on for
+ * hundreds). */
+const SHOWN_FOR = 3;
+/** The running turn's self-shown cards, each with the steps it has left (`stepTaken`). */
+const showing = new Map();
+
+/** A step of the running turn ended: the previews it opened before fold once the turn has
+ * gone `SHOWN_FOR` steps past them, but for one the user is reading (`readingAt`), which
+ * folds at a later step, once they have left it. */
+function stepTaken() {
+  for (const [card, left] of showing) {
+    if (!card.isConnected) {
+      showing.delete(card);
+    } else if (left > 1) {
+      showing.set(card, left - 1);
+    } else if (!readingAt(card)) {
+      showing.delete(card);
+      card.unpreview?.();
+    }
+  }
+}
+
+/** Whether the user reads `card` where it is: it shows on screen while they have scrolled
+ * up from the conversation's end (`following`; folding it would pull it from under them). */
+function readingAt(card) {
+  if (following) return false;
+  const shown = card.getBoundingClientRect();
+  const view = $('main').getBoundingClientRect();
+  return shown.bottom > view.top && shown.top < view.bottom;
+}
 /** Kinds the workspace offers to open in a tab of their own (view.html). */
 const TABBED = new Set(['page', 'picture', 'pdf', 'document', 'media']);
 /** What a kind is called where a file is listed. */
 const KIND_NAMES = { page: 'page', picture: 'picture', markdown: 'Markdown', text: 'text', pdf: 'PDF', document: 'document', media: 'audio or video' };
 
 /** Where a file a step wrote shows: a page, picture, Markdown file or document below its
- * run of steps, in sight; any other file inside the run, after its step. One card per
- * file in a run: the latest. */
+ * run of steps, in sight; any other file, and the thread's own notes (`isNotes`), inside
+ * the run, after its step. One card per file in a run: the latest. */
 function placeFile(card, made) {
   const steps = card.closest('.steps');
   if (!steps) {
@@ -1866,7 +1991,7 @@ function placeFile(card, made) {
     return;
   }
   for (const old of steps.querySelectorAll(`.file-card[data-path="${CSS.escape(made.dataset.path)}"]`)) old.remove();
-  if (PRESENTED.has(kindOf(made.dataset.path))) steps.append(made);
+  if (PRESENTED.has(kindOf(made.dataset.path)) && !isNotes(made.dataset.path)) steps.append(made);
   else card.after(made);
 }
 
@@ -1876,8 +2001,17 @@ function wroteFile(card, preview = true) {
   const path = workspacePath(card.input?.path);
   if (!current || !path || !['write_file', 'edit_file'].includes(card.dataset.tool)) return null;
   turnPaths.add(path);
-  const presentable = PRESENTED.has(kindOf(path));
-  return fileCard(current, path, { content: card.dataset.tool === 'write_file' ? card.input.content : null, preview: preview && presentable });
+  const kind = kindOf(path);
+  const shows = preview && SELF_SHOWING.has(kind) && !isNotes(path);
+  const made = fileCard(current, path, { content: card.dataset.tool === 'write_file' ? card.input.content : null, preview: shows });
+  // A Markdown file or document takes the one place: the one shown before it folds. A
+  // picture folds nothing and holds no place (a chart stays beside the Markdown on it).
+  if (shows && kind !== 'picture') {
+    if (selfShown !== made) selfShown?.unpreview?.();
+    selfShown = made;
+  }
+  if (shows) showing.set(made, SHOWN_FOR);
+  return made;
 }
 
 /** A file of thread `id` in the conversation: its icon, name (opening it in the workspace
@@ -1936,9 +2070,8 @@ function fileCard(id, path, { content = null, size: bytes = null, preview = fals
     // PDF takes the page around the viewer with it).
     action('external', `Open ${path} in a tab`, () => chrome.tabs.create({ url: viewUrl(id, path) }));
   } else if (kind) {
-    toggle = action('eye', `Preview ${path}`, () => {
-      body.hidden = !body.hidden;
-      const shown = !body.hidden;
+    const show = (shown) => {
+      body.hidden = !shown;
       // Folded away, what plays stops (it would go on unseen).
       if (!shown) for (const player of body.querySelectorAll('audio, video')) player.pause();
       toggle.replaceChildren(icon(shown ? 'eye-off' : 'eye'));
@@ -1946,8 +2079,15 @@ function fileCard(id, path, { content = null, size: bytes = null, preview = fals
       toggle.setAttribute('aria-label', toggle.title);
       toggle.setAttribute('aria-expanded', String(shown));
       if (shown && !filled) fill();
+    };
+    // The user's doing is kept: a preview they opened or shut is not folded or shown
+    // for them again.
+    toggle = action('eye', `Preview ${path}`, () => {
+      card.dataset.user = '1';
+      show(body.hidden);
     });
     toggle.setAttribute('aria-expanded', 'false');
+    card.show = show;
   }
   action('download', `Download ${path}`, async () => {
     try {
@@ -1960,8 +2100,16 @@ function fileCard(id, path, { content = null, size: bytes = null, preview = fals
   });
   head.append(mark, text, actions);
   card.append(head, body);
-  // Shows its preview (once, if it has one to show).
-  if (toggle && PRESENTED.has(kind)) card.preview = () => body.hidden && toggle.click();
+  // Shows its preview (if it has one to show), and folds one it showed itself: neither
+  // over what the user did.
+  if (toggle && PRESENTED.has(kind)) {
+    card.preview = () => {
+      if (body.hidden && !card.dataset.user) card.show(true);
+    };
+    card.unpreview = () => {
+      if (!body.hidden && !card.dataset.user) card.show(false);
+    };
+  }
   if (preview) card.preview?.();
   return card;
 }
@@ -2289,9 +2437,17 @@ function drawTree(box, files, changes, { onOpen, filter = '', links = null, key 
 function scrollDown(force = false) {
   // The workspace page scrolls in the same place: a turn going on behind it leaves it be.
   if (document.body.dataset.view === 'workspace') return;
-  const main = $('main');
-  if (force || main.scrollHeight - main.scrollTop - main.clientHeight < 160) main.scrollTop = main.scrollHeight;
+  if (force) following = true;
+  if (following) toEnd();
   renderJump();
+}
+
+/** The conversation scrolled to its end, and that kept as where it was put (scroll events
+ * come with the next frame, if one is drawn: a scroll up is told from this, not them). */
+function toEnd() {
+  const main = $('main');
+  main.scrollTop = main.scrollHeight;
+  scrolledTo = main.scrollTop;
 }
 
 /** "Latest" shows while a turn runs and the conversation is scrolled up from its end. */
@@ -2301,9 +2457,28 @@ function renderJump() {
   const running = Boolean(current && threads.get(current)?.state === 'running');
   $('jump').hidden = !(running && away && !$('thread').hidden);
 }
-$('main').addEventListener('scroll', renderJump, { passive: true });
+$('main').addEventListener('scroll', () => {
+  // (The same element scrolls the thread list and the workspace page: only the
+  // conversation's scrolling says whether it is followed.)
+  if (document.body.dataset.view === 'thread') {
+    const main = $('main');
+    if (main.scrollHeight - main.scrollTop - main.clientHeight < 160) following = true;
+    else if (main.scrollTop < scrolledTo - 1) following = false;
+    scrolledTo = main.scrollTop;
+  }
+  renderJump();
+}, { passive: true });
+// While a turn runs, what comes in after its event (a preview read, a picture loaded)
+// keeps the end in sight as its event did, and so does the panel growing shorter (a
+// smaller window, the message box growing as the user writes).
+const keepingEnd = new ResizeObserver(() => {
+  if (following && document.body.dataset.view === 'thread' && current && threads.get(current)?.state === 'running') toEnd();
+});
+keepingEnd.observe($('history'));
+keepingEnd.observe($('main'));
 $('jump').onclick = () => {
   const main = $('main');
+  following = true;
   main.scrollTo({ top: main.scrollHeight, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
   $('prompt').focus({ preventScroll: true });
 };
@@ -2378,6 +2553,11 @@ function renderBar() {
         ? note
         : `${note}\n\nContinue picks up where it left off; Retry sends the last model request again.`;
     notice.hidden = false;
+    // A ChatGPT plan's usage limit (refused at once, or ended in the reply's stream):
+    // where the user reviews it comes first.
+    if (note.includes(CHATGPT_USAGE) || /subscription_sharing_\w*usage_limit_exceeded/.test(note)) {
+      go = ['Manage usage', 'Review and limit what Spindle uses of your ChatGPT plan, in ChatGPT', openUsage];
+    }
   } else if (thread.state === 'moved') {
     phase('Moved out');
   } else {
@@ -2729,6 +2909,9 @@ function send() {
     try {
       if (thread) {
         if (thread.state !== 'running' && current === target) shown.turnFrom = shown.total;
+        // The user's own message: the conversation follows on from it (set first: the turn's
+        // first events may come before the answer).
+        if (current === target) following = true;
         const answer = await ask('send', { id: thread.id, text, ...(files.length && { files }) });
         sending = null;
         if (answer.steered != null) {
@@ -2743,7 +2926,7 @@ function send() {
         }
         if (answer.queued) toast('It goes when this turn ends: a running turn takes text only, not files.');
       } else {
-        const { id } = await ask('create', { provider, model, ...(effort && effort !== 'default' && { effort }), text, runner, network, ...(choice.tasks && { tasks: true }), ...(choice.max_usd != null && { max_usd: choice.max_usd }), ...(files.length && { files }), ...(from && { from }) });
+        const { id } = await ask('create', { provider, model, ...(effort && effort !== 'default' && { effort }), text, runner, network, ...(choice.tasks && { tasks: true }), ...(choice.max_usd != null && { max_usd: choice.max_usd }), ...(choice.compact_tokens !== undefined && { compact_tokens: choice.compact_tokens }), ...(files.length && { files }), ...(from && { from }) });
         sending = null;
         if (current === target) {
           carry(null);
@@ -2757,6 +2940,35 @@ function send() {
     }
   }).catch((error) => toast(error.message)).finally(() => { if (sending === sendId) sending = null; });
 }
+
+// While the user writes here, tabs Spindle opens open behind the one showing
+// (background.js `typing`): Chrome gives the keys to a tab it shows, which would take
+// them from this box mid-word. Writing: the box has the focus and holds text, or a key
+// went into it in the last few seconds. Told once a telling is half spent, and at once
+// when it stops (it lasts past itself, so a panel closed mid-word holds no longer).
+const WRITING_MS = 8_000;
+const HOLDING_MS = 30_000;
+/** When a key last went into the box (or it took the focus), and until when that was told. */
+let wrote = 0;
+let toldUntil = 0;
+function tellWriting(event) {
+  const box = $('prompt');
+  const now = Date.now();
+  if (event?.type === 'input' || event?.type === 'focus') wrote = now;
+  const focused = document.hasFocus() && document.activeElement === box;
+  const until = !focused ? 0 : box.value.trim() ? now + HOLDING_MS : wrote + WRITING_MS > now ? wrote + WRITING_MS : 0;
+  if (until ? toldUntil - now > (until - now) / 2 : toldUntil <= now) {
+    // Run out (an empty box no key went into): nothing to tell again.
+    if (!until) toldUntil = 0;
+    return;
+  }
+  toldUntil = until;
+  chrome.runtime.sendMessage({ type: 'typing', until }).catch(() => {});
+}
+for (const type of ['input', 'focus', 'blur']) $('prompt').addEventListener(type, tellWriting);
+addEventListener('blur', tellWriting);
+// A box left holding text, focused, is told again while it stays so.
+setInterval(() => { if (toldUntil) tellWriting(); }, 10_000);
 
 $('composer').addEventListener('submit', (event) => {
   event.preventDefault();
@@ -3019,9 +3231,11 @@ const modelPicker = picker($('model-name'), {
   chose: () => loadEfforts(),
 });
 
-/** The chosen model's efforts, the chosen one kept if it takes it (else its default). */
+/** The chosen model's efforts, the chosen one kept if it takes it (else its default);
+ * and, for Sign in with ChatGPT, that the ChatGPT plan pays (with where to manage it). */
 function loadEfforts() {
   const provider = providerPicker.value;
+  $('model-plan').hidden = !planSignIn(profileOf(provider));
   const model = modelPicker.value || profileOf(provider)?.default_model;
   const loading = (provider && model ? effortsOf(provider, model) : Promise.resolve([])).then((efforts) => {
     if (sheet.loading !== loading) return;
@@ -3190,7 +3404,7 @@ function loadSheet(scope) {
   $('model-label').hidden = !thread;
   $('model-label').textContent = thread?.title ?? '';
   $('model-halted').hidden = !sheet.halted;
-  $('model-apply').textContent = sheet.halted ? 'Start the turn over' : thread ? 'Save for this thread' : 'Save for new threads';
+  $('model-apply').textContent = sheet.halted ? 'Go on with this' : thread ? 'Save for this thread' : 'Save for new threads';
   providerPicker.value = now.provider ?? null;
   modelPicker.value = now.model ?? profileOf(now.provider)?.default_model ?? '';
   renderEffort();
@@ -3206,6 +3420,22 @@ function renderBudget(thread) {
   sheet.budget = undefined;
   sheet.budgetTyped = false;
   $('model-budget').value = '';
+  // Where history compacts (thousands of tokens shown; null: the window alone). A new
+  // thread's default is the engine's (256K) until the user sets one.
+  sheet.compact = undefined;
+  sheet.compactTyped = false;
+  const shownCompact = (tokens) => (tokens ? String(Math.round(tokens / 1000)) : '');
+  $('model-compact').value = '';
+  if (!thread) {
+    sheet.compact = choice.compact_tokens === undefined ? 256_000 : choice.compact_tokens;
+    $('model-compact').value = shownCompact(sheet.compact);
+  } else {
+    ask('spend', { id: thread.id }).then((spend) => {
+      if (sheet.thread !== thread.id) return;
+      sheet.compact = spend.compact_tokens ?? null;
+      if (!sheet.compactTyped) $('model-compact').value = shownCompact(sheet.compact);
+    }).catch(() => {});
+  }
   $('budget-note').textContent = 'Per thread, tasks included';
   if (!thread) {
     sheet.budget = choice.max_usd ?? null;
@@ -3224,7 +3454,9 @@ function renderBudget(thread) {
 }
 
 $('model-chip').onclick = () => openModel();
+$('model-usage').onclick = openUsage;
 $('model-budget').oninput = () => { sheet.budgetTyped = true; };
+$('model-compact').oninput = () => { sheet.compactTyped = true; };
 $('model-apply').onclick = () => {
   const provider = providerPicker.value;
   const profile = profileOf(provider);
@@ -3243,6 +3475,13 @@ $('model-apply').onclick = () => {
     toast('A spending limit is a number of US dollars, 0 or more (empty for none).');
     return;
   }
+  // Where history compacts: thousands of tokens, 16 or more (empty: the window alone).
+  const compactTyped = $('model-compact').value.trim();
+  const compactAt = compactTyped === '' ? null : Math.round(Number(compactTyped) * 1000);
+  if ($('model-compact').validity.badInput || (compactAt != null && !(Number.isFinite(compactAt) && compactAt >= 16_000 && compactAt <= 100_000_000))) {
+    toast('Compact history past takes thousands of tokens, from 16 to 100,000 (empty for the model\'s whole window).');
+    return;
+  }
   // Asked now, in the click: a thread's next turn uses it, and network through Chrome
   // needs Chrome's access to sites (a new thread asks again when it is sent).
   const sites = network && runner === 'app' && !engine?.relay;
@@ -3255,7 +3494,7 @@ $('model-apply').onclick = () => {
     const effort = sheet.efforts.some((entry) => entry.effort === sheet.effort) ? sheet.effort : 'default';
     const what = `${profile.display_name} · ${model}${effortOn(provider, model, effort) ? `, ${effortOn(provider, model, effort).short}` : ''}`;
     if (!thread) {
-      choice = { provider, model, effort, runner, network, tasks: sheet.tasks, max_usd: budget };
+      choice = { provider, model, effort, runner, network, tasks: sheet.tasks, max_usd: budget, compact_tokens: compactAt };
       try { localStorage.setItem('spindle-new', JSON.stringify(choice)); } catch {}
       renderBar();
       if (!(await granted)) toast(`Without ${BROWSER}'s access to sites, new threads' commands reach no website; ${BROWSER} asks again when you send.`);
@@ -3273,14 +3512,17 @@ $('model-apply').onclick = () => {
     // The spending limit, when the user changed it.
     const budgetChanged = sheet.budget === undefined ? budget != null : budget !== sheet.budget;
     const tasksChanged = sheet.tasks !== Boolean(thread.tasks);
-    const changes = { provider, model, effort, ...(moved && { runner }), ...(networkChange && { network }), ...(budgetChanged && { max_usd: budget }), ...(tasksChanged && { tasks: sheet.tasks }) };
-    const limit = budgetChanged ? (budget == null ? ', no spending limit' : `, a US$${budget} spending limit`) : '';
+    const compactChanged = sheet.compact === undefined ? compactAt != null : compactAt !== sheet.compact;
+    const changes = { provider, model, effort, ...(moved && { runner }), ...(networkChange && { network }), ...(budgetChanged && { max_usd: budget }), ...(compactChanged && { compact_tokens: compactAt }), ...(tasksChanged && { tasks: sheet.tasks }) };
+    const limit = `${budgetChanged ? (budget == null ? ', no spending limit' : `, a US$${budget} spending limit`) : ''}${compactChanged ? (compactAt ? `, history compacting past ${compactAt / 1000}K tokens` : ', history compacting at the model\'s window') : ''}`;
     const also = `${moved ? `, ${where}` : ''}${networkChange ? (network ? ', commands with network' : ', commands without network') : ''}${tasksChanged ? (sheet.tasks ? ', tasks on' : ', tasks off') : ''}${limit}.${refused ? " ${BROWSER} did not give access to sites, so the thread's network stays off." : ''}`;
     if (halted) {
-      await ask('restart', { id: thread.id, changes });
-      // The conversation as it is now: the stopped turn gone, its message sent again.
+      const { from } = await ask('restart', { id: thread.id, changes });
+      // The conversation as it is now: from the stopped request, or the turn started over.
       if (current === thread.id) await openThread(thread.id);
-      toast(`The turn starts over with ${what}${also}`);
+      toast(from === 'request' ? `The turn goes on with ${what}${also} Its work so far stays; the request that stopped goes again.`
+        : from === 'start' ? `The thread starts afresh with ${what}${also} The thread as it was is kept as an earlier version (Settings › Storage).`
+        : `The turn starts over with ${what}${also} Your earlier turns stay.`);
     } else {
       await ask('settings', { id: thread.id, changes });
       toast(`The next turn uses ${what}${also}`);
@@ -3406,12 +3648,30 @@ function renderProviders() {
     const actions = el('span', 'provider-actions');
     row.append(mark, name, detail, state, actions);
     if (flow) {
-      // A browser sign-in: the provider's own page in a tab; no key to paste.
-      const signIn = iconButton(has ? 'retry' : 'signin', has ? `Sign in to ${profile.display_name} again` : `Sign in to ${profile.display_name}`, null, `icon-button${has && !ended ? '' : ' add'}`);
+      // A browser sign-in: the provider's own page in a tab; no key to paste. Sign in
+      // with ChatGPT says so as OpenAI asks ("Continue with ChatGPT"), links to where the
+      // plan's use is managed and, signed out, can take another account (it registers
+      // anew; signed in, its row keeps to three actions).
+      const plan = planSignIn(profile);
+      const words = plan ? 'Continue with ChatGPT' : has ? `Sign in to ${profile.display_name} again` : `Sign in to ${profile.display_name}`;
+      const signIn = iconButton(has ? 'retry' : 'signin', words, null, `icon-button${has && !ended ? '' : ' add'}`);
       signIn.dataset.act = 'signin';
       signIn.disabled = signingIn.has(profile.id);
       signIn.onclick = () => signInTo(profile, signIn);
       actions.append(signIn);
+      if (plan && !has && engine?.registrations?.[profile.id] !== undefined) {
+        const another = iconButton('plus', 'Use another ChatGPT account', null, 'icon-button');
+        another.dataset.act = 'another';
+        another.disabled = signingIn.has(profile.id);
+        another.onclick = () => signInTo(profile, another, { fresh: true });
+        actions.append(another);
+      }
+      if (plan && has) {
+        const usage = iconButton('external', 'Manage usage: what Spindle uses of your ChatGPT plan, in ChatGPT', null, 'icon-button');
+        usage.dataset.act = 'usage';
+        usage.onclick = openUsage;
+        actions.append(usage);
+      }
       if (has) actions.append(forgetButton(profile, `Sign out of ${profile.display_name}`, `Signed out of ${profile.display_name}.`, 'signout'));
     } else if (needsKey(profile) || has) {
       const toggle = iconButton(has ? 'pencil' : 'plus', has ? `Change ${profile.display_name} key` : `Add ${profile.display_name} key`, null, `icon-button${has ? '' : ' add'}`);
@@ -3460,8 +3720,9 @@ function forgetButton(profile, label, done, name = null) {
   button.type = 'button';
   button.onclick = async () => {
     try {
-      apply(await ask('forget', { provider: profile.id }));
-      toast(done);
+      const after = await ask('forget', { provider: profile.id });
+      apply(after);
+      toast(after.unconfirmed ? `${done} OpenAI did not confirm the session ended: to be sure, disconnect Spindle in ChatGPT's settings.` : done);
     } catch (error) {
       toast(error.message);
     }
@@ -3471,8 +3732,9 @@ function forgetButton(profile, label, done, name = null) {
 }
 
 /** A browser sign-in: Chrome's leave to reach the provider (asked first, in the click),
- * the provider's page in a tab, then the engine keeps what it gives. */
-async function signInTo(profile, button) {
+ * the provider's page in a tab, then the engine keeps what it gives. `fresh`: Sign in
+ * with ChatGPT for another account (registered anew, not signed in again). */
+async function signInTo(profile, button, { fresh = false } = {}) {
   if (engine?.vault?.locked) {
     toast('Your keys are locked: unlock them below, then sign in.');
     return;
@@ -3489,11 +3751,17 @@ async function signInTo(profile, button) {
     return;
   }
   try {
-    toast(`Sign in to ${profile.display_name} in the tab that opened.`);
-    const caught = await signInInTab(profile);
-    apply(await ask('signIn', { provider: profile.id, ...caught }));
-    toast(`Signed in to ${profile.display_name}.`);
+    const plan = planSignIn(profile);
+    const start = await ask('signInStart', { provider: profile.id, fresh });
+    toast(plan ? 'Continue with ChatGPT in the tab that opened.' : `Sign in to ${profile.display_name} in the tab that opened.`);
+    const caught = await signInInTab(profile, start);
+    const after = await ask('signIn', { provider: profile.id, ...caught });
+    apply(after);
+    toast(plan ? `Signed in with ChatGPT${engine?.vault?.accounts?.[profile.id] ? ` as ${engine.vault.accounts[profile.id]}` : ''}.` : `Signed in to ${profile.display_name}.`);
+    if (after.planWelcome) planWelcome();
   } catch (error) {
+    // Declined on OpenAI's page: the next sign-in asks for the plan permission again.
+    if (error.kind === 'declined' && planSignIn(profile)) ask('signInDeclined', { provider: profile.id }).catch(() => {});
     if (error.kind !== 'cancelled') toast(`Not signed in: ${error.message}`);
   } finally {
     signingIn.delete(profile.id);
@@ -3906,7 +4174,7 @@ async function renderPages() {
   // it since this was drawn), never over what this drawing read.
   const set = async (next) => {
     const fresh = await read('kv', 'pages').catch(() => null);
-    await write('kv', 'pages', { ...(fresh ?? {}), ...next });
+    await write('kv', 'pages', pagesRecord(fresh, next));
     // The service worker lets go of tabs when actions go off.
     chrome.runtime.sendMessage({ type: 'pages' }).catch(() => {});
     renderPages();
@@ -3932,8 +4200,8 @@ async function renderPages() {
     const asked = access ? Promise.resolve(true) : mayReach(PAGE_ACCESS, 'websites');
     asked.then((given) => (given ? set({ reading: true, acting: true }) : toast(`${BROWSER} did not give Spindle access to sites.`)));
   };
-  // Before acting: Full acts without asking (the default); Auto asks before it sends or
-  // submits; Ask before every action that changes a page.
+  // Before acting: Auto (the default) asks before it sends or submits; Ask before every
+  // action that changes a page; Full acts without asking.
   const mode = confirmMode(kept);
   for (const button of $('act-confirm').querySelectorAll('button')) {
     button.setAttribute('aria-checked', String(button.dataset.value === mode));
@@ -3941,8 +4209,8 @@ async function renderPages() {
   }
   $('act-confirm-note').textContent = {
     full: 'Acts without asking: the whole task, start to end.',
-    auto: 'Asks you first before it sends or submits: Enter, a submit or send button, a page dialog it accepts.',
-    ask: 'Asks you first before every click, keystroke, choice, page it opens and tab it closes.',
+    auto: 'Asks you first before it sends or submits: Enter, a submit or send button, a page dialog it accepts, files it uploads. It judges by a control\'s words, so it can miss one.',
+    ask: 'Asks you first before every click, keystroke, choice, file it uploads, page it opens and tab it closes.',
   }[mode];
   $('pages-summary').textContent = now.acting ? (mode === 'full' ? 'Read · act' : `Read · act · ${mode === 'auto' ? 'Auto' : 'Ask'}`) : now.reading ? 'Read' : 'Off';
   // Rules by site (Allow, Ask, Never) wait for the engine to keep and follow them.
@@ -3955,7 +4223,7 @@ async function renderPages() {
     await chrome.permissions.remove({ origins: [...PAGE_ACCESS, ...PICTURE_ACCESS] }).catch(() => false);
     // Giving the access again later (for a thread's network) turns no switch back on.
     const fresh = await read('kv', 'pages').catch(() => null);
-    await write('kv', 'pages', { ...(fresh ?? {}), reading: false, acting: false });
+    await write('kv', 'pages', pagesRecord(fresh, { reading: false, acting: false }));
     chrome.runtime.sendMessage({ type: 'pages' }).catch(() => {});
     toast(`${BROWSER}'s access to sites is taken back: no page is read or acted on, and commands reach no website through ${BROWSER}.`);
     renderPages();
@@ -3999,7 +4267,7 @@ async function renderAbout() {
   // What this build is made of (chrome/build.sh), to name in a report of a fault.
   try {
     const build = await (await fetch(chrome.runtime.getURL('build.json'))).json();
-    add('Build', `${build.version} · spindle ${build.spindle} · engine ${build.engine}`);
+    add('Build', [`${build.version} · spindle ${build.spindle} · engine ${build.engine}`, build.edition === 'store' && 'store build'].filter(Boolean).join(' · '));
     add('Linux', [`v86 image ${String(build.linux).slice(0, 12)}`, build.wasm_linux ? `wasm Linux ${String(build.wasm_linux).slice(0, 12)}` : 'no wasm Linux'].join(' · '));
   } catch {}
   try {
@@ -4034,7 +4302,7 @@ async function linuxSnapshot() {
 
 /** A text button for a Storage row (its tooltip says more). */
 function storageAction(label, title, run, { disabled = false, danger = false } = {}) {
-  const button = el('button', `link-like${danger ? ' danger' : ''}`, label);
+  const button = el('button', `storage-act${danger ? ' danger' : ''}`, label);
   button.type = 'button';
   button.title = title;
   button.disabled = disabled || freeing;
@@ -4042,16 +4310,61 @@ function storageAction(label, title, run, { disabled = false, danger = false } =
   return button;
 }
 
-function storageRow(name, bytes, detail, actions = [], cls = '') {
+/** A Storage row: its name and size, a ⋯ menu for what is done less often (`menu`:
+ * [label, icon, run, class]), a short line of what it holds (`parts`) with at most one
+ * action beside it (`action`: what gives space back and costs nothing), a hairline
+ * of its share of the largest row, and rows of its own beneath (`subs`). */
+function storageRow({ name, bytes, parts = [], action = null, menu = [], share = 0, subs = [], cls = '' }) {
   const row = el('li', `storage-row${cls ? ` ${cls}` : ''}`);
-  const text = el('span', 'storage-text');
-  text.append(el('span', 'storage-name', name));
-  if (detail) text.append(el('span', 'storage-detail', detail));
-  const acts = el('span', 'storage-acts');
-  acts.append(...actions);
-  row.append(text, el('span', 'storage-size', size(bytes)), acts);
+  const head = el('div', 'storage-head');
+  head.append(el('span', 'storage-name', name), el('span', 'storage-size', size(bytes)));
+  if (menu.length) {
+    const more = iconButton('more', `More for “${name}”`, (event) => {
+      event.stopPropagation();
+      rowMenu(more, menu);
+    }, 'icon-button storage-more', 16);
+    more.setAttribute('aria-haspopup', 'menu');
+    more.setAttribute('aria-expanded', 'false');
+    more.disabled = freeing;
+    head.append(more);
+  } else {
+    // Its place kept, so sizes line up whether a row has a menu or not.
+    head.append(el('span', 'storage-more-place'));
+  }
+  row.append(head);
+  if (parts.length || action) {
+    const line = el('div', 'storage-line');
+    line.append(el('span', 'storage-detail', parts.filter(Boolean).join(' · ')));
+    if (action) line.append(action);
+    row.append(line);
+  }
+  if (share > 0) {
+    const bar = el('div', 'storage-bar');
+    bar.style.setProperty('--share', `${Math.max(1, Math.round(share * 100))}%`);
+    row.append(bar);
+  }
+  if (subs.length) {
+    const list = el('ul', 'storage-subs');
+    list.append(...subs);
+    row.append(list);
+  }
   return row;
 }
+
+/** A row beneath a thread's: `text`, a quieter `note`, and its actions. */
+function storageSub(text, note, actions = []) {
+  const sub = el('li', 'storage-sub');
+  const words = el('span', 'storage-sub-text');
+  words.append(el('span', '', text));
+  if (note) words.append(el('span', 'storage-detail', note));
+  const acts = el('span', 'storage-sub-acts');
+  acts.append(...actions);
+  sub.append(words, acts);
+  return sub;
+}
+
+/** A day and time, short ("Nov 3, 10:09 PM"). */
+const whenShort = (at) => new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 
 /** Settings > Storage: each thread, largest first, with what can be freed in it and how;
  * the Linux snapshot; and the rest (settings, keys, the browser's own bookkeeping). */
@@ -4074,63 +4387,82 @@ async function renderStorage() {
     .map((usage) => ({ usage, thread: threads.get(usage.id), total: usage.bytes + usage.bundle + (usage.held ?? 0) }))
     .filter(({ thread }) => thread)
     .sort((a, b) => b.total - a.total);
+  const largest = Math.max(1, rows[0]?.total ?? 0, report.lost?.bytes ?? 0, linux.bytes ?? 0);
   let freeable = 0;
   let counted = 0;
   for (const { usage, thread, total } of rows) {
     counted += total;
-    const details = [];
-    const actions = [];
     const title = thread.title || 'Untitled';
-    // Moving to or from the user's host: the bytes held here until the other side has it.
+    const parts = [];
+    const menu = [];
+    let action = null;
     if (usage.move) {
-      const held = usage.held ? `${size(usage.held)} held here` : '';
-      details.push(usage.move.way === 'to'
-        ? `moving to your host${held ? `: ${held} until your host has it` : ''}`
-        : `coming back from your host${held ? `: ${held} until it is in` : ''}`);
-      if (usage.move.error) details.push(`waits: ${usage.move.error}`);
+      // Moving to or from the user's host: the bytes held here until the other side has it.
+      parts.push(usage.move.way === 'to' ? 'Moving to your host' : 'Coming back from your host');
+      if (usage.held) parts.push(`${size(usage.held)} held here until it arrives`);
+      if (usage.move.error) parts.push(`waits: ${usage.move.error}`);
     } else if (usage.hosted) {
-      details.push('on your host (only a note of where it went stays here)');
+      parts.push('On your host; only a note of it is kept here');
     }
     if (thread.state === 'moved') {
-      details.push(usage.bundle ? `in a file of ${size(usage.bundle)}` : 'moved into a file');
+      parts.push(usage.bundle ? `In a file, ${size(usage.bundle)} of it kept here` : thread.file ? `In your file ${thread.file.name}` : 'Moved into a file');
       if (usage.sealed) {
-        details.push(`sealed copy ${size(usage.sealed)}`);
+        parts.push(`sealed copy ${size(usage.sealed)}`);
         freeable += usage.sealed;
-        actions.push(storageAction(`Free ${size(usage.sealed)}`, `Remove the sealed copy “${title}” left when it moved (its file is checked first)`, () => freeSealed(usage.id, title)));
+        action = storageAction(`Free ${size(usage.sealed)}`, `Remove the sealed copy “${title}” left when it moved (its file is checked whole first)`, () => freeSealed(usage.id, title));
       }
-    } else {
+      if (usage.bundle) menu.push(['Save and free…', 'download', () => toFile(usage.id, title, false)]);
+    } else if (!usage.hosted) {
+      const history = (usage.database ?? 0) + (usage.log ?? 0);
+      if (history) parts.push(`History ${size(history)}`);
+      if (usage.tasks) parts.push(`tasks ${size(usage.tasks)}`);
+      if (usage.aside) parts.push(`first attempts ${size(usage.aside)}`);
       if (usage.free >= WORTH_FREEING) {
-        details.push(`${size(usage.free)} free inside`);
+        parts.push(`${size(usage.free)} free inside`);
         freeable += usage.free;
-        actions.push(storageAction(`Free ${size(usage.free)}`, `Give back the free space in “${title}” (its history stays as it is)`, () => compactThread(usage.id, title), { disabled: busy }));
+        action = storageAction(`Free ${size(usage.free)}`, `Give back the free space inside “${title}” (nothing in it changes)`, () => compactThread(usage.id, title), { disabled: busy });
       }
-      if (usage.aside) {
-        details.push(`first attempts ${size(usage.aside)}`);
-        actions.push(storageAction('Remove first attempts', `Remove the first attempts “${title}” kept aside when a first request was tried again (what they may have cost stays counted)`, () => dropAside(usage.id, title), { danger: true }));
-      }
+      if (usage.tasks >= WORTH_FREEING) menu.push(['Free tasks…', 'task', () => freeTasks(usage.id, title)]);
+      if (!usage.move && thread.state !== 'running') menu.push(['Move to file…', 'download', () => toFile(usage.id, title, true, (usage.versions ?? []).length)]);
+      if (usage.aside) menu.push(['Remove first attempts…', 'trash', () => dropAside(usage.id, title), 'danger']);
     }
-    box.append(storageRow(title, total, details.join(' · '), actions));
+    // The thread as it was before it started afresh: kept until it has gone on past it.
+    const subs = (usage.versions ?? []).map((version) => {
+      const when = whenShort(version.made);
+      const waits = [version.due && `until ${new Date(version.due).toLocaleDateString([], { month: 'short', day: 'numeric' })}`, version.turns && `${version.turns} more ${version.turns === 1 ? 'turn' : 'turns'}`].filter(Boolean);
+      const actions = [storageAction('Open', `Open “${title}” as it was on ${when}, as a thread of its own (this copy stays kept)`, () => openEarlier(usage.id, version.backup, title))];
+      if (version.free) actions.push(storageAction('Remove', `Remove the earlier version of “${title}” from ${when} for good`, () => freeEarlier(usage.id, version.backup, title, when), { danger: true }));
+      return storageSub(`As it was on ${when}`, `Earlier version · ${size(version.size)}${version.free ? '' : ` · kept ${waits.join(' and ')}`}`, actions);
+    });
+    box.append(storageRow({ name: title, bytes: total, parts, action, menu, share: total / largest, subs }));
   }
-  // Bytes whose slot's name could not be read (its header damaged): no file leads to them.
+  // Bytes whose slot's name could not be read (its header damaged): no file leads to them,
+  // but they may be a thread's: never in Free all, and removed only when asked, for good.
   if (report.lost?.bytes) {
     counted += report.lost.bytes;
-    freeable += report.lost.bytes;
     const one = report.lost.files === 1;
-    box.append(storageRow('Unreadable', report.lost.bytes, `${one ? 'a file' : `${report.lost.files} files`} whose name in storage could not be read (${one ? 'its record' : 'their records'} damaged); nothing reads ${one ? 'it' : 'them'}`,
-      [storageAction(`Free ${size(report.lost.bytes)}`, 'Remove the bytes no file name leads to', () => reclaimLost())]));
+    box.append(storageRow({
+      name: 'Unreadable', bytes: report.lost.bytes, share: report.lost.bytes / largest,
+      parts: [`${one ? 'A file' : `${report.lost.files} files`} whose name in storage was found damaged; nothing reads ${one ? 'it' : 'them'}`],
+      action: storageAction('Remove', 'Remove the bytes no file name leads to, for good', () => reclaimLost(report.lost.bytes), { danger: true }),
+    }));
   }
   if (linux.bytes) {
     counted += linux.bytes;
-    box.append(storageRow('Linux snapshot', linux.bytes, 'v86 resumes from it; rebuilt in under a minute when next needed',
-      [storageAction('Remove', 'Remove the Linux snapshot (the next command for v86 boots it afresh)', () => removeSnapshot(), { danger: true })]));
+    box.append(storageRow({
+      name: 'Linux snapshot', bytes: linux.bytes, share: linux.bytes / largest,
+      parts: ['v86 resumes from it; rebuilt in under a minute when next needed'],
+      action: storageAction('Remove', 'Remove the Linux snapshot (the next command for v86 boots afresh)', () => removeSnapshot(), { danger: true }),
+    }));
   }
   const used = estimate.usage ?? 0;
-  if (used - counted >= WORTH_FREEING) box.append(storageRow('Everything else', used - counted, 'settings, keys and the browser’s own bookkeeping', [], 'rest'));
+  if (used - counted >= WORTH_FREEING) box.append(storageRow({ name: 'Everything else', bytes: used - counted, parts: ['Settings, keys and the browser’s own bookkeeping'], cls: 'rest' }));
   const worth = freeable >= WORTH_FREEING;
   $('storage-summary').textContent = used ? `${size(used)}${worth ? ` · ${size(freeable)} can be freed` : ''}` : '';
   $('storage-free-all').hidden = !worth;
+  $('storage-free-all').textContent = `Free ${size(freeable)}`;
   $('storage-free-all').disabled = busy || freeing;
-  $('storage-free-all').title = busy ? 'Space is freed while no thread is running' : 'Free the space every thread can give back';
+  $('storage-free-all').title = busy ? 'Space is freed while no thread is running' : 'Give back the free space every thread can, and the sealed copies moved threads left (nothing in them changes)';
   if (!freeing) {
     $('storage-note').hidden = !busy || !worth;
     $('storage-note').textContent = busy && worth ? 'Space is freed while no thread is running.' : '';
@@ -4169,17 +4501,109 @@ function freeSealed(id, title) {
   });
 }
 
-function dropAside(id, title) {
+async function dropAside(id, title) {
+  if (!(await confirmed('Remove first attempts?', `When its first request was tried again, “${title}” kept the first attempt aside. Removing it frees its space; what it may have cost stays counted.`, 'Remove'))) return;
   return freeSpace(`Removing the first attempts of “${title}”…`, async () => {
     const { freed } = await ask('dropAside', { id });
     toast(`Removed ${size(freed)} of first attempts from “${title}”.`);
   });
 }
 
-function reclaimLost() {
-  return freeSpace('Removing unreadable files…', async () => {
+/** A saved file's own name (Chrome gives its whole path). */
+const fileName = (path) => String(path).split(/[\\/]/).pop();
+
+/** A thread's finished tasks into one .zip of session bundles on the user's disk (each
+ * imports as a thread to read), then their working copies freed here, once Chrome says
+ * the file is saved whole. */
+async function freeTasks(id, title) {
+  let found;
+  try {
+    found = await ask('finishedTasks', { id });
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+  if (!found.length) {
+    toast(`“${title}” has no finished task whose working copy is still here.`);
+    return;
+  }
+  const total = found.reduce((sum, task) => sum + task.bytes, 0);
+  const many = found.length === 1 ? 'task' : 'tasks';
+  if (!(await confirmed(`Free ${found.length} finished ${many}?`, `Their working copies in “${title}” (${size(total)}: each task's own steps and files) are saved to a .zip in your Downloads, then removed from this browser. Each task's answer and the files it gave stay in the thread, and so does what it spent. A task freed this way, a stopped one included, never runs again. Each file in the .zip imports as a thread of its own.`, 'Save tasks and free'))) return;
+  return freeSpace(`Saving the finished ${many} of “${title}”…`, async () => {
+    // In .zip files of about 1 GiB each, each freed once it is saved whole: what is held
+    // in memory stays bounded, and no .zip nears the 4 GiB the format can hold.
+    const stem = `${title.replace(/[^\p{L}\p{N}]+/gu, '-').slice(0, 60) || 'thread'}-tasks`;
+    const saved = [];
+    let freed = 0;
+    let group = [];
+    let held = 0;
+    const flush = async () => {
+      if (!group.length) return;
+      const { filename } = await savedOnDisk(zip(group.map(({ file }) => file)), `${stem}${saved.length ? `-${saved.length + 1}` : ''}.zip`);
+      saved.push(fileName(filename));
+      $('storage-note').textContent = `Freeing the finished ${many}…`;
+      for (const { task } of group) freed += (await ask('taskDrop', { id, task: task.task, expectedState: task.sourceState })).dropped?.bytes ?? 0;
+      group = [];
+      held = 0;
+    };
+    for (const [index, task] of found.entries()) {
+      // The remains of a task that never began (storage ran out as it started) hold
+      // nothing to save: freed as they are.
+      if (task.remains) {
+        freed += (await ask('taskDrop', { id, task: task.task, expectedState: '' })).dropped?.bytes ?? 0;
+        continue;
+      }
+      $('storage-note').textContent = `Saving ${found.length === 1 ? 'the task' : `task ${index + 1} of ${found.length}`}…`;
+      const { bytes } = await ask('taskExport', { id, task: task.task }, 300_000);
+      task.sourceState = bundleFacts(bytes).sourceState;
+      if (group.length && held + bytes.byteLength > 1024 ** 3) await flush();
+      // Numbered: two tasks may share a name.
+      group.push({ task, file: { path: `${index + 1}-${String(task.name).replace(/[^\p{L}\p{N}._-]+/gu, '-').slice(0, 60) || 'task'}.spindle`, bytes } });
+      held += bytes.byteLength;
+    }
+    await flush();
+    toast(`Saved to ${saved.join(', ')}; ${size(freed)} freed here.`);
+  });
+}
+
+/** A thread into a file on the user's disk (`move`: moved into it first), then its copy
+ * here removed once Chrome says the file is saved whole. A save that fails leaves the
+ * thread moved, with its file still here to save again. */
+async function toFile(id, title, move, versions = 0) {
+  const asked = move
+    ? confirmed(`Move “${title}” to a file and free its space?`, `It is saved to your Downloads as a .spindle file, and its copy in this browser is removed once Chrome has the file whole. Import the file to bring it back, here or in native Spindle.${versions ? ` Its ${versions === 1 ? 'earlier version stays' : `${versions} earlier versions stay`} here (Settings › Storage), removable after a week.` : ''}`, 'Move and free')
+    : confirmed(`Save “${title}” and free its space?`, 'Its file is saved to your Downloads, and the copy kept in this browser is removed once Chrome has the file whole. Import the file to bring it back.', 'Save and free');
+  if (!(await asked)) return;
+  return freeSpace(`Saving “${title}” to a file…`, async () => {
+    const kept = move ? await ask('export', { id, keep: false }) : await read('bundles', id);
+    if (!kept?.bytes) throw new Error('This thread keeps no file here.');
+    const { filename } = await savedOnDisk(kept.bytes, kept.name);
+    const { freed } = await ask('dropBundle', { id, filename });
+    toast(`“${title}” is saved as ${fileName(filename)}; ${size(freed)} freed here.`);
+  });
+}
+
+function openEarlier(id, backup, title) {
+  return freeSpace(`Opening the earlier version of “${title}”…`, async () => {
+    const { id: opened } = await ask('earlierOpen', { id, backup });
+    toast(`Opened as “${threads.get(opened)?.title ?? 'a new thread'}”; the earlier version stays kept here.`);
+  });
+}
+
+async function freeEarlier(id, backup, title, when) {
+  if (!(await confirmed('Remove this earlier version?', `“${title}” as it was on ${when} is deleted for good.`, 'Remove'))) return;
+  return freeSpace(`Removing the earlier version of “${title}”…`, async () => {
+    const { freed } = await ask('earlierFree', { id, backup });
+    toast(`Removed ${size(freed)}.`);
+  });
+}
+
+async function reclaimLost(bytes) {
+  if (!(await confirmed('Remove unreadable bytes?', `${size(bytes)} whose names in storage were found damaged. They may have been part of a thread; once removed they are gone for good.`, 'Remove'))) return;
+  return freeSpace('Removing unreadable bytes…', async () => {
     const { freed } = await ask('reclaimLost');
-    toast(`Freed ${size(freed)}.`);
+    toast(`Removed ${size(freed)}.`);
   });
 }
 
@@ -4195,10 +4619,9 @@ function removeSnapshot() {
 /** Free all: every thread with free space worth giving back, one after another, and
  * every moved thread's sealed copy. */
 $('storage-free-all').onclick = () => freeSpace('Freeing space…', async () => {
-  const { threads: usage, lost } = await ask('storage');
+  const { threads: usage } = await ask('storage');
   let freed = 0;
   try {
-    if (lost?.bytes) freed += (await ask('reclaimLost')).freed;
     for (const entry of usage) {
       const thread = threads.get(entry.id);
       if (!thread) continue;
@@ -4223,9 +4646,7 @@ $('settings').onclick = () => openSettings();
 $('open-tab').onclick = openTab;
 $('restart-engine').onclick = async () => {
   $('settings-dialog').close();
-  const busy = [...threads.values()].filter((thread) => thread.state === 'running' && !thread.home).length;
-  if (busy && !(await confirmed('Restart the engine?', `${busy} browser thread(s) are running. Restarting cuts them off; each can be retried after. Threads on your host keep running there.`, 'Restart'))) return;
-  await restartEngine();
+  await askRestartEngine();
 };
 
 $('catalog-file').onchange = async (event) => {
@@ -4866,7 +5287,7 @@ $('menu-fresh').onclick = () => {
   $('thread-dialog').close();
   if (!thread) return;
   // Its model, effort and where its commands run, to change in the model menu if wanted.
-  choice = { provider: thread.provider, model: thread.model, effort: thread.effort ?? 'default', runner: thread.runner, network: Boolean(thread.network), tasks: Boolean(thread.tasks), max_usd: choice.max_usd ?? null };
+  choice = { provider: thread.provider, model: thread.model, effort: thread.effort ?? 'default', runner: thread.runner, network: Boolean(thread.network), tasks: Boolean(thread.tasks), max_usd: choice.max_usd ?? null, compact_tokens: choice.compact_tokens };
   showHome();
   carry(thread);
   $('prompt').focus();
@@ -4885,6 +5306,49 @@ $('rename').addEventListener('blur', () => {
     ask('rename', { id: current, title: $('rename').value }).catch((error) => toast(error.message));
   }
 });
+
+/** Saves `data` (a Blob, or bytes) as `name` through Chrome's downloads and answers once Chrome says the
+ * file is complete and on disk (`{filename}`, its full path), or throws: what removes a
+ * copy here on the strength of the file waits for this. */
+async function savedOnDisk(data, name) {
+  // A Blob as it is (no copy of what may be gigabytes), bytes in one.
+  const blob = data instanceof Blob ? data : new Blob([data], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  try {
+    const id = await chrome.downloads.download({ url, filename: downloadName(name), saveAs: false });
+    const done = await new Promise((resolve, reject) => {
+      const check = async () => {
+        const [item] = await chrome.downloads.search({ id });
+        if (item?.state === 'complete') return finish(resolve, item);
+        if (!item || item.state === 'interrupted') return finish(reject, new Error(item?.error === 'USER_CANCELED' ? 'The save was cancelled; nothing was removed.' : `The file was not saved${item?.error ? ` (${item.error.toLowerCase().replace(/_/g, ' ')})` : ''}; nothing was removed.`));
+      };
+      const listener = (change) => { if (change.id === id && change.state) check().catch((error) => finish(reject, error)); };
+      const finish = (settle, value) => { chrome.downloads.onChanged.removeListener(listener); settle(value); };
+      chrome.downloads.onChanged.addListener(listener);
+      check().catch((error) => finish(reject, error));
+    });
+    const [item] = await chrome.downloads.search({ id });
+    if (!item?.exists || item.bytesReceived !== blob.size) throw new Error('The saved file could not be found whole on disk; nothing was removed.');
+    return { filename: done.filename };
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+}
+
+/** ChatGPT's own page where the user reviews and limits what apps use of their plan. */
+function openUsage() {
+  chrome.tabs.create({ url: CHATGPT_USAGE }).catch((error) => toast(error.message));
+}
+
+/** Said once, after the first Sign in with ChatGPT here: what using the plan means. */
+function planWelcome() {
+  const dialog = $('plan-dialog');
+  $('plan-usage').onclick = () => {
+    openUsage();
+    dialog.close();
+  };
+  dialog.showModal();
+}
 
 function confirmed(title, text, yes = 'Confirm') {
   $('confirm-title').textContent = title;

@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { nodeClient, remoteRunner } from '../../clients/js/embedded-node.mjs';
@@ -365,9 +365,39 @@ async function aKilledOwner() {
   await ended;
   const fetch = scriptedFetch([text('sent again')]);
   const c = client(fetch);
-  await assert.rejects(c.status(dir), /another spindle process or connection/, "a killed owner's lock is never taken over");
-  fs.unlinkSync(join(dir, 'store', 'authority.sqlite.lock')); // the operator's decision
+  const lock = join(dir, 'store', 'authority.sqlite.lock');
+  const left = fs.readFileSync(lock, 'utf8');
+  assert.match(left, new RegExp(`^spindle-embed: pid ${child.pid} on `), 'the lock names its owner');
+  if (process.platform !== 'linux') fs.unlinkSync(lock);
+  // Taken over only where it names a process of this machine that is gone: one whose
+  // process runs (here, this test's parent), or of another machine, stays held.
+  for (const note of [`pid ${process.ppid} on ${hostname()}`, `pid ${child.pid} on elsewhere.invalid`, 'an app',
+    left.replace(/^spindle-embed: /, '').replace(' ns ', ' ns foreign-'),
+    left.replace(/^spindle-embed: /, '').replace(' boot ', ' boot foreign-')]) {
+    fs.writeFileSync(lock, `spindle-embed: ${note}`);
+    await assert.rejects(c.status(dir), (error) => /another spindle process or connection/.test(error.message)
+      && error.message.includes('no longer running') && error.message.includes(note), `held: ${note}`);
+  }
+  if (process.platform === 'linux') {
+    // A takeover lock another taker holds (its process runs) keeps it held; one a taker
+    // left as its process ended (here, the killed owner's own note) is removed on the
+    // same proof, and the takeover goes on.
+    const takeover = `${lock}.takeover`;
+    const stat = fs.readFileSync(`/proc/${process.ppid}/stat`, 'utf8');
+    const started = stat.slice(stat.lastIndexOf(')') + 2).split(/\s+/)[19];
+    const running = left.replace(`pid ${child.pid} `, `pid ${process.ppid} `).replace(/ start \S+$/, ` start ${started}`);
+    fs.writeFileSync(lock, left);
+    fs.writeFileSync(takeover, running);
+    await assert.rejects(c.status(dir), (error) => /another spindle process or connection/.test(error.message)
+      && error.message.includes('.takeover'), 'a running taker\'s takeover holds');
+    assert.equal(fs.readFileSync(takeover, 'utf8'), running);
+    fs.writeFileSync(takeover, left);
+  } else fs.unlinkSync(lock);
+  // The killed owner's lock is taken over (its takeover lock gone again); reopened, the
+  // session is this client's.
   await assert.rejects(c.resume(dir), (error) => error.kind === 'failed', 'resume does not send an unknown request again');
+  assert.match(fs.readFileSync(lock, 'utf8'), new RegExp(`^spindle-embed: pid ${process.pid} on `));
+  assert.ok(!fs.existsSync(`${lock}.takeover`));
   assert.equal(fetch.seen.length, 0);
   const recover = await c.recover(dir);
   assert.equal(recover.wake.work, 'blocked');
@@ -444,7 +474,7 @@ async function readItNowAndStop() {
 async function aModelWrittenSummary() {
   const dir = join(root, 'summary');
   const long = (tag) => text(`${tag} ${'lorem ipsum dolor sit amet '.repeat(1700)}`);
-  const fetch = scriptedFetch([long('first'), long('second'), long('third'), text('SUMMARY: carry on'), text('done')]);
+  const fetch = scriptedFetch([long('first'), long('second'), long('third'), text(`SUMMARY: carry on. ${'The three answers are done; the fourth comes next, in the same style. '.repeat(40)}`), text('done')]);
   const c = client(fetch);
   const events = [];
   c.on('event', (event) => events.push(event));
@@ -516,6 +546,100 @@ async function aBackgroundTask() {
   await c.close();
 }
 
+/** A background task's files come with its report: what it wrote in its own session is
+ * in the thread's workspace once the report is delivered (at the next prompt), and the
+ * report says how many; a task that discards its files leaves none. */
+async function aBackgroundTasksFiles() {
+  const dir = join(root, 'background-files');
+  // A finished task's report reaches the model at the end of the next turn (after its
+  // reply), and the model goes on from it: two replies per turn here.
+  const fetch = scriptedFetch([
+    text('ready'),
+    call('write_file', { path: 'from-task.txt', content: 'made by the task' }), text('the task is done'),
+    text('nothing yet'), text('noted'),
+    call('write_file', { path: 'scratch.txt', content: 'thrown away' }), text('the scratch task is done'),
+    text('nothing more'), text('noted again'),
+  ]);
+  const c = client(fetch);
+  await c.create(dir, 'fake', { tasks: true });
+  await c.prompt(dir, 'hello');
+  const finished = async (task) => {
+    let seen;
+    for (let tries = 0; tries < 300; tries++) {
+      seen = await c.taskWait(dir, task);
+      if (seen.state === 'finished') return seen;
+      await new Promise((done) => setTimeout(done, 10));
+    }
+    throw new Error(`task ${task} did not finish: ${JSON.stringify(seen)}`);
+  };
+  await c.taskStart(dir, 'maker', 'make a file', { report: 'queue' });
+  const made = await finished('maker');
+  assert.match(made.answer.content, /\[task \w+: 1 file\(s\) written, 0 removed\]$/, 'its answer counts its files');
+  const paths = async () => (await c.files(dir)).files.map((file) => file.path).sort();
+  assert.deepEqual(await paths(), [], 'until its report is delivered, the file is the task\'s own');
+  await c.prompt(dir, 'anything new?');
+  assert.deepEqual(await paths(), ['from-task.txt'], 'the report brings the file');
+  assert.equal(new TextDecoder().decode(await c.read(dir, 'from-task.txt')), 'made by the task');
+  const report = fetch.seen.at(-1).body;
+  assert.ok(report.includes('1 file(s) written') && report.includes('the task is done'), 'the model reads the report with the count');
+  await c.taskStart(dir, 'scratch', 'make a scratch file', { report: 'queue', files: 'discard' });
+  const scratch = await finished('scratch');
+  assert.doesNotMatch(scratch.answer.content, /file\(s\) written/, 'a task that discards its files counts none');
+  await c.prompt(dir, 'and now?');
+  assert.deepEqual(await paths(), ['from-task.txt'], 'nothing of a discarding task reaches the workspace');
+  await c.close();
+}
+
+/** A background task the model starts (the task tool with `background`) that finishes
+ * while the turn is still under way: its report is read at that turn's end, and brings
+ * its files (offered as the task ends, not only as a prompt begins). The task's requests
+ * are told from the turn's by their first message. */
+async function aBackgroundTaskFinishingMidTurn() {
+  const dir = join(root, 'mid-turn');
+  const parent = scriptedFetch([
+    text('ready'),
+    call('task', { prompt: 'make mid.txt', background: true }),
+    call('hold', { who: 'turn' }),
+    text('held no more'), text('seen the report'),
+  ]);
+  const child = scriptedFetch([call('write_file', { path: 'mid.txt', content: 'made mid-turn' }), text('mid done')]);
+  const fetch = (url, init) => {
+    const first = JSON.parse(new TextDecoder().decode(init.body)).messages.find((message) => message.role === 'user');
+    return (typeof first?.content === 'string' && first.content === 'make mid.txt' ? child : parent)(url, init);
+  };
+  const c = client(fetch);
+  const held = new Map();
+  c.tool({
+    name: 'hold', description: 'Waits until it is let go', rerun: 'safe',
+    inputSchema: { type: 'object', properties: { who: { type: 'string' } }, required: ['who'], additionalProperties: false },
+    run: ({ who }, asked) => new Promise((resolve) => held.set(who, { asked, release: resolve })),
+  });
+  const until = async (what, why) => {
+    for (let tries = 0; tries < 500 && !what(); tries++) await new Promise((done) => setTimeout(done, 10));
+    assert.ok(what(), why);
+  };
+  await c.create(dir, 'fake', { tasks: true });
+  await c.prompt(dir, 'hello');
+  const turn = c.prompt(dir, 'go');
+  await until(() => held.has('turn'), 'the turn waits on its app call, its task started');
+  await until(() => child.replies.length === 0, 'the task ran meanwhile');
+  let listed;
+  for (let tries = 0; tries < 300; tries++) {
+    listed = (await c.tasks(dir)).tasks;
+    if (listed.some((task) => task.state === 'finished')) break;
+    await new Promise((done) => setTimeout(done, 10));
+  }
+  assert.ok(listed.some((task) => task.state === 'finished'), `the task finished mid-turn: ${JSON.stringify(listed)}`);
+  assert.deepEqual((await c.files(dir)).files, [], 'nothing of it in the workspace until its report is read');
+  held.get('turn').release('let go');
+  await turn;
+  const paths = (await c.files(dir)).files.map((file) => file.path);
+  assert.deepEqual(paths, ['mid.txt'], 'the file came with the report read at the turn\'s end');
+  assert.equal(new TextDecoder().decode(await c.read(dir, 'mid.txt')), 'made mid-turn');
+  assert.ok(parent.seen.at(-1).body.includes('mid done') && parent.seen.at(-1).body.includes('1 file(s) written'), 'the model read the report with the count');
+  await c.close();
+}
+
 /** Stopping a turn ends its own app call (its handler's `call.signal`, and no answer is
  * sent for it) but not a background task's: the task's call goes on, is answered, and
  * the task finishes. */
@@ -565,6 +689,31 @@ async function aStopLeavesBackgroundTasksCalls() {
   await c.close();
 }
 
+async function aBusyRemoteRunner() {
+  const inputs = { command: 'echo once', timeoutS: 30, files: [], links: [], directories: [], read: () => new Uint8Array() };
+  const sent = [];
+  const runner = remoteRunner({ url: 'http://runner', token: 't', fetch: async (_url, init) => {
+    sent.push(await init.body.text());
+    return sent.length === 1 ? Response.json({ code: 'busy', error: 'full' }, { status: 503 }) : Response.json({ success: true, output: 'once' });
+  } });
+  assert.equal((await runner.run(inputs)).success, true);
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0], sent[1], 'only a pre-admission busy refusal retries, using the same run id');
+  let uncertain = 0;
+  const lost = remoteRunner({ url: 'http://runner', token: 't', fetch: async () => { uncertain += 1; throw new Error('lost answer'); } });
+  await assert.rejects(lost.run(inputs), /lost answer/);
+  assert.equal(uncertain, 1, 'an uncertain run never retries');
+  const signal = new AbortController();
+  let attempts = 0;
+  const busy = remoteRunner({ url: 'http://runner', token: 't', fetch: async () => {
+    attempts += 1;
+    setTimeout(() => signal.abort(), 10);
+    return Response.json({ code: 'busy', error: 'full' }, { status: 503 });
+  } });
+  assert.equal((await busy.run({ ...inputs, signal: signal.signal })).success, false);
+  assert.equal(attempts, 1, 'Stop during backoff never starts a run or sends a Stop tombstone');
+}
+
 async function aRemoteRunner() {
   const binary = process.env.SPINDLE_BIN;
   if (!binary) {
@@ -608,8 +757,9 @@ async function aRemoteRunner() {
     const named = [];
     const watched = remoteRunner({
       url: `http://127.0.0.1:${port}`, token,
-      fetch: (url, init) => {
-        if (String(url).endsWith('/v1/run')) named.push(JSON.parse(init.body).run);
+      // The request's body is a Blob, built a file at a time.
+      fetch: async (url, init) => {
+        if (String(url).endsWith('/v1/run')) named.push(JSON.parse(await init.body.text()).run);
         return fetch(url, init);
       },
     });
@@ -670,7 +820,8 @@ async function responsesReasoningSnapshots() {
   const c = nodeClient({ glue, catalog: profiles, credentials, fetch });
   const dir = join(root, 'responses-reasoning');
   try {
-    await c.create(dir, 'fake');
+    // Its megabytes of reasoning stay in the history: compacted by the window alone.
+    await c.create(dir, 'fake', { compact_tokens: null });
     await c.prompt(dir, 'old task');
     const result = await c.prompt(dir, 'current task');
     assert.equal(result.stopped.complete, true);
@@ -719,7 +870,10 @@ try {
   await aModelWrittenSummary();
   await aBudget();
   await aBackgroundTask();
+  await aBackgroundTasksFiles();
+  await aBackgroundTaskFinishingMidTurn();
   await aStopLeavesBackgroundTasksCalls();
+  await aBusyRemoteRunner();
   await aRemoteRunner();
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
@@ -728,7 +882,7 @@ console.log(
   'node-session passed: wasm package via EmbeddedClient against a scripted model (file tools, ' +
     'Responses reasoning snapshots budgeted as a batch, final copies replayed only within their turn, duplicate placeholders rejected without resend, ' +
     'credentials kept out of the store, app tool with files/state, app runner, a command the user stops (recorded with its output, a reply going on after a reopen, never run again), app and remote runners at once (a declared sandbox isolates), Spindle calls from a script journaled and replayed (http() only where a grant allows; a secret header a grant adds, never kept or shown), reopen, second ' +
-    'owner refused, killed owner: unknown kept and sent once by retry, killed between a stop and its record: not completed, never run again, read-it-now cut, stop, ' +
-    'compaction by a model-written summary, a budget (refused unsent, raised, sent once, costed, usage), a background task (queued, driven after its answer, reported next turn; its app call going on when its parent\'s turn is stopped, while the turn\'s own call is told it ended), ' +
+    'owner refused, killed owner: its lock taken over (only for a process of this machine that is gone), unknown kept and sent once by retry, killed between a stop and its record: not completed, never run again, read-it-now cut, stop, ' +
+    'compaction by a model-written summary, a budget (refused unsent, raised, sent once, costed, usage), a background task (queued, driven after its answer, reported next turn with the files it made, none when it discards them; its app call going on when its parent\'s turn is stopped, while the turn\'s own call is told it ended), ' +
     'remote runner on spindle serve with a runner token, and Stop stopping its command, when SPINDLE_BIN is set)',
 );

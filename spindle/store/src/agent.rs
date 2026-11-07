@@ -321,9 +321,7 @@ fn anthropic_subscription(route: &Route) -> bool {
 /// these credentials hold): what the shared spend ledger asks the native host.
 pub(crate) fn route_is_subscription(provider: &str, model: &str) -> bool {
     match route(provider, Some(model)) {
-        Ok(route) => {
-            route.contract == RequestContract::ChatGptResponses || anthropic_subscription(&route)
-        }
+        Ok(route) => route.contract.plan_paid() || anthropic_subscription(&route),
         Err(_) => false,
     }
 }
@@ -533,6 +531,7 @@ impl Settings {
             isolation: Isolation::Auto,
             effort: Effort::Default,
             compaction: Compaction::default(),
+            compact_tokens: Some(driver::COMPACT_TOKENS),
             max_usd: None,
             self_edit: false,
             tools: vec![],
@@ -780,7 +779,7 @@ pub(crate) fn execute_code_model_with_credentials(
         // `subscription`: a login with no marginal cost (usage accounting).
         Ok(
             json!({"text":text_of(&response.blocks),"usage":response.usage,"provider":route.profile.id,"model":route.model,
-                "subscription":subscription || route.contract == RequestContract::ChatGptResponses}),
+                "subscription":subscription || route.contract.plan_paid()}),
         )
     };
     match run() {
@@ -1551,7 +1550,9 @@ pub fn doctor(dir: &Path) -> Vec<Finding> {
                     true,
                     format!(
                         "schema {}; every page and record checked",
-                        crate::CAPABILITIES.schema
+                        store
+                            .schema()
+                            .unwrap_or(i64::from(crate::CAPABILITIES.schema))
                     ),
                 ),
                 Err(error) => add(
@@ -1985,10 +1986,49 @@ impl Session {
         save_private(&self.dir.join("session.json"), &bytes)
     }
 
-    /// Save new settings; refused while a turn is in progress.
+    /// Save new settings; refused while a turn is in progress. The user's own choice
+    /// wins over a queued change for the fields it changes (`set_chosen_settings`).
     pub fn set_settings(&mut self, settings: Settings) -> Result<()> {
-        self.ensure_idle()?;
-        self.save_settings(&settings)
+        self.set_chosen_settings(settings, &[])
+    }
+
+    /// `set_settings` with the fields the user named (`named`): a queued change gives
+    /// way for those and for the fields that change, a provider and its model together,
+    /// as the web host's does, so a queued field left from a turn that never ended
+    /// cannot undo the user's choice, even one equal to the setting as it is.
+    pub fn set_chosen_settings(&mut self, settings: Settings, named: &[&str]) -> Result<()> {
+        // Between turns, or where a stopped turn waits for its next model request (that
+        // request is prepared from the settings then).
+        let snapshot = self.store.snapshot().map_err(store_error)?;
+        let before_model = snapshot.revision > 0
+            && driver::before_model(
+                &crate::turn::restored(&snapshot.continuation).map_err(turn_error)?,
+            );
+        if !before_model {
+            self.ensure_idle()?;
+        }
+        let before = self.settings()?.to_json()?;
+        let after = settings.to_json()?;
+        self.save_settings(&settings)?;
+        let mut set: Vec<&str> = [
+            "provider",
+            "model",
+            "effort",
+            "network",
+            "toolchain",
+            "compaction",
+            "max_usd",
+        ]
+        .into_iter()
+        .filter(|key| named.contains(key) || before.get(*key) != after.get(*key))
+        .collect();
+        if set.is_empty() {
+            return Ok(());
+        }
+        if set.iter().any(|key| matches!(*key, "provider" | "model")) {
+            set.extend(["provider", "model"]);
+        }
+        drop_pending_settings(&self.dir, Some(&set))
     }
 
     /// Start a turn with `text` and drive it to its next stop.
@@ -2001,6 +2041,9 @@ impl Session {
 
     fn prompt_inner(&mut self, text: &str) -> Result<()> {
         // A turn stopped part way goes on with the message (read after what it has).
+        // Finished background tasks' files go with their reports: delivered as the
+        // prompt starts, or at the end of the turn a stopped one goes on with.
+        self.offer_task_files()?;
         if driver::Driver::takes_message(&mut self.store)? {
             return self.say_inner(text);
         }
@@ -2105,6 +2148,7 @@ impl Session {
     pub fn resume(&mut self) -> Result<()> {
         self.driver.until_unknown = false;
         self.restart_tasks()?;
+        self.offer_task_files()?;
         match self.driver.resume(&mut self.store)? {
             driver::Need::Stopped(_) => self.report_stop(),
             driver::Need::PackIdle(idle) => {
@@ -2139,6 +2183,7 @@ impl Session {
         }
         self.driver.until_unknown = true;
         self.restart_tasks()?;
+        self.offer_task_files()?;
         let need = self.driver.resume_until_unknown(&mut self.store)?;
         self.drive_from(Some(need))
     }
@@ -2231,17 +2276,16 @@ impl Session {
         self.observer.event(event);
     }
 
-    fn head(&mut self) -> Result<(u64, TurnContinuation)> {
-        let snapshot = self.store.snapshot().map_err(store_error)?;
-        if snapshot.revision == 0 {
-            return Err("this session has no turns yet".into());
-        }
-        let state = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
-        Ok((snapshot.revision, state))
+    /// The head revision and its turn, restored once per revision (`Driver::head`).
+    fn head(&mut self) -> Result<(u64, Arc<TurnContinuation>)> {
+        self.driver.head(&mut self.store)
     }
 
     fn start_turn(&mut self, prompt: &str, start: Start) -> Result<()> {
         let start_state = self.start_state.take();
+        // Background tasks a stopped process left running go on (their report is
+        // waited for when this turn ends), as they do on resume.
+        self.restart_tasks()?;
         // Settings queued while no model turn ran to its end (sent during an install)
         // apply before this turn, as they would have when the last one stopped.
         let host = self.observer.host();
@@ -2269,12 +2313,21 @@ impl Session {
                     )?
                 }
                 driver::Need::Start(start) => {
+                    // A turn a retry restarts (it carries its state) was rewound already:
+                    // its prompt is held only here until the start commits.
+                    let restarted = start.state.is_some();
                     self.start_state = start.state;
                     if let Err(error) = self.start_turn(&start.prompt, start.start) {
+                        // The prompt (the waiting messages joined into it) goes back to
+                        // the queue, to be sent again: nothing the user wrote is lost.
+                        let back = match restarted {
+                            true => vec![start.prompt],
+                            false => start.joined,
+                        };
                         self.steering
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .splice(0..0, start.joined);
+                            .splice(0..0, back);
                         return Err(error);
                     }
                     for text in &start.joined {
@@ -2300,11 +2353,10 @@ impl Session {
 
     /// A new turn may start (and the session config change) only after a completed one.
     fn ensure_idle(&mut self) -> Result<()> {
-        let snapshot = self.store.snapshot().map_err(store_error)?;
-        if snapshot.revision == 0 {
+        if self.store.head_revision().map_err(store_error)? == 0 {
             return Ok(());
         }
-        let prior = crate::turn::restored(&snapshot.continuation).map_err(turn_error)?;
+        let (_, prior) = self.head()?;
         match prior.control().phase() {
             Phase::Stopped(Stop::Complete) => Ok(()),
             Phase::Stopped(stop) => Err(format!(
@@ -2321,7 +2373,7 @@ impl Session {
         &mut self,
         command: &str,
         state: &TurnContinuation,
-        dropped: &[Message],
+        dropped: &driver::Dropped,
         prompt: Option<usize>,
     ) -> Option<String> {
         let config = self.settings().ok()?;
@@ -2364,6 +2416,9 @@ impl Session {
                         return Err("stopped while waiting for background tasks".into());
                     }
                     std::thread::sleep(Duration::from_millis(20));
+                    // A task that finished meanwhile has its files offered before its
+                    // report is read (nothing to read while none has).
+                    self.offer_task_files()?;
                 }
                 driver::Need::Summarize(_) | driver::Need::Start(_) => {
                     unreachable!("nested needs were fulfilled above")
@@ -2885,6 +2940,66 @@ impl Session {
 
     pub fn stop_task(&self, task: &str) -> Result<bool> {
         tasks::stop(&self.dir, &tasks::key(&self.dir, task)?)
+    }
+
+    /// Finished background tasks' file changes, read from their own sessions and
+    /// offered to the driver before a prompt or a continue, so the report that delivers
+    /// each one's answer brings its files too (`Driver::offer_task_changes`; the driver
+    /// stages them over the head, or says why not). A task that discards its files, one
+    /// that stopped, or one whose session is gone offers none; one whose store cannot
+    /// be read is said, and keeps its files.
+    fn offer_task_files(&mut self) -> Result<()> {
+        self.driver.clear_task_changes();
+        let pending = self.driver.pending_task_reports(&mut self.store)?;
+        for run in pending {
+            if run.state != "finished" {
+                continue;
+            }
+            let input: Value = serde_json::from_slice(&run.input).unwrap_or(Value::Null);
+            if input["files"] == "discard" {
+                continue;
+            }
+            self.driver
+                .offer_task_changes(&run.task, Ok(driver::TaskChanges::default()));
+            let dir = tasks::task_dir(&self.dir, &run.task);
+            if !dir.join("store").join("authority.sqlite").exists() {
+                continue;
+            }
+            let label = crate::reads::task_name(&run.task);
+            match self.task_file_changes(&dir, &run.base) {
+                Ok(Some(Ok(changes))) if !changes.is_empty() => {
+                    self.driver.offer_task_changes(&run.task, Ok(changes));
+                }
+                Ok(Some(Err(note))) => self.driver.offer_task_changes(&run.task, Err(note)),
+                Ok(_) => {}
+                Err(why) => {
+                    let note = format!(
+                        "[task {label}: its files could not be read ({why}); they stay in the task]"
+                    );
+                    self.driver.offer_task_changes(&run.task, Err(note));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What the finished task at `dir` changed of the workspace it began from (`base`,
+    /// that tree's root): read from its own store, closed again at once.
+    fn task_file_changes(
+        &mut self,
+        dir: &Path,
+        base: &str,
+    ) -> Result<Option<std::result::Result<driver::TaskChanges, String>>> {
+        let mut child = Store::open(&dir.join("store")).map_err(store_error)?;
+        let Some(root) = child.head_root().map_err(store_error)?.1 else {
+            return Ok(None);
+        };
+        let now = child.tree_map(SCOPE, &root).map_err(store_error)?;
+        let base = self.store.tree_map(SCOPE, base).map_err(store_error)?;
+        driver::tree_changes(&base, &now, |object| {
+            child.read_object(SCOPE, object).map_err(store_error)
+        })
+        .map(Some)
     }
 
     fn restart_tasks(&mut self) -> Result<()> {
@@ -3914,7 +4029,8 @@ impl driver::Env for NativeEnv {
 mod tests {
     use super::*;
     use crate::driver::{
-        CURRENT_REQUEST, compacted, context_overflow, stated_output_limit, transcript_bytes,
+        COMPACTED_TRAILER, CURRENT_REQUEST, compacted, context_overflow, stated_output_limit,
+        transcript_bytes,
     };
 
     #[cfg(unix)]
@@ -3960,6 +4076,7 @@ mod tests {
             isolation: Isolation::Off,
             effort: Effort::High,
             compaction: Compaction::Digest,
+            compact_tokens: None,
             max_usd: None,
             self_edit: false,
             tools: vec![],
@@ -3974,6 +4091,7 @@ mod tests {
             ("deepseek", "deepseek-flash", false),
             ("openai", "gpt-5", false),
             ("chatgpt", "gpt-5", false),
+            ("chatgpt-plan", "gpt-6.1-sol", false),
             ("anthropic", "claude-sonnet-4-6", false),
             ("anthropic", "claude-sonnet-4-6", true),
         ] {
@@ -4033,6 +4151,87 @@ mod tests {
                 found.body(),
                 prepared_request(&state, &shape).unwrap().body()
             );
+        }
+    }
+
+    #[test]
+    fn sign_in_with_chatgpt_sends_the_api_namespaced_tools_and_no_output_cap() {
+        let route = builtin("chatgpt-plan", "gpt-6.1-sol");
+        assert_eq!(route.contract, RequestContract::ChatGptPlan);
+        assert_eq!(route.endpoint, "https://api.openai.com/v1/responses");
+        assert!(
+            route.contract.plan_paid(),
+            "paid by the plan, not per token"
+        );
+        assert!(crate::spend::plan_paid(route.contract.as_str()));
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1",
+                "name": "read_file", "input": {"path": "a"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1",
+                "content": "it says a"}]},
+        ]))
+        .unwrap();
+        let transcript = TranscriptCheckpoint {
+            route_binding: ROUTE.into(),
+            messages,
+        };
+        let body = request_body(
+            &route,
+            &route.model,
+            "s",
+            false,
+            false,
+            Effort::High,
+            &transcript,
+        )
+        .unwrap();
+        assert_eq!(
+            (&body["store"], &body["stream"]),
+            (&json!(false), &json!(true))
+        );
+        assert!(body.get("max_output_tokens").is_none(), "{body}");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        // Function tools only inside a namespace, and the call sent back names it.
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "{body}");
+        assert_eq!(tools[0]["type"], "namespace");
+        assert_eq!(tools[0]["name"], crate::shape::PLAN_NAMESPACE);
+        let inner = tools[0]["tools"].as_array().unwrap();
+        assert!(inner.iter().any(|tool| tool["name"] == "read_file"));
+        assert!(inner.iter().all(|tool| tool["type"] == "function"));
+        let input = body["input"].as_array().unwrap();
+        let call = input
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        assert_eq!(call["namespace"], crate::shape::PLAN_NAMESPACE);
+        assert_eq!(call["name"], "read_file");
+        assert!(
+            input
+                .iter()
+                .all(|item| item["role"] != "system" && item["role"] != "developer"),
+            "the route takes no system items: {body}"
+        );
+        // The API's own bearer token, without the Codex backend's headers.
+        let headers = provider::provider_headers_with_context(
+            route.contract,
+            "token",
+            false,
+            false,
+            false,
+            Some("s"),
+            &provider::HeaderContext {
+                originator: "spindle",
+                user_agent: "test",
+                request_id: None,
+                kimi: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(headers["authorization"], "Bearer token");
+        for codex in ["chatgpt-account-id", "originator", "openai-beta"] {
+            assert!(headers.get(codex).is_none(), "{codex}: {headers:?}");
         }
     }
 
@@ -4420,6 +4619,14 @@ mod tests {
             "",
         );
         assert_eq!(steered_text(&wrapped), Some(words), "its own marker stays");
+        // Spindle's own (shorter) wrapper reads back the same, as earlier ones still do.
+        let ours = crate::turn::steering_text(words);
+        assert!(ours.len() < wrapped.len() / 2, "{ours}");
+        assert_eq!(steered_text(&ours), Some(words));
+        assert!(!is_prompt(&Message {
+            role: "user".into(),
+            content: vec![Block::Text { text: ours }],
+        }));
         assert_eq!(steered_text("User update:\nnot steering"), None);
         let mut messages = json!([
             {"role": "user", "content": [{"type": "text", "text": wrapped}]},
@@ -4671,6 +4878,7 @@ mod tests {
             isolation: Isolation::Required,
             effort: Effort::Default,
             compaction: Compaction::Model,
+            compact_tokens: Some(64_000),
             max_usd: Some(2.5),
             self_edit: false,
             tools: vec![],
@@ -4683,6 +4891,7 @@ mod tests {
         };
         settings.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir).unwrap().max_usd, Some(2.5));
+        assert_eq!(Settings::load(&dir).unwrap().compact_tokens, Some(64_000));
         std::thread::scope(|scope| {
             let path = &dir;
             let reader = scope.spawn(move || {
@@ -4731,6 +4940,66 @@ mod tests {
     }
 
     #[test]
+    fn a_thin_model_summary_keeps_the_recorded_steps_beside_it() {
+        let mut messages = vec![text("user", "first task"), text("assistant", "done")];
+        messages.push(text("user", "second task"));
+        for index in 0..40 {
+            messages.extend(step(index));
+        }
+        let transcript = TranscriptCheckpoint {
+            route_binding: ROUTE.into(),
+            messages,
+        };
+        // One paragraph for 160 KiB of history (the fragment a real model returned).
+        let thin = compacted(
+            &transcript,
+            24 * 1024,
+            Some("Crypto: flat overnight."),
+            None,
+        )
+        .unwrap();
+        let thin = text_of(&thin.messages[0].content);
+        assert!(thin.contains("Crypto: flat overnight."), "{thin}");
+        assert!(
+            thin.contains("User asked: first task") && thin.contains("$ echo 0"),
+            "{thin}"
+        );
+        // A summary of the asked-for length stands alone.
+        let full = "Goal: two tasks. ".repeat(200);
+        let full = compacted(&transcript, 24 * 1024, Some(&full), None).unwrap();
+        let full = text_of(&full.messages[0].content);
+        assert!(
+            full.contains("Goal: two tasks.") && !full.contains("User asked:"),
+            "{full}"
+        );
+        // The workspace's state goes after the summary, before the trailer, so what the
+        // model goes on from names the files it has; blank notes add nothing.
+        let notes = "Workspace now: 3 file(s). Top level: NOTES.md, src/\nNOTES.md starts:\n- done: parsing";
+        let noted = compacted(
+            &transcript,
+            24 * 1024,
+            Some("Crypto: flat overnight."),
+            Some(notes),
+        )
+        .unwrap();
+        let noted = text_of(&noted.messages[0].content);
+        let (summary_at, notes_at) = (
+            noted.find("Crypto:").unwrap(),
+            noted.find("Workspace now:").unwrap(),
+        );
+        assert!(
+            summary_at < notes_at && noted.contains("- done: parsing"),
+            "{noted}"
+        );
+        assert!(noted.find(COMPACTED_TRAILER).unwrap() > notes_at, "{noted}");
+        let blank = compacted(&transcript, 24 * 1024, Some(&full), Some("  \n")).unwrap();
+        assert!(
+            !text_of(&blank.messages[0].content).contains("\n\n\n"),
+            "blank notes add nothing"
+        );
+    }
+
+    #[test]
     fn compaction_keeps_recent_pairs_and_the_current_prompt() {
         let mut messages = vec![text("user", "first task"), text("assistant", "done")];
         messages.push(text("user", "second task"));
@@ -4742,7 +5011,7 @@ mod tests {
             messages,
         };
         let before = transcript_bytes(&transcript).unwrap().len();
-        let compacted = compacted(&transcript, 24 * 1024, None).unwrap();
+        let compacted = compacted(&transcript, 24 * 1024, None, None).unwrap();
         let after = transcript_bytes(&compacted).unwrap().len();
         assert!(after < before / 2, "{before} -> {after}");
         let digest = text_of(&compacted.messages[0].content);
@@ -4769,7 +5038,7 @@ mod tests {
         for index in 40..80 {
             longer.messages.extend(step(index));
         }
-        let again = crate::driver::compacted(&longer, 24 * 1024, None).unwrap();
+        let again = crate::driver::compacted(&longer, 24 * 1024, None, None).unwrap();
         assert!(text_of(&again.messages[0].content).contains("first task"));
         assert_eq!(text_of(&again.messages[1].content), "second task");
         assert!(transcript_bytes(&again).unwrap().len() < 48 * 1024);
@@ -4788,7 +5057,7 @@ mod tests {
             route_binding: ROUTE.into(),
             messages,
         };
-        let compacted = compacted(&transcript, 24 * 1024, None).unwrap();
+        let compacted = compacted(&transcript, 24 * 1024, None, None).unwrap();
         let prompts: Vec<_> = compacted
             .messages
             .iter()
@@ -4805,7 +5074,7 @@ mod tests {
             route_binding: ROUTE.into(),
             messages: vec![text("user", "only")],
         };
-        assert!(compacted(&transcript, 24 * 1024, None).is_none());
+        assert!(compacted(&transcript, 24 * 1024, None, None).is_none());
     }
 
     #[test]

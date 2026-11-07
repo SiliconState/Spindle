@@ -518,7 +518,8 @@ pub(crate) fn eligible_target(
     revision: u64,
 ) -> Result<RewindTargetKind> {
     let (_, _, kind) = fork(db, scope, "eligibility-probe", revision)?;
-    eligible_kind(db, scope, revision, kind)
+    let spans = pending_spans(db, scope, revision, revision)?;
+    eligible_kind(db, scope, revision, kind, &spans)
 }
 
 /// Whether some revision at or below `head` is a rewind target, as
@@ -531,33 +532,65 @@ pub(crate) fn has_target(db: &Connection, scope: &str, head: u64) -> bool {
     if ensure_open(db).is_err() {
         return false;
     }
-    let revisions: Vec<u64> = match db.prepare(
-        "SELECT revision FROM revisions WHERE scope=?1 AND revision<=?2 AND engine=?3 ORDER BY revision DESC LIMIT ?4",
-    ) {
-        Ok(mut query) => query
-            .query_map(
-                params![
-                    scope,
-                    head.min(i64::MAX as u64) as i64,
-                    crate::turn::ENGINE,
-                    crate::ownership::MAX_REPORT as i64
-                ],
-                |row| crate::nonnegative_id(row, 0),
-            )
-            .and_then(|rows| rows.collect())
-            .unwrap_or_default(),
-        Err(_) => return false,
+    let Ok(revisions) = candidates(db, scope, head) else {
+        return false;
     };
-    revisions.into_iter().any(|revision| {
-        header_kind(db, scope, revision)
-            .and_then(|kind| eligible_kind(db, scope, revision, kind))
-            .is_ok()
-    })
+    headed_targets(db, scope, &revisions, false).is_ok_and(|targets| !targets.is_empty())
 }
 
-/// Rewind targets among `revisions`, for listing: the head is checked once, and each
-/// candidate by its control header instead of re-deriving the fork and re-hashing its
-/// workspace (both were checked when it was committed; `begin_rewind` checks again).
+/// The scope's newest revisions at or below `head` (at most `MAX_REPORT`), newest
+/// first: the candidates `Store::rewind_targets` and `has_target` consider.
+#[cfg(feature = "dext-turn")]
+fn candidates(db: &Connection, scope: &str, head: u64) -> Result<Vec<u64>> {
+    Ok(db
+        .prepare_cached(
+            "SELECT revision FROM revisions WHERE scope=?1 AND revision<=?2 AND engine=?3 ORDER BY revision DESC LIMIT ?4",
+        )?
+        .query_map(
+            params![
+                scope,
+                head.min(i64::MAX as u64) as i64,
+                crate::turn::ENGINE,
+                crate::ownership::MAX_REPORT as i64
+            ],
+            |row| crate::nonnegative_id(row, 0),
+        )?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Rewind targets among `revisions`, each read by its control header (`header_kind`)
+/// instead of re-deriving its fork and re-hashing its workspace (both were checked when
+/// it was committed; `begin_rewind` checks its target in full again), with the intents
+/// that could hold any of them back read once for all. `strict`: a candidate's error
+/// other than its refusal (Conflict, Unsupported) is returned, not passed over.
+#[cfg(feature = "dext-turn")]
+fn headed_targets(
+    db: &Connection,
+    scope: &str,
+    revisions: &[u64],
+    strict: bool,
+) -> Result<Vec<(u64, RewindTargetKind)>> {
+    let (Some(&oldest), Some(&newest)) = (revisions.iter().min(), revisions.iter().max()) else {
+        return Ok(vec![]);
+    };
+    let spans = pending_spans(db, scope, oldest, newest)?;
+    let mut targets = vec![];
+    for &revision in revisions {
+        match header_kind(db, scope, revision)
+            .and_then(|kind| eligible_kind(db, scope, revision, kind, &spans))
+        {
+            Ok(kind) => targets.push((revision, kind)),
+            Err(error) if strict && !matches!(error, Error::Conflict | Error::Unsupported) => {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(targets)
+}
+
+/// Rewind targets among `revisions`, for listing: the head is checked once, and the
+/// candidates as `headed_targets` checks them.
 #[cfg(feature = "dext-turn")]
 pub(crate) fn listed_targets(
     db: &Connection,
@@ -568,13 +601,58 @@ pub(crate) fn listed_targets(
     if ensure_open(db).is_err() || eligible_head(db, scope, head).is_err() {
         return vec![];
     }
-    revisions
-        .iter()
-        .filter_map(|&revision| {
-            let kind = header_kind(db, scope, revision).ok()?;
-            Some((revision, eligible_kind(db, scope, revision, kind).ok()?))
-        })
-        .collect()
+    headed_targets(db, scope, revisions, false).unwrap_or_default()
+}
+
+/// Rewind targets among `revisions` (newest first), up to and including the newest
+/// completed turn, and whether one was seen (eligible or not: a task still running
+/// keeps every target of a task-owning realm). The walk stops there, so its cost is
+/// the current turn's length, not the history's. While a rewind is held (`ensure_open`)
+/// there is no target, as `listed_targets` lists none, and a completed turn is assumed:
+/// never a first turn while that is not known.
+#[cfg(feature = "dext-turn")]
+pub(crate) fn targets_to_settled(
+    db: &Connection,
+    scope: &str,
+    head: u64,
+    revisions: &[u64],
+) -> Result<(Vec<(u64, RewindTargetKind)>, bool)> {
+    let mut found = vec![];
+    match ensure_open(db) {
+        Ok(()) => {}
+        Err(Error::Paused) => return Ok((found, true)),
+        Err(error) => return Err(error),
+    }
+    let head_ok = match eligible_head(db, scope, head) {
+        Ok(()) => true,
+        Err(Error::Conflict | Error::Unsupported) => false,
+        Err(error) => return Err(error),
+    };
+    let spans = match (revisions.last(), revisions.first()) {
+        (Some(&oldest), Some(&newest)) if head_ok => pending_spans(db, scope, oldest, newest)?,
+        _ => vec![],
+    };
+    for &revision in revisions {
+        if revision == 0 {
+            continue;
+        }
+        let kind = match header_kind(db, scope, revision) {
+            Ok(kind) => kind,
+            Err(Error::Conflict | Error::Unsupported) => continue,
+            Err(error) => return Err(error),
+        };
+        if head_ok {
+            match eligible_kind(db, scope, revision, kind, &spans) {
+                Ok(kind) => found.push((revision, kind)),
+                Err(Error::Conflict | Error::Unsupported) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if kind == RewindTargetKind::Settled {
+            return Ok((found, true));
+        }
+    }
+    Ok((found, false))
 }
 
 /// What a revision would restore, read from its DTT1 control header (bytes 4..27) and
@@ -589,7 +667,8 @@ fn header_kind(db: &Connection, scope: &str, revision: u64) -> Result<RewindTarg
             |row| {
                 Ok((
                     crate::bounded_label(row, 0)?,
-                    crate::packed_blob(db, row, 1, crate::MAX_PAYLOAD)?,
+                    // The header alone: one chunk read, however long the history is.
+                    crate::packed_prefix(db, row, 1, crate::MAX_PAYLOAD, 28)?,
                     crate::optional_digest(row, 2)?,
                 ))
             },
@@ -611,12 +690,48 @@ fn header_kind(db: &Connection, scope: &str, revision: u64) -> Result<RewindTarg
     }
 }
 
+/// The revisions intents of `scope` hold back, for candidates from `oldest` to
+/// `newest`, in one read: an intent reserved at revision `from` keeps every revision
+/// from it until (not including) `until`, where its receipt was applied (u64::MAX
+/// while it has none, or while it is a native one unsealed). An intent never reserved
+/// is not pending here: `fork` refuses a target with pending effects, so it was
+/// resolved without dispatch (guard or refusal).
+#[cfg(feature = "dext-turn")]
+fn pending_spans(
+    db: &Connection,
+    scope: &str,
+    oldest: u64,
+    newest: u64,
+) -> Result<Vec<(u64, u64)>> {
+    let mut query = db.prepare_cached(&format!(
+        "SELECT i.revision,coalesce(p.revision,-1) FROM intents i JOIN revisions r ON r.revision=i.revision JOIN attempts a ON a.effect=i.id LEFT JOIN applied_receipts p ON p.attempt=a.id WHERE r.scope=?1 AND i.revision<=?2 AND (p.attempt IS NULL OR p.revision>?3) AND {LIVE_INTENT}
+         UNION ALL SELECT i.revision,-1 FROM attempts a JOIN intents i ON i.id=a.effect JOIN revisions r ON r.revision=i.revision WHERE r.scope=?1 AND i.revision<=?2 AND {UNSEALED}"
+    ))?;
+    let spans = query.query_map(
+        params![
+            scope,
+            newest.min(i64::MAX as u64) as i64,
+            oldest.min(i64::MAX as u64) as i64
+        ],
+        |row| {
+            let until: i64 = row.get(1)?;
+            Ok((
+                crate::nonnegative_id(row, 0)?,
+                u64::try_from(until).unwrap_or(u64::MAX),
+            ))
+        },
+    )?;
+    Ok(spans.collect::<rusqlite::Result<_>>()?)
+}
+
+/// `kind` if `revision` may be rewound to, given the `pending_spans` read for it.
 #[cfg(feature = "dext-turn")]
 fn eligible_kind(
     db: &Connection,
     scope: &str,
     revision: u64,
     kind: RewindTargetKind,
+    spans: &[(u64, u64)],
 ) -> Result<RewindTargetKind> {
     if owned_realm(db)? {
         if kind != RewindTargetKind::Settled {
@@ -638,17 +753,10 @@ fn eligible_kind(
             }
         }
     }
-    // An intent never reserved is not pending here: `fork` already refused a target
-    // with pending effects, so it was resolved without dispatch (guard or refusal).
-    let pending: bool = db.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM intents i JOIN revisions r ON r.revision=i.revision JOIN attempts a ON a.effect=i.id LEFT JOIN applied_receipts p ON p.attempt=a.id WHERE r.scope=?1 AND i.revision<=?2 AND (p.attempt IS NULL OR p.revision>?2) AND {LIVE_INTENT})
-             OR EXISTS(SELECT 1 FROM attempts a JOIN intents i ON i.id=a.effect JOIN revisions r ON r.revision=i.revision WHERE r.scope=?1 AND i.revision<=?2 AND {UNSEALED})"
-        ),
-        params![scope, revision as i64],
-        |row| row.get(0),
-    )?;
-    if pending {
+    if spans
+        .iter()
+        .any(|&(from, until)| from <= revision && revision < until)
+    {
         return Err(Error::Conflict);
     }
     Ok(kind)
@@ -791,9 +899,17 @@ fn validate_rewound_tasks(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The rewind records, checked whole; a finished rewind's revision is rebuilt with
+/// `fork` and compared byte for byte only above revision `since`, the last validated
+/// head (0 in a full check). `finish_rewind` wrote it from that same rebuild, so an open
+/// rebuilds only the rewinds finished since the last one. A full check (`doctor`,
+/// `upgrade`'s check of a candidate, imports, migrations) rebuilds every one, as does
+/// the first open after a rewind: an engine whose `fork` output changes fails those on
+/// a store that rewound, and must keep reproducing the old bytes (or come with a
+/// migration) to be installed or opened over one.
 // Without the turn engine a stored row cannot be checked, so the first one refuses.
 #[cfg_attr(not(feature = "dext-turn"), allow(clippy::never_loop))]
-pub(crate) fn validate_storage(db: &Connection) -> Result<()> {
+pub(crate) fn validate_storage(db: &Connection, since: i64) -> Result<()> {
     validate_rewound_tasks(db)?;
     let mut cuts = db.prepare("SELECT scope,revision FROM execution_cuts ORDER BY revision")?;
     let mut rows = cuts.query([])?;
@@ -882,7 +998,7 @@ pub(crate) fn validate_storage(db: &Connection) -> Result<()> {
             }
         }
         #[cfg(feature = "dext-turn")]
-        if matches!(state, 1 | 2) {
+        if matches!(state, 1 | 2) && crate::nonnegative_id(row, 7)? > since.max(0) as u64 {
             let revision = crate::nonnegative_id(row, 7)?;
             let (expected, root, _) = fork(db, &scope, &command, target)?;
             let (saved, saved_root): (Vec<u8>, Option<String>) = db.query_row(
@@ -901,7 +1017,7 @@ pub(crate) fn validate_storage(db: &Connection) -> Result<()> {
         }
         #[cfg(not(feature = "dext-turn"))]
         {
-            let _ = (&scope, &command, completed, prior_revision);
+            let _ = (&scope, &command, completed, prior_revision, since);
             return Err(Error::Unsupported);
         }
     }
@@ -1395,10 +1511,10 @@ impl Store {
 
     #[cfg(feature = "dext-turn")]
     /// Revisions `begin_rewind` would accept for this scope against the current head,
-    /// newest first, from the scope's newest MAX_REPORT revisions (each candidate's
-    /// workspace is verified, so the scan is bounded). An error means the head itself
-    /// cannot be rewound now (held rewind, queued or in-flight work, or another scope
-    /// at the head).
+    /// newest first, from the scope's newest MAX_REPORT revisions, each read by its
+    /// control header (`begin_rewind` re-derives the chosen one in full: its fork and
+    /// workspace). An error means the head itself cannot be rewound now (held rewind,
+    /// queued or in-flight work, or another scope at the head).
     pub fn rewind_targets(&mut self, scope: &str) -> Result<Vec<RewindTarget>> {
         if self.paused {
             return Err(Error::Paused);
@@ -1412,28 +1528,11 @@ impl Store {
                 crate::nonnegative_id(row, 0)
             })?;
             eligible_head(&self.db, scope, head)?;
-            let revisions: Vec<u64> = self
-                .db
-                .prepare("SELECT revision FROM revisions WHERE scope=?1 AND revision<=?2 AND engine=?3 ORDER BY revision DESC LIMIT ?4")?
-                .query_map(
-                    params![
-                        scope,
-                        head as i64,
-                        crate::turn::ENGINE,
-                        crate::ownership::MAX_REPORT as i64
-                    ],
-                    |row| crate::nonnegative_id(row, 0),
-                )?
-                .collect::<rusqlite::Result<_>>()?;
-            let mut targets = vec![];
-            for revision in revisions {
-                match eligible_target(&self.db, scope, revision) {
-                    Ok(kind) => targets.push(RewindTarget { revision, kind }),
-                    Err(Error::Conflict | Error::Unsupported) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(targets)
+            let revisions = candidates(&self.db, scope, head)?;
+            Ok(headed_targets(&self.db, scope, &revisions, true)?
+                .into_iter()
+                .map(|(revision, kind)| RewindTarget { revision, kind })
+                .collect())
         })();
         self.rewind_result(result)
     }

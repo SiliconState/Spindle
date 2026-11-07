@@ -23,8 +23,18 @@ let requests = 0;
 let lastBody = '';
 /** What the covered page's button registered (a click that should never land). */
 let coveredClicks = 0;
+/** What the upload page's file field was given (its change handler posts it). */
+let uploaded = null;
 const server = http.createServer(async (request, response) => {
   if (request.url === '/page') {
+    response.writeHead(200, { 'content-type': 'text/html' }).end('<title>Review page</title><p>Review</p>');
+    return;
+  }
+  if (request.url === '/opener') {
+    response.writeHead(200, { 'content-type': 'text/html' }).end('<title>Opener page</title><a href="/page?popup" target="_blank" style="margin:40px;display:block">Popup</a>');
+    return;
+  }
+  if (request.url.startsWith('/page?')) {
     response.writeHead(200, { 'content-type': 'text/html' }).end('<title>Review page</title><p>Review</p>');
     return;
   }
@@ -40,6 +50,26 @@ const server = http.createServer(async (request, response) => {
     response.writeHead(200, { 'content-type': 'text/html' }).end(`<title>Moving page</title>
 <input aria-label="Name" style="margin:40px" onmousedown="this.replaceWith(Object.assign(document.createElement('input'), { ariaLabel: 'Name' }))">
 <input type="password" aria-label="Secret" value="mirrored-secret">`);
+    return;
+  }
+  if (request.url === '/upload') {
+    // A styled button beside its hidden file field, as most sites draw one; the page reads
+    // the file it is given as a site that uploads at once would.
+    response.writeHead(200, { 'content-type': 'text/html' }).end(`<title>Upload page</title>
+<div class="drop"><button type="button" onclick="this.nextElementSibling.click()">Upload resume</button>
+<input type="file" aria-label="Resume" accept=".pdf" hidden></div>
+<script>document.querySelector('input').addEventListener('change', async (event) => {
+  const [file] = event.target.files;
+  const head = [...new Uint8Array(await file.arrayBuffer())].slice(0, 9);
+  fetch('/uploaded', { method: 'POST', body: JSON.stringify({ name: file.name, type: file.type, size: file.size, head, trusted: event.isTrusted }) });
+});</script>`);
+    return;
+  }
+  if (request.url === '/uploaded') {
+    const parts = [];
+    for await (const part of request) parts.push(part);
+    uploaded = JSON.parse(Buffer.concat(parts).toString());
+    response.writeHead(204).end();
     return;
   }
   if (request.url === '/clicked') {
@@ -94,7 +124,7 @@ try {
   await page.eval(`globalThis.rpc = (() => {
     const channel = new BroadcastChannel('spindle-engine'); const pending = new Map(); let next = 0;
     channel.onmessage = ({ data }) => { if (data?.to !== 'review') return; const wait = pending.get(data.id); if (!wait) return; pending.delete(data.id); clearTimeout(wait.timer); data.ok ? wait.resolve(data.result) : wait.reject(new Error(data.error.message)); };
-    return (op, args = {}) => new Promise((resolve, reject) => { const id = ++next; const timer = setTimeout(() => { pending.delete(id); reject(new Error(op + ' did not answer in 15 s')); }, 15000); pending.set(id, { resolve, reject, timer }); channel.postMessage({ to: 'engine', from: 'review', id, op, args }); });
+    return (op, args = {}, wait = 15000) => new Promise((resolve, reject) => { const id = ++next; const timer = setTimeout(() => { pending.delete(id); reject(new Error(op + ' did not answer in ' + wait / 1000 + ' s')); }, wait); pending.set(id, { resolve, reject, timer }); channel.postMessage({ to: 'engine', from: 'review', id, op, args }); });
   })()`);
   const catalog = { version: 4, active_provider: 'review', providers: [{ id: 'review', display_name: 'Review', api_provider: 'openai', request_contract: 'openai-chat-completions', base_url: `http://127.0.0.1:${port}/v1`, default_model: 'review-model', requires_api_key: false, models: ['review-model'] }] };
   const catalogPath = join(work, 'providers.json');
@@ -102,7 +132,7 @@ try {
   await page.files('#catalog-file', [catalogPath]);
   await page.until(`spindlePanel.engine.catalog.providers.some((profile) => profile.id === 'review')`);
   await page.eval(`document.querySelector('#settings-dialog').open && document.querySelector('#settings-dialog').close()`);
-  const rpc = (op, args = {}) => page.eval(`rpc(${JSON.stringify(op)}, ${JSON.stringify(args)})`);
+  const rpc = (op, args = {}, wait = 15000) => page.eval(`rpc(${JSON.stringify(op)}, ${JSON.stringify(args)}, ${wait})`);
   // A new thread's index entry is idle until its first turn marks it running: the
   // engine itself says when the turn has ended.
   const settled = async (id) => {
@@ -221,6 +251,36 @@ try {
   console.log('ok a covered target is refused, not clicked through');
   await covered.close();
 
+  // The tabs a turn opened close once it is done: one it opened, and one a page opened on
+  // its click; one it kept open for the user stays, and so does the user's own tab.
+  const opener = await open(browser, `http://127.0.0.1:${port}/opener`);
+  const openerId = await page.eval(`chrome.tabs.query({}).then((tabs) => tabs.find((tab) => tab.url === 'http://127.0.0.1:${port}/opener').id)`);
+  replies.push(
+    { for: 'open some tabs', tool: 'navigate', input: { url: `http://127.0.0.1:${port}/page?mine`, new_tab: true } },
+    { for: 'open some tabs', tool: 'navigate', input: { url: `http://127.0.0.1:${port}/page?kept`, new_tab: true, keep_open: true } },
+    { for: 'open some tabs', tool: 'page_elements', input: { tab: openerId } },
+    { for: 'open some tabs', from: (body) => ({ tool: 'click', input: { ref: /link \\"Popup\\"[^[]*\[([a-z]{3}\d+)\]/.exec(body)?.[1] ?? 'k0', tab: openerId } }) },
+    { for: 'open some tabs', content: 'done' },
+  );
+  const tabsAt = (path) => page.eval(`chrome.tabs.query({}).then((tabs) => tabs.filter((tab) => (tab.url || tab.pendingUrl) === 'http://127.0.0.1:${port}${path}').length)`);
+  const opening = await rpc('create', { provider: 'review', runner: 'none', text: 'open some tabs' });
+  await settled(opening.id);
+  const openedSaid = await page.eval(`(async () => (await rpc('open', { id: ${JSON.stringify(opening.id)} })).history.messages.flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_result').map((b) => JSON.stringify(b.content)).join(' | '))()`);
+  assert.match(openedSaid, /Clicked/, `the link was clicked: ${openedSaid.slice(0, 600)}`);
+  await page.until(`(async () => {
+    const tabs = await chrome.tabs.query({});
+    const at = (path) => tabs.filter((tab) => (tab.url || tab.pendingUrl) === 'http://127.0.0.1:${port}' + path).length;
+    return at('/page?mine') === 0 && at('/page?popup') === 0 || null;
+  })()`, { what: 'the turn\'s tabs to close', timeout: 15_000 }).catch(async (error) => {
+    const left = await page.eval(`(async () => ({ tabs: (await chrome.tabs.query({})).map((tab) => [tab.id, tab.url, tab.openerTabId]), opened: await chrome.storage.session.get(null) }))()`);
+    throw new Error(`${error.message}\n${JSON.stringify(left)}`);
+  });
+  assert.equal(await tabsAt('/page?kept'), 1, 'the tab kept open for the user stays');
+  assert.equal(await tabsAt('/opener'), 1, 'the user\'s own tab stays');
+  console.log('ok the tabs a turn opened close once it is done (not one kept for the user, nor the user\'s)');
+  await page.eval(`chrome.tabs.query({}).then((tabs) => Promise.all(tabs.filter((tab) => /\\/page\\?kept$/.test(tab.url ?? '')).map((tab) => chrome.tabs.remove(tab.id))))`);
+  await opener.close();
+
   // Typing whose click reached the page but could not finish is unknown, not a plain
   // failure (it may have acted); the page's HTML keeps a mirrored password out.
   const moving = await open(browser, `http://127.0.0.1:${port}/moving`);
@@ -241,6 +301,35 @@ try {
   assert.doesNotMatch(results[2], /mirrored-secret/, 'no password in the HTML');
   console.log('ok an action cut off after it reached the page is unknown; page_html hides passwords');
   await moving.close();
+
+  // A file the user attached goes into a site's file field (hidden behind its button), as
+  // if picked in its dialog: the page reads the very bytes; no dialog opens.
+  const upload = await open(browser, `http://127.0.0.1:${port}/upload`);
+  const uploadId = await page.eval(`chrome.tabs.query({}).then((tabs) => tabs.find((tab) => tab.url === 'http://127.0.0.1:${port}/upload').id)`);
+  const uploadRef = (body) => /button \\"Upload resume\\" \[([a-z]{3}\d+)\]/.exec(body)?.[1] ?? 'k0';
+  replies.push(
+    { for: 'upload the resume', tool: 'page_elements', input: { tab: uploadId } },
+    // Clicked first, its button opens the file field's dialog: caught, not shown.
+    { for: 'upload the resume', from: (body) => ({ tool: 'click', input: { ref: uploadRef(body), tab: uploadId } }) },
+    { for: 'upload the resume', from: (body) => ({ tool: 'select', input: { ref: uploadRef(body), files: ['resume.pdf'], tab: uploadId } }) },
+    { for: 'upload the resume', content: 'done' },
+  );
+  const uploadThread = await page.eval(`rpc('create', { provider: 'review', runner: 'none', text: 'upload the resume', files: [{ path: 'resume.pdf', bytes: new TextEncoder().encode('%PDF-1.7 a resume') }] })`);
+  // Before acting is Auto (the Pages record above names no mode): the click went without a
+  // question, but a file put in a field reaches the site, so that waits for the user's Yes.
+  const uploadAsked = await page.until(`spindlePanel.engine.approvals?.find((approval) => approval.thread === ${JSON.stringify(uploadThread.id)}) ?? null`, { what: 'the question before the upload' });
+  assert.match(uploadAsked.text, /^Upload “resume\.pdf” \(17 bytes\) to /, uploadAsked.text);
+  assert.equal(uploaded, null, 'nothing reached the page before the user said yes');
+  await rpc('approve', { approval: uploadAsked.id, allow: true });
+  await settled(uploadThread.id);
+  const uploadResults = await page.eval(`(async () => (await rpc('open', { id: ${JSON.stringify(uploadThread.id)} })).history.messages.flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_result').map((b) => JSON.stringify(b.content)))()`);
+  assert.match(uploadResults[0], /file \\"Resume\\" accepts=\\".pdf\\" empty hidden \[/, `the hidden file field shows: ${uploadResults[0]?.slice(0, 600)}`);
+  assert.match(uploadResults[1], /it opened a file dialog, which Spindle caught \(nothing was chosen\)/, uploadResults[1]);
+  assert.match(uploadResults[2], /Put resume\.pdf \(17 bytes\) in file \\"Resume\\" \[[a-z]{3}\d+\] \(the file field of \[/, uploadResults[2]);
+  for (const until = Date.now() + 10_000; !uploaded && Date.now() < until;) await new Promise((done) => setTimeout(done, 50));
+  assert.deepEqual(uploaded, { name: 'resume.pdf', type: 'application/pdf', size: 17, head: [...Buffer.from('%PDF-1.7 ')], trusted: false }, 'the page read the very file');
+  console.log('ok a workspace file goes into a hidden file field beside its button once the user allows it (Auto asks first), read by the page');
+  await upload.close();
 
   // Invalid restart settings must not erase or send a failed first turn again.
   replies.push({ refuse: 401 });
@@ -274,14 +363,30 @@ try {
   assert.equal(await page.eval(`import('./shared.mjs').then((shared) => shared.keysOf('bundles')).then((keys) => keys.filter((key) => key.startsWith('prior:')).length)`), 0, 'no reset backup is kept');
   assert.equal(await page.eval(`import('./shared.mjs').then((shared) => shared.read('bundles', '${failed.id}')).then(Boolean)`), false, 'the stale file of a move cut short goes');
   console.log('ok interrupted reset restores its saved record after engine restart, and its backup goes');
-  // A reset that succeeds (the first message taken back) keeps no backup either.
+  // A reset that succeeds (the first message taken back) keeps the thread as it was, as
+  // an earlier version, never deleted; it survives an engine restart, and Storage lists
+  // it, kept until the thread has gone on past it.
   replies.push({ refuse: 401 });
   const over = await rpc('create', { provider: 'review', runner: 'none', text: 'start over' });
   await page.until(`spindlePanel.threads.get('${over.id}')?.state === 'failed'`);
   const taken = await rpc('restart', { id: over.id, resend: false });
   assert.equal(taken.text, 'start over');
-  assert.equal(await page.eval(`import('./shared.mjs').then((shared) => shared.keysOf('bundles')).then((keys) => keys.filter((key) => key.startsWith('prior:')).length)`), 0, 'a finished reset keeps no backup');
-  console.log('ok a reset that succeeds keeps no backup');
+  const earlierCount = () => page.eval(`import('./shared.mjs').then((shared) => shared.keysOf('kv')).then((keys) => keys.filter((key) => key.startsWith('earlier:${over.id}:')).length)`);
+  assert.equal(await earlierCount(), 1, 'a finished reset keeps the thread as it was');
+  assert.equal(await page.eval(`import('./shared.mjs').then((shared) => shared.keysOf('bundles')).then((keys) => keys.filter((key) => key.startsWith('prior:${over.id}:')).length)`), 1, 'with its whole copy');
+  const listed = (await rpc('storage', {})).threads.find((entry) => entry.id === over.id);
+  assert.equal(listed?.versions?.length, 1);
+  assert.equal(listed.versions[0].free, false, 'kept until the thread has gone on past it');
+  await page.eval(`(async () => { const shared = await import('./shared.mjs'); await chrome.offscreen.closeDocument(); await shared.startEngine(); })()`);
+  await page.until(`import('./shared.mjs').then((shared) => shared.keysOf('kv')).then((keys) => keys.some((key) => key.startsWith('earlier:${over.id}:')))`, { what: 'earlier version after engine restart', timeout: 20_000 });
+  assert.equal(await earlierCount(), 1, 'an engine start keeps it');
+  // Opened, it is a thread of its own with the history the reset took back.
+  // The engine that started again answers (a message sent before it listens is lost).
+  await page.until(`rpc('ping', {}, 2000).then(() => true, () => false)`, { what: 'the engine after its restart', timeout: 30_000 });
+  const opened = await rpc('earlierOpen', { id: over.id, backup: listed.versions[0].backup }, 60_000);
+  const back = await rpc('open', { id: opened.id });
+  assert.ok(JSON.stringify(back.history.messages).includes('start over'), 'the earlier version holds the first message');
+  console.log('ok a reset that succeeds keeps the thread as it was, as an earlier version that opens as a thread');
   // A move sealed before the index update must still show as moved after restart.
   const moved = await rpc('create', { provider: 'review', runner: 'none', text: 'move' });
   await settled(moved.id);
@@ -340,7 +445,7 @@ try {
     await page.eval(`document.querySelector('#settings').click()`);
     await page.until(`[...document.querySelectorAll('#storage .storage-row')].some((row) => /free inside/.test(row.textContent)) || null`, { what: 'the Storage rows' });
     assert.match(await page.eval(`document.querySelector('#storage-summary').textContent`), /can be freed/);
-    await page.eval(`[...document.querySelectorAll('#storage .storage-row')].find((row) => /free inside/.test(row.textContent)).querySelector('.link-like').click()`);
+    await page.eval(`[...document.querySelectorAll('#storage .storage-row')].find((row) => /free inside/.test(row.textContent)).querySelector('.storage-act').click()`);
     await page.until(`/Freed/.test(document.querySelector('#toast')?.textContent ?? '') && document.querySelector('#storage-note').hidden || null`, { what: 'the space freed', timeout: 30_000 });
     const after = (await rpc('storage')).threads.find((entry) => entry.id === roomy);
     assert.ok(after.free < 1048576 && after.bytes <= usage.bytes - 5 * 1048576, `the space went: ${JSON.stringify(after)}`);
@@ -360,8 +465,21 @@ try {
   await settled(cut.id);
   const aside = (await rpc('storage')).threads.find((entry) => entry.id === cut.id);
   assert.ok(aside.aside > 0, `the first attempt is kept aside: ${JSON.stringify(aside)}`);
-  const dropped = await rpc('dropAside', { id: cut.id });
-  assert.equal(dropped.freed, aside.aside);
+  // Removed from its row's ⋯ menu in Settings, with real clicks (a menu outside the open
+  // dialog showed there but took none: the dialog leaves all outside it inert).
+  await page.eval(`(() => { document.querySelector('#settings').click(); document.querySelector('[data-fold="storage"]').open = true; })()`);
+  await page.until(`(() => {
+    const row = [...document.querySelectorAll('#storage .storage-row')].find((row) => row.querySelector('.storage-name')?.textContent === spindlePanel.threads.get('${cut.id}').title && /first attempts/.test(row.textContent));
+    row?.querySelector('.storage-more')?.setAttribute('data-probe', 'aside');
+    return row ? true : null;
+  })()`, { what: 'its Storage row' });
+  await page.click('.storage-more[data-probe="aside"]');
+  await page.until(`document.querySelector('#row-menu')?.matches(':popover-open') || null`, { what: 'the row menu' });
+  await page.click('#row-menu button.danger');
+  await page.until(`document.querySelector('#confirm-dialog').open || null`, { what: 'the confirm' });
+  await page.click('#confirm-yes');
+  await page.until(`/Removed/.test(document.querySelector('#toast')?.textContent ?? '') || null`, { what: 'the first attempts removed', timeout: 30_000 });
+  await page.eval(`document.querySelector('#settings-dialog').close()`);
   assert.equal((await rpc('storage')).threads.find((entry) => entry.id === cut.id).aside, 0);
   assert.match(JSON.stringify((await rpc('open', { id: cut.id })).history), /answered this time/, 'the thread goes on');
   console.log('ok a set-aside first attempt shows in Storage and goes when removed');
@@ -387,9 +505,15 @@ try {
       await page.click(`#threads .thread-row[data-id="${id}"]`);
       await page.until(`spindlePanel.current === '${id}' && spindlePanel.status`);
     }
+    // The first time, held twice mid-run: the summary shows itself once written, and folds
+    // three steps later (the turn has moved on); the thread's own NOTES.md never shows.
+    const gates = n === 0 ? [0, 1].map(() => { let open; const hold = new Promise((done) => { open = done; }); return { hold, open }; }) : null;
     replies.push({ tool: 'write_file', input: { path: '/workspace/report.html', content: report } },
       { tool: 'navigate', input: { url: '/workspace/report.html' } },
-      { tool: 'bash', input: { command: "printf '# Notes\\n' > notes.md" } }, { content: `report ${n}` });
+      { tool: 'write_file', input: { path: 'summary.md', content: `# Summary ${n}\n` } },
+      { tool: 'write_file', input: { path: 'NOTES.md', content: `# Notes ${n}\n\n- what is left\n` }, ...(gates && { hold: gates[0].hold }) },
+      { tool: 'bash', input: { command: "printf '# More\\n' >> summary.md" } },
+      { tool: 'read_file', input: { path: 'NOTES.md' } }, { content: `report ${n}`, ...(gates && { hold: gates[1].hold }) });
     await page.eval(`chrome.permissions.request = async () => true;`);
     const requestCount = requests;
     await page.type('#prompt', `make report ${n}`);
@@ -400,6 +524,21 @@ try {
       const said = await page.eval(`({ toast: document.querySelector('#toast')?.textContent ?? '', state: spindlePanel.threads.get('${id}')?.state, note: spindlePanel.threads.get('${id}')?.note, box: document.querySelector('#prompt').value, queued: document.querySelector('#queued')?.hidden === false ? document.querySelector('#queued-text')?.textContent : null })`).catch((error) => ({ error: error.message }));
       assert.fail(`report ${n} did not reach the provider: ${JSON.stringify(said)}`);
     }
+    if (gates) {
+      const cards = `[...document.querySelectorAll('#history .file-card')].filter((card) => ['summary.md', 'NOTES.md'].includes(card.dataset.path)).map((card) => [card.dataset.path, card.querySelector('.file-body').hidden ? 'folded' : 'shown', card.closest('.group-list') ? 'in the run' : 'below it'].join(' '))`;
+      // (The cards of this turn only: the thread's earlier turns wrote neither file.)
+      await page.until(`${cards}.includes('summary.md shown below it') || null`, { what: 'the summary shown as written', timeout: 60_000 });
+      const written = await page.eval(cards);
+      gates[0].open();
+      await page.until(`${cards}.includes('NOTES.md folded in the run') && document.querySelectorAll('#history .tool').length && !document.querySelector('#history .tool.running') && ${cards}.includes('summary.md folded below it') || null`, { what: 'the summary folded three steps on', timeout: 120_000 }).catch(async (error) => {
+        throw new Error(`${error.message}\n${JSON.stringify(await page.eval(cards))}`);
+      });
+      const movedOn = await page.eval(cards);
+      gates[1].open();
+      assert.deepEqual(written, ['summary.md shown below it'], 'the summary shows itself once written');
+      assert.deepEqual(movedOn, ['NOTES.md folded in the run', 'summary.md folded below it'], 'three steps on the summary folds; NOTES.md sits folded in the run');
+      console.log('ok a Markdown file shows as written and folds three steps on; NOTES.md stays folded in its run');
+    }
     await page.until(`spindlePanel.threads.get('${id}')?.state === 'idle'`, { timeout: 240_000 });
     await page.activate();
     await page.until(`document.querySelector('#history .workspace-card .ws-tree')`, { what: 'report workspace', timeout: 5000 }).catch(async (error) => {
@@ -407,19 +546,80 @@ try {
       const files = await rpc('turnFiles', { id }).catch((error) => error.message);
       throw new Error(`${error.message}\n${JSON.stringify({ details, files, logs })}`);
     });
-    await page.until(`document.querySelector('#history .file-card[data-path="report.html"] .file-web button')`, { what: 'report web button' });
-    await page.click('#history .file-card[data-path="report.html"] .file-web button');
+    // Once the turn is done, its page and Markdown file sit folded below its steps (the
+    // page opened in a tab; the summary showed while the turn worked on it), and its
+    // NOTES.md folded in the run; the eye opens each, and a page's preview offers to load
+    // from the web.
+    // (The last card of each: an earlier turn's stays above.)
+    const lastCard = (path) => `[...document.querySelectorAll('#history .file-card[data-path="${path}"]')].at(-1)`;
+    const folded = await page.eval(`['report.html', 'summary.md', 'NOTES.md'].map((path) => { const card = [...document.querySelectorAll('#history .file-card[data-path="' + path + '"]')].at(-1); return card ? card.querySelector('.file-body').hidden : null; })`);
+    assert.deepEqual(folded, [true, true, true], `the page, the summary and the notes are folded once the turn is done: ${JSON.stringify(folded)}`);
+    await page.eval(`${lastCard('summary.md')}.querySelector('.file-actions button[aria-label^="Preview"]').click()`);
+    await page.until(`/Summary ${n}/.test(${lastCard('summary.md')}?.querySelector('.file-markdown')?.textContent ?? '')`, { what: 'the summary shown on demand' }).catch(async (error) => {
+      const seen = await page.eval(`(() => { const card = ${lastCard('summary.md')}; return { cards: document.querySelectorAll('#history .file-card[data-path="summary.md"]').length, hidden: card?.querySelector('.file-body')?.hidden, eye: card?.querySelector('.file-actions button')?.getAttribute('aria-label'), body: card?.querySelector('.file-body')?.innerHTML?.slice(0, 400) }; })()`);
+      throw new Error(`${error.message}\n${JSON.stringify(seen)}`);
+    });
+    await page.eval(`${lastCard('report.html')}.querySelector('.file-actions button[aria-label^="Preview"]').click()`);
+    await page.until(`${lastCard('report.html')}?.querySelector('.file-web button')`, { what: 'report web button' });
+    await page.eval(`${lastCard('report.html')}.querySelector('.file-web button').click()`);
     console.log(`ok file-card flow ${n + 1}`);
+  }
+
+  // A long run (18 steps, more than a group shows at once) keeps its newest rows in sight
+  // and folds the earlier ones: while the model thinks between steps (no step running),
+  // and once the turn is done. At a side panel's size, the tall Markdown file it writes
+  // near its end shows without stopping the conversation following the run down.
+  {
+    let open;
+    const hold = new Promise((done) => { open = done; });
+    for (let n = 0; n < 15; n++) replies.push({ tool: 'read_file', input: { path: n % 2 ? 'NOTES.md' : 'summary.md' } });
+    const tall = `# Tall\n\n${Array.from({ length: 60 }, (_, n) => `- line ${n} of a long list, with words enough to wrap at a side panel's width`).join('\n')}\n`;
+    replies.push({ tool: 'write_file', input: { path: 'tall.md', content: tall } }, { tool: 'read_file', input: { path: 'NOTES.md' } }, { tool: 'read_file', input: { path: 'summary.md' } });
+    replies.push({ content: 'read them', hold });
+    await page.activate();
+    if (await page.eval(`spindlePanel.current !== '${id}'`)) {
+      await page.eval(`document.querySelector('#home').click()`);
+      await page.click(`#threads .thread-row[data-id="${id}"]`);
+      await page.until(`spindlePanel.current === '${id}' && spindlePanel.status`);
+    }
+    await page.size(420, 900);
+    await page.type('#prompt', 'read them all');
+    await page.click('#send');
+    const fold = `(() => { const steps = [...document.querySelectorAll('#history > .steps')].at(-1); const rows = [...steps.list.children]; const tools = rows.filter((row) => row.classList.contains('tool'));
+      return { more: rows[0].classList.contains('group-more') ? rows[0].textContent : null, moreLast: rows.at(-1).classList.contains('group-more'), tools: tools.length, hidden: tools.map((row, at) => row.classList.contains('beyond') ? at : null).filter((at) => at !== null), running: Boolean(steps.querySelector('.tool.running')) }; })()`;
+    const want = { more: '6 earlier steps', moreLast: false, tools: 18, hidden: [0, 1, 2, 3, 4, 5], running: false };
+    await page.until(`(() => { const seen = ${fold}; return seen.tools === 18 && !seen.running; })() || null`, { what: 'the 18 steps done, the answer held', timeout: 60_000 });
+    await new Promise((done) => setTimeout(done, 300));
+    const thinking = await page.eval(fold);
+    const followed = await page.eval(`(() => { const main = document.querySelector('main'); const card = [...document.querySelectorAll('#history .file-card[data-path="tall.md"]')].at(-1); return { off: main.scrollHeight - main.scrollTop - main.clientHeight, scrolls: main.scrollHeight > main.clientHeight, latest: !document.querySelector('#jump').hidden, tall: card ? (card.querySelector('.file-body').hidden ? 'folded' : 'shown') : null }; })()`);
+    open();
+    await page.until(`spindlePanel.threads.get('${id}')?.state === 'idle'`, { timeout: 60_000 });
+    await page.until(`document.querySelector('#history .workspace-card') || null`, { what: 'the turn redrawn' });
+    const done = await page.eval(fold);
+    await page.unsize();
+    assert.deepEqual(thinking, want, 'between steps, the earliest rows fold and the newest show');
+    assert.deepEqual(done, want, 'done, the same');
+    assert.ok(followed.scrolls && followed.off < 160 && !followed.latest && followed.tall === 'shown', `the conversation followed the run down past the tall preview, still shown two steps on: ${JSON.stringify(followed)}`);
+    console.log('ok a long run folds its earlier steps, never its newest (between steps and once done); a tall preview does not stop the conversation following it');
   }
 
   // A report among many unrelated data files, opened in a tab: it runs as it shows,
   // contained (nothing to say, nothing to let), and the data file it uses comes from the
   // workspace when it asks; reloaded fast, one frame shows it, and only the report itself
   // is read to make it ready.
-  const reportPage = '<!doctype html><title>Report</title><p>Report</p><script>fetch("data/used.json").then((r) => r.json()).then((d) => parent.postMessage({ review: d.word }, "*"), (e) => parent.postMessage({ review: "failed " + e.message }, "*"))</script>';
+  const reportPage = '<!doctype html><title>Report</title><p>Report</p><script>fetch("data/used.json").then((r) => r.json()).then((d) => parent.postMessage({ review: d.word }, "*"), (e) => parent.postMessage({ review: "failed " + e.message }, "*"));'
+    + 'addEventListener("beforeprint", () => parent.postMessage({ review: "printing" }, "*")); print(); alert("a"); parent.postMessage({ review: "dialogs " + confirm("b") + " " + prompt("c") }, "*")</script>';
+  // Pages that print, or ask "Leave site?", only as below.
+  const printPages = {
+    'button.html': '<!doctype html><title>Button</title><button style="position:fixed;inset:0" onclick="print()">Print</button><script>addEventListener("beforeprint", () => parent.postMessage({ review: "printing" }, "*"))</script>',
+    'keys.html': '<!doctype html><title>Keys</title><p style="height:100vh">Keys</p><script>addEventListener("beforeprint", () => parent.postMessage({ review: "printing" }, "*"))</script>',
+    'leave.html': '<!doctype html><title>Leave</title><body onbeforeunload="return \'leave?\'"><p style="height:100vh">Leave</p><script>addEventListener("beforeunload", (e) => { e.preventDefault(); e.returnValue = "leave?"; }); onbeforeunload = () => "leave?";</script></body>',
+    'plain.html': '<!doctype html><title>Plain</title><p>Plain</p>',
+  };
   const reportThread = await page.eval(`(async () => {
     const bytes = (text) => new TextEncoder().encode(text);
     const files = [{ path: 'report.html', bytes: bytes(${JSON.stringify(reportPage)}) }, { path: 'data/used.json', bytes: bytes('{"word":"lazy"}') }];
+    for (const [path, text] of Object.entries(${JSON.stringify(printPages)})) files.push({ path, bytes: bytes(text) });
     for (let n = 0; n < 40; n++) files.push({ path: 'data/unused-' + n + '.json', bytes: bytes(JSON.stringify({ filler: 'x'.repeat(100000) })) });
     return rpc('create', { provider: 'review', runner: 'none', text: 'a report and its data', files });
   })()`);
@@ -430,6 +630,16 @@ try {
   await viewer.eval(`globalThis.heard = []; addEventListener('message', ({ data }) => { if (data?.review) heard.push(data.review); }); document.querySelector('#view-reload').click()`);
   await viewer.until(`heard.includes('lazy')`, { what: 'the report to run, unasked, and get its data' });
   assert.equal(await viewer.eval(`document.querySelector('#view-note').hidden`), true, 'nothing to say about a page that runs contained');
+  // Its frame stays sandboxed whatever it goes to (and is still served contained); modals
+  // only so that it may print: alert, confirm and prompt show nothing, as before, and its
+  // print() as it loads prints nothing (its beforeprint, told at once, would come first).
+  assert.equal(await viewer.eval(`document.querySelector('iframe#view').getAttribute('sandbox')`), 'allow-scripts allow-same-origin allow-modals');
+  await viewer.until(`heard.includes('dialogs false null')`, { what: 'alert, confirm and prompt to show nothing' });
+  assert.ok(!(await viewer.eval('heard')).includes('printing'), 'a page does not print as it loads');
+  // The tab's Print prints the page (its own beforeprint is heard).
+  assert.equal(await viewer.eval(`document.querySelector('#view-print').hidden`), false, 'Print offered for a page');
+  await viewer.eval(`document.querySelector('#view-print').click()`);
+  await viewer.until(`heard.includes('printing')`, { what: 'the page to print from the tab' });
   await viewer.eval(`heard.length = 0; for (let n = 0; n < 6; n++) document.querySelector('#view-reload').click()`);
   await viewer.until(`heard.includes('lazy')`, { what: 'the report to get its data again' });
   await viewer.until(`/file\\(s\\) read/.test(document.querySelector('#view-path').title)`, { what: 'the timings' });
@@ -441,7 +651,158 @@ try {
   assert.match(timings, /, 1 file\(s\) read /, `only the report was read to make it ready: ${timings}`);
   assert.ok(!(await viewer.eval('heard')).some((said) => said.startsWith('failed')), 'no fetch failed');
   await browser.send('Target.closeTarget', { targetId: viewer.targetId }).catch(() => {});
-  console.log(`ok a report runs as it shows, contained; it shows once however fast it is reloaded and reads only what it uses (${timings})`);
+  console.log(`ok a report runs as it shows, contained; it shows once however fast it is reloaded and reads only what it uses (${timings}); it prints from the tab, and shows no alert, confirm or prompt`);
+
+  // Printing, and nothing else a modal could do, only as the user asks: a page prints from
+  // a button of its own, from Ctrl+P pressed in it or in the tab around it (the page, not
+  // the tab: its beforeprint, not the tab's), and never as it loads (the report above);
+  // it asks no "Leave site?" however it asks. A page with no scripts of its own prints
+  // from the tab's Print too (heard from a world of the test's own in its frame); text
+  // has no Print. Each print in a tab of its own: headless Chrome keeps a tab's print
+  // preview open, and takes no other print there meanwhile.
+  {
+    const tabOf = async (path) => {
+      const tab = await open(browser, `chrome-extension://${extension}/view.html?thread=${reportThread.id}&path=${path}`);
+      await tab.until(`/frame /.test(document.querySelector('#view-path').title) && !document.querySelector('#view-print').hidden`, { what: `${path} shown, with Print` });
+      await tab.eval(`globalThis.heard = []; addEventListener('message', ({ data }) => { if (data?.review) heard.push(data.review); }); addEventListener('beforeprint', () => heard.push('the tab printing'))`);
+      return tab;
+    };
+    const ctrlP = async (tab) => {
+      for (const type of ['rawKeyDown', 'keyUp']) await browser.send('Input.dispatchKeyEvent', { type, modifiers: 2, key: 'p', code: 'KeyP', windowsVirtualKeyCode: 80, nativeVirtualKeyCode: 80 }, tab.sessionId);
+    };
+    const printed = async (tab, what) => {
+      await tab.until(`heard.includes('printing')`, { what, timeout: 15_000 });
+      assert.ok(!(await tab.eval('heard')).includes('the tab printing'), `${what}: the page printed, not the tab`);
+      await browser.send('Target.closeTarget', { targetId: tab.targetId }).catch(() => {});
+    };
+    const button = await tabOf('button.html');
+    // While Spindle reads the page to show it, no element it reads carries the page's
+    // handler (Edge checks one against Spindle's own policy at once, and lists it as an
+    // error of Spindle's); the page shown still has it (its button prints).
+    await button.eval(`(() => {
+      const parse = DOMParser.prototype.parseFromString;
+      globalThis.parsedHandlers = 0;
+      DOMParser.prototype.parseFromString = function (...args) {
+        const doc = parse.apply(this, args);
+        for (const element of doc.querySelectorAll('*')) for (const attribute of element.attributes) if (/^on/i.test(attribute.name)) parsedHandlers += 1;
+        return doc;
+      };
+      document.querySelector('#view-path').title = '';
+      document.querySelector('#view-reload').click();
+    })()`);
+    await button.until(`/frame /.test(document.querySelector('#view-path').title)`, { what: 'button.html shown again' });
+    assert.equal(await button.eval('parsedHandlers'), 0, 'no handler on what Spindle reads of a page');
+    await button.click('iframe#view');
+    await printed(button, 'its own Print button clicked');
+    // Focus in the page (a click on it that prints nothing), then Ctrl+P.
+    const inPage = await tabOf('keys.html');
+    await inPage.click('iframe#view');
+    await new Promise((done) => setTimeout(done, 300));
+    assert.ok(!(await inPage.eval('heard')).includes('printing'), 'a click in it prints nothing');
+    await ctrlP(inPage);
+    await printed(inPage, 'Ctrl+P pressed in the page');
+    const inTab = await tabOf('keys.html');
+    await inTab.click('#view-path');
+    await ctrlP(inTab);
+    await printed(inTab, 'Ctrl+P pressed in the tab around it');
+    // Clicked in (Chrome asks "Leave site?" only of a page the user used), then left.
+    const leave = await tabOf('leave.html');
+    await leave.click('iframe#view');
+    const dialogs = [];
+    const watch = ({ method, params, sessionId }) => {
+      if (sessionId !== leave.sessionId || method !== 'Page.javascriptDialogOpening') return;
+      dialogs.push(params.type);
+      browser.send('Page.handleJavaScriptDialog', { accept: true }, leave.sessionId).catch(() => {});
+    };
+    browser.on(watch);
+    await browser.send('Page.enable', {}, leave.sessionId);
+    await browser.send('Page.navigate', { url: 'about:blank' }, leave.sessionId);
+    await leave.until(`location.href === 'about:blank'`, { what: 'the tab to leave the page' });
+    await new Promise((done) => setTimeout(done, 500));
+    browser.off(watch);
+    assert.deepEqual(dialogs, [], 'no "Leave site?" (its listener, its handler and its body attribute all asked)');
+    await browser.send('Target.closeTarget', { targetId: leave.targetId }).catch(() => {});
+
+    const plain = await tabOf('plain.html');
+    // The frame is a target of its own (a sandboxed frame in a process of its own, whose
+    // parent is the tab) or in the tab's process: a world of the test's own made in it.
+    let world = null;
+    let tried = null;
+    let attached = null;
+    for (const until = Date.now() + 15_000; !world; await new Promise((done) => setTimeout(done, 200))) {
+      const { targetInfos } = await browser.send('Target.getTargets');
+      const target = targetInfos.find((info) => info.type === 'iframe' && info.parentId === plain.targetId && info.url.includes('preview.html'));
+      let where = null;
+      if (target) {
+        if (attached?.targetId !== target.targetId) attached = { targetId: target.targetId, ...(await browser.send('Target.attachToTarget', { targetId: target.targetId, flatten: true })) };
+        where = { frameId: target.targetId, sessionId: attached.sessionId };
+      } else {
+        const { frameTree } = await browser.send('Page.getFrameTree', {}, plain.sessionId);
+        const child = frameTree.childFrames?.find((entry) => entry.frame.url.includes('preview.html'));
+        if (child) where = { frameId: child.frame.id, sessionId: plain.sessionId };
+      }
+      tried = where;
+      if (where) {
+        const made = await browser.send('Page.createIsolatedWorld', { frameId: where.frameId, worldName: 'review-print' }, where.sessionId).catch((error) => ({ error: error.message }));
+        const shown = made?.executionContextId && await browser.send('Runtime.evaluate', { contextId: made.executionContextId, expression: 'document.title', returnByValue: true }, where.sessionId).catch((error) => ({ error: error.message }));
+        tried = { ...where, made, shown };
+        if (shown?.result?.value === 'Plain') world = { contextId: made.executionContextId, sessionId: where.sessionId };
+      }
+      if (!world && Date.now() > until) throw new Error(`the plain page never showed in its frame: ${JSON.stringify(tried)}`);
+    }
+    const inWorld = async (expression) => (await browser.send('Runtime.evaluate', { contextId: world.contextId, expression, returnByValue: true }, world.sessionId)).result.value;
+    await inWorld(`addEventListener('beforeprint', () => { document.documentElement.dataset.printed = 'yes'; }), true`);
+    await plain.eval(`document.querySelector('#view-print').click()`);
+    for (const until = Date.now() + 15_000; (await inWorld(`document.documentElement.dataset.printed ?? null`)) !== 'yes'; await new Promise((done) => setTimeout(done, 200))) {
+      if (Date.now() > until) throw new Error('a page with no scripts did not print from the tab');
+    }
+    await browser.send('Target.closeTarget', { targetId: plain.targetId }).catch(() => {});
+    const text = await open(browser, `chrome-extension://${extension}/view.html?thread=${reportThread.id}&path=data/used.json`);
+    await text.until(`document.querySelector('#view.view-text, #view.view-bytes')`, { what: 'the data file as text' });
+    assert.equal(await text.eval(`document.querySelector('#view-print').hidden`), true, 'no Print for text');
+    await browser.send('Target.closeTarget', { targetId: text.targetId }).catch(() => {});
+    console.log('ok a page prints only as the user asks (its own button, Ctrl+P in it or in its tab; never as it loads), asks no "Leave site?", and prints from the tab without scripts of its own; text has no Print');
+  }
+
+  // A model reads a workspace file open in Spindle's own tab (view.html) with read_page
+  // (Chrome keeps scripts out of extension pages: the file itself is read then), finds
+  // lines in it with `find`, and is told a screenshot of such a tab is impossible; `find`
+  // on an ordinary page gives only the matching lines.
+  {
+    const shown = await open(browser, `chrome-extension://${extension}/view.html?thread=${reportThread.id}&path=plain.html`);
+    await shown.until(`/frame /.test(document.querySelector('#view-path').title)`, { what: 'plain.html shown' });
+    const shownId = await page.eval(`chrome.tabs.query({}).then((tabs) => tabs.find((tab) => (tab.url ?? '').includes('path=plain.html')).id)`);
+    const plainPage = await open(browser, `http://127.0.0.1:${port}/page`);
+    const plainId = await page.eval(`chrome.tabs.query({}).then((tabs) => tabs.find((tab) => tab.url === 'http://127.0.0.1:${port}/page').id)`);
+    replies.push(
+      { for: 'read the shown file', tool: 'read_page', input: { tab: shownId } },
+      { for: 'read the shown file', tool: 'read_page', input: { tab: shownId, find: 'plain' } },
+      { for: 'read the shown file', tool: 'read_page', input: { tab: shownId, find: '/nothing-here/' } },
+      { for: 'read the shown file', tool: 'screenshot', input: { tab: shownId } },
+      { for: 'read the shown file', tool: 'read_page', input: { tab: plainId, find: 'review' } },
+      // A tab id in quotes, as some models write it, is that tab; anything else is refused
+      // in words that say how to name one.
+      { for: 'read the shown file', tool: 'read_page', input: { tab: String(plainId), find: 'review' } },
+      { for: 'read the shown file', tool: 'read_page', input: { tab: 'the review page' } },
+      { for: 'read the shown file', content: 'done' },
+    );
+    const reading = await rpc('create', { provider: 'review', runner: 'none', text: 'read the shown file' });
+    await settled(reading.id);
+    const read = await page.eval(`(async () => (await rpc('open', { id: ${JSON.stringify(reading.id)} })).history.messages.flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_result').map((b) => typeof b.content === 'string' ? b.content : JSON.stringify(b.content)))()`);
+    assert.equal(read.length, 7, `seven tool results: ${read.join(' | ').slice(0, 800)}`);
+    assert.match(read[0], /Workspace file: plain\.html \((as the preview shows it|the file itself)\)/, `the file's text, however read: ${read[0].slice(0, 300)}`);
+    assert.match(read[0], /\nPlain/, `its text: ${read[0].slice(0, 300)}`);
+    assert.doesNotMatch(read[0], /<title>/, 'no markup when the file itself is read');
+    assert.match(read[1], /Workspace file: plain\.html[\s\S]*\nPlain/, `the matching line: ${read[1].slice(0, 300)}`);
+    assert.match(read[2], /\[no line matches "\/nothing-here\/"\]/, `no match says so: ${read[2].slice(0, 300)}`);
+    assert.match(read[3], /does not picture extension pages[\s\S]*read_page on it gives the file's text/, `a screenshot of Spindle's own tab is refused with what to do instead: ${read[3].slice(0, 300)}`);
+    assert.equal(read[4], `Address: http://127.0.0.1:${port}/page\nTitle: Review page\n\n[1 matching line, each with its neighbours]\nReview`, 'only the matching line of an ordinary page');
+    assert.equal(read[5], read[4], 'the tab id in quotes reads the same tab');
+    assert.match(read[6], /tab is a tab's number from list_tabs, such as 2054624637, not "the review page"; nothing was done/, read[6].slice(0, 300));
+    console.log('ok read_page reads a workspace file shown in Spindle\'s own tab and finds lines with `find`; a screenshot of that tab is refused; `find` on an ordinary page gives its matching lines; a tab id in quotes is that tab, any other non-number refused saying how to name one');
+    await browser.send('Target.closeTarget', { targetId: shown.targetId }).catch(() => {});
+    await plainPage.close();
+  }
 
   // A running preview sends nothing anywhere, whatever its scripts try: WebRTC (through a
   // STUN or TURN server, or straight to an address the page gives), the same from frames
@@ -568,6 +929,28 @@ try {
     return { revives, kept: found(page.html) };
   })()`);
   assert.deepEqual(reread, { revives: true, kept: 0 }, 'what a second reading brings back is taken out');
+  // A stylesheet goes in as text that cannot end its element (a `</style>` in it would make
+  // what follows markup: a script run under a choice made for other code), and its bytes
+  // are part of the version; the version is told before any choice (the first one offered
+  // names it), and a choice that gives a page more holds for the version it names only.
+  const styled = await plain.eval(`(async () => {
+    const { pageOf } = await import('./page.mjs');
+    let css = 'p { color: red }</sTyle><script>parent.postMessage({ review: "injected" }, "*")<\/script><style>';
+    const files = [{ path: 'styled.html', size: 0, digest: '' }, { path: 'style.css', size: 0, digest: '' }];
+    const read = async () => new TextEncoder().encode(css);
+    const html = '<!doctype html><link rel="stylesheet" href="style.css"><p>Styled</p><script>void 0<\/script>';
+    const show = (allowed) => pageOf({ path: 'styled.html', files, read, html, allowed, contained: false });
+    const first = await show(null);
+    const run = await show({ scripts: true, version: first.version });
+    const scripts = new DOMParser().parseFromString(run.html, 'text/html').querySelectorAll('script').length;
+    const unnamed = await show({ scripts: true, version: null });
+    const off = await show({ scripts: false, web: false });
+    css = 'p { color: blue }';
+    const restyled = await show({ scripts: true, version: first.version });
+    return { version: typeof first.version, run: run.mode, scripts, unnamed: unnamed.mode, off: off.mode, restyled: [restyled.mode, restyled.lapsed] };
+  })()`);
+  assert.deepEqual(styled, { version: 'string', run: 'scripts', scripts: 2, unnamed: 'static', off: 'static', restyled: ['static', 'scripts'] },
+    'a stylesheet cannot add a script, and a choice holds for the version (stylesheets too) it names');
   // Followed, its link goes nowhere; nothing else it holds goes anywhere either.
   const box = await plain.eval(`(() => { const r = document.querySelector('iframe#view').getBoundingClientRect(); return { x: r.x + 40, y: r.y + r.height - 40 }; })()`);
   for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) await browser.send('Input.dispatchMouseEvent', { type, x: box.x, y: box.y, button: 'left', clickCount: 1 }, plain.sessionId);

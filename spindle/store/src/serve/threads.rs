@@ -70,8 +70,8 @@ pub(super) fn owned(db: &Connection, id: &str, client: &str) -> bool {
 }
 
 /// Moves `root/sessions/<id>` to trash (both directories synced) and returns where it
-/// went (None: it was not there). Only for a session no `sessions` row names; trash no
-/// row names is removed when the host opens, or by the caller.
+/// went (None: it was not there). Only for a session no `sessions` row names; the
+/// caller removes it (the open, for what `recover` discards).
 fn discard(root: &Path, id: &str) -> std::io::Result<Option<PathBuf>> {
     let dir = root.join("sessions").join(id);
     if std::fs::symlink_metadata(&dir).is_err() {
@@ -89,9 +89,11 @@ fn discard(root: &Path, id: &str) -> std::io::Result<Option<PathBuf>> {
 
 /// At open, before sessions are listed: uploads and staged imports go (no row names
 /// them), an import that stopped before its commit is taken away and forgotten (its
-/// key imports again), and rows of sessions that are gone are dropped.
-pub(super) fn recover(root: &Path, db: &Connection) -> super::Result<()> {
+/// key imports again), and rows of sessions that are gone are dropped. Returns where
+/// the half-made sessions went in trash, for the open to remove.
+pub(super) fn recover(root: &Path, db: &Connection) -> super::Result<Vec<PathBuf>> {
     disk::remove_tree(&root.join(INCOMING)).map_err(err)?;
+    let mut discarded = vec![];
     let pending: Vec<String> = db
         .prepare("SELECT session FROM threads WHERE state='pending'")
         .and_then(|mut query| {
@@ -110,7 +112,7 @@ pub(super) fn recover(root: &Path, db: &Connection) -> super::Result<()> {
             .map_err(err)?;
         // Into trash, which the open then sweeps (no row names it).
         if id_ok(&id) && !registered {
-            discard(root, &id).map_err(err)?;
+            discarded.extend(discard(root, &id).map_err(err)?);
         }
         db.execute(
             "DELETE FROM threads WHERE session=?1 AND state='pending'",
@@ -122,7 +124,8 @@ pub(super) fn recover(root: &Path, db: &Connection) -> super::Result<()> {
         "DELETE FROM owners WHERE session NOT IN (SELECT id FROM sessions);
          DELETE FROM threads WHERE session NOT IN (SELECT id FROM sessions);",
     )
-    .map_err(err)
+    .map_err(err)?;
+    Ok(discarded)
 }
 
 /// A file removed when dropped, unless kept.
@@ -171,6 +174,63 @@ impl Drop for Admission<'_> {
             );
         }
         // Otherwise the record stays pending and the next open finishes the cleanup.
+    }
+}
+
+/// Imports under way at once (uploading, staging or checking).
+const MAX_ARRIVING: usize = 2;
+/// Free disk an import leaves the host, beyond its upload and its staged copy.
+const DISK_RESERVE: u64 = 1 << 30;
+
+/// An import under way, counted with the disk it may take until dropped: at most
+/// `MAX_ARRIVING`, each with room for its upload and staged copy (twice the bundle)
+/// beside those already under way. A new one counts toward the session limit too.
+struct Arriving<'a> {
+    host: &'a Host,
+    bytes: u64,
+}
+impl<'a> Arriving<'a> {
+    fn take(host: &'a Host, bytes: u64, new: bool) -> std::result::Result<Self, Failure> {
+        let mut arriving = lock(&host.arriving);
+        let (count, taking) = *arriving;
+        if count >= MAX_ARRIVING {
+            return Err(Failure::new(
+                503,
+                "busy",
+                "two threads are already arriving here; send it again when one has",
+            ));
+        }
+        if new && lock(&host.lives).len() + count >= super::MAX_SESSIONS {
+            return Err(limit());
+        }
+        let needs = bytes
+            .saturating_add(taking)
+            .saturating_mul(2)
+            .saturating_add(DISK_RESERVE);
+        if let Some((free, _)) = disk::space(&host.root)
+            && free < needs
+        {
+            return Err(Failure::new(
+                507,
+                "insufficient_storage",
+                format!(
+                    "this host has {} MiB free; bringing this thread needs {} MiB",
+                    free >> 20,
+                    needs >> 20
+                ),
+            ));
+        }
+        *arriving = (count + 1, taking.saturating_add(bytes));
+        Ok(Self { host, bytes })
+    }
+}
+impl Drop for Arriving<'_> {
+    fn drop(&mut self) {
+        let mut arriving = lock(&self.host.arriving);
+        *arriving = (
+            arriving.0.saturating_sub(1),
+            arriving.1.saturating_sub(self.bytes),
+        );
     }
 }
 
@@ -245,19 +305,42 @@ pub(super) fn import(
         ));
     }
     // Refused before the upload: a host that is full, or a key still importing.
-    let known: Option<String> = lock(&host.db)
+    let known: Option<(String, String, String, Option<String>)> = lock(&host.db)
         .query_row(
-            "SELECT state FROM threads WHERE client=?1 AND key=?2",
+            "SELECT digest,session,state,fit FROM threads WHERE client=?1 AND key=?2",
             [client, &key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(super::v1::internal)?;
-    match known.as_deref() {
-        Some("pending") => return Err(still_importing()),
-        None if lock(&host.lives).len() >= super::MAX_SESSIONS => return Err(limit()),
-        _ => {}
+    if let Some((expected, session, state, fit)) = known {
+        if state == "pending" {
+            return Err(still_importing());
+        }
+        // A committed replay only verifies the bytes: no upload or staged copy is
+        // needed, even when the original import consumed the remaining disk space.
+        let mut digest = Sha256::new();
+        http::stream_body(stream, request, |chunk| {
+            digest.update(chunk);
+            Ok(())
+        })
+        .map_err(|why| bad(&why))?;
+        if hex(&digest.finalize()) != expected {
+            return Err(Failure::new(
+                409,
+                "conflict",
+                "this Idempotency-Key was used for another bundle",
+            ));
+        }
+        return Ok(Imported {
+            id: session,
+            fit: fit
+                .and_then(|fit| serde_json::from_str(&fit).ok())
+                .unwrap_or(Value::Null),
+            replayed: true,
+        });
     }
+    let _arriving = Arriving::take(host, request.length() as u64, true)?;
     // The upload: to a private file, hashed as it arrives, synced once whole.
     let incoming = host.root.join(INCOMING);
     private_dir(&incoming).map_err(super::v1::internal)?;

@@ -333,4 +333,25 @@ for (const view of [short.fs, open(spare).fs]) {
   assert.equal(view.free, free);
 }
 
+// Independent callers grow the same pool without opening a slot twice.
+{
+  const opened = new Map();
+  const dir = { async getFileHandle(name) {
+    if (!opened.has(name)) opened.set(name, new Handle());
+    const handle = opened.get(name);
+    return { async createSyncAccessHandle() {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (handle.open) throw new Error('slot opened twice');
+      handle.open = true;
+      return handle;
+    } };
+  } };
+  const fs = new OpfsFs([], dir);
+  await Promise.all([fs.grow(2), fs.grow(3)]);
+  assert.equal(fs.free, 5);
+  assert.equal(opened.size, 5);
+  fs.close();
+  assert.ok([...opened.values()].every((handle) => !handle.open));
+}
+
 console.log('node-opfs-replace passed: a replacement takes the name before the old slot goes, and a directory moves under a record the next open finishes; power lost at any step leaves every file whole under one name; short reads and writes are finished or fail before anything is let go of; a directory move that failed is finished with only the files it began with; a rename to itself changes nothing, and none moves a directory inside itself; slots open at once, all or none');

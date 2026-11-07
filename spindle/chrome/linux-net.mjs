@@ -6,9 +6,11 @@
 // from proxy clients; or, once the guest's proxy names a site it opened over HTTPS,
 // that site's paths), fetches each (Chrome's own TLS, never the user's cookies) and
 // answers as the response streams in. This computer and its local network are refused
-// by address and by name (Chrome resolves names, so a public name pointing into the
-// network is not caught). Redirects are never followed here: checking where a request
-// landed would be too late to prevent requests into the local network.
+// by address, by name, and by what a public name resolves to (looked up over
+// DNS-over-HTTPS first: `resolvesLocal`). Chrome then resolves the name again itself,
+// so a name that answers otherwise the second time (DNS rebinding) is not caught.
+// Redirects are never followed here: checking where a request landed would be too late
+// to prevent requests into the local network.
 //
 // With the user's relay (a WISP server), every connection goes there as it is, and so
 // do name lookups (over DNS-over-HTTPS) while a command with network runs; meanwhile a
@@ -16,7 +18,9 @@
 
 import { BROWSER } from './page-tools.mjs';
 
-const ROUTER = '192.168.86.1';
+/** The guest's own network (v86's), and its router there. */
+const GUEST_NET = '192.168.86.';
+const ROUTER = `${GUEST_NET}1`;
 export const GATEWAY_PORT = 3128;
 /** A request's head, and its body, are at most this long. */
 const MAX_HEAD = 64 * 1024;
@@ -132,20 +136,117 @@ export function local(hostname) {
   if (!name.includes('.') && !name.includes(':')) return true;
   if (/(^|\.)(localhost|local|internal|lan|localdomain|home\.arpa)$/.test(name)) return true;
   const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(name);
-  if (v4) {
-    const [a, b] = [Number(v4[1]), Number(v4[2])];
-    return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
-  }
+  if (v4) return localV4(Number(v4[1]), Number(v4[2]));
   if (name.includes(':')) {
-    return name.startsWith('::') || /^f[cd]/.test(name) || /^fe[89ab]/.test(name) || name.startsWith('ff');
+    // NAT64 (64:ff9b::/96) reaches the IPv4 address in its last 32 bits, as URL writes
+    // it (`64:ff9b::a00:1`); 64:ff9b:1::/48 is only ever a local network's.
+    const nat64 = /^64:ff9b::(?:([0-9a-f]{1,4}):)?[0-9a-f]{0,4}$/.exec(name);
+    if (nat64) {
+      const high = parseInt(nat64[1] ?? '0', 16);
+      return localV4(high >> 8, high & 0xff);
+    }
+    return name.startsWith('::') || /^f[cd]/.test(name) || /^fe[89ab]/.test(name) || name.startsWith('ff') || /^64:ff9b:1:/.test(name);
   }
   return false;
 }
 
+/** Whether an IPv4 address starting `a.b` is this computer's or a local network's (or
+ * none to reach: unspecified, multicast, reserved, benchmarking). */
+function localV4(a, b) {
+  return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || (a === 198 && (b === 18 || b === 19));
+}
+
+/** Where a name's addresses are looked up before Chrome fetches from it. */
+const DOH = 'https://cloudflare-dns.com/dns-query';
+/** How long a lookup's verdict is kept (its TTL, within these), and for how many names. */
+const LOOKUP_MIN_S = 30;
+const LOOKUP_MAX_S = 300;
+const LOOKUP_KEPT = 256;
+const LOOKUP_MS = 5_000;
+/** After DNS-over-HTTPS could not be reached, how long no lookup is tried (requests go
+ * on as before this check existed, rather than each waiting for its timeout). */
+const LOOKUP_PAUSE_MS = 60_000;
+/** Per lookup function (a test's stand-in has its own): verdicts by name, and until
+ * when lookups pause. */
+const caches = new WeakMap();
+
+/** The A and AAAA addresses `name` has, over DNS-over-HTTPS, with the shortest TTL
+ * among them: `{addresses, ttl, incomplete}` (`incomplete`: one of the two lookups
+ * failed, and `addresses` are the other's). Throws when neither answers. */
+export async function dohLookup(name) {
+  const ask = async (type) => {
+    const url = `${DOH}?name=${encodeURIComponent(name)}&type=${type}`;
+    let response;
+    try {
+      response = await fetch(url, {
+        headers: { accept: 'application/dns-json' }, credentials: 'omit', cache: 'no-store',
+        redirect: 'error', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(LOOKUP_MS),
+      });
+    } catch (error) {
+      // Not reached at all (`transport`: `resolvesLocal` pauses lookups). Too slow is
+      // not that: a name's own slow servers can make it so, and must not pause the
+      // check for every other name.
+      const slow = error?.name === 'TimeoutError';
+      throw Object.assign(new Error(`DNS-over-HTTPS ${slow ? 'did not answer in time' : 'could not be reached'} (${error?.message ?? error})`), { transport: !slow });
+    }
+    if (!response.ok) throw new Error(`DNS-over-HTTPS answered HTTP ${response.status}`);
+    const body = await response.json();
+    if (typeof body?.Status !== 'number') throw new Error('DNS-over-HTTPS gave no answer');
+    return (body.Answer ?? []).filter((record) => record?.type === 1 || record?.type === 28);
+  };
+  // Each on its own: a local address one of them gives counts even if the other fails.
+  const settled = await Promise.allSettled([ask('A'), ask('AAAA')]);
+  const failed = settled.filter((one) => one.status === 'rejected').map((one) => one.reason);
+  if (failed.length === settled.length) throw failed.find((reason) => !reason?.transport) ?? failed[0];
+  const records = settled.flatMap((one) => (one.status === 'fulfilled' ? one.value : []));
+  return {
+    addresses: records.map((record) => String(record.data ?? '').toLowerCase()),
+    // No address (no such name, yet): kept the shortest time.
+    ttl: records.length ? Math.min(...records.map((record) => Number(record.TTL) || 0)) : 0,
+    incomplete: failed.length > 0,
+  };
+}
+
+/** Whether public name `hostname` resolves to an address on this computer or its local
+ * network (an address literal is `local`'s to judge). A lookup that fails (no answer in
+ * time, an error) says no, kept as such for 30 s; one that could not reach
+ * DNS-over-HTTPS at all pauses lookups for a minute. Either way Chrome's own lookup
+ * then decides, as before there was this check: a name whose own servers answer too
+ * slowly passes, as one that answers otherwise to Chrome (rebinding) does. Verdicts are
+ * kept for the answer's TTL (30 s to 5 min). */
+export async function resolvesLocal(hostname, lookup = dohLookup) {
+  const name = hostname.replace(/\.$/, '').toLowerCase();
+  if (/^\[.*\]$/.test(name) || /^\d+\.\d+\.\d+\.\d+$/.test(name)) return false;
+  if (!caches.has(lookup)) caches.set(lookup, { verdicts: new Map(), pausedUntil: 0 });
+  const cache = caches.get(lookup);
+  const kept = cache.verdicts.get(name);
+  if (kept && kept.until > Date.now()) return kept.local;
+  if (cache.pausedUntil > Date.now()) return false;
+  let verdict = false;
+  let ttl = LOOKUP_MIN_S;
+  try {
+    const found = await lookup(name);
+    verdict = found.addresses.some((address) => local(address.includes(':') ? `[${address}]` : address));
+    // Half an answer that names nothing local is kept as a failed lookup is.
+    ttl = found.incomplete && !verdict ? LOOKUP_MIN_S : Math.max(LOOKUP_MIN_S, Math.min(LOOKUP_MAX_S, Number(found.ttl) || 0));
+  } catch (error) {
+    if (error?.transport) {
+      cache.pausedUntil = Date.now() + LOOKUP_PAUSE_MS;
+      return false;
+    }
+  }
+  cache.verdicts.delete(name);
+  cache.verdicts.set(name, { local: verdict, until: Date.now() + ttl * 1000 });
+  while (cache.verdicts.size > LOOKUP_KEPT) cache.verdicts.delete(cache.verdicts.keys().next().value);
+  return verdict;
+}
+
 /** Wires the machine's network: through `relay` (a wisp:// or wisps:// address) or
- * Chrome. Returns `end()`, which cuts what the last command left open. */
-export function wireNetwork(vm, { relay, allowed }) {
+ * Chrome. `lookup` (tests) stands in for the DNS-over-HTTPS lookup that checks where a
+ * name leads before Chrome fetches from it. Returns `end()`, which cuts what the last
+ * command left open. */
+export function wireNetwork(vm, { relay, allowed, lookup = dohLookup }) {
   const adapter = vm.network_adapter;
   if (relay && typeof adapter?.on_tcp_connection !== 'function') {
     throw new Error(`the Linux's network card is not wired to a WISP relay (${relay})`);
@@ -167,7 +268,7 @@ export function wireNetwork(vm, { relay, allowed }) {
     // A connection not taken is reset. The guest's own subnet is not the relay's to reach.
     const through = adapter.on_tcp_connection.bind(adapter);
     adapter.on_tcp_connection = (conn, packet) => {
-      if (!allowed() || conn.psrc.join('.').startsWith('192.168.86.')) return false;
+      if (!allowed() || conn.psrc.join('.').startsWith(GUEST_NET)) return false;
       open.add(steady(conn));
       // The relay sends without asking: a guest that does not keep up is cut off.
       const write = conn.write.bind(conn);
@@ -191,7 +292,7 @@ export function wireNetwork(vm, { relay, allowed }) {
         return;
       }
       if (!adapter.tcp_conn[conn.tuple]) conn.accept();
-      const handle = serve(steady(conn), gateway ? null : 'http', () => open.delete(handle));
+      const handle = serve(steady(conn), gateway ? null : 'http', () => open.delete(handle), lookup);
       open.add(handle);
     };
   }
@@ -220,7 +321,7 @@ export function wireNetwork(vm, { relay, allowed }) {
 
 /** One connection's requests, answered in turn. `scheme` names the site from the Host
  * header (plain HTTP to port 80); otherwise requests name it, or the guest's proxy did. */
-function serve(conn, scheme, gone) {
+function serve(conn, scheme, gone, lookup) {
   let chunks = [];
   let size = 0;
   /** The request whose body is still coming: its head, parsed. */
@@ -420,6 +521,12 @@ function serve(conn, scheme, gone) {
       reply(403, `The browser Linux does not reach ${url.host}: addresses on this computer or its local network are closed to it.`, close);
       return;
     }
+    // A public name may point into the network: where it leads is checked first.
+    if (await resolvesLocal(url.hostname, lookup)) {
+      if (!closed) reply(403, `The browser Linux does not reach ${url.host}: that name leads to an address on this computer or its local network, which are closed to it.`, close);
+      return;
+    }
+    if (closed) return;
     const sent = new Headers();
     for (const [name, value] of headers) {
       if (HOP.has(name.toLowerCase())) continue;

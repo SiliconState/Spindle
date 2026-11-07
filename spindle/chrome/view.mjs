@@ -5,7 +5,7 @@
 // (the tab becomes it), a Word, Excel or PowerPoint document drawn as a page
 // (documents.mjs; nothing in it runs), audio and video in a player, anything else to
 // download.
-import { CHANNEL, keepPreviewChoice, previewChoice, startEngine } from './shared.mjs';
+import { keepPreviewChoice, previewChoice, startEngine, REQUESTS, answersFor } from './shared.mjs';
 import { containment, documentFrame, kindOf, pageOf, pdfAddress, pdfShows, pictureBlob, previewFrame, previewNote, saveFile, svgPage, typeOf } from './page.mjs';
 import { MAX_DOCUMENT, documentPage } from './documents.mjs';
 import { BROWSER } from './page-tools.mjs';
@@ -17,11 +17,14 @@ const query = new URLSearchParams(location.search);
 const thread = query.get('thread') ?? '';
 const path = query.get('path') ?? '';
 const me = crypto.randomUUID();
-const channel = new BroadcastChannel(CHANNEL);
+// Requests go to the engine alone, and its answers come back to this page alone (it
+// takes no events: the shared channel's traffic never reaches it).
+const requests = new BroadcastChannel(REQUESTS);
+const answers = new BroadcastChannel(answersFor(me));
 const waiting = new Map();
 let next = 0;
 
-channel.onmessage = ({ data }) => {
+answers.onmessage = ({ data }) => {
   if (data?.to !== me) return;
   const answer = waiting.get(data.id);
   if (!answer) return;
@@ -39,7 +42,7 @@ function ask(op, args, timeout = 60_000) {
       reject(Object.assign(new Error("Spindle's engine did not answer"), { kind: 'timeout' }));
     }, timeout);
     waiting.set(id, { resolve, reject, timer });
-    channel.postMessage({ to: 'engine', from: me, id, op, args });
+    requests.postMessage({ to: 'engine', from: me, id, op, args });
   });
 }
 
@@ -71,6 +74,12 @@ let shownUrl = null;
 function commit(view, url = null) {
   for (const stray of document.querySelectorAll('#view')) if (stray.parentElement?.id !== 'view-box') stray.remove();
   document.querySelector('#view-box').replaceChildren(...(view ? [view] : []));
+  // A page (a document drawn as one) prints itself, asked by Print or Ctrl+P (preview.js):
+  // the tab around it would print only the part of it in sight. Told the key is its once
+  // its frame has loaded (it keeps that through the page being written in).
+  const framed = view instanceof HTMLIFrameElement;
+  document.querySelector('#view-print').hidden = !framed;
+  if (framed) view.addEventListener('load', () => view.contentWindow?.postMessage({ spindleKeys: true }, '*'));
   if (shownUrl) URL.revokeObjectURL(shownUrl);
   shownUrl = url;
 }
@@ -217,6 +226,21 @@ async function show(choice = null) {
 }
 
 document.querySelector('#view-reload').onclick = () => show();
+/** Prints what shows, when it is a page (its frame prints itself: preview.js). */
+const printView = () => document.querySelector('iframe#view')?.contentWindow?.postMessage({ spindlePrint: true }, '*');
+// Ctrl+P (⌘P on a Mac; keyCode: the P key on any layout, as preview.js) pressed here, not
+// in the frame (which hears it itself), prints the page too, not this tab.
+const MAC = /Mac/i.test(navigator.userAgentData?.platform ?? navigator.platform);
+const printButton = document.querySelector('#view-print');
+printButton.onclick = printView;
+printButton.title += ` (${MAC ? '⌘P' : 'Ctrl+P'})`;
+addEventListener('keydown', (event) => {
+  const key = event.keyCode === 80 && !event.altKey && !event.shiftKey
+    && (MAC ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey);
+  if (!key || printButton.hidden) return;
+  event.preventDefault();
+  printView();
+});
 document.querySelector('#view-download').onclick = async () => {
   try {
     await saveFile(await read(path), path.split('/').pop(), typeOf(path));

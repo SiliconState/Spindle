@@ -16,6 +16,13 @@ export const API_VERSION = 1;
 const DEADLINES = { firstByte: 180_000, idle: 180_000, total: 600_000 };
 /** Longest refusal body read (as the native transport keeps it). */
 const MAX_REFUSAL = 4096;
+/** Longest reply a script's nested model request reads (the most code mode lets a
+ * script's model calls bring back); a longer one is cut off and reported, as it may
+ * have run. */
+const MAX_NESTED_REPLY = 16 * 1024 * 1024;
+/** OPFS pool slots kept free beyond what a bundle's import or a session's export
+ * needs at once (each file written, each store's journal, renames' records). */
+const POOL_SPARE = 16;
 /** How long a stopped command's runner has to answer (with what it printed) before the
  * client answers for it, as stopped without its output. */
 const STOP_GRACE_MS = 15_000;
@@ -125,10 +132,53 @@ function partialEnd(text, needle) {
   return longest[joined.length - 1];
 }
 
+/** A session bundle's manifest, read from its first bytes (the magic, the format, the
+ * manifest's length, then the manifest), or null when it does not read as one. */
+function manifestOf(bytes) {
+  try {
+    if (bytes.length < 24) return null;
+    const length = new DataView(bytes.buffer, bytes.byteOffset + 20, 4).getUint32(0, true);
+    if (length > 1 << 20 || 24 + length > bytes.length) return null;
+    return JSON.parse(new TextDecoder().decode(bytes.subarray(24, 24 + length)));
+  } catch {
+    return null;
+  }
+}
+
+/** The head and identity a session bundle's manifest names (`{head, identity}`, or null
+ * when it does not read as a bundle), from its first bytes only: nothing else is
+ * checked, so it is for a bundle this app just made (`exportSession`), such as the
+ * head `sealSession` expects. `checkBundle` checks one whole. */
+export function bundleFacts(bytes) {
+  const manifest = manifestOf(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+  if (!Number.isSafeInteger(manifest?.head) || typeof manifest?.identity !== 'string') return null;
+  return { head: manifest.head, identity: manifest.identity, sourceState: manifest.source_state ?? null };
+}
+
+/** How many files a session bundle's manifest lists (0 when it does not read as one: the
+ * import then says why). */
+function bundleFiles(bytes) {
+  const manifest = manifestOf(bytes);
+  return Array.isArray(manifest?.files) ? manifest.files.length : 0;
+}
+
 /** A runner's file write as the package takes it: `{path, base64, executable}`. */
 function writeOf(file) {
   const bytes = typeof file.content === 'string' ? new TextEncoder().encode(file.content) : file.content ?? new Uint8Array();
   return { path: file.path, base64: bytesToBase64(bytes), executable: Boolean(file.executable) };
+}
+
+/** A `/v1/run` request's JSON body (`fields`, and `files` as `{path, base64,
+ * executable}`), built as a Blob a file at a time: each file's bytes are read and
+ * encoded only as it is added, and go once the Blob holds them, so the workspace is
+ * never held whole as one string as well. */
+function runBody(fields, files, read) {
+  let body = new Blob([JSON.stringify(fields).slice(0, -1), ',"files":[']);
+  files.forEach((file, index) => {
+    const head = `${index ? ',' : ''}{"path":${JSON.stringify(file.path)},"executable":${Boolean(file.executable)},"base64":"`;
+    body = new Blob([body, head, bytesToBase64(read(file.object)), '"}']);
+  });
+  return new Blob([body, ']}'], { type: 'application/json' });
 }
 
 /** What a host's refusal says: the HTTP API's error envelope is `{error, code}`. */
@@ -152,7 +202,6 @@ export function remoteRunner({ url, token, fetch = globalThis.fetch }) {
     },
     async run({ command, timeoutS, network, files, links, directories, read, signal }) {
       if (signal?.aborted) return { output: '', success: false, failure: 'the command was stopped before it ran' };
-      const upload = files.map((file) => ({ path: file.path, base64: bytesToBase64(read(file.object)), executable: file.executable }));
       // The run's name: a Stop tells the host to stop the command, whose own answer then
       // says what it printed until then (a host that predates /v1/run/ID/stop says 404,
       // and the command runs out its time there). That answer is waited for
@@ -160,19 +209,36 @@ export function remoteRunner({ url, token, fetch = globalThis.fetch }) {
       const run = crypto.randomUUID();
       const ended = new AbortController();
       let waited = null;
+      let admitted = false;
       const stop = () => {
+        if (!admitted) { ended.abort(); return; }
         fetch(`${base}/v1/run/${run}/stop`, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(10_000) }).catch(() => {});
         waited = setTimeout(() => ended.abort(), REMOTE_STOP_MS);
       };
       signal?.addEventListener('abort', stop, { once: true });
       try {
-        const response = await fetch(`${base}/v1/run`, {
-          method: 'POST', headers, signal: ended.signal,
-          body: JSON.stringify({ command, timeout_s: timeoutS, network, files: upload, links, directories, run }),
-        });
-        const body = await response.json().catch(() => ({}));
-        if (!response.ok) return { output: '', success: false, failure: refusal(body) || `the runner answered HTTP ${response.status}` };
-        return body;
+        const upload = runBody({ command, timeout_s: timeoutS, network, links, directories, run }, files, read);
+        for (let attempt = 0; ; attempt += 1) {
+          if (signal?.aborted) return { output: '', success: false, failure: 'the command was stopped before it ran' };
+          admitted = true;
+          const response = await fetch(`${base}/v1/run`, {
+            method: 'POST', headers, signal: ended.signal, body: upload,
+          });
+          const body = await response.json().catch(() => ({}));
+          // Only this explicit pre-admission refusal proves nothing ran. Never retry
+          // a lost answer, another 5xx, or any response whose outcome is uncertain.
+          if (response.status === 503 && body.code === 'busy' && attempt < 8 && !signal?.aborted) {
+            admitted = false;
+            await new Promise((resolve) => {
+              const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
+              const timer = setTimeout(done, Math.min(250 * 2 ** attempt, 4000));
+              signal?.addEventListener('abort', done, { once: true });
+            });
+            continue;
+          }
+          if (!response.ok) return { output: '', success: false, failure: refusal(body) || `the runner answered HTTP ${response.status}` };
+          return body;
+        }
       } finally {
         clearTimeout(waited);
         signal?.removeEventListener('abort', stop);
@@ -261,6 +327,7 @@ export class EmbeddedClient extends Emitter {
   #auth = new Map();
   #closed = null;
   #opfs = null;
+  #growing = Promise.resolve();
 
   constructor({ wasm, storage = 'memory', storageOptions = {}, fs, platform, pool, catalog, credentials, grantHeaders, fetch = globalThis.fetch, runner, deadlines = {}, resolveDir = (dir) => dir } = {}) {
     super();
@@ -271,7 +338,7 @@ export class EmbeddedClient extends Emitter {
     }
     if (storage === 'opfs') {
       if (typeof pool !== 'function') throw new TypeError("storage 'opfs' needs `pool`, an async function opening it");
-      this.#opfs = { open: pool, fs: null, owned: new Set(), owning: new Map(), releasing: new Map() };
+      this.#opfs = { open: pool, fs: null, opening: null, owned: new Set(), owning: new Map(), releasing: new Map() };
     }
     this.#wasm = wasm;
     this.#embedded = new wasm.Embedded(storage, JSON.stringify(storageOptions), catalog ? JSON.stringify(catalog) : undefined);
@@ -337,10 +404,19 @@ export class EmbeddedClient extends Emitter {
         const release = await lockSession(dir);
         if (!release) throw new SpindleError('locked', `another worker or tab holds the session ${dir}`);
         try {
-          if (!opfs.fs) {
-            opfs.fs = await opfs.open();
-            this.#wasm.installNodeFs(opfs.fs, 'opfs');
+          if (!opfs.opening) {
+            opfs.opening = (async () => {
+              const fs = await opfs.open();
+              try {
+                this.#wasm.installNodeFs(fs, 'opfs');
+                opfs.fs = fs;
+              } catch (error) {
+                fs.close();
+                throw error;
+              }
+            })().catch((error) => { opfs.opening = null; throw error; });
           }
+          await opfs.opening;
         } catch (error) {
           await release();
           throw error;
@@ -378,6 +454,20 @@ export class EmbeddedClient extends Emitter {
 
   #send(id, method, params) {
     if (this.#closed) return Promise.reject(new SpindleError('closed', this.#closed));
+    // Files given as bytes (`{path, bytes: Uint8Array}`) cross beside the line, once,
+    // never as base64 in it.
+    const attached = [];
+    if (Array.isArray(params?.files) && params.files.some((file) => file?.bytes instanceof Uint8Array)) {
+      params = {
+        ...params,
+        files: params.files.map((file) => {
+          if (!(file?.bytes instanceof Uint8Array)) return file;
+          const { bytes, ...rest } = file;
+          attached.push(bytes);
+          return { ...rest, attached: attached.length - 1 };
+        }),
+      };
+    }
     let line;
     try {
       line = JSON.stringify({ jsonrpc: '2.0', id, method, params });
@@ -386,7 +476,14 @@ export class EmbeddedClient extends Emitter {
     }
     const reply = new Promise((resolve, reject) => this.#pending.set(id, { resolve, reject }));
     reply.requestId = id;
-    this.#frames(this.#embedded.handle(line));
+    let frames;
+    try {
+      frames = attached.length ? this.#embedded.handleWith(line, attached) : this.#embedded.handle(line);
+    } catch (error) {
+      this.#pending.delete(id);
+      return Promise.reject(new SpindleError(error.code || 'failed', error.message ?? String(error)));
+    }
+    this.#frames(frames);
     return reply;
   }
 
@@ -567,7 +664,30 @@ export class EmbeddedClient extends Emitter {
         headers: { ...headers, 'content-type': 'application/json', accept: 'text/event-stream' },
         body: new TextEncoder().encode(JSON.stringify(child.body)),
       });
-      return { status: response.status, body: await response.text() };
+      // Read up to its cap: a reply past it is not held whole (it may have run).
+      const reader = response.body?.getReader();
+      const parts = [];
+      let size = 0;
+      try {
+        while (reader) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          size += value.length;
+          if (size > MAX_NESTED_REPLY) {
+            return { error: `the reply was over ${MAX_NESTED_REPLY / 2 ** 20} MiB, more than a script's model call brings back; it may have run`, sent: true };
+          }
+          parts.push(value);
+        }
+      } finally {
+        reader?.cancel().catch(() => {});
+      }
+      const body = new Uint8Array(size);
+      let at = 0;
+      for (const part of parts) {
+        body.set(part, at);
+        at += part.length;
+      }
+      return { status: response.status, body: new TextDecoder().decode(body) };
     } catch (error) {
       // Whether it left is not known: the store keeps it uncertain.
       return { error: `the request failed: ${error?.message ?? error}`, sent: true };
@@ -703,6 +823,19 @@ export class EmbeddedClient extends Emitter {
   }
 
   async #fetch(session, id, work, entry) {
+    // The headers this request was authorized with are for it alone: not kept past it.
+    const auth = this.#auth.get(session);
+    this.#auth.delete(session);
+    if (entry.cancelled) return;
+    let body;
+    try {
+      // The body, as bytes, straight from the package (never base64 in a frame).
+      body = this.#embedded.requestBody(session, id);
+    } catch (error) {
+      // No longer waited for: nothing was sent, nothing to answer.
+      this.emit('work_error', error, work, session);
+      return;
+    }
     const { signal } = entry.controller;
     let ended = false;
     let timedOut = false;
@@ -712,12 +845,13 @@ export class EmbeddedClient extends Emitter {
     const dropped = (reason) => this.#deliver(session, id, { kind: 'dropped', reason });
     try {
       const headers = {
-        ...(this.#auth.get(session) || {}),
+        ...(auth || {}),
         'content-type': 'application/json',
         accept: 'text/event-stream',
         ...(work.gzip ? { 'content-encoding': 'gzip' } : {}),
       };
-      const response = await this.fetchImpl(work.endpoint, { method: 'POST', headers, body: base64ToBytes(work.body), signal, redirect: 'error' });
+      const response = await this.fetchImpl(work.endpoint, { method: 'POST', headers, body, signal, redirect: 'error' });
+      body = null;
       clearTimeout(idle);
       const contentType = response.headers.get('content-type');
       if (!response.ok) {
@@ -890,6 +1024,10 @@ export class EmbeddedClient extends Emitter {
   history(dir, revision, { from } = {}) { return this.call('history', { dir: this.#dir(dir), revision, ...(from && { from }) }); }
   /** Rewind targets, newest first, among the newest `limit` steps (48 unless said; at most 8192). */
   async targets(dir, { limit } = {}) { return (await this.call('targets', { dir: this.#dir(dir), ...(limit && { limit }) })).targets; }
+  /** Where a stopped turn can go on from: `{targets, completed, prompt}`, the rewind
+   * targets newest first back to the newest completed turn however far (`completed`:
+   * false only for a first turn) and the turn's own message. */
+  turn(dir) { return this.call('targets', { dir: this.#dir(dir), until: 'settled' }); }
   files(dir, revision) { return this.call('files', { dir: this.#dir(dir), revision }); }
   /** The file's bytes (a Uint8Array). */
   async read(dir, path, revision) {
@@ -910,7 +1048,10 @@ export class EmbeddedClient extends Emitter {
     return this.call('state_set', { dir: this.#dir(dir), patch, ...(expectedHead != null && { expected_head: expectedHead }) });
   }
   recover(dir) { return this.call('recover', { dir: this.#dir(dir) }); }
-  /** The tasks the session started: `{tasks: [{task, state, queued, answer, pending, delivered}]}`. */
+  /** The tasks the session started: `{tasks: [{task, state, queued, answer, pending,
+   * delivered, prompt, store, bytes, dropped, orphan}]}`: `store` whether its store is
+   * kept here (taking `bytes`, its own tasks' included), `dropped` the record of a
+   * store `dropTask` removed, `orphan` a task directory no row of the session names. */
   tasks(dir) { return this.call('tasks', { dir: this.#dir(dir) }); }
   /** A task as it stands now (`task` its name or label; nothing waits here: an app
    * hears of its work and events as they come). */
@@ -922,17 +1063,28 @@ export class EmbeddedClient extends Emitter {
   }
 
   /** The session as a session bundle (a Uint8Array) to save or send: its store and its
-   * tasks', each as one image. Unless `keep`, the session moves: it closes here and this
-   * copy is sealed, so it continues only where the bundle is imported (here, in
-   * another app, or a native host's `import_session`). `settings` change the bundle's
-   * copy only, for the host it goes to (a native host's own, such as `builtin_tools:
-   * 'all'`, included); the session keeps its own. A copy's stores are checked as far as
-   * the bundle records them (an import checks them whole), unless `whole`: a copy the
-   * app may need to go back to, a backup, is checked record by record, as a move is. */
-  async exportSession(dir, { keep = false, settings, whole = false } = {}) {
+   * tasks', each as one image. The session stays here (`keep`, the default). To move it,
+   * keep the bundle where it goes on first (written to disk, or imported there), then
+   * `sealSession` with its head and sourceState (`bundleFacts(bytes)`): stale source
+   * metadata or task state refuses sealing. (`keep:
+   * false` seals as it exports, before the bytes have left
+   * this call: a crash before they are kept leaves only the sealed copy.) `settings`
+   * change the bundle's copy only, for the host it goes to (a native host's own, such
+   * as `builtin_tools: 'all'`, included); the session keeps its own. A copy's stores are
+   * checked as far as the bundle records them (an import checks them whole), unless
+   * `whole`: a copy the app may need to go back to, a backup, is checked record by
+   * record, as a move is. */
+  async exportSession(dir, { keep = true, settings, whole = false } = {}) {
     dir = this.#dir(dir);
     if (this.#closed) throw new SpindleError('closed', this.#closed);
-    if (this.#opfs) await this.#own(dir);
+    if (this.#opfs) {
+      await this.#own(dir);
+      // Every store of the session is open at once while it is written (each with its
+      // journal): room for them all first, as the pool cannot grow during the call.
+      const stores = this.#opfs.fs.files().filter(({ path }) => path.startsWith(`${dir}/`) && path.endsWith('/store/authority.sqlite')).length;
+      await this.#room(stores + 1);
+    }
+    if (this.#closed) throw new SpindleError('closed', this.#closed);
     try {
       return this.#embedded.exportSession(dir, Boolean(keep), settings ? JSON.stringify(settings) : undefined, Boolean(whole));
     } catch (error) {
@@ -940,8 +1092,93 @@ export class EmbeddedClient extends Emitter {
     }
   }
 
+  /** A finished task of the session (`task`: its name, or a label or key `tasks` gave)
+   * as a session bundle of its own (a Uint8Array): its store and its own tasks', checked
+   * record by record. Keep it (write it to disk and check it is there) before
+   * `dropTask` frees the task's space; `importSession` reads it later as a session.
+   * Refused while the task runs, a turn of the session runs, or the session may still
+   * need it, and once its store was removed. One task at a time: its stores and the
+   * bundle are held in memory while it is written. */
+  async exportTask(dir, task) {
+    dir = this.#dir(dir);
+    if (this.#closed) throw new SpindleError('closed', this.#closed);
+    if (this.#opfs) {
+      await this.#own(dir);
+      await this.#room(this.#taskStores(dir) + 1);
+    }
+    if (this.#closed) throw new SpindleError('closed', this.#closed);
+    try {
+      return this.#embedded.exportTask(dir, String(task));
+    } catch (error) {
+      throw new SpindleError(error.code || 'failed', error.message);
+    }
+  }
+
+  /** Frees a finished task's space for good: its store and its own tasks' are removed,
+   * its spend kept in the session's first (a budget counts it once), its answer and the
+   * files it merged staying in the session. Keep its `exportTask` bundle first. A removal
+   * cut short is finished by the next open, or by calling this again. Refused while a
+   * turn or background task runs, or the session may still need the task.
+   * `expectedState`, when supplied, is its saved export's sourceState; changes refuse
+   * before accounting/deletion. Resolves with `{task, dropped: {key, task, prompt, bytes, at}}`. */
+  async dropTask(dir, task, { expectedState } = {}) {
+    dir = this.#dir(dir);
+    if (this.#closed) throw new SpindleError('closed', this.#closed);
+    if (this.#opfs) {
+      await this.#own(dir);
+      // Each store of the task is opened to read its spend (with its log), and its
+      // directory's move takes a record or two.
+      await this.#room(this.#taskStores(dir) + 4);
+    }
+    return this.call('task_drop', { dir, task: String(task), at: Math.floor(Date.now() / 1000), ...(expectedState != null && { expected_state: expectedState }) });
+  }
+
+  /** OPFS: how many task stores session `dir` keeps (nested ones too). */
+  #taskStores(dir) {
+    return this.#opfs.fs.files().filter(({ path }) => path.startsWith(`${dir}/tasks/`) && path.endsWith('/store/authority.sqlite')).length;
+  }
+
+  /** Moves the session: once its bundle (`exportSession`) is kept where it goes on, this
+   * copy closes and is sealed (`spindle-moved`), without writing the bundle again; no
+   * host opens it as the session after. `expectedHead` is the bundle's head (its
+   * `checkBundle(bytes).head`) and `expectedState` its source fingerprint
+   * (`bundleFacts(bytes).sourceState`): any source or task change since export refuses
+   * (kind `head_moved`; export it again), as does a running turn/background task.
+   * Nothing is sealed then. Resolves with `{session, head, sealed}`. */
+  async sealSession(dir, { expectedHead, expectedState } = {}) {
+    dir = this.#dir(dir);
+    if (!Number.isSafeInteger(expectedHead) || expectedHead < 0) throw new TypeError('sealSession needs `expectedHead`, the head of the bundle that was kept');
+    if (typeof expectedState !== 'string' || !/^[a-f0-9]{64}$/.test(expectedState)) throw new TypeError('sealSession needs `expectedState`, bundleFacts(bytes).sourceState of the bundle that was kept');
+    if (this.#closed) throw new SpindleError('closed', this.#closed);
+    if (this.#opfs) {
+      await this.#own(dir);
+      const stores = this.#opfs.fs.files().filter(({ path }) => path.startsWith(`${dir}/`) && path.endsWith('/store/authority.sqlite')).length;
+      await this.#room(stores + 1);
+    }
+    if (this.#closed) throw new SpindleError('closed', this.#closed);
+    try {
+      return JSON.parse(this.#embedded.sealSession(dir, expectedHead, expectedState));
+    } catch (error) {
+      throw new SpindleError(error.code || 'failed', error.message);
+    }
+  }
+
+  /** OPFS: at least `slots` free in the pool (plus a margin), grown between calls (it
+   * cannot grow during one). */
+  async #room(slots) {
+    const before = this.#growing;
+    const next = before.catch(() => {}).then(async () => {
+      const fs = this.#opfs.fs;
+      if (this.#closed) throw new SpindleError('closed', this.#closed);
+      const want = slots + POOL_SPARE;
+      if (fs.free < want && typeof fs.grow === 'function') await fs.grow(want - fs.free);
+    });
+    this.#growing = next;
+    await next;
+  }
+
   /** Checks a session bundle whole, as `importSession` would (framing, checksum,
-   * manifest, every store), writing nothing: `{head, identity, files}`. */
+   * manifest, every store), writing nothing: `{head, identity, files, sourceState}`. */
   checkBundle(bytes) {
     try {
       return JSON.parse(this.#embedded.checkBundle(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)));
@@ -954,9 +1191,16 @@ export class EmbeddedClient extends Emitter {
   async importSession(dir, bytes) {
     dir = this.#dir(dir);
     if (this.#closed) throw new SpindleError('closed', this.#closed);
-    if (this.#opfs) await this.#own(dir);
+    bytes = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    if (this.#opfs) {
+      await this.#own(dir);
+      // Each file it holds is written in this one call (with a rename's records), and
+      // the session's store opens after: room for them all first.
+      await this.#room(2 * bundleFiles(bytes) + 2);
+    }
+    if (this.#closed) throw new SpindleError('closed', this.#closed);
     try {
-      return JSON.parse(this.#embedded.importSession(dir, bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)));
+      return JSON.parse(this.#embedded.importSession(dir, bytes));
     } catch (error) {
       throw new SpindleError(error.code || 'failed', error.message);
     }
@@ -976,11 +1220,16 @@ export class EmbeddedClient extends Emitter {
     }
     for (const { reject } of this.#pending.values()) reject(new SpindleError('closed', this.#closed));
     this.#pending.clear();
-    // Closing the sessions closes their stores, which gives their Web Locks back.
-    this.#embedded.free?.();
-    if (this.#opfs) {
-      await Promise.allSettled([...this.#opfs.owning.values(), ...this.#opfs.releasing.values()]);
-      this.#opfs.fs?.close();
+    this.#auth.clear();
+    try {
+      // Closing the sessions closes their stores, which gives their Web Locks back.
+      this.#embedded.free?.();
+    } finally {
+      // The pool's handles go back whatever freeing the package said.
+      if (this.#opfs) {
+        await Promise.allSettled([...this.#opfs.owning.values(), ...this.#opfs.releasing.values(), this.#growing]);
+        this.#opfs.fs?.close();
+      }
     }
     return 0;
   }

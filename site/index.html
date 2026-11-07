@@ -108,10 +108,10 @@
       <ol class="principles">
         <li><h3>One revision holds everything.</h3><p>Conversation, workspace and app state commit together.
           Go back, and all three come back: no files left over from a future that was undone.</p></li>
-        <li><h3>Sent at most once.</h3><p>Every model request is reserved before it leaves. A crash, a kill or
-          a dropped connection never quietly sends it again, and never quietly bills you twice.</p></li>
+        <li><h3>Reserved before send.</h3><p>A crash, a kill or a dropped connection leaves uncertainty recorded.
+          Repeating an uncertain model request needs Retry or explicit resend consent; each resend can bill.</p></li>
         <li><h3>Unknown is said, not guessed.</h3><p>When a request's fate cannot be known, Spindle tells you
-          so. Continue never resends it; Retry sends it once more, on your word.</p></li>
+          so. Continue reports it by default; Retry or an explicit resend setting consents to sending it again.</p></li>
         <li><h3>The store decides; hosts act.</h3><p>A portable decision driver, with no network and no
           clock, says what a turn needs next. Whatever hosts it performs the effect and hands the answer back.</p></li>
         <li><h3>Sessions move.</h3><p>A session is a directory, or one file. Export it from one host and go

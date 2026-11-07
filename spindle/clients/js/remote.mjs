@@ -206,6 +206,9 @@ export class RemoteClient {
     return new Uint8Array(await response.arrayBuffer());
   }
   async targets(id, options) { return (await this.request('GET', `/v1/sessions/${id}/targets`, options)).targets; }
+  /** `{targets, completed, prompt}`: back to the newest completed turn, however far
+   * (an older host answers without `completed`). */
+  turn(id, options) { return this.request('GET', `/v1/sessions/${id}/targets?until=settled`, options); }
   usage(id, options) { return this.request('GET', `/v1/sessions/${id}/usage`, options); }
   tasks(id, options) { return this.request('GET', `/v1/sessions/${id}/tasks`, options); }
   taskStop(id, task, options) { return this.request('POST', `/v1/sessions/${id}/tasks/${encodeURIComponent(task)}/stop`, { ...options, body: {} }); }

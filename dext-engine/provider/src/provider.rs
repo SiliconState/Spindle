@@ -543,7 +543,7 @@ fn read_runtime_state_file(path: &Path, secret: bool) -> Result<Option<String>> 
 pub fn load_provider_catalog() -> Result<ProviderCatalog> {
     let path = provider_catalog_path();
     let Some(text) = read_runtime_state_file(&path, false)? else {
-        return Ok(default_provider_catalog());
+        return Ok(native_catalog(default_provider_catalog()));
     };
     let raw: Value = serde_json::from_str(&text).context("invalid provider catalog JSON")?;
 
@@ -571,12 +571,33 @@ pub fn load_provider_catalog() -> Result<ProviderCatalog> {
         }
         serde_json::from_value::<ProviderCatalog>(raw).context("invalid provider catalog JSON")?
     };
-    normalize_provider_catalog(catalog)
+    normalize_provider_catalog(catalog).map(native_catalog)
+}
+
+/// The providers a native host offers: not Sign in with ChatGPT (`chatgpt-plan`), whose
+/// sign-in runs in Spindle for Browser; a native host has no flow for it.
+fn native_catalog(mut catalog: ProviderCatalog) -> ProviderCatalog {
+    catalog.providers.retain(|profile| {
+        profile
+            .oauth_flow
+            .as_ref()
+            .is_none_or(|flow| flow.protocol != OAuthProtocol::ChatGptPlan)
+    });
+    if !catalog
+        .providers
+        .iter()
+        .any(|profile| profile.id == catalog.active_provider)
+    {
+        catalog.active_provider = default_active_provider();
+    }
+    catalog
 }
 
 pub fn save_provider_catalog(catalog: &ProviderCatalog) -> Result<()> {
     let path = provider_catalog_path();
-    let normalized = normalize_provider_catalog(catalog.clone())?;
+    // Never `chatgpt-plan`: this file is the Dext CLI's too, and a Dext whose catalog has
+    // no such contract or sign-in would refuse the whole file.
+    let normalized = native_catalog(normalize_provider_catalog(catalog.clone())?);
     let bytes = serde_json::to_vec_pretty(&normalized)?;
     atomic_write_bytes(&path, &bytes)?;
     Ok(())
@@ -2469,6 +2490,12 @@ fn oauth_exchange_failure_result(
 }
 
 fn run_oauth_login(oauth: &OAuthFlow, profile: &ProviderProfile) -> Result<LoginResult> {
+    if oauth.protocol == OAuthProtocol::ChatGptPlan {
+        anyhow::bail!(
+            "{} (Sign in with ChatGPT) signs in from Spindle for Browser; here, sign in to `chatgpt` or use an OpenAI API key",
+            profile.display_name
+        );
+    }
     let code_verifier = generate_code_verifier()?;
     let code_challenge = pkce_code_challenge(&code_verifier);
     let state = if oauth.protocol == OAuthProtocol::AnthropicClaude {
@@ -4700,6 +4727,50 @@ mod tests {
         assert!(response.contains("AUTHENTICATION INCOMPLETE"));
         assert!(!response.contains("access_denied"));
         Ok(())
+    }
+
+    #[test]
+    fn a_saved_catalog_holds_nothing_a_dext_without_sign_in_with_chatgpt_refuses() -> Result<()> {
+        let _guard = crate::test_env_lock();
+        let home = temp_home("catalog-without-plan");
+        let old_home = std::env::var_os("DEXT_HOME");
+        unsafe { std::env::set_var("DEXT_HOME", &home) };
+        let result = (|| -> Result<()> {
+            // Whatever is saved (here the whole default catalog, which the browser's
+            // engine offers with `chatgpt-plan`), the file is one a Dext that knows only
+            // the earlier contracts and sign-ins reads.
+            assert!(
+                default_provider_catalog()
+                    .providers
+                    .iter()
+                    .any(|profile| profile.id == CHATGPT_PLAN_PROFILE)
+            );
+            save_provider_catalog(&default_provider_catalog())?;
+            let text = std::fs::read_to_string(provider_catalog_path())?;
+            assert!(!text.contains("chatgpt-plan"), "{text}");
+            assert!(!text.contains("\"issuer\""), "no empty issuer written");
+            let saved: Value = serde_json::from_str(&text)?;
+            for profile in saved["providers"].as_array().context("providers")? {
+                let flow = &profile["oauth_flow"];
+                if flow.is_object() && profile["id"] != "chatgpt" {
+                    assert!(flow.get("authorize_params").is_none(), "{profile}");
+                }
+            }
+            assert!(
+                load_provider_catalog()?
+                    .providers
+                    .iter()
+                    .all(|profile| profile.id != CHATGPT_PLAN_PROFILE)
+            );
+            Ok(())
+        })();
+        if let Some(value) = old_home {
+            unsafe { std::env::set_var("DEXT_HOME", value) };
+        } else {
+            unsafe { std::env::remove_var("DEXT_HOME") };
+        }
+        let _ = std::fs::remove_dir_all(home);
+        result
     }
 
     #[test]

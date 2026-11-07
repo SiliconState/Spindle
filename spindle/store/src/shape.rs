@@ -501,7 +501,8 @@ pub(crate) fn reasoning(route: &Route, effort: Effort) -> Result<Reasoning> {
         (
             RequestContract::OpenAiChatCompletions
             | RequestContract::OpenAiResponses
-            | RequestContract::ChatGptResponses,
+            | RequestContract::ChatGptResponses
+            | RequestContract::ChatGptPlan,
             level,
         ) if level != Effort::Default
             && !deepseek
@@ -574,10 +575,18 @@ pub(crate) fn reasoning(route: &Route, effort: Effort) -> Result<Reasoning> {
                 short: format!("effort {sent}"),
             })
         }
-        (RequestContract::OpenAiResponses | RequestContract::ChatGptResponses, Effort::Default) => {
-            plain(vec![], "provider default", "default")
-        }
-        (RequestContract::OpenAiResponses | RequestContract::ChatGptResponses, level) => {
+        (
+            RequestContract::OpenAiResponses
+            | RequestContract::ChatGptResponses
+            | RequestContract::ChatGptPlan,
+            Effort::Default,
+        ) => plain(vec![], "provider default", "default"),
+        (
+            RequestContract::OpenAiResponses
+            | RequestContract::ChatGptResponses
+            | RequestContract::ChatGptPlan,
+            level,
+        ) => {
             let levels = provider::resolve_model_spec(&route.profile, &route.model).effort_levels;
             // A model whose catalog entry lists `none` (GPT-6 Sol, GPT-6 Luna) turns
             // reasoning off with it.
@@ -595,8 +604,8 @@ pub(crate) fn reasoning(route: &Route, effort: Effort) -> Result<Reasoning> {
             };
             let (answer, allowance, _) = output_tokens(route, level);
             let mut fields = vec![("reasoning", json!({"effort": sent}))];
-            // Hidden reasoning counts against max_output_tokens; the ChatGPT backend
-            // refuses any output cap.
+            // Hidden reasoning counts against max_output_tokens; neither ChatGPT route
+            // takes an output cap.
             if route.contract == RequestContract::OpenAiResponses {
                 fields.push(("max_output_tokens", json!(answer + allowance)));
             }
@@ -1106,56 +1115,65 @@ pub(crate) fn request_body_for(
     let tools = offer.tools(network, toolchain);
     let system = offer.system(network, toolchain, guidance);
     let reasoning = reasoning(route, effort)?;
+    // The history's wire form is moved into the body, never copied (`json!` would copy
+    // it): with the history itself, it is the largest thing a request holds.
     let mut body = match route.contract {
         RequestContract::AnthropicMessages => {
-            json!({
+            let messages = {
+                let sanitized =
+                    wire::sanitize_anthropic_messages(&transcript.messages, true, false);
+                wire::anthropic_messages(&sanitized, &mut no_images)
+                    .map_err(|error| error.to_string())?
+            };
+            let mut body = json!({
             "model": model,
             "max_tokens": reasoning.answer,
             "stream": true,
             "system": system,
-            "messages": wire::anthropic_messages(
-                &wire::sanitize_anthropic_messages(&transcript.messages, true, false),
-                &mut no_images,
-            )
-            .map_err(|error| error.to_string())?,
             "tools": tools.iter().map(|(name, description, schema)| json!(
                 {"name": name, "description": description, "input_schema": schema})).collect::<Vec<_>>(),
             "tool_choice": {"type": "auto"},
-            })
+            });
+            body["messages"] = Value::Array(messages);
+            body
         }
         RequestContract::OpenAiChatCompletions => {
-            json!({
+            let messages = serde_json::to_value(wire::chat_messages(
+                &transcript.messages,
+                &system,
+                // DeepSeek needs the reasoning of the current turn's tool calls;
+                // earlier turns' reasoning is ignored, so it is not resent.
+                thinking_enabled(&reasoning.fields)
+                    .then(|| transcript.messages.iter().rposition(is_prompt).unwrap_or(0)),
+                &mut no_images,
+            ))
+            .map_err(|error| error.to_string())?;
+            let mut body = json!({
                 "model": model,
                 "stream": true,
                 "stream_options": {"include_usage": true},
                 "max_tokens": reasoning.answer,
-                "messages": wire::chat_messages(
-                    &transcript.messages,
-                    &system,
-                    // DeepSeek needs the reasoning of the current turn's tool calls;
-                    // earlier turns' reasoning is ignored, so it is not resent.
-                    thinking_enabled(&reasoning.fields).then(|| {
-                        transcript.messages.iter().rposition(is_prompt).unwrap_or(0)
-                    }),
-                    &mut no_images,
-                ),
                 "tools": tools.iter().map(|(name, description, schema)| json!(
                     {"type": "function", "function": {
                         "name": name, "description": description, "parameters": schema}}))
                     .collect::<Vec<_>>(),
-            })
+            });
+            body["messages"] = messages;
+            body
         }
-        RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
+        RequestContract::OpenAiResponses
+        | RequestContract::ChatGptResponses
+        | RequestContract::ChatGptPlan => {
+            let mut input = wire::responses_input(
+                &transcript.messages,
+                route.contract == RequestContract::OpenAiResponses,
+                &mut no_images,
+            );
             let mut body = json!({
                 "model": model,
                 "store": false,
                 "stream": true,
                 "instructions": system,
-                "input": wire::responses_input(
-                    &transcript.messages,
-                    route.contract == RequestContract::OpenAiResponses,
-                    &mut no_images,
-                ),
                 "text": {"verbosity": "medium"},
                 "prompt_cache_key": session,
                 "tools": tools.iter().map(|(name, description, schema)| json!(
@@ -1164,6 +1182,10 @@ pub(crate) fn request_body_for(
                 "tool_choice": "auto",
                 "parallel_tool_calls": true,
             });
+            if route.contract == RequestContract::ChatGptPlan {
+                in_plan_namespace(&mut body, &mut input);
+            }
+            body["input"] = Value::Array(input);
             if route.contract == RequestContract::OpenAiResponses {
                 body["max_output_tokens"] = json!(reasoning.answer);
             }
@@ -1180,6 +1202,31 @@ pub(crate) fn request_body_for(
         mark_prompt_cache(&mut body);
     }
     Ok(body)
+}
+
+/// The namespace a Sign in with ChatGPT request groups its function tools in: the route
+/// takes function tools only inside a namespace (or as `additional_tools` input items),
+/// and a call it makes names its namespace, as each call sent back must.
+pub(crate) const PLAN_NAMESPACE: &str = "spindle";
+
+/// A `chatgpt-plan` body's tools moved into `PLAN_NAMESPACE`, and the calls in its
+/// `input` named in it.
+fn in_plan_namespace(body: &mut Value, input: &mut [Value]) {
+    let tools = body["tools"].take();
+    body["tools"] = match tools {
+        Value::Array(tools) if !tools.is_empty() => json!([{
+            "type": "namespace",
+            "name": PLAN_NAMESPACE,
+            "description": "This thread's tools: its workspace, commands, pages and tasks.",
+            "tools": tools,
+        }]),
+        other => other,
+    };
+    for item in input {
+        if item["type"] == "function_call" {
+            item["namespace"] = json!(PLAN_NAMESPACE);
+        }
+    }
 }
 
 /// The field a chat completions request caps its output with on `route` for `model`:
@@ -1266,10 +1313,7 @@ pub(crate) fn history_budget(route: &Route, effort: Effort) -> Result<usize> {
         .unwrap_or(DEFAULT_WINDOW);
     let reasoning = reasoning(route, effort)?;
     let reply = u64::from(reasoning.answer + reasoning.allowance);
-    let bytes = window.saturating_sub(reply).saturating_mul(3) / 10 * 8;
-    Ok(usize::try_from(bytes)
-        .unwrap_or(usize::MAX)
-        .clamp(HISTORY_MIN, HISTORY_MAX))
+    Ok(crate::driver::token_bytes(window.saturating_sub(reply)).clamp(HISTORY_MIN, HISTORY_MAX))
 }
 
 /// Room a model call needs beside its prepared step: the largest reply it allows.
@@ -1329,7 +1373,8 @@ pub(crate) fn prepared_request(
             .unwrap_or_default();
         subscription_body_with_identity(body, &first, state.execution(), shape.identity.as_ref())?
     } else {
-        serde_json::to_vec(&body).map_err(|error| error.to_string())?
+        // Moved in, so it is dropped as soon as it is encoded.
+        serde_json::to_vec(&{ body }).map_err(|error| error.to_string())?
     };
     PreparedRequest::new(identity, Encoding::Json, body)
         .map_err(|error| format!("request rejected: {error:?}"))
@@ -1363,12 +1408,14 @@ pub(crate) fn host_specs() -> Vec<(&'static str, String, Value)> {
         (
             "settings",
             "Read or change this thread's settings when the user asks (\"use a cheaper \
-             model\", \"think harder\", \"turn on internet\", \"what models can I use?\"). \
+             model\", \"think harder\", \"turn off internet\", \"what models can I use?\"). \
              Without arguments it returns the current settings and the available providers, \
              models and efforts. A change (provider, model, effort, network, toolchain, \
-             compaction, max_usd as dollars or null for no budget, name for the thread) is \
-             checked, queued and applied when this turn ends, never in the middle of it; \
-             unknown values are refused with the valid choices."
+             compaction, max_usd as dollars, name for the thread) is checked, queued and \
+             applied when this turn ends, never in the middle of it; unknown values are \
+             refused with the valid choices. Network and toolchain you may only turn off \
+             and max_usd only lower: turning them on, raising the budget or removing it \
+             is the user's, so ask them."
                 .into(),
             json!({
                 "type": "object",
@@ -1606,7 +1653,9 @@ pub(crate) fn code_model_request(
                 json!(max_tokens + thinking),
             );
         }
-        RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
+        RequestContract::OpenAiResponses
+        | RequestContract::ChatGptResponses
+        | RequestContract::ChatGptPlan => {
             let mut content = vec![json!({"type":"input_text","text":prompt})];
             content.extend(images.iter().map(|(media_type, data)| {
                 json!({"type":"input_image","image_url":format!("data:{media_type};base64,{data}")})
@@ -1616,8 +1665,8 @@ pub(crate) fn code_model_request(
                 json!([{"type":"message","role":"user","content":content}]),
             );
             object.insert("instructions".into(), json!(system));
-            // The ChatGPT subscription backend refuses an output cap; the allowance below
-            // still counts max_tokens against the script's model budget.
+            // Neither ChatGPT route takes an output cap; the allowance below still counts
+            // max_tokens against the script's model budget.
             if route.contract == RequestContract::OpenAiResponses {
                 object.insert("max_output_tokens".into(), json!(max_tokens + thinking));
             }

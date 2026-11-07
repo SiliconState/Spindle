@@ -344,6 +344,11 @@ pre.code { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; paddin
 .tool-input .copy { position: absolute; top: 4px; right: 4px; }
 .tool pre { margin: 0; padding: 8px 10px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; }
 .tool pre.input { color: var(--code); background: var(--terminal); padding-right: 36px; }
+/* An edit's diff: removed lines tinted with the danger colour, added ones with the accent
+   (mixed over the terminal background, so every theme keeps its own). */
+.tool pre.diff .diff-path { color: var(--muted); }
+.tool pre.diff .diff-del { display: block; margin: 0 -10px; padding: 0 10px; background: color-mix(in srgb, var(--danger) 14%, transparent); }
+.tool pre.diff .diff-ins { display: block; margin: 0 -10px; padding: 0 10px; background: color-mix(in srgb, var(--accent) 18%, transparent); }
 .tool pre.result { border-top: 1px solid var(--edge); }
 .tool-full > pre.result:first-child { border-top: 0; }
 
@@ -600,19 +605,33 @@ details[open] > summary > .chev { transform: rotate(90deg); }
 .provider-key { flex-basis: 100%; display: flex; gap: 6px; padding: 0 4px 8px 18px; }
 .provider-key input { flex: 1; min-width: 0; padding: 5px 8px; border: 1px solid var(--line); background: var(--input); font-size: 13px; }
 .provider-key button { min-height: 30px; padding: 0 10px; }
-/* Settings > Storage: a row each (a thread, the Linux snapshot, the rest), its size, what
-   can be freed under its name, and the action that frees it. */
-.storage-row { display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 6px 12px 6px 16px; }
+/* Settings > Storage: a row each (a thread, the Linux snapshot, the rest): its name and
+   size, a quiet menu for what is done less often, a line of what it holds with the one
+   action that frees space at no cost, a hairline of its share, and rows beneath it (a
+   thread's earlier versions). */
+.storage-row { padding: 9px 8px 9px 16px; }
 .storage-row + .storage-row { border-top: 1px solid var(--hair); }
-.storage-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.storage-name { font-size: 13px; font-weight: 600; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.storage-head { display: flex; align-items: center; gap: 10px; min-height: 22px; }
+.storage-name { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .storage-row.rest .storage-name { font-weight: 400; color: var(--ink-2); }
-.storage-detail { font-size: 11px; color: var(--muted); }
-.storage-size { font-family: var(--mono); font-size: 11px; color: var(--ink-2); flex-shrink: 0; }
-.storage-acts { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
-.storage-acts .link-like { font-size: 12px; }
-.storage-acts .link-like:disabled { color: var(--muted); text-decoration: none; cursor: default; }
-.storage-acts .link-like.danger { color: var(--error); }
+.storage-size { font-family: var(--mono); font-size: 11px; color: var(--ink-2); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.storage-more { width: 26px; height: 26px; min-height: 26px; margin: -2px 0; color: var(--muted); flex-shrink: 0; }
+.storage-more:hover, .storage-more[aria-expanded="true"] { color: var(--ink); }
+.storage-more-place { width: 26px; flex-shrink: 0; }
+.storage-line { display: flex; align-items: center; gap: 10px; margin-top: 3px; padding-right: 8px; }
+.storage-detail { flex: 1; min-width: 0; font-size: 11px; line-height: 1.45; color: var(--muted); }
+/* Its actions: small and quiet, never louder than what they act on. */
+.storage-act { flex-shrink: 0; min-height: 24px; padding: 0 9px; border: 1px solid var(--line); background: transparent; color: var(--ink); font-size: 11.5px; font-weight: 500; white-space: nowrap; cursor: pointer; }
+.storage-act:hover:not(:disabled) { background: var(--chrome); border-color: var(--ink-2); }
+.storage-act.danger { color: var(--error); }
+.storage-act.danger:hover:not(:disabled) { border-color: var(--error); }
+.storage-act:disabled { color: var(--muted); cursor: default; }
+.storage-bar { height: 2px; margin: 7px 8px 0 0; border-radius: 1px; background: var(--hair); overflow: hidden; }
+.storage-bar::before { content: ''; display: block; width: var(--share); height: 100%; background: var(--accent); opacity: .45; }
+.storage-subs { list-style: none; margin: 8px 8px 0 2px; padding: 0 0 0 10px; border-left: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+.storage-sub { display: flex; align-items: center; gap: 10px; }
+.storage-sub-text { flex: 1; min-width: 0; display: flex; flex-direction: column; font-size: 12px; color: var(--ink-2); }
+.storage-sub-acts { display: flex; gap: 6px; flex-shrink: 0; }
 .storage-actions { padding: 0 16px; margin-top: 0; }
 .storage-actions:has(> [hidden]:only-child) { display: none; }
 .facts { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 12px; margin: 0; }

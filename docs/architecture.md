@@ -151,6 +151,7 @@ flowchart LR
 | `dext-strict-workspace` | The strict sandbox runner for commands | no |
 | `dext-provider` | Native provider HTTP | no |
 | `agent` | The native `Session` (Tokio, reqwest) | no |
+| `codex-signin` | The legacy ChatGPT Codex profile; default in `spindle-embed` and enabled by `agent`, omitted in the browser store edition | yes |
 | `cli` | The `spindle` binary, `serve`, Cloudflare Access verification | no |
 | `dext-image`, `dext-native-image` | Image receipts and the pinned image worker (not enabled by `agent` or `cli`) | partly |
 
@@ -247,8 +248,10 @@ Web Locks). `EmbeddedClient` ([`clients/js/embedded.mjs`](../spindle/clients/js/
 speaks the same JSON-RPC protocol as `spindle api`, so an app can switch between the two.
 Both hosts price recorded requests, nested calls and summaries through
 [`spend.rs`](../spindle/store/src/spend.rs), and enforce `max_usd` before sending.
-Embedded background tasks keep their own work streams beside the parent and
-commit reports, including stopped reports, at its next boundary. `capabilities`
+Embedded background tasks keep their own work streams beside the parent and commit a
+background task's report (including mergeable files) or stopped report at its next
+boundary. Finished keep-files reports wait for the host's explicit bounded file offer.
+`capabilities`
 reports the host's abilities; embedded `fit` proposes, but does not apply, settings
 changes for a session moved from another host. See [embedded.md](embedded.md).
 
@@ -313,8 +316,10 @@ checks it there, every store where it lies, before renaming it into place.
 
 ## On disk
 
-A session is a directory. Schema 20 packs workspace objects without changing their
-logical ids; schema 19 migrates in place. The authoritative state is its store;
+A session is a directory. This build reads schemas 20 and 21; stores begin at 20
+and move atomically to 21 on a step with more than eight intents (up to 256).
+Schema 20 packs workspace objects without changing their logical ids; schema 19
+migrates in place. Older builds cannot read a widened schema-21 store. The authoritative state is its store;
 everything else is a mirror or index, bounded metadata, or a cache. The JSON
 checkpoint codec compares canonical output with input without keeping a
 second encoding; the outer `DTT1` restore still re-encodes its composite frame.

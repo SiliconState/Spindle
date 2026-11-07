@@ -42,7 +42,10 @@ const actions = {
     return { head: (await open().prompt(dir, 'again')).head };
   },
   async export({ dir }) {
-    const bytes = await open().exportSession(dir);
+    const c = open();
+    const bytes = await c.exportSession(dir);
+    // A move in two steps: the bundle kept (handed to the page), then this copy sealed.
+    await c.sealSession(dir, { expectedHead: c.checkBundle(bytes).head, expectedState: c.checkBundle(bytes).sourceState });
     let binary = '';
     for (const byte of bytes) binary += String.fromCharCode(byte);
     return { size: bytes.length, base64: btoa(binary) };
@@ -73,14 +76,16 @@ const actions = {
   // The pool by itself: it grows past its opening count, removes a tree, and a later
   // opening finds every slot a grow added (with the files they hold).
   async pool({ phase }) {
-    const pool = await openOpfsPool({ directory: 'pool-test', slots: 2 });
+    const writer = (pool) => (path, text) => {
+      const fd = pool.openSync(path, 'w+');
+      const bytes = new TextEncoder().encode(text);
+      pool.writeSync(fd, bytes, 0, bytes.length, 0);
+      pool.fsyncSync(fd);
+    };
+    // A pool kept small (no growth of its own): full says so, grows as asked.
+    const pool = await openOpfsPool({ directory: 'pool-test', slots: 2, lowWater: 0 });
     try {
-      const write = (path, text) => {
-        const fd = pool.openSync(path, 'w+');
-        const bytes = new TextEncoder().encode(text);
-        pool.writeSync(fd, bytes, 0, bytes.length, 0);
-        pool.fsyncSync(fd);
-      };
+      const write = writer(pool);
       if (phase === 'reopen') return { free: pool.free, kept: pool.readFileSync('/keep/a'), gone: pool.existsSync('/t') };
       write('/keep/a', 'kept');
       write('/t/x', '1');
@@ -93,7 +98,21 @@ const actions = {
       let notDir = null;
       try { pool.rmSync('/t'); } catch (error) { notDir = error.code; }
       pool.rmSync('/t', { recursive: true });
-      return { full, before, notDir, after: pool.free, gone: !pool.existsSync('/t'), kept: pool.readFileSync('/keep/a') };
+      // A pool left to itself grows in the real OPFS once its slots run low (between
+      // the files a step names), ahead of the next file.
+      const growing = await openOpfsPool({ directory: 'pool-grow', slots: 2 });
+      let grew;
+      try {
+        const name = writer(growing);
+        name('/a', '1');
+        name('/b', '2');
+        for (const until = Date.now() + 10_000; growing.free < 1 && Date.now() < until;) await new Promise((done) => setTimeout(done, 20));
+        grew = growing.free;
+        name('/c', '3');
+      } finally {
+        growing.close();
+      }
+      return { full, before, notDir, after: pool.free, gone: !pool.existsSync('/t'), kept: pool.readFileSync('/keep/a'), grew };
     } finally {
       pool.close();
     }

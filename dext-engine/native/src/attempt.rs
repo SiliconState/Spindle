@@ -152,6 +152,7 @@ pub fn contract(identity: &Identity) -> Result<Contract, AttemptError> {
         "openai-chat-completions" => Ok(Contract::OpenAiChatCompletions),
         "openai-responses" => Ok(Contract::OpenAiResponses),
         "chatgpt-responses" => Ok(Contract::ChatGptResponses),
+        "chatgpt-plan" => Ok(Contract::ChatGptPlan),
         _ => Err(AttemptError::Invalid),
     }
 }

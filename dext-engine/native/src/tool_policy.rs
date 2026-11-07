@@ -3496,7 +3496,13 @@ mod tests {
 
     #[test]
     fn bulk_network_detection_boundaries_are_reasonable() {
+        // A loop over a list or more than four words sweeps; up to four literal words
+        // name the pages it reaches (transcript `small_literal_loop`).
         assert!(looks_like_bulk_network_call(
+            "bash",
+            &json!({"command": "for t in a b c d e; do curl -s https://api.example.com/v1/item/$t; done"})
+        ));
+        assert!(!looks_like_bulk_network_call(
             "bash",
             &json!({"command": "for t in a b c; do curl -s https://api.example.com/v1/item/$t; done"})
         ));
@@ -3514,7 +3520,7 @@ mod tests {
         ));
         assert!(looks_like_bulk_network_call(
             "bash",
-            &json!({"command": "for t in a b c\ndo\n  curl -s https://api.example.com/v1/item/$t\ndone"})
+            &json!({"command": "for t in $(cat ids.txt)\ndo\n  curl -s https://api.example.com/v1/item/$t\ndone"})
         ));
         assert!(!looks_like_bulk_network_call(
             "bash",

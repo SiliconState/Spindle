@@ -466,7 +466,7 @@ fn a_thread_comes_and_goes_back_with_its_head_and_identity() {
         "{receipt}"
     );
     assert!(!host.dir(&id).exists());
-    settle(&root.join("trash").join(&id));
+    assert!(root.join("trash").join(&id).exists(), "kept a day");
     assert_eq!(count(&host, "SELECT count(*) FROM owners"), 0);
     assert_eq!(count(&host, "SELECT count(*) FROM threads"), 0);
     // Brought again later (its record went with it): a new session, the same thread.
@@ -488,6 +488,11 @@ fn imports_replay_by_key_and_refuse_what_they_cannot_take() {
     let (status, first) = bring(&host, &token, key, "", &bundle);
     assert_eq!(status, 201, "{first}");
     assert_eq!(first["session"]["name"], "Imported thread");
+    assert_eq!(
+        *lock(&host.arriving),
+        (0, 0),
+        "an import counts while under way"
+    );
     // The same key and bundle: the same session and fit, nothing imported again.
     let (status, again) = bring(&host, &token, key, "", &bundle);
     assert_eq!(status, 200, "{again}");
@@ -557,8 +562,23 @@ fn imports_replay_by_key_and_refuse_what_they_cannot_take() {
         &bundle,
     );
     assert_eq!(status, 400, "provider goes with model");
-    // A full host refuses with its session limit (before the upload).
-    for n in 0..(super::super::MAX_SESSIONS - 2) {
+    // Two under way: another is refused before its upload, as is one the disk has no
+    // room for beside those.
+    *lock(&host.arriving) = (2, 0);
+    let (status, refused) = bring(&host, &token, "busy-key-00000000001", "", &bundle);
+    assert_eq!((status, refused["code"].clone()), (503, json!("busy")));
+    *lock(&host.arriving) = (1, u64::MAX / 4);
+    let (status, replay) = bring(&host, &token, key, "", &bundle);
+    assert_eq!(status, 200, "replays need no staging space: {replay}");
+    let (status, refused) = bring(&host, &token, "disk-key-00000000001", "", &bundle);
+    assert_eq!(
+        (status, refused["code"].clone()),
+        (507, json!("insufficient_storage"))
+    );
+    // A full host refuses with its session limit (before the upload); an import under
+    // way counts.
+    *lock(&host.arriving) = (1, 0);
+    for n in 0..(super::super::MAX_SESSIONS - 3) {
         lock(&host.lives).insert(format!("filler{n}"), Watch::new());
     }
     let (status, refused) = bring(&host, &token, "full-key-00000000001", "", &bundle);
@@ -566,6 +586,7 @@ fn imports_replay_by_key_and_refuse_what_they_cannot_take() {
         (status, refused["error"].clone()),
         (409, json!("session limit reached"))
     );
+    *lock(&host.arriving) = (0, 0);
     drop(host);
     let _ = super::super::disk::remove_tree(&root);
 }
@@ -646,7 +667,7 @@ fn an_import_stopped_at_any_point_is_whole_or_absent_after_a_restart() {
             &json!({"request_id": format!("del-{point}"), "kind": "delete", "session": id}),
         );
         assert_eq!(status, 202, "{receipt}");
-        settle(&root.join("trash").join(&id));
+        assert!(root.join("trash").join(&id).exists(), "kept a day");
         drop(host);
     }
     // After the commit: the session, through a restart, and the key answers with it.
@@ -1093,10 +1114,10 @@ fn one_click_connect_trades_a_single_use_code_for_a_browser_token() {
         400
     );
     // The answer: a paired screen's same-origin POST only.
-    let answer = |allow: bool, client: &str, csrf: bool| {
-        let body =
-            json!({"client": client, "challenge": challenge, "state": "s-1", "allow": allow})
-                .to_string();
+    let answer = |allow: bool, client: &str, csrf: bool, replace: bool| {
+        let body = json!({"client": client, "challenge": challenge, "state": "s-1",
+            "allow": allow, "replace": replace})
+        .to_string();
         let proof = if csrf {
             "Origin: http://HOST\r\nX-Spindle: 1\r\n"
         } else {
@@ -1113,8 +1134,8 @@ fn one_click_connect_trades_a_single_use_code_for_a_browser_token() {
         );
         (status, json_of(&reply))
     };
-    assert_eq!(answer(true, "Edge", false).0, 403);
-    let (status, denied) = answer(false, "Edge", true);
+    assert_eq!(answer(true, "Edge", false, false).0, 403);
+    let (status, denied) = answer(false, "Edge", true, false);
     assert_eq!(
         (status, denied["redirect"].clone()),
         (200, json!("/connect/done?error=denied&state=s-1"))
@@ -1127,7 +1148,7 @@ fn one_click_connect_trades_a_single_use_code_for_a_browser_token() {
         );
         redirect["/connect/done?code=".len()..redirect.len() - "&state=s-1".len()].to_string()
     };
-    let (status, allowed) = answer(true, "Edge", true);
+    let (status, allowed) = answer(true, "Edge", true, false);
     assert_eq!(status, 200);
     let code = code_of(&allowed);
     assert_eq!(code.len(), 64);
@@ -1153,7 +1174,7 @@ fn one_click_connect_trades_a_single_use_code_for_a_browser_token() {
     assert_eq!((status, refused["code"].clone()), (400, json!("bad_code")));
     assert_eq!(trade(&code, &verifier).0, 400, "burned");
     // The right one, once.
-    let code = code_of(&answer(true, "Edge", true).1);
+    let code = code_of(&answer(true, "Edge", true, false).1);
     let (status, minted) = trade(&code, &verifier);
     assert_eq!(status, 200, "{minted}");
     assert_eq!(minted["client"], "Edge");
@@ -1161,17 +1182,30 @@ fn one_click_connect_trades_a_single_use_code_for_a_browser_token() {
     assert_eq!(get(&host, "/v1", &token).0, 200);
     assert_eq!(get(&host, "/v1/usage", &token).0, 403, "a browser token");
     assert_eq!(trade(&code, &verifier).0, 400, "single use");
-    // Connecting again replaces the token.
-    let code = code_of(&answer(true, "Edge", true).1);
+    // Connecting again replaces the token and hands over its threads: said first.
+    lock(&host.db)
+        .execute(
+            "INSERT INTO owners VALUES('brought','api:browser:Edge')",
+            [],
+        )
+        .unwrap();
+    let (status, asked) = answer(true, "Edge", true, false);
+    let asked = asked["error"].as_str().unwrap_or_default().to_string();
+    assert_eq!(status, 409, "{asked}");
+    assert!(
+        asked.contains("Edge is already connected") && asked.contains("its 1 thread here"),
+        "{asked}"
+    );
+    let code = code_of(&answer(true, "Edge", true, true).1);
     let (_, again) = trade(&code, &verifier);
     assert_eq!(get(&host, "/v1", &token).0, 401);
     assert_eq!(get(&host, "/v1", again["token"].as_str().unwrap()).0, 200);
     // Expired after 120 s.
-    let code = code_of(&answer(true, "Edge", true).1);
+    let code = code_of(&answer(true, "Edge", true, true).1);
     lock(&host.connect).age(Duration::from_secs(121));
     assert_eq!(trade(&code, &verifier).0, 400);
     // Failures are limited: ten a minute, then 429 even for a good code.
-    let code = code_of(&answer(true, "Edge", true).1);
+    let code = code_of(&answer(true, "Edge", true, true).1);
     // Four so far (wrong, burned, used, expired).
     for _ in 0..6 {
         assert_eq!(trade("nope", &verifier).0, 400);
@@ -1181,6 +1215,19 @@ fn one_click_connect_trades_a_single_use_code_for_a_browser_token() {
         (status, limited["code"].clone()),
         (429, json!("rate_limited"))
     );
+    // Counted by source: a client elsewhere (the address Cloudflare saw) is not locked
+    // out by this one's guesses, and the code a refusal did not take still trades.
+    let body = json!({"code": code, "verifier": verifier}).to_string();
+    let (status, _, reply) = exchange(
+        &host,
+        &format!(
+            "POST /v1/connect/token HTTP/1.1\r\nHost: HOST\r\nCf-Connecting-Ip: 203.0.113.9\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        ),
+        body.as_bytes(),
+        None,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&reply));
     drop(host);
     let _ = super::super::disk::remove_tree(&root);
 }

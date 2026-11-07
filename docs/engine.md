@@ -75,13 +75,15 @@ Defined in [`native/Cargo.toml`](../dext-engine/native/Cargo.toml). Default: `na
 
 ### dext-provider
 
-Defined in [`provider/Cargo.toml`](../dext-engine/provider/Cargo.toml). Default: `native`.
+Defined in [`provider/Cargo.toml`](../dext-engine/provider/Cargo.toml). Defaults:
+`native` and `codex-signin`.
 
 | Feature | Enables | Pulls in |
 |---|---|---|
 | (none) | `catalog`, `wire`, `claude_subscription` (portable parts) | `anyhow`, `base64`, `bytes`, `flate2` (pure-Rust backend), `http`, `serde`, `serde_json`, `sha2`, `url` |
 | `native` | `host` (state directory, atomic writes, command hooks) and `provider` (credential store, OAuth, `auth` CLI), random request ids, local identity discovery | `reqwest` (blocking, rustls), `libc` (Unix), `getrandom` |
 | `test-support` | `native` plus test-only state-directory handling | |
+| `codex-signin` | The legacy `chatgpt` built-in profile and Codex OAuth options; omitted by the browser store edition | None |
 
 A test in [`provider/tests/portable.rs`](../dext-engine/provider/tests/portable.rs)
 (`portable_sources_have_no_ambient_native_dependencies`) fails if `catalog.rs` or `wire.rs`
@@ -170,7 +172,7 @@ characters):
 |---|---|
 | `effect` | Effect id of the request (in a turn, `<execution>/m/<ordinal>`) |
 | `provider` | Provider profile id |
-| `contract` | Wire contract name (`anthropic-messages`, `openai-chat-completions`, `openai-responses`, `chatgpt-responses`) |
+| `contract` | Wire contract name (`anthropic-messages`, `openai-chat-completions`, `openai-responses`, `chatgpt-responses`, `chatgpt-plan`) |
 | `endpoint` | Request URL |
 | `model` | Model id |
 | `credential_scope` | An opaque authorization scope chosen by the host, never a token or a hash of one |
@@ -237,7 +239,8 @@ cannot produce.
 
 [`recovery.rs`](../dext-engine/core/src/recovery.rs) classifies how a response ended.
 
-- `Contract` is the four wire contracts. `stream_recovery_reason` returns why a response
+- `Contract` names five wire contracts, including `ChatGptPlan` (`chatgpt-plan`,
+  checkpoint tag 4). Old builds refuse that tag. `stream_recovery_reason` returns why a response
   is incomplete: for Responses contracts, the `incomplete:<reason>` stop reason; for
   Anthropic Messages and Chat Completions, `unfinished_tool_call` when a tool call was cut
   off, or `output_token_limit` on `max_tokens` / `length`.
@@ -420,7 +423,7 @@ without NUL. On Windows each component must also survive the filesystem as writt
   with `stream protocol error [sse/frame]` when one event exceeds its cap or is not UTF-8.
 - [`streaming.rs`](../dext-engine/native/src/streaming.rs): `ProviderStreamParser` turns
   frames into blocks for one contract. `sse_event_cap` is 4 MiB for Anthropic Messages and
-  both Responses contracts (a thinking signature or a terminal snapshot arrives in one
+  all three Responses routes (a thinking signature or a terminal snapshot arrives in one
   event) and 256,000 bytes for Chat Completions. Tool arguments are buffered up to
   256,000 bytes per call and reasoning up to 4 MiB.
 
@@ -428,7 +431,7 @@ without NUL. On Windows each component must also survive the filesystem as writt
 |---|---|---|---|
 | Anthropic Messages | Indexed content blocks from `message_start`, `content_block_start/delta/stop`, `message_delta`, `message_stop` (`text_delta`, `thinking_delta`, `signature_delta`, `input_json_delta`, redacted thinking) | `message_start` and `message_stop` seen, every block stopped | Text, thinking with signature, redacted thinking, tool calls |
 | Chat Completions | One text and one reasoning buffer, tool calls by index | A `finish_reason` or `[DONE]`; nothing after `[DONE]` | Thinking (when reasoning capture is on), text, tool calls |
-| OpenAI Responses, ChatGPT | Output items, text, reasoning summaries, function calls by item id, from `response.*` events | A terminal `response.completed`, `response.done` or `response.incomplete` event, or `[DONE]`; function calls require the terminal event and must reconcile with its output | Reasoning items (OpenAI Responses only), thinking from reasoning summaries, text, tool calls |
+| OpenAI Responses, ChatGPT Codex and ChatGPT plan | Output items, text, reasoning summaries, function calls by item id, from `response.*` events | A terminal `response.completed`, `response.done` or `response.incomplete` event, or `[DONE]`; function calls require the terminal event and must reconcile with its output | Reasoning items (OpenAI Responses only), thinking from reasoning summaries, text, tool calls |
 
 OpenAI Responses reasoning items that carry `encrypted_content` are kept by item id, to
 be sent back with the next request. The terminal event's copy of an item replaces the
@@ -689,7 +692,7 @@ JSON from the app (`Catalog::from_json` in spindle-store). Either way it passes 
 | `id` | yes | Provider id, canonicalized (see aliases below) |
 | `display_name` | no | Defaults to the id |
 | `api_provider` | yes | `anthropic`, `openai` or `chatgpt` (aliases such as `openai-compatible`, `local`, `deepseek` map to `openai`; anything unknown maps to `anthropic`). Replaced by the contract's provider when `request_contract` is set. |
-| `request_contract` | no | `anthropic-messages`, `openai-chat-completions`, `openai-responses` or `chatgpt-responses` (aliases `anthropic`, `openai`, `openai-compatible`, `responses`, `chatgpt`, `codex`); defaults from `api_provider` |
+| `request_contract` | no | `anthropic-messages`, `openai-chat-completions`, `openai-responses`, `chatgpt-responses` or `chatgpt-plan` (aliases `anthropic`, `openai`, `openai-compatible`, `responses`, `chatgpt`, `codex`); defaults from `api_provider` |
 | `base_url` | yes | Endpoint base; a trailing slash is dropped |
 | `default_model` | yes | Normalized and added to `models` if missing |
 | `models` | no | Curated model list |
@@ -697,7 +700,7 @@ JSON from the app (`Catalog::from_json` in spindle-store). Either way it passes 
 | `model_defaults`, `model_specs` | no | `ModelSpec` for all models and per model (keys normalized and lowercased) |
 | `env_vars` | no | Environment variables that may hold the API key, in order |
 | `requires_api_key` | no | Default `true` |
-| `login_url`, `oauth_flow`, `notes` | no | Where to get a key; OAuth endpoints, client id, scope, redirect URI, callback host, protocol (`generic` or `anthropic-claude`) |
+| `login_url`, `oauth_flow`, `notes` | no | Where to get a key; OAuth endpoints, client id, scope, redirect URI, callback host, protocol (`generic`, `anthropic-claude` or `chatgpt-plan`), optional issuer and authorize parameters |
 | `context_window`, `model_context_windows`, `model_effort_levels` | no | Older per-profile and per-model overrides |
 
 `ModelSpec` has `context_window`, `max_output_tokens`, `effort_levels`, `reasoning_modes`,
@@ -715,7 +718,8 @@ provider is `glm`):
 | id | Display name | Contract | Default model | Credentials |
 |---|---|---|---|---|
 | `glm` | ZAI GLM | `anthropic-messages` | `glm-5.2[1m]` | API key, `ZAI_API_KEY` |
-| `chatgpt` | ChatGPT | `chatgpt-responses` | `gpt-6.1-sol` | OAuth (PKCE), or `CHATGPT_ACCESS_TOKEN` |
+| `chatgpt-plan` | ChatGPT | `chatgpt-plan` | `gpt-6.1-sol` | OpenAI's issued-client Sign in with ChatGPT; browser only, absent from native load/save |
+| `chatgpt` | ChatGPT (Codex) | `chatgpt-responses` | `gpt-6.1-sol` | Legacy OAuth (PKCE), or `CHATGPT_ACCESS_TOKEN`; feature `codex-signin` |
 | `openai` | OpenAI API | `openai-chat-completions`; `openai-responses` for the gpt-5.6 and gpt-6 models on the official API host | `gpt-5` | API key, `OPENAI_API_KEY` |
 | `anthropic` | Anthropic | `anthropic-messages` | `claude-sonnet-4-6` | API key (`ANTHROPIC_API_KEY`) or subscription OAuth |
 | `kimi` | Kimi Code | `anthropic-messages` | `k3` | API key, `KIMI_API_KEY` (stored OAuth entries are ignored) |
@@ -786,7 +790,7 @@ by both.
 
 | File | Written by | Contents |
 |---|---|---|
-| `providers.json` | `save_provider_catalog`, provider and default-model changes | The normalized catalog |
+| `providers.json` | `save_provider_catalog`, provider and default-model changes | The normalized native catalog; `chatgpt-plan` removed to remain readable by Dext builds without its enum values |
 | `auth.json` | `save_auth_store` | Credentials, owner-only |
 | `pending_oauth.json` | `run_oauth_login` | PKCE verifier, state and redirect URI of a login in progress, owner-only |
 | `kimi_device_id` | Kimi header shaping | A generated device id sent to the official Kimi endpoint |
@@ -850,6 +854,14 @@ supplies the catalog and the key, and headers are built with
 from its OAuth token's claim, become templates the app fills in; a provider whose headers
 otherwise derive from the key is refused there ([embedded.md](embedded.md#credentials)).
 
+The portable catalog includes `chatgpt-plan`, but native `load_provider_catalog`
+and `save_provider_catalog` remove profiles using that contract or OAuth protocol.
+Native login refuses it. This protects the shared `providers.json` from enum values
+older Dext builds do not understand. Empty new OAuth fields are not serialized.
+The browser handles registration, identity checks, refresh and revocation itself;
+see [chrome.md](chrome.md#sign-in-with-chatgpt). `RequestContract::plan_paid()` is
+true for both ChatGPT routes, so subscription requests are not priced as API spend.
+
 ### Logins
 
 `handle_auth_cli` implements `auth status | providers | provider | models | login |
@@ -882,7 +894,7 @@ contract's path, without doubling a `/v1` or `/codex` suffix already in the base
 |---|---|
 | `anthropic-messages` | `/v1/messages` |
 | `openai-chat-completions` | `/v1/chat/completions` |
-| `openai-responses` | `/v1/responses` |
+| `openai-responses`, `chatgpt-plan` | `/v1/responses` |
 | `chatgpt-responses` | `/codex/responses` |
 
 `provider_headers_with_context` builds the authentication and client headers; secret
@@ -890,7 +902,7 @@ values are marked sensitive.
 
 | API provider | Headers |
 |---|---|
-| OpenAI (both OpenAI contracts) | `authorization: Bearer <key>` when a key is set |
+| OpenAI (OpenAI contracts and `chatgpt-plan`) | `authorization: Bearer <key>` when a key is set |
 | ChatGPT | `authorization: Bearer <token>`, `chatgpt-account-id` (read from the token's claims), `originator`, `user-agent`, `openai-beta`, and `session_id` / `x-client-request-id` from the session |
 | Anthropic, API key | `anthropic-version` (`ANTHROPIC_API_VERSION`), `x-api-key`, an optional extended-cache beta; for the official Kimi endpoint also a `dext/<version>` user agent and `x-msh-*` device headers |
 | Anthropic, subscription OAuth | `anthropic-version`, `authorization: Bearer <token>`, the subscription beta flags, a fixed client user agent, `x-app`, a per-request `x-client-request-id` and a session id header |
@@ -955,7 +967,7 @@ Spindle chooses the wire fields for an effort in `shape::reasoning`
 | Anthropic Messages, other models | `thinking: {type: enabled, budget_tokens}` (at least 1024) with `max_tokens` = answer + budget; `off` disables thinking; GLM's default is thinking off |
 | Chat Completions, DeepSeek | `thinking: {type: enabled}`, `reasoning_effort` (`low`, `high` or `max`) and `max_tokens`; default and `off` disable thinking |
 | Chat Completions, others | `reasoning_effort` at the nearest level the model declares (at most `high` when it declares none); local llama.cpp servers also get `chat_template_kwargs.enable_thinking`, which is how `off` works there; elsewhere `off` is refused |
-| OpenAI Responses, ChatGPT | `reasoning.effort`; OpenAI Responses also sets `max_output_tokens`, while ChatGPT requests never carry an output cap |
+| OpenAI Responses, ChatGPT | `reasoning.effort`; only ordinary OpenAI Responses sets `max_output_tokens`; both ChatGPT subscription routes omit it. `chatgpt-plan` additionally nests function tools under the `spindle` namespace and names it on replayed calls. |
 
 ## From transcript to wire and back
 

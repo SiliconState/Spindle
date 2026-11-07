@@ -56,7 +56,9 @@ export type SpindleEvent =
   | { type: 'app_tool_done'; call: string; outcome: 'answered' | 'failed' | 'unknown' | 'no_answer' | 'stopped' };
 
 /** A file given with a prompt or a new session. */
-export type FileParam = { path: string; executable?: boolean } & ({ text: string } | { base64: string });
+/** A file of `create` or `prompt`: its text, its bytes as base64, or its bytes as they
+ * are (`bytes`: they cross into the package once, never encoded). */
+export type FileParam = { path: string; executable?: boolean } & ({ text: string } | { base64: string } | { bytes: Uint8Array });
 
 /** What an app tool's `run` returns: text, an answer object, or any JSON value. */
 export type ToolAnswer =
@@ -165,6 +167,17 @@ export interface EmbeddedOptions {
   resolveDir?(dir: string): string;
 }
 
+/** A task whose store `dropTask` removed, as its session records it: its directory
+ * key, its registered name (null for a directory no row named), the first line of its
+ * prompt, the bytes its directory took and when (Unix seconds, the app's clock). */
+export interface DroppedTask {
+  key: string;
+  task: string | null;
+  prompt: string;
+  bytes: number;
+  at: number | null;
+}
+
 /** Settings `create` and `settings` take (docs/API.md); the package honors file
  * tools (`builtin_tools: 'files' | 'none'`), `runner` and either compaction (`model`,
  * the default, or `digest`). */
@@ -173,6 +186,9 @@ export interface SessionSettings {
   network?: boolean;
   effort?: 'default' | 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   compaction?: 'model' | 'digest';
+  /** Compact once the history passes this many tokens, even where the model's window is
+   * larger (16000 to 100 million; null or 0: the window alone; new sessions: 256000). */
+  compact_tokens?: number | null;
   tools?: unknown[];
   builtin_tools?: 'files' | 'none';
   instructions?: string;
@@ -197,6 +213,11 @@ export interface TurnResult {
   rewound: (SpindleEvent & { type: 'rewound' }) | null;
   unsent: string[];
 }
+
+/** The head and identity a session bundle's manifest names, from its first bytes only
+ * (null when it does not read as one): for a bundle this app just made, such as the head
+ * `sealSession` expects. `checkBundle` checks one whole. */
+export declare function bundleFacts(bytes: Uint8Array | ArrayBuffer): { head: number; identity: string; sourceState: string | null } | null;
 
 export declare class EmbeddedClient {
   constructor(options: EmbeddedOptions);
@@ -240,13 +261,24 @@ export declare class EmbeddedClient {
   history(dir: string, revision?: number, options?: { from?: number }): Promise<{ head: number; revision: number; messages: unknown[]; total: number; app_details: unknown[] }>;
   /** Rewind targets among the newest `limit` steps (48 unless said; at most 8192), newest first. */
   targets(dir: string, options?: { limit?: number }): Promise<{ revision: number; kind: 'settled' | 'before_model' }[]>;
+  /** Where a stopped turn can go on from: rewind targets newest first back to the newest
+   * completed turn (however far), whether there is one (false: a first turn), and the
+   * turn's own message (never a compaction summary, steering or a task report).
+   * `completed` is null (no targets, no prompt, `busy: true`) only in a Spindle host's
+   * answer while a command of the session runs (v1 `targets?until=settled`): unknown
+   * until it ends. This package refuses then instead (`busy`). */
+  turn(dir: string): Promise<{ targets: { revision: number; kind: 'settled' | 'before_model' }[]; completed: boolean | null; prompt: string | null; busy?: true }>;
   files(dir: string, revision?: number): Promise<{ head: number; revision: number; files: { path: string; size: number; digest: string; executable: boolean }[]; links: unknown[]; directories: string[] }>;
   read(dir: string, path: string, revision?: number): Promise<Uint8Array>;
   settings(dir: string, changes?: SessionSettings): Promise<any>;
   /** The session's spend: totals, `turns` and `models`, as a native host's `usage`. */
   usage(dir: string): Promise<any>;
   /** The tasks the session started. */
-  tasks(dir: string): Promise<{ tasks: { task: string; state: string; queued: boolean; answer: { content: string; failed: boolean } | null; pending: boolean; delivered: boolean }[] }>;
+  /** `store`: its store is kept here, taking `bytes` (its own tasks' included; null
+   * without one); `dropped`: the record of a store `dropTask` removed; `orphan`: a task
+   * directory no row of the session names (`finished`, or `running` while the session's
+   * turn may still need it). */
+  tasks(dir: string): Promise<{ tasks: { task: string; state: string; queued: boolean; answer: { content: string; failed: boolean } | null; pending: boolean; delivered: boolean; prompt: string; store: boolean; bytes: number | null; dropped: DroppedTask | null; orphan: boolean }[] }>;
   /** A task as it stands now (nothing waits here). */
   taskWait(dir: string, task: string): Promise<{ task: string; state: string; queued: boolean; answer: { content: string; failed: boolean } | null; pending: boolean; delivered: boolean }>;
   /** Stops a background task where it is. */
@@ -259,11 +291,26 @@ export declare class EmbeddedClient {
   setState(dir: string, patch: Record<string, unknown>, options?: { expectedHead?: number }): Promise<{ session: string; revision?: number; queued?: number }>;
   recover(dir: string): Promise<{ head: number; phase: string; items: unknown[]; wake: { work: 'none' | 'ready' | 'blocked'; why: string | null } }>;
   taskStart(dir: string, task: string, prompt: string, options?: { model?: string; effort?: string; files?: 'keep' | 'discard'; settings?: Record<string, unknown>; report?: 'wait'; expectedHead?: number }): Promise<TurnResult & { task: string; answer: string; failed: boolean; state: 'finished' }>;
-  /** The session as a session bundle; it moves (this copy sealed) unless `keep`.
-   * `settings` change the bundle's copy only, for the host it goes to. */
-  exportSession(dir: string, options?: { keep?: boolean; settings?: Record<string, unknown> }): Promise<Uint8Array>;
+  /** The session as a session bundle; it stays here unless `keep: false` (then this
+   * copy is sealed as the bytes are made: prefer keeping the bundle where it goes on,
+   * then `sealSession`). `settings` change the bundle's copy only, for the host it goes
+   * to; `whole` checks a copy record by record. */
+  exportSession(dir: string, options?: { keep?: boolean; settings?: Record<string, unknown>; whole?: boolean }): Promise<Uint8Array>;
+  /** Moves the session once its bundle is kept where it goes on: this copy closes and
+   * is sealed. `expectedHead` and `expectedState` come from the bundle's `head` and
+   * `sourceState`; changed source metadata or task snapshots refuse (`head_moved`). The
+   * spend ledger is kept at both ends, so reading `usage` between them changes neither. */
+  sealSession(dir: string, options: { expectedHead: number; expectedState: string }): Promise<{ session: string; head: number; sealed: true }>;
+  /** A finished task as a session bundle of its own (its store and its tasks'), to keep
+   * before `dropTask`; `importSession` reads it later as a session. */
+  exportTask(dir: string, task: string): Promise<Uint8Array>;
+  /** Frees a finished task's space: its stores removed, its spend kept in the
+   * session's first (budgets count it once), its answer and merged files kept. A task
+   * whose row still says `running` (a background task, or an app task `taskStart` takes
+   * up again) is refused (`conflict`); a finished, failed or stopped one is let go. */
+  dropTask(dir: string, task: string, options?: { expectedState?: string }): Promise<{ task: string; dropped: DroppedTask }>;
   /** Checks a session bundle whole, as an import would, writing nothing. */
-  checkBundle(bytes: Uint8Array): { head: number; identity: string; files: number };
+  checkBundle(bytes: Uint8Array): { head: number; identity: string; files: number; sourceState: string | null };
   /** Continues a bundled session as `dir` (nothing there yet). */
   importSession(dir: string, bytes: Uint8Array | ArrayBuffer): Promise<any>;
   close(): Promise<number>;

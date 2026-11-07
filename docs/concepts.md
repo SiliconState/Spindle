@@ -27,8 +27,9 @@ A **revision** is one committed step. It records, in one transaction:
 - the *intents* the step produced (model requests to send, tool calls to run).
 
 The **head** is the newest revision. Revisions only grow; nothing in a committed
-revision is edited afterwards. Reading "the session at revision R" always gives the same
-answer.
+revision is edited afterwards. Reading "the session at revision R" gives the same
+conversation and workspace while that history is retained; revision metadata such as
+priced usage and settings is kept separately and is not rewound.
 
 ```mermaid
 flowchart LR
@@ -62,7 +63,7 @@ request, or not. Spindle states this instead of guessing.
 
 | Action | What it does with an unknown outcome |
 | --- | --- |
-| **Continue** (`spindle continue`; API `continue`, client `resume`) | Never resends it on its own. Reports that the outcome is unknown and stops. |
+| Continue (`spindle continue`; API `continue`, client `resume`) | By default reports unknown model outcomes and stops; the explicit `resend_unknown` setting below permits bounded resends. |
 | **Retry** (`spindle retry`; API and client `retry`) | Rewinds to the point before the request, prepares it again under a fresh identity and sends it once. |
 | **`resend_unknown` setting** | Opt-in consent: Continue and a dropped send during a turn retry it automatically, up to three times (waiting 1, 2 and 4 seconds), when a rewind target exists. Each resend may be billed. |
 
@@ -152,9 +153,10 @@ A **task** is a child session the model starts with the `task` tool when the ses
 `tasks/` named by a hash of the call's effect id, works on a copy of the parent's
 workspace, and its answer becomes the tool result. Unless the call says `files: "discard"`, the files it changed land in the
 parent's workspace with that result. A background task (`background: true`, or an
-app's `task_start` with `report: "queue"`) returns immediately; files stay in the
-child and a durable report reaches the parent later: its answer, or that it stopped,
-with a reason when available. A finished parent turn waits for running tasks; a
+app's `task_start` with `report: "queue"`) returns immediately. Its durable report
+later delivers the answer and mergeable file changes together, or says it stopped.
+Files stay in the child when discarded, conflicting, unreadable or above the merge
+bounds (64 MiB / 8192 paths). A finished parent turn waits for running tasks; a
 stopped child reports rather than wedging the parent. Starting the same id again
 resumes that child with matching input. Reports are delivered once per lineage;
 a rewind before a report makes it readable again. See
@@ -162,7 +164,8 @@ a rewind before a report makes it readable again. See
 
 Both hosts support tasks and dollar budgets. Native child spend counts in the
 parent's report, with leases reserving task allowances; the embedded host shares
-the task tree's spend and in-flight worst cases while its hosts are open, and
+the task tree's spend and in-flight worst cases while its hosts are open, recounts
+retained child stores after reopen before a budgeted send, and
 reports only each session's own spend through `usage`. A `max_usd` cap refuses a
 fresh request before sending when its worst case will not fit; both hosts use the
 same [`spend.rs`](../spindle/store/src/spend.rs) ledger. Given as an

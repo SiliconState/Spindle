@@ -112,13 +112,14 @@
     <div class="page-title"><h2 id="model-heading">Model</h2><p class="page-sub" id="model-label" hidden></p></div>
   </div>
   <div class="page-body">
-    <p id="model-halted" class="note attention" hidden>Its last turn stopped before it finished. A change starts that turn over: it is taken back and your message is sent again.</p>
+    <p id="model-halted" class="note attention" hidden>Its last turn stopped before it finished. A change goes on with it from the request that stopped (its work so far stays), or, where it cannot, starts that turn over (your message is sent again). Earlier turns are never lost.</p>
     <fieldset id="model-scope" class="seg seg-2" role="radiogroup" aria-labelledby="scope-heading">
       <legend id="scope-heading" class="sr-only">Apply to</legend>
       <button type="button" role="radio" data-scope="thread">This thread</button><button type="button" role="radio" data-scope="new">New threads</button>
     </fieldset>
     <div class="card pick-card">
       <div class="pick-row" id="provider-row"><span class="pick-label" id="provider-heading">Provider</span><div class="picker" id="model-provider"></div></div>
+      <p id="model-plan" class="note" hidden>Using your ChatGPT plan · <button id="model-usage" type="button" class="link-like">Manage usage</button></p>
       <div class="pick-row" id="name-row"><span class="pick-label" id="name-heading">Model</span><div class="picker" id="model-name"></div></div>
     </div>
     <div class="field" id="effort-field">
@@ -145,6 +146,10 @@
       <div class="switch-row" id="budget-field">
         <div><label for="model-budget" id="budget-heading">Spend limit</label><small id="budget-note"></small></div>
         <span class="money-input"><span aria-hidden="true">$</span><input id="model-budget" type="number" min="0" step="0.01" inputmode="decimal" placeholder="None" autocomplete="off" aria-describedby="budget-note"></span>
+      </div>
+      <div class="switch-row" id="compact-field">
+        <div><label for="model-compact" id="compact-heading">Compact history past</label><small id="compact-note">Thousand tokens; empty: the model's whole window. Every message stays in the thread's history.</small></div>
+        <span class="money-input"><input id="model-compact" type="number" min="16" step="1" inputmode="numeric" placeholder="Window" autocomplete="off" aria-describedby="compact-note"><span aria-hidden="true">K</span></span>
       </div>
     </div>
     <p id="model-note" class="note"></p>
@@ -194,7 +199,7 @@
           <button id="page-actions" type="button" role="switch" class="switch" aria-labelledby="page-actions-label"></button>
         </div>
         <div class="field act-confirm-field"><span class="field-label" id="act-confirm-heading">Before acting</span>
-          <div id="act-confirm" class="seg seg-3" role="radiogroup" aria-labelledby="act-confirm-heading"><button type="button" role="radio" data-value="full" aria-checked="true">Full</button><button type="button" role="radio" data-value="auto" aria-checked="false">Auto</button><button type="button" role="radio" data-value="ask" aria-checked="false">Ask</button></div>
+          <div id="act-confirm" class="seg seg-3" role="radiogroup" aria-labelledby="act-confirm-heading"><button type="button" role="radio" data-value="full" aria-checked="false">Full</button><button type="button" role="radio" data-value="auto" aria-checked="true">Auto</button><button type="button" role="radio" data-value="ask" aria-checked="false">Ask</button></div>
           <p class="field-note" id="act-confirm-note"></p></div>
         <p class="warn-note" role="note"><span class="warn-icon" data-icon="warning"></span><span>Acting threads are signed in as you, and a page's text can try to steer them.</span></p>
         <div id="site-rules" hidden></div>
@@ -343,6 +348,14 @@
     <h2 id="confirm-title"></h2>
     <p id="confirm-text"></p>
     <div class="confirm-actions"><button value="no" type="submit">Cancel</button><button id="confirm-yes" value="yes" type="submit" class="primary">Confirm</button></div>
+  </form>
+</dialog>
+<dialog id="plan-dialog" aria-labelledby="plan-title" aria-describedby="plan-text">
+  <form method="dialog">
+    <p class="eyebrow">Sign in with ChatGPT</p>
+    <h2 id="plan-title">You're using your ChatGPT plan</h2>
+    <p id="plan-text">Threads on ChatGPT now use your ChatGPT plan for their requests. You can review that use, and set a limit for Spindle, in ChatGPT's settings.</p>
+    <div class="confirm-actions"><button id="plan-usage" type="button">Manage usage</button><button value="ok" type="submit" class="primary">Got it</button></div>
   </form>
 </dialog>
 <div id="row-menu" class="row-menu" popover="auto" role="menu" aria-label="Thread actions"></div>

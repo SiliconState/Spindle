@@ -5,7 +5,12 @@ use crate::{Error, MAX_ADMISSIONS, MAX_PAYLOAD, Result, Store, valid_label};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::BTreeSet;
 
-pub const MAX_EFFECTS: usize = 8;
+/// Intents one step can publish: the engine's `MAX_CALLS` (one reply's tool calls), so
+/// a reply the engine accepts is never one the store refuses to adopt.
+pub const MAX_EFFECTS: usize = 256;
+/// Intents one step of a schema-20 store holds at most: builds of that schema refuse a
+/// store with a wider step, so committing one moves the store to schema 21 (`widen`).
+pub(crate) const NARROW_EFFECTS: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectIntent {
@@ -128,9 +133,58 @@ pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Tables of the history itself, which hold the most of a store's rows: added with the
+/// rows they refer to and never changed, except staging pins, which collection removes
+/// (`Store::collect_garbage`; a removed row breaks no key). Every write to a store runs
+/// with foreign keys enforced (each owner, migration and metadata connection turns them
+/// on; an open refuses a connection without), so an open checks the foreign keys of
+/// every other table only (the state it recovers from); a full check all of them.
+const HISTORY_TABLES: [&str; 11] = [
+    "revisions",
+    "proposals",
+    "consumed",
+    "intents",
+    "attempts",
+    "receipts",
+    "applied_receipts",
+    "strict_receipts",
+    "staging_pins",
+    "app_details",
+    "app_patches",
+];
+
+/// Whether some foreign key is broken: in every table (`full`), or in all but the
+/// history's (`HISTORY_TABLES`).
+fn foreign_fault(db: &Connection, full: bool) -> Result<bool> {
+    if full {
+        return Ok(db.prepare("PRAGMA foreign_key_check")?.exists([])?);
+    }
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'")?
+        .query_map([], |row| crate::bounded_label(row, 0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for table in tables {
+        // Names from the schema, which the open checked is exactly this build's.
+        if !HISTORY_TABLES.contains(&table.as_str())
+            && db
+                .prepare(&format!("PRAGMA foreign_key_check(\"{table}\")"))?
+                .exists([])?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Counts and bounds always; proposals, intents and receipt roots in full only above
-/// revision `since` and receipt row `receipts_since` (the last full pass).
-pub(crate) fn validate_storage(db: &Connection, since: i64, receipts_since: i64) -> Result<()> {
+/// revision `since` and receipt row `receipts_since` (the last full pass); foreign keys
+/// as `foreign_fault` checks them.
+pub(crate) fn validate_storage(
+    db: &Connection,
+    since: i64,
+    receipts_since: i64,
+    full: bool,
+) -> Result<()> {
     let heads: i64 =
         crate::cached_row(db, "SELECT count(*) FROM head WHERE id=1", [], |r| r.get(0))?;
     let revisions: i64 = crate::cached_row(db, "SELECT count(*) FROM revisions", [], |r| r.get(0))?;
@@ -152,7 +206,7 @@ pub(crate) fn validate_storage(db: &Connection, since: i64, receipts_since: i64)
         [crate::codec::stored_bound(MAX_PAYLOAD) as i64],
         |r| r.get(0),
     )?;
-    let foreign_fault = db.prepare("PRAGMA foreign_key_check")?.exists([])?;
+    let foreign_fault = foreign_fault(db, full)?;
     if heads != 1
         || revisions != proposals + 1
         || proposals != consumed + applied_receipts
@@ -182,7 +236,7 @@ pub(crate) fn validate_storage(db: &Connection, since: i64, receipts_since: i64)
 fn validate_records(db: &Connection, since: i64) -> Result<()> {
     let invalid: i64 = crate::cached_row(db,
         "SELECT
-          (SELECT count(*) FROM intents WHERE revision<=0 OR position<0 OR position>=8 OR length(id) NOT BETWEEN 1 AND 128 OR length(adapter) NOT BETWEEN 1 AND 128 OR length(input)>?1)
+          (SELECT count(*) FROM intents WHERE revision<=0 OR position<0 OR position>=?3 OR length(id) NOT BETWEEN 1 AND 128 OR length(adapter) NOT BETWEEN 1 AND 128 OR length(input)>?1)
         + (SELECT count(*) FROM receipts WHERE length(result)>?1)
         + (SELECT count(*) FROM attempts WHERE owner_epoch<=0 OR owner_epoch>(SELECT epoch FROM realm WHERE id=1) OR length(id) NOT BETWEEN 1 AND 128 OR length(implementation) NOT BETWEEN 1 AND 128 OR length(grant_reference) NOT BETWEEN 1 AND 128)
         + (SELECT count(*) FROM cancellations WHERE epoch<=0 OR epoch>(SELECT epoch FROM realm WHERE id=1) OR length(scope) NOT BETWEEN 1 AND 128 OR length(command_id) NOT BETWEEN 1 AND 128 OR NOT EXISTS(SELECT 1 FROM admissions WHERE admissions.scope=cancellations.scope))
@@ -194,6 +248,7 @@ fn validate_records(db: &Connection, since: i64) -> Result<()> {
         [
             crate::codec::stored_bound(MAX_PAYLOAD) as i64,
             crate::codec::stored_bound(crate::MAX_CANONICAL) as i64,
+            MAX_EFFECTS as i64,
         ],
         |r| r.get(0),
     )?;
@@ -660,6 +715,29 @@ impl Store {
         }
     }
 
+    /// The head revision and its workspace root: `snapshot` without the continuation
+    /// (never read or inflated), for callers that need only those two.
+    pub fn head_root(&mut self) -> Result<(u64, Option<String>)> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let result = crate::cached_row(
+            &self.db,
+            "SELECT r.revision,r.workspace FROM head h JOIN revisions r ON h.revision=r.revision WHERE h.id=1",
+            [],
+            |r| Ok((crate::nonnegative_id(r, 0)?, crate::optional_digest(r, 1)?)),
+        );
+        result.map_err(|error| {
+            self.paused = true;
+            error.into()
+        })
+    }
+
+    /// The head revision alone (`head_root`'s first part).
+    pub fn head_revision(&mut self) -> Result<u64> {
+        self.head_root().map(|(revision, _)| revision)
+    }
+
     /// Current state for one scope; an uninitialized scope has the empty revision zero.
     /// The realm snapshot remains the global journal tail, not a scheduling baseline.
     pub fn snapshot_scope(&mut self, scope: &str) -> Result<Snapshot> {
@@ -1046,6 +1124,9 @@ impl Store {
                 ],
             )?;
         }
+        if proposal.effects.len() > NARROW_EFFECTS {
+            crate::widen(&tx)?;
+        }
         if let Some(state) = &proposal.state {
             crate::execute_one(
                 &tx,
@@ -1112,10 +1193,10 @@ impl Store {
         }
         let result = (|| -> std::result::Result<Vec<EffectIntent>, rusqlite::Error> {
             let mut statement = self.db.prepare(
-                "SELECT id,adapter,input FROM intents WHERE revision=?1 ORDER BY position LIMIT 9",
+                "SELECT id,adapter,input FROM intents WHERE revision=?1 ORDER BY position LIMIT ?2",
             )?;
             statement
-                .query_map([revision as i64], |r| {
+                .query_map([revision as i64, MAX_EFFECTS as i64 + 1], |r| {
                     Ok(EffectIntent {
                         id: crate::bounded_label(r, 0)?,
                         adapter: crate::bounded_label(r, 1)?,

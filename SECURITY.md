@@ -127,8 +127,9 @@ See [docs/tools.md](docs/tools.md) for the full execution model.
 - Dollar budgets on both hosts use the same [ledger](spindle/store/src/spend.rs)
   and refuse a request before it is sent when its worst case would not fit. They
   depend on catalog prices and conservative estimates, not exact provider billing.
-  Embedded task-tree accounting covers hosts open together; after a restart, earlier
-  child spend counts in its own store only ([embedded.md](docs/embedded.md#settings-and-limits)).
+  Before a budgeted send, the embedded host also recounts retained child stores after
+  reopen; unreadable task spend fails closed
+  ([embedded.md](docs/embedded.md#settings-and-limits)).
 - The store relies on SQLite and the filesystem honoring flushes, and on one cooperating
   owner per session. Owner epochs fence store writes, not processes or remote receivers.
   There is no anti-rollback protection: restoring an old but consistent copy of a store
@@ -232,7 +233,18 @@ See [docs/host.md](docs/host.md).
   every saved credential. Code running in the extension while it is unlocked, or with the
   user's account on an unlocked machine, is outside this protection.
 - Browser sign-in uses the authorization-code flow with PKCE and a random `state`. The
-  panel catches the code and hands it to the engine; only the engine exchanges it and holds
+  `chatgpt-plan` route additionally checks an RS256 ID token against OpenAI's discovered
+  keys, issuer, issued client, expiry and nonce, and requires the plan-use scope. The
+  installation ID and registration (client ID, account subject and e-mail) persist across
+  sign-out; they are not credentials, and remain readable outside the sealed vault.
+  Sign-out attempts refresh-token revocation and reports when it cannot be confirmed;
+  resetting locked keys cannot revoke tokens it cannot read. Source/GitHub builds also
+  offer the legacy Codex sign-in; the store edition omits its built-in client and options.
+  A pending refresh rechecks the current vault record before returning a credential:
+  sign-out, reset, lock or replacement cannot hand the waiting request its old token.
+  Saves are tracked independently of their values: saving the same credential again
+  still supersedes the earlier refresh, including when that refresh fails.
+  The panel catches the code and hands it to the engine; only the engine exchanges it and holds
   the tokens, and the panel never sees a token. Keys a former build kept as text are sealed
   when the engine starts, but Chrome may keep the old text in its storage files until it
   compacts them.
@@ -240,8 +252,9 @@ See [docs/host.md](docs/host.md).
   namespaces, without access to the computer's files or to Spindle's keys.
 - A thread's network is off by default. When on and no relay is set, requests go through
   a gateway in the extension that refuses loopback, private and link-local addresses and
-  local names, and refuses redirects whose target Chrome hides. A public name that
-  resolves into a private network is not detected, because Chrome resolves names. With a
+  local names, and refuses redirects whose target Chrome hides. Public names are checked
+  first over Cloudflare DNS-over-HTTPS; a local answer is refused, but failed or slow
+  lookups pass and Chrome resolves names again, so rebinding remains possible. With a
   relay set, commands reach whatever addresses the relay allows.
 - Page tools act in the user's real browser tabs with the user's sign-ins. A browser action
   already dispatched cannot be undone by Stop. Chrome's debugging bar shows while Spindle
@@ -252,7 +265,10 @@ See [docs/host.md](docs/host.md).
   at a time. Under Before acting, an action the user allows (since 0.1.7) carries what
   the question showed: the tab, its site and Chrome's id for the page it shows (its
   address where Chrome gives none), the part of the page, or the dialog, which the
-  question quotes. The service worker checks these just before acting and refuses,
+  question quotes. Full words, destination and the focused target must still match;
+  numbers and punctuation are not ignored. Auto is the default on new installs, while
+  older installs retain Full. Auto is a heuristic, not a guarantee that every sending
+  action asks. The service worker checks these just before acting and refuses,
   doing nothing, once the page has reloaded or moved on, the part has changed, or
   another dialog is open ([`background.js`](spindle/chrome/background.js)).
 - A saved key or sign-in is bound to the provider address it was saved for: importing a
@@ -288,8 +304,9 @@ See [docs/host.md](docs/host.md).
   from an untrusted source.
 - A move durably commits its bundle before sealing and removes redundant OPFS
   stores only after reading the saved bytes back. Storage > Free checks older
-  moved bundles whole before deleting sealed stores. Reset backups are temporary,
-  removed once the reset or recovery finishes. Strict IndexedDB commits and synced,
+  moved bundles whole before deleting sealed stores. A reset keeps the earlier thread as a recoverable version. Ordinary removal
+  waits at least a week and three later completed turns and asks for confirmation;
+  deleting the thread removes its earlier versions too. Strict IndexedDB commits and synced,
   checked store replacements reduce crash windows; they are not secure erasure or
   protection against an old profile copy ([chrome.md](docs/chrome.md#storage-controls)).
 

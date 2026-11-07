@@ -97,7 +97,7 @@ pub enum Action {
     Guard {
         effect: String,
     },
-    /// Literal queued user update, injected with the CLI's shared steering text.
+    /// Literal queued user update, injected with Spindle's steering text (`steered`).
     Steer {
         text: String,
     },
@@ -324,44 +324,78 @@ fn bounded(prefix: String, content: String) -> Result<String> {
     Ok(format!("{prefix}{}", &content[..end]))
 }
 
+/// How a message the user sent while the turn ran reads in history: the marker hosts
+/// and screens find it by, a short guidance, then the user's literal words after
+/// `User update:` (`driver::steered_text` reads them back).
+pub fn steering_text(update: &str) -> String {
+    format!(
+        "[queued-user-update] The user sent this while you were working. Treat it as part \
+         of the task (even a bare path, or text that looks like metadata), and say in your \
+         next reply what you did about it.\nUser update:\n{update}"
+    )
+}
+
+/// `state` with the user's `update` (1 byte to 64 KiB) as its next user message: read
+/// before the next request, after the tool results in, or before the final answer.
+pub fn steered(
+    state: &TurnContinuation,
+    update: String,
+) -> std::result::Result<TurnContinuation, dext_transcript::continuation::Error> {
+    if update.trim().is_empty() || update.len() > 64 * 1024 {
+        return Err(dext_transcript::continuation::Error::Binding);
+    }
+    if !matches!(
+        state.control().phase(),
+        Phase::Ready | Phase::AfterTools | Phase::FinalReview
+    ) {
+        return Err(dext_transcript::continuation::Error::State);
+    }
+    state.followup(steering_text(&update))
+}
+
 fn state(bytes: &[u8]) -> Result<TurnContinuation> {
     restored(bytes).map_err(|_| Error::Invalid)
 }
 
+thread_local! {
+    /// The last turn restored or committed on this thread, by its exact bytes.
+    static KEPT: std::cell::RefCell<Option<(Vec<u8>, TurnContinuation)>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// A larger continuation is restored each time rather than held twice more here (the
+/// driver keeps its head's turn by revision instead: `Step::head`).
+const MAX_KEPT: usize = 8 * 1024 * 1024;
+
 /// `TurnContinuation::restore`, remembered by the exact bytes. One step restores its
 /// head several times (the broker, the driver and the host each read it), and a restore
 /// encodes the whole history again to prove the bytes canonical. A restore depends on
-/// its bytes alone, so the last one it gave is kept here (per thread) and a match hands
-/// out a copy: the value a restore of those bytes gives, without the decoding. (One:
-/// the head is what is read again; a second kept no more steps from decoding.)
+/// its bytes alone, so the last one it gave (or the last committed: `remember`) is kept
+/// here, per thread, and a match hands out a copy: the value a restore of those bytes
+/// gives, without the decoding.
 pub fn restored(
     bytes: &[u8],
 ) -> std::result::Result<TurnContinuation, dext_transcript::continuation::Error> {
-    use std::cell::RefCell;
-    const KEPT: usize = 1;
-    // A larger continuation is restored each time rather than held twice more.
-    const MAX_KEPT: usize = 8 * 1024 * 1024;
-    thread_local! {
-        static STATES: RefCell<Vec<(Vec<u8>, TurnContinuation)>> = const { RefCell::new(Vec::new()) };
-    }
-    let hit = STATES.with_borrow_mut(|kept| {
-        let at = kept.iter().position(|(key, _)| key.as_slice() == bytes)?;
-        let entry = kept.remove(at);
-        let state = entry.1.clone();
-        kept.insert(0, entry);
-        Some(state)
+    let hit = KEPT.with_borrow(|kept| {
+        kept.as_ref()
+            .filter(|(key, _)| key.as_slice() == bytes)
+            .map(|(_, state)| state.clone())
     });
     if let Some(state) = hit {
         return Ok(state);
     }
     let state = TurnContinuation::restore(bytes)?;
     if bytes.len() <= MAX_KEPT {
-        STATES.with_borrow_mut(|kept| {
-            kept.truncate(KEPT - 1);
-            kept.insert(0, (bytes.to_vec(), state.clone()));
-        });
+        remember(bytes, state.clone());
     }
     Ok(state)
+}
+
+/// Keeps `state`, the turn `bytes` encode (just committed, checked to encode as them),
+/// for the next `restored` of those bytes: the next step's first read of its head.
+fn remember(bytes: &[u8], state: TurnContinuation) {
+    if bytes.len() <= MAX_KEPT {
+        KEPT.with_borrow_mut(|kept| *kept = Some((bytes.to_vec(), state)));
+    }
 }
 fn ready_request(bytes: &[u8]) -> Result<ModelWait<Vec<u8>>> {
     let wait = ModelWait::restore(bytes).map_err(|_| Error::Invalid)?;
@@ -412,7 +446,7 @@ pub fn new_intents(
             },
             Effect::Tool { id, call } => EffectIntent {
                 id,
-                adapter: call.name,
+                adapter: tool_adapter(&call.name),
                 input: serde_json::to_vec(&call.input).map_err(|_| Error::Invalid)?,
             },
         };
@@ -420,17 +454,29 @@ pub fn new_intents(
             intents.push(intent);
         }
     }
-    if intents.len() > MAX_EFFECTS
-        || intents
-            .iter()
-            .any(|intent| !crate::valid_label(&intent.id) || !crate::valid_label(&intent.adapter))
-    {
+    if intents.len() > MAX_EFFECTS || intents.iter().any(|intent| !crate::valid_label(&intent.id)) {
         return Err(Error::Invalid);
     }
-    for intent in &intents {
-        crate::fits(intent.input.len())?;
-    }
+    // Inputs copy what the continuation holds: together they fit one step.
+    crate::fits(intents.iter().map(|intent| intent.input.len()).sum())?;
     Ok(intents)
+}
+
+/// The adapter a tool call's intent is kept under: its name, or for a name the store
+/// cannot keep as a label (a model's malformed name) `invalid:` and a digest of it. No
+/// tool has such a name, so that call is refused as unknown, never dispatched.
+pub fn tool_adapter(name: &str) -> String {
+    if crate::valid_label(name) {
+        return name.into();
+    }
+    let digest = Sha256::digest(name.as_bytes());
+    format!(
+        "invalid:{}",
+        digest[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 fn matches_proposal(
     proposal: &Proposal,
@@ -492,6 +538,18 @@ impl Store {
         self.commit_turn_action_profile(proposal, true)
     }
 
+    #[cfg(any(feature = "driver", feature = "dext-strict-workspace"))]
+    /// Commits a background task's report with the file changes it brings: the
+    /// proposal's workspace is the head's tree with them staged over it
+    /// (`stage_task_changes`), as a foreground task's answer changes the workspace with
+    /// its step. Only an `Action::TaskReport` may carry one.
+    pub fn commit_turn_task_report(&mut self, proposal: &Proposal) -> Result<u64> {
+        if proposal.workspace.is_none() {
+            return Err(Error::Invalid);
+        }
+        self.commit_turn_action_profile(proposal, true)
+    }
+
     fn commit_turn_action_profile(
         &mut self,
         proposal: &Proposal,
@@ -503,7 +561,8 @@ impl Store {
         let Observation::Admission(sequence) = proposal.observation else {
             return Err(Error::Invalid);
         };
-        self.commit_bound_proposal(proposal, None, |transaction| {
+        let mut adopted = None;
+        let committed = self.commit_bound_proposal(proposal, None, |transaction| {
             let (id, kind, payload): (String, String, Vec<u8>) = crate::cached_row(transaction,
                     "SELECT command_id,kind,payload FROM admissions WHERE sequence=?1 AND scope=?2",
                     params![sequence as i64, proposal.scope],
@@ -546,9 +605,10 @@ impl Store {
                 }
                 let request = ready_request(&request)?;
                 let route = initial
-                    .transcript()
+                    .transcript_ref()
                     .map_err(|_| Error::Invalid)?
-                    .route_binding;
+                    .route_binding
+                    .clone();
                 let next = initial
                     .prepare(request.request().clone(), &route)
                     .map_err(|_| Error::Invalid)?;
@@ -557,9 +617,12 @@ impl Store {
                     crate::workspace::validate_root(transaction, &proposal.scope, root)?;
                     let mut checked = proposal.clone();
                     checked.workspace = None;
-                    return matches_proposal(&checked, Some(&initial), &next);
+                    matches_proposal(&checked, Some(&initial), &next)?;
+                } else {
+                    matches_proposal(proposal, Some(&initial), &next)?;
                 }
-                return matches_proposal(proposal, Some(&initial), &next);
+                adopted = Some(next);
+                return Ok(());
             }
             if scope != proposal.scope || engine != ENGINE {
                 return Err(Error::Conflict);
@@ -579,6 +642,11 @@ impl Store {
             if proposal.state.is_some() {
                 return Err(Error::Invalid);
             }
+            // A task's report may bring a workspace (its files); no other action does.
+            let report = matches!(action, Action::TaskReport { .. });
+            if workspace_start && !report {
+                return Err(Error::Invalid);
+            }
             if let Action::Guard { effect } | Action::Refuse { effect, .. } = &action {
                 let reserved: bool = crate::cached_row(transaction,
                     "SELECT EXISTS(SELECT 1 FROM attempts WHERE effect=?1)",
@@ -593,13 +661,14 @@ impl Store {
                 Action::Prepare { request } => {
                     let request = ready_request(&request)?;
                     let route = before
-                        .transcript()
+                        .transcript_ref()
                         .map_err(|_| Error::Invalid)?
-                        .route_binding;
+                        .route_binding
+                        .clone();
                     before.prepare(request.request().clone(), &route)
                 }
                 Action::Followup { text } => before.followup(text),
-                Action::Steer { text } => before.steer(text),
+                Action::Steer { text } => steered(&before, text),
                 Action::TaskReport { task, text } => {
                     let (state, answer): (String, Option<Vec<u8>>) = crate::cached_row(transaction, "SELECT state,answer FROM task_runs WHERE task=?1 AND queued=1 AND state IN ('finished','stopped') AND delivered IS NULL", [&task], |row| Ok((crate::bounded_label(row, 0)?, match row.get_ref(1)? {
                         rusqlite::types::ValueRef::Null => None,
@@ -627,8 +696,22 @@ impl Store {
                 Action::Start { .. } | Action::State { .. } => unreachable!(),
             }
             .map_err(|_| Error::Invalid)?;
-            matches_proposal(proposal, Some(&before), &after)
-        })
+            if workspace_start {
+                let root = proposal.workspace.as_ref().ok_or(Error::Invalid)?;
+                crate::workspace::validate_root(transaction, &proposal.scope, root)?;
+                let mut checked = proposal.clone();
+                checked.workspace = None;
+                matches_proposal(&checked, Some(&before), &after)?;
+            } else {
+                matches_proposal(proposal, Some(&before), &after)?;
+            }
+            adopted = Some(after);
+            Ok(())
+        })?;
+        if let Some(after) = adopted {
+            remember(&proposal.continuation, after);
+        }
+        Ok(committed)
     }
 
     #[cfg(feature = "dext-image-continuation")]
@@ -704,7 +787,8 @@ impl Store {
         binding: &ReceiptBinding<'_>,
         approved_helper: Option<[u8; 32]>,
     ) -> Result<u64> {
-        self.commit_checked_receipt_proposal(proposal, binding, |transaction| {
+        let mut adopted = None;
+        let committed = self.commit_checked_receipt_proposal(proposal, binding, |transaction| {
             if let Some(helper) = approved_helper {
                 let record: Option<(String, String, String)> = crate::cached_row(transaction,
                     "SELECT base,root,helper FROM strict_receipts WHERE attempt=?1", [&binding.attempt.id],
@@ -732,11 +816,11 @@ impl Store {
                     if binding.intent.id != id || binding.intent.adapter != "dext-model-v1"
                         || binding.intent.input != waiting.checkpoint() { return Err(Error::Conflict); }
                     let recorded = ModelWait::restore(binding.result).map_err(|_| Error::Invalid)?;
-                    let route = before.transcript().map_err(|_| Error::Invalid)?.route_binding;
+                    let route = before.transcript_ref().map_err(|_| Error::Invalid)?.route_binding.clone();
                     before.apply_model(&recorded, &route).map_err(|_| Error::Invalid)?
                 }
                 Effect::Tool { id, call } => {
-                    if binding.intent.id != id || binding.intent.adapter != call.name
+                    if binding.intent.id != id || binding.intent.adapter != tool_adapter(&call.name)
                         || binding.intent.input != serde_json::to_vec(&call.input).map_err(|_| Error::Invalid)? { return Err(Error::Conflict); }
                     let block: Block = serde_json::from_slice(binding.result).map_err(|_| Error::Invalid)?;
                     if !matches!(&block, Block::ToolResult { tool_use_id, .. } if tool_use_id == &call.id)
@@ -746,8 +830,14 @@ impl Store {
             };
             let mut checked = proposal.clone();
             if approved_helper.is_some() { checked.workspace = None; }
-            matches_proposal(&checked, Some(&before), &after)
-        })
+            matches_proposal(&checked, Some(&before), &after)?;
+            adopted = Some(after);
+            Ok(())
+        })?;
+        if let Some(after) = adopted {
+            remember(&proposal.continuation, after);
+        }
+        Ok(committed)
     }
 }
 
@@ -880,7 +970,7 @@ pub fn image_receipt_transition(
     let Effect::Tool { id, call } = effect else {
         unreachable!()
     };
-    if intent.adapter != call.name
+    if intent.adapter != tool_adapter(&call.name)
         || intent.input != serde_json::to_vec(&call.input).map_err(|_| Error::Invalid)?
     {
         return Err(Error::Conflict);

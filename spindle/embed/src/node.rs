@@ -8,8 +8,9 @@
 //! (Node has no directory fsync on Windows; there NTFS's metadata journal is trusted
 //! instead). Byte-range locks are not taken: the store runs in exclusive locking mode
 //! and its owner holds `<database>.lock`, created with `wx` (fails if it exists), so
-//! one connection uses a database at a time. A lock left by a crashed owner is never
-//! taken over automatically; opening says `Locked` until an operator removes it.
+//! one connection uses a database at a time. A lock left by a crashed owner is taken
+//! over only when its note names a process of this machine the app's check says is
+//! gone (`set_process_check`); any other says `Locked` until an operator removes it.
 use rusqlite::{Connection, OpenFlags};
 use spindle_store::{ConnectionProfile, Error, Initialization, JournalMode, OwnerExclusion, Store};
 use sqlite_wasm_rs as ffi;
@@ -55,8 +56,10 @@ extern "C" {
     fn close_sync(this: &NodeFs, fd: i32) -> Result<(), JsValue>;
     #[wasm_bindgen(method, catch, js_name = unlinkSync)]
     fn unlink_sync(this: &NodeFs, path: &str) -> Result<(), JsValue>;
-    #[wasm_bindgen(method, js_name = existsSync)]
-    fn exists_sync(this: &NodeFs, path: &str) -> bool;
+    // Caught, as every call is: a pool that stopped throws here too, and an exception
+    // left to cross the wasm frames would leave the package's state borrowed.
+    #[wasm_bindgen(method, catch, js_name = existsSync)]
+    fn exists_sync(this: &NodeFs, path: &str) -> Result<bool, JsValue>;
     #[wasm_bindgen(method, catch, js_name = readFileSync)]
     fn read_file_sync(this: &NodeFs, path: &str, encoding: &str) -> Result<String, JsValue>;
     #[wasm_bindgen(method, catch, js_name = mkdirSync)]
@@ -67,6 +70,8 @@ extern "C" {
     fn link_sync(this: &NodeFs, existing: &str, new: &str) -> Result<(), JsValue>;
     #[wasm_bindgen(method, catch, js_name = readdirSync)]
     fn readdir_sync(this: &NodeFs, path: &str) -> Result<Vec<String>, JsValue>;
+    #[wasm_bindgen(method, catch, js_name = rmSync)]
+    fn rm_sync(this: &NodeFs, path: &str, options: &JsValue) -> Result<(), JsValue>;
 
     type Stats;
     #[wasm_bindgen(method, getter)]
@@ -250,7 +255,7 @@ unsafe extern "C" fn x_open(
     let create = flags & ffi::SQLITE_OPEN_CREATE != 0;
     let exclusive = flags & ffi::SQLITE_OPEN_EXCLUSIVE != 0;
     let opened = with_fs(|fs, _| {
-        if fs.exists_sync(path) && !exclusive {
+        if fs.exists_sync(path)? && !exclusive {
             return fs.open_sync(path, if readonly { "r" } else { "r+" }, 0);
         }
         if !create {
@@ -464,7 +469,7 @@ unsafe extern "C" fn x_access(
     let Ok(path) = unsafe { CStr::from_ptr(name) }.to_str() else {
         return ffi::SQLITE_IOERR_ACCESS;
     };
-    match with_fs(|fs, _| Ok(fs.exists_sync(path))) {
+    match with_fs(|fs, _| fs.exists_sync(path)) {
         Ok(exists) => {
             unsafe { *out = c_int::from(exists) };
             ffi::SQLITE_OK
@@ -555,20 +560,73 @@ fn register() -> Result<(), Error> {
     }
 }
 
+/// A place's failure as an I/O error: a full OPFS pool or quota (`ENOSPC`, `EDQUOT`)
+/// reads as a full disk, so the store says so and `continue` tries the step again
+/// once there is room (the app grows its pool); anything else is unclassified.
 fn io(error: JsValue) -> Error {
-    Error::Io(std::io::Error::other(describe(&error)))
+    let kind = match code(&error).as_str() {
+        "ENOSPC" | "EDQUOT" => std::io::ErrorKind::StorageFull,
+        _ => std::io::ErrorKind::Other,
+    };
+    Error::Io(std::io::Error::new(kind, describe(&error)))
 }
 
-/// A note that turns a store's lock file into the seal of a session that moved
-/// elsewhere, once the store closes (shared by the place and its open store's owner).
-pub type Seal = std::rc::Rc<RefCell<Option<String>>>;
+/// A store's lock file as its place sees it (shared by the place and its open store's
+/// owner): the file's path while an open store holds it, and whether it now holds the
+/// seal of a session that moved elsewhere (`seal_held`), which stays when the store
+/// closes.
+#[derive(Default)]
+pub struct SealState {
+    held: Option<String>,
+    sealed: bool,
+}
+
+pub type Seal = std::rc::Rc<RefCell<SealState>>;
+
+/// Seals the store open under `seal`: its lock file says `note` from now on, written
+/// whole and durably before this returns, and stays when the store closes. Refused
+/// (`Invalid`) while no store holds it: only its owner writes a lock file. A write that
+/// fails leaves the file as it was (the store stays this owner's, removed at its close).
+pub fn seal_held(seal: &Seal, note: &str) -> Result<(), Error> {
+    let mut state = seal.borrow_mut();
+    let path = state.held.clone().ok_or(Error::Invalid)?;
+    write_file(&path, note.as_bytes())?;
+    state.sealed = true;
+    Ok(())
+}
+
+thread_local! {
+    /// The app's check of whether a process of this machine still runs (`pid`), for
+    /// lock files a crashed owner left (`NodeOwner::acquire`).
+    static ALIVE: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
+}
+
+/// Installs `check(pid, start) -> boolean`: whether that exact owner still runs.
+pub fn set_process_check(check: Option<js_sys::Function>) {
+    ALIVE.with(|alive| *alive.borrow_mut() = check);
+}
+
+/// The process and machine a note names (`pid N on HOST`, as the Node client writes).
+fn process_of(note: &str) -> Option<(u32, &str, &str)> {
+    let (pid, rest) = note.strip_prefix("pid ")?.split_once(" on ")?;
+    let (scope, start) = rest.rsplit_once(" start ")?;
+    if !scope.contains(" boot ") || !scope.contains(" ns ") || start.is_empty() {
+        return None;
+    }
+    Some((pid.parse().ok()?, scope, start))
+}
+
+/// How a package owner's note begins in its lock file.
+const EMBED_NOTE: &str = "spindle-embed: ";
 
 /// The lock file naming a store's owner, held while the store is open. It is removed
 /// only when the store closes (after SQLite), or when opening fails; a sealed one
-/// stays, holding the seal's note (no host opens that copy again).
+/// stays, holding the seal's note (no host opens that copy again). Where the store's
+/// directory is renamed under it (a retry's swap), it is removed where it went
+/// (`moved`), never at its old path, which another owner's may hold by then.
 pub struct NodeOwner {
-    path: String,
-    seal: Option<Seal>,
+    path: RefCell<String>,
+    seal: RefCell<Option<Seal>>,
 }
 
 impl OwnerExclusion for NodeOwner {}
@@ -582,31 +640,30 @@ impl NodeOwner {
     /// Creates the lock file holding `note` (who owns it), or `Locked` if one exists
     /// (a package owner's, or a native host's: it holds one while it owns the store).
     /// The note is written as `spindle-embed: <note>`, so it never reads as a native
-    /// owner's, which a native host may take over once that owner is gone.
+    /// owner's, which a native host may take over once that owner is gone. One a package
+    /// owner of this machine left when its process ended is taken over (`stale`).
     pub fn acquire(database: &str, note: &str) -> Result<Self, Error> {
         let path = Self::path(database);
-        let note = format!("spindle-embed: {note}");
+        let text = format!("{EMBED_NOTE}{note}");
         // The note is linked into place whole, so a crash leaves no lock file or the
         // whole one, never an empty one: no host could tell that from another owner's
         // half-made file, so every host would refuse the store until someone removed it.
         // A link fails where the lock file exists, as an exclusive create does.
-        let mut nonce = [0u8; 8];
-        getrandom::fill(&mut nonce).map_err(|error| io(JsValue::from_str(&error.to_string())))?;
-        let draft = format!(
-            "{path}.embed-{}-draft",
-            nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        );
-        write_whole(&draft, note.as_bytes(), "wx").map_err(io)?;
-        let linked = with_fs(|fs, _| fs.link_sync(&draft, &path));
-        let _ = with_fs(|fs, _| fs.unlink_sync(&draft));
+        let mut linked = link_whole(&path, &text);
+        if matches!(&linked, Ok(false)) && take_over(&path, note)? {
+            linked = link_whole(&path, &text);
+        }
         match linked {
-            Ok(()) => {
-                let owner = Self { path, seal: None };
+            Ok(true) => {
+                let owner = Self {
+                    path: RefCell::new(path.clone()),
+                    seal: RefCell::new(None),
+                };
                 // A failure here drops `owner`, which removes the lock file.
-                sync_dir(&owner.path).map_err(io)?;
+                sync_dir(&path).map_err(io)?;
                 Ok(owner)
             }
-            Err(error) if code(&error) == "EEXIST" => Err(Error::Locked),
+            Ok(false) => Err(Error::Locked),
             Err(error) => Err(io(error)),
         }
     }
@@ -615,20 +672,139 @@ impl NodeOwner {
     pub fn holder(database: &str) -> Option<String> {
         with_fs(|fs, _| fs.read_file_sync(&Self::path(database), "utf8")).ok()
     }
+
+    /// The lock file is sealed with `seal`'s note, once one is written (`seal_held`).
+    pub(crate) fn attach(&self, seal: Option<Seal>) {
+        if let Some(seal) = &seal {
+            seal.borrow_mut().held = Some(self.path.borrow().clone());
+        }
+        *self.seal.borrow_mut() = seal;
+    }
+
+    /// Whether this is the lock file of `database`.
+    pub(crate) fn holds(&self, database: &str) -> bool {
+        *self.path.borrow() == Self::path(database)
+    }
+
+    /// The lock file went with its store's directory, renamed (a retry's swap): it is
+    /// `database`'s now, and removed there when this owner lets it go.
+    pub(crate) fn moved(&self, database: &str) {
+        let path = Self::path(database);
+        if let Some(seal) = self.seal.borrow().as_ref() {
+            seal.borrow_mut().held = Some(path.clone());
+        }
+        *self.path.borrow_mut() = path;
+    }
+
+    /// No longer the lock file of its session's store (that store was set aside): the
+    /// session's seal goes with the store that takes its place.
+    pub(crate) fn detach(&self) {
+        if let Some(seal) = self.seal.borrow_mut().take() {
+            seal.borrow_mut().held = None;
+        }
+    }
+}
+
+/// Links a file holding `text` into place at `path` whole: true, or false when a file
+/// is there already.
+fn link_whole(path: &str, text: &str) -> Result<bool, JsValue> {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let draft = format!(
+        "{path}.embed-{}-draft",
+        nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    write_whole(&draft, text.as_bytes(), "wx")?;
+    let linked = with_fs(|fs, _| fs.link_sync(&draft, path));
+    let _ = with_fs(|fs, _| fs.unlink_sync(&draft));
+    match linked {
+        Ok(()) => Ok(true),
+        Err(error) if code(&error) == "EEXIST" => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes the lock file at `path` when a package owner of this machine left it as its
+/// process ended: its note names a process (`pid N on HOST`) of the machine this owner's
+/// `note` names, not this one, and the app's check (`set_process_check`) says it runs
+/// no more. Done under a takeover lock of its own (`<path>.takeover`, holding this
+/// taker's note), the note read again there, so of owners that find it at once only one
+/// removes it, never a lock another took meanwhile. A takeover lock a taker left as its
+/// process ended is removed on the same proof first (else no takeover could ever happen
+/// again). True when the lock file was removed (the caller links its own).
+fn take_over(path: &str, note: &str) -> Result<bool, Error> {
+    let Some((mine, here, _)) = process_of(note) else {
+        return Ok(false);
+    };
+    let read = |at: &str| with_fs(|fs, _| fs.read_file_sync(at, "utf8")).ok();
+    // A note of a package owner of this machine (not this process) that is gone.
+    let left = |found: &str| {
+        found
+            .strip_prefix(EMBED_NOTE)
+            .and_then(process_of)
+            .is_some_and(|(pid, scope, start)| scope == here && pid != mine && !alive(pid, start))
+    };
+    let Some(found) = read(path).filter(|found| left(found)) else {
+        return Ok(false);
+    };
+    let takeover = format!("{path}.takeover");
+    let taker = format!("{EMBED_NOTE}{note}");
+    let mut linked = link_whole(&takeover, &taker).map_err(io)?;
+    if !linked
+        && let Some(stale) = read(&takeover).filter(|stale| left(stale))
+        && remove_unchanged(&takeover, &stale).map_err(io)?
+    {
+        linked = link_whole(&takeover, &taker).map_err(io)?;
+    }
+    if !linked {
+        return Ok(false);
+    }
+    let removed = remove_unchanged(path, &found);
+    let released = with_fs(|fs, _| fs.unlink_sync(&takeover)).and_then(|()| sync_dir(&takeover));
+    let removed = removed.map_err(io)?;
+    released.map_err(io)?;
+    Ok(removed)
+}
+
+/// Removes the file at `path` (durably) if it still says `found`, read again just before.
+fn remove_unchanged(path: &str, found: &str) -> Result<bool, JsValue> {
+    if with_fs(|fs, _| fs.read_file_sync(path, "utf8"))
+        .ok()
+        .as_deref()
+        != Some(found)
+    {
+        return Ok(false);
+    }
+    with_fs(|fs, _| fs.unlink_sync(path))?;
+    sync_dir(path).map(|()| true)
+}
+
+/// Whether process `pid` of this machine runs, as the app's check says (with none, or
+/// one that fails, it is taken to run).
+fn alive(pid: u32, start: &str) -> bool {
+    ALIVE.with(|alive| match alive.borrow().as_ref() {
+        None => true,
+        Some(check) => check
+            .call2(
+                &JsValue::NULL,
+                &JsValue::from(pid),
+                &JsValue::from_str(start),
+            )
+            .map_or(true, |answer| answer.is_truthy()),
+    })
 }
 
 impl Drop for NodeOwner {
     fn drop(&mut self) {
-        let sealed = self.seal.as_ref().and_then(|seal| seal.borrow().clone());
-        match sealed {
-            // SQLite has closed: the lock file now says where the session went.
-            Some(note) => {
-                let _ = write_file(&self.path, note.as_bytes());
-            }
-            None => {
-                let _ =
-                    with_fs(|fs, _| fs.unlink_sync(&self.path)).and_then(|()| sync_dir(&self.path));
-            }
+        let sealed = self.seal.get_mut().as_ref().is_some_and(|seal| {
+            let mut state = seal.borrow_mut();
+            state.held = None;
+            state.sealed
+        });
+        // SQLite has closed. A sealed lock file stays: it says where the session went.
+        if !sealed {
+            let path = self.path.get_mut();
+            let _ = with_fs(|fs, _| fs.unlink_sync(path)).and_then(|()| sync_dir(path));
         }
     }
 }
@@ -655,7 +831,7 @@ pub fn make_dirs(path: &str) -> Result<(), Error> {
 /// host's store directory has its `owner.lock`.
 pub fn ensure_file(path: &str) -> Result<(), Error> {
     with_fs(|fs, _| {
-        if fs.exists_sync(path) {
+        if fs.exists_sync(path)? {
             return Ok(false);
         }
         let fd = fs.open_sync(path, "wx", 0o600)?;
@@ -667,9 +843,9 @@ pub fn ensure_file(path: &str) -> Result<(), Error> {
     .map_err(io)
 }
 
-/// Whether `path` exists.
-pub fn exists(path: &str) -> bool {
-    with_fs(|fs, _| Ok(fs.exists_sync(path))).unwrap_or(false)
+/// Whether `path` exists (an error when that cannot be told: never taken for no).
+pub fn exists(path: &str) -> Result<bool, Error> {
+    with_fs(|fs, _| fs.exists_sync(path)).map_err(io)
 }
 
 /// Largest sidecar file read (`read_file`).
@@ -679,7 +855,7 @@ const MAX_SIDECAR: usize = 4 * 1024 * 1024;
 pub fn read_file(path: &str) -> Option<Vec<u8>> {
     with_fs(|fs, _| {
         // Checked first: the OPFS adapter opens a missing path read-only as a directory.
-        if !fs.exists_sync(path) {
+        if !fs.exists_sync(path)? {
             return Ok(None);
         }
         let fd = fs.open_sync(path, "r", 0)?;
@@ -714,7 +890,7 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<(), Error> {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let pending = format!("{}/.{name}.tmp", parent(path));
     let written = with_fs(|fs, _| {
-        if fs.exists_sync(&pending) {
+        if fs.exists_sync(&pending)? {
             fs.unlink_sync(&pending)?;
         }
         let fd = fs.open_sync(&pending, "wx", 0o600)?;
@@ -743,13 +919,43 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<(), Error> {
 /// Removes the file `path`, if it is there, durably.
 pub fn remove_file(path: &str) -> Result<(), Error> {
     with_fs(|fs, _| {
-        if !fs.exists_sync(path) {
+        if !fs.exists_sync(path)? {
             return Ok(false);
         }
         fs.unlink_sync(path).map(|()| true)
     })
     .and_then(|removed| if removed { sync_dir(path) } else { Ok(()) })
     .map_err(io)
+}
+
+/// Removes `path` and everything under it, if it is there, durably.
+pub fn remove_tree(path: &str) -> Result<(), Error> {
+    let options = js_sys::Object::new();
+    for key in ["recursive", "force"] {
+        js_sys::Reflect::set(&options, &key.into(), &JsValue::TRUE).map_err(|_| Error::Invalid)?;
+    }
+    with_fs(|fs, _| fs.rm_sync(path, &options))
+        .and_then(|()| sync_dir(path))
+        .map_err(io)
+}
+
+/// The bytes of the files under `path` (or of the file `path`), as far as they can be
+/// told: one that cannot be read counts none. An empty directory may count its own size.
+pub fn tree_size(path: &str) -> u64 {
+    let names = read_dir(path);
+    if names.is_empty() {
+        return with_fs(|fs, _| {
+            let fd = fs.open_sync(path, "r", 0)?;
+            let size = fs.fstat_sync(fd).map(|stats| stats.size());
+            let _ = fs.close_sync(fd);
+            size
+        })
+        .map_or(0, |size| size as u64);
+    }
+    names
+        .iter()
+        .map(|name| tree_size(&format!("{path}/{name}")))
+        .sum()
 }
 
 /// Makes the file `path` durable (what was written to it reaches the disk). Opened
@@ -785,8 +991,8 @@ pub fn open(
     open_sealable(database, journal, initialization, note, None)
 }
 
-/// `open`, its lock file sealed with `seal`'s note (if one is set by then) when the
-/// store closes instead of removed.
+/// `open`, its lock file shared with `seal` (`seal_held` writes a moved session's note
+/// into it, which then stays when the store closes).
 pub fn open_sealable(
     database: &str,
     journal: JournalMode,
@@ -798,9 +1004,26 @@ pub fn open_sealable(
         return Err(Error::Invalid);
     }
     let _ = take_last_error();
-    let mut owner = NodeOwner::acquire(database, note)?;
-    owner.seal = seal;
+    let owner = NodeOwner::acquire(database, note)?;
+    owner.attach(seal);
     open_owned(database, journal, initialization, owner)
+}
+
+/// The lock file of the store at `database` (absolute), holding `note`, sealable through
+/// `seal`: what `open_sealable` opens a store behind, for a place that keeps it (shared)
+/// past the store's close.
+pub fn acquire_sealable(
+    database: &str,
+    note: &str,
+    seal: Option<Seal>,
+) -> Result<NodeOwner, Error> {
+    if !absolute(database) {
+        return Err(Error::Invalid);
+    }
+    let _ = take_last_error();
+    let owner = NodeOwner::acquire(database, note)?;
+    owner.attach(seal);
+    Ok(owner)
 }
 
 /// Opens the store at `database` through this VFS behind a guard the host already

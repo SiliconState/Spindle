@@ -13,9 +13,15 @@ const stores = globalThis.__vaultStores;
 const store = (name) => { if (!stores.has(name)) stores.set(name, new Map()); return stores.get(name); };
 export async function read(name, key) { return structuredClone(store(name).get(key)); }
 export async function entriesOf(name) { return [...store(name)].map(([key, value]) => [key, structuredClone(value)]); }
-export async function writeTogether(changes) {
-  for (const [name, key, value] of changes) value === undefined ? store(name).delete(key) : store(name).set(key, value);
+export async function writeTogether(changes, durability = null) {
+  for (const [name, key, value] of changes) {
+    value === undefined ? store(name).delete(key) : store(name).set(key, value);
+    globalThis.__vaultWrites.push({ name, key, durability });
+  }
 }`;
+/** Each record written: its store, key and the durability it was written with. */
+const writes = [];
+globalThis.__vaultWrites = writes;
 register(`data:text/javascript,${encodeURIComponent(`
 export async function resolve(specifier, context, next) {
   if (specifier === './shared.mjs' && context.parentURL?.endsWith('/vault.mjs')) {
@@ -54,6 +60,108 @@ stores.get('keys').set('openai', stores.get('keys').get(':host'));
 await assert.rejects(vault.secret('openai'), (error) => error.kind === 'damaged');
 await vault.forget('openai');
 
+// A sign-in kept, and its refresh token rotated: on disk before either is used (a power
+// cut must not bring back a spent refresh token).
+const durabilityOf = (key) => writes.filter((write) => write.name === 'keys' && write.key === key).at(-1)?.durability;
+await vault.keep('chatgpt', { kind: 'signin', access: 'a1', refresh: 'r1' });
+assert.equal(durabilityOf('chatgpt'), 'strict', 'a kept secret is written durably');
+writes.length = 0;
+const renewed = await vault.secret('chatgpt', async (held) => ({ ...held, access: 'a2', refresh: 'r2' }));
+assert.equal(renewed.refresh, 'r2');
+assert.equal(durabilityOf('chatgpt'), 'strict', 'a rotated refresh token is written durably');
+assert.equal((await vault.secret('chatgpt')).refresh, 'r2');
+await vault.forget('chatgpt');
+
+const deferred = () => {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+};
+for (const changed of ['forgotten', 'replaced', 'unchanged']) {
+  await vault.keep('chatgpt', { kind: 'signin', access: 'before', refresh: 'before-refresh' });
+  const entered = deferred();
+  const finish = deferred();
+  const renewing = vault.secret('chatgpt', async (held) => {
+    entered.resolve();
+    await finish.promise;
+    return changed === 'unchanged' ? null : { ...held, access: 'after', refresh: 'after-refresh' };
+  });
+  await entered.promise;
+  if (changed === 'replaced') await vault.keep('chatgpt', { kind: 'key', key: 'replacement' });
+  else await vault.forget('chatgpt');
+  finish.resolve();
+  const result = await renewing;
+  assert.deepEqual(result, changed === 'replaced' ? { kind: 'key', key: 'replacement' } : undefined,
+    'a pending refresh cannot return a forgotten or replaced credential, even with no update');
+  assert.deepEqual(await vault.secret('chatgpt'), result);
+}
+for (const changed of ['identical', 'renew-failed', 'no-update', 'reset-identical']) {
+  const original = { kind: 'signin', access: 'before', refresh: 'before-refresh' };
+  await vault.keep('chatgpt', original);
+  const entered = deferred();
+  const finish = deferred();
+  const pending = vault.secret('chatgpt', async (held) => {
+    entered.resolve();
+    await finish.promise;
+    if (changed === 'renew-failed') throw new Error('old sign-in could not refresh');
+    return changed === 'no-update' ? null : { ...held, access: 'after', refresh: 'after-refresh' };
+  });
+  await entered.promise;
+  if (changed === 'reset-identical') await vault.reset();
+  else await vault.forget('chatgpt');
+  await vault.keep('chatgpt', original);
+  finish.resolve();
+  assert.deepEqual(await pending, original, 'a new save is not the old refresh, even with identical values');
+  assert.deepEqual(await vault.secret('chatgpt'), original);
+}
+for (const changed of ['same-refresh', 'locked', 'reset']) {
+  await vault.keep('chatgpt', { kind: 'signin', access: 'before', refresh: 'before-refresh' });
+  const entered = deferred();
+  const finish = deferred();
+  const renewing = vault.secret('chatgpt', async (held) => {
+    entered.resolve();
+    await finish.promise;
+    return { ...held, access: 'after', refresh: 'after-refresh' };
+  });
+  await entered.promise;
+  if (changed === 'same-refresh') await vault.keep('chatgpt', { kind: 'signin', access: 'replacement', refresh: 'before-refresh' });
+  else if (changed === 'locked') {
+    await vault.protect('correct horse battery', 'correct horse battery');
+    await vault.lock();
+  } else await vault.reset();
+  finish.resolve();
+  if (changed === 'locked') {
+    await assert.rejects(renewing, (error) => error.kind === 'locked');
+    await vault.unlock('correct horse battery');
+    await vault.unprotect('correct horse battery');
+  } else assert.deepEqual(await renewing, changed === 'same-refresh'
+    ? { kind: 'signin', access: 'replacement', refresh: 'before-refresh' } : undefined);
+}
+await vault.forget('chatgpt');
+
+await vault.keep('chatgpt', { kind: 'signin', access: 'shared', refresh: 'shared-refresh' });
+{
+  const entered = deferred();
+  const finish = deferred();
+  let calls = 0;
+  const renew = async (held) => {
+    calls++;
+    entered.resolve();
+    await finish.promise;
+    return { ...held, access: 'shared-after' };
+  };
+  const first = vault.secret('chatgpt', renew);
+  const second = vault.secret('chatgpt', renew);
+  await entered.promise;
+  await vault.state();
+  finish.resolve();
+  assert.deepEqual(await first, await second, 'concurrent callers share the renewed record');
+  assert.equal(calls, 1, 'only one refresh runs per provider');
+  await assert.rejects(vault.secret('chatgpt', () => { throw new Error('refresh failed'); }), /refresh failed/);
+  assert.equal((await vault.secret('chatgpt')).access, 'shared-after', 'a failed current refresh does not change storage');
+}
+await vault.forget('chatgpt');
+
 // Forgotten and reset: gone.
 await vault.forgetHost([['kv', 'host', undefined]]);
 assert.equal(await vault.hostToken(), undefined);
@@ -63,4 +171,4 @@ await vault.reset();
 assert.equal(await vault.hostToken(), undefined, 'a reset takes the host token with the keys');
 assert.equal((await vault.state()).host, false);
 
-console.log('vault-host passed: the host token sealed (never text), listed apart, locked and unlocked with the keys, re-sealed by a new passphrase, bound to its name, gone with a reset');
+console.log('vault-host passed: the host token sealed (never text), listed apart, locked and unlocked with the keys, re-sealed by a new passphrase, bound to its name, gone with a reset; kept and rotated sign-ins written durably');

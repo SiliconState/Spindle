@@ -19,8 +19,9 @@ cargo build --release --locked -p spindle-store --features cli --bin spindle
 cargo test --locked --workspace --all-features
 ```
 
-The store is schema 20: workspace objects are packed without changing their ids,
-and schema 19 migrates in place. Native and embedded hosts share the
+The store reads schemas 20 and 21: it starts at 20 and widens atomically to 21 for
+more than eight intents in a step (up to 256). Schema 19 migrates in place; a widened
+store is not readable by an older binary. Native and embedded hosts share the
 [`spend` ledger](store/src/spend.rs), dollar budgets and queued task reports.
 The embedded client also offers checked store compaction and bundle validation;
 see [the package reference](../docs/embedded.md). The browser extension is version

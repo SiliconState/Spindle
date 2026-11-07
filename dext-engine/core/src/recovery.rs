@@ -7,11 +7,16 @@ pub enum Contract {
     OpenAiChatCompletions,
     OpenAiResponses,
     ChatGptResponses,
+    /// The OpenAI API's Responses endpoint on a ChatGPT plan (Sign in with ChatGPT).
+    ChatGptPlan,
 }
 
 impl Contract {
     pub fn is_responses(self) -> bool {
-        matches!(self, Self::OpenAiResponses | Self::ChatGptResponses)
+        matches!(
+            self,
+            Self::OpenAiResponses | Self::ChatGptResponses | Self::ChatGptPlan
+        )
     }
     pub fn as_str(self) -> &'static str {
         match self {
@@ -19,15 +24,13 @@ impl Contract {
             Self::OpenAiChatCompletions => "openai-chat-completions",
             Self::OpenAiResponses => "openai-responses",
             Self::ChatGptResponses => "chatgpt-responses",
+            Self::ChatGptPlan => "chatgpt-plan",
         }
     }
 }
 
 pub fn incomplete_reason(contract: Contract, stop_reason: Option<&str>) -> Option<&str> {
-    if !matches!(
-        contract,
-        Contract::OpenAiResponses | Contract::ChatGptResponses
-    ) {
+    if !contract.is_responses() {
         return None;
     }
     match stop_reason? {
@@ -507,6 +510,40 @@ impl RetryPlan {
     }
 }
 
+/// A refusal of Sign in with ChatGPT's plan route that no retry changes: a usage limit
+/// (the plan's, or the one the user set for this app: requests pause until they change
+/// it), an account, workspace or policy that may not use its plan here, a request or
+/// route it does not take, or a permission the sign-in does not carry. Its 503s (usage
+/// or account details unavailable) are left to the transient rules.
+pub fn chatgpt_plan_refusal(body: &str) -> Option<RetryPlan> {
+    let lower = body.to_ascii_lowercase();
+    let auth = [
+        "subscription_sharing_invalid_user",
+        "chatpass_v2_scope_not_authorized",
+        "chatpass_v2_invalid_authorization_context",
+    ];
+    if auth.iter().any(|code| lower.contains(code)) {
+        return Some(RetryPlan {
+            kind: FailureKind::Auth,
+            retry: false,
+        });
+    }
+    if lower.contains("subscription_sharing_unsupported_capability") {
+        return Some(RetryPlan {
+            kind: FailureKind::Schema,
+            retry: false,
+        });
+    }
+    let refused = (lower.contains("subscription_sharing_")
+        && lower.contains("usage_limit_exceeded"))
+        || lower.contains("subscription_sharing_user_not_eligible")
+        || lower.contains("subscription_sharing_route_not_supported");
+    refused.then_some(RetryPlan {
+        kind: FailureKind::Permanent,
+        retry: false,
+    })
+}
+
 /// Classify a mid-stream error event body. Many providers return HTTP 200 and then
 /// emit an error inside the SSE stream — those never go through classify_http_failure.
 /// Examples that should be retryable (transient server hiccup, not the agent's fault):
@@ -514,6 +551,9 @@ impl RetryPlan {
 ///   - Anthropic: `{"type":"error","error":{"type":"overloaded_error", ...}}`
 ///   - OpenAI: `{"error":{"code":"server_error", ...}}` with messages like "try again"
 pub fn classify_stream_error(body: &str) -> RetryPlan {
+    if let Some(plan) = chatgpt_plan_refusal(body) {
+        return plan;
+    }
     let lower = body.to_ascii_lowercase();
 
     // Responses streams that die inside a `response.incomplete` terminal event

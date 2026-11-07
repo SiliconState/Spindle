@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use http::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -133,6 +133,11 @@ pub enum RequestContract {
     OpenAiResponses,
     #[serde(rename = "chatgpt-responses", alias = "chatgpt", alias = "codex")]
     ChatGptResponses,
+    /// The OpenAI API's Responses endpoint used with a ChatGPT plan (Sign in with
+    /// ChatGPT, `OAuthProtocol::ChatGptPlan`): a bearer token as for the API, every
+    /// request streamed and unstored, no output cap, function tools in a namespace.
+    #[serde(rename = "chatgpt-plan")]
+    ChatGptPlan,
 }
 
 impl From<RequestContract> for dext_core::recovery::Contract {
@@ -148,6 +153,7 @@ impl RequestContract {
             Self::OpenAiChatCompletions => dext_core::recovery::Contract::OpenAiChatCompletions,
             Self::OpenAiResponses => dext_core::recovery::Contract::OpenAiResponses,
             Self::ChatGptResponses => dext_core::recovery::Contract::ChatGptResponses,
+            Self::ChatGptPlan => dext_core::recovery::Contract::ChatGptPlan,
         }
     }
 
@@ -162,13 +168,25 @@ impl RequestContract {
     pub fn api_provider(self) -> ApiProvider {
         match self {
             Self::AnthropicMessages => ApiProvider::Anthropic,
-            Self::OpenAiChatCompletions | Self::OpenAiResponses => ApiProvider::OpenAi,
+            // The plan route is the OpenAI API itself: a bearer token, no Codex headers.
+            Self::OpenAiChatCompletions | Self::OpenAiResponses | Self::ChatGptPlan => {
+                ApiProvider::OpenAi
+            }
             Self::ChatGptResponses => ApiProvider::ChatGpt,
         }
     }
 
     pub fn is_responses(self) -> bool {
-        matches!(self, Self::OpenAiResponses | Self::ChatGptResponses)
+        matches!(
+            self,
+            Self::OpenAiResponses | Self::ChatGptResponses | Self::ChatGptPlan
+        )
+    }
+
+    /// Whether a request on this contract is paid by the user's ChatGPT plan, not per
+    /// token (the Codex backend, or the OpenAI API under Sign in with ChatGPT).
+    pub fn plan_paid(self) -> bool {
+        matches!(self, Self::ChatGptResponses | Self::ChatGptPlan)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -177,6 +195,7 @@ impl RequestContract {
             Self::OpenAiChatCompletions => "openai-chat-completions",
             Self::OpenAiResponses => "openai-responses",
             Self::ChatGptResponses => "chatgpt-responses",
+            Self::ChatGptPlan => "chatgpt-plan",
         }
     }
 }
@@ -239,6 +258,13 @@ pub enum OAuthProtocol {
     #[default]
     Generic,
     AnthropicClaude,
+    /// OpenAI's Sign in with ChatGPT for open-source apps that run locally: a first
+    /// sign-in registers the app as the user's own client (`client_id` names the
+    /// registration entrypoint; the callback returns the issued one), every request names
+    /// the API the token is for (`resource`: the profile's base URL) and the installation
+    /// (`ext_agent_host_id`), and the ID token is checked against the issuer's keys.
+    #[serde(rename = "chatgpt-plan")]
+    ChatGptPlan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +281,15 @@ pub struct OAuthFlow {
     pub callback_host: Option<String>,
     #[serde(default)]
     pub protocol: OAuthProtocol,
+    /// More query parameters the authorization request carries: a provider's own
+    /// sign-in options. Written only when there are some (a catalog file is shared with
+    /// Dext builds that predate the field).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub authorize_params: BTreeMap<String, String>,
+    /// The OpenID issuer whose discovery document names the keys that sign its ID
+    /// tokens and where a session is revoked (`chatgpt-plan`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -586,6 +621,7 @@ pub(crate) fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
                     RequestContract::AnthropicMessages
                         | RequestContract::OpenAiResponses
                         | RequestContract::ChatGptResponses
+                        | RequestContract::ChatGptPlan
                 ) || provider_id == "openai",
             ),
             prompt_cache: Some(matches!(
@@ -619,6 +655,76 @@ pub(crate) fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
             profile.model_specs.insert(normalized, spec);
         }
     }
+}
+
+/// The ChatGPT sign-in through OpenAI's Codex CLI client and the Codex backend, kept for
+/// builds made from source (feature `codex-signin`); store builds offer only
+/// `chatgpt-plan`, OpenAI's own Sign in with ChatGPT.
+#[cfg(feature = "codex-signin")]
+fn chatgpt_codex_profile() -> ProviderProfile {
+    ProviderProfile {
+        id: "chatgpt".to_string(),
+        builtin: None,
+        display_name: "ChatGPT (Codex)".to_string(),
+        api_provider: ApiProvider::ChatGpt,
+        base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+        default_model: CHATGPT_DEFAULT_MODEL.to_string(),
+        models: chatgpt_plan_models(),
+        env_vars: vec!["CHATGPT_ACCESS_TOKEN".to_string()],
+        requires_api_key: true,
+        login_url: Some("https://chatgpt.com".to_string()),
+        oauth_flow: Some(OAuthFlow {
+            authorize_url: "https://auth.openai.com/oauth/authorize".to_string(),
+            token_url: "https://auth.openai.com/oauth/token".to_string(),
+            client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
+            scope: "openid profile email offline_access".to_string(),
+            audience: String::new(),
+            redirect_uri: Some("http://localhost:1455/auth/callback".to_string()),
+            callback_host: Some("127.0.0.1".to_string()),
+            protocol: OAuthProtocol::Generic,
+            // The ChatGPT sign-in page's own options for a coding agent's sign-in.
+            authorize_params: BTreeMap::from([
+                ("id_token_add_organizations".to_string(), "true".to_string()),
+                ("codex_cli_simplified_flow".to_string(), "true".to_string()),
+                ("originator".to_string(), "spindle".to_string()),
+            ]),
+            issuer: None,
+        }),
+        notes: Some(
+            "ChatGPT/Codex login opens an OpenAI OAuth flow; paste the callback URL or authorization code if browser callback is unavailable."
+                .to_string(),
+        ),
+        context_window: Some(272_000),
+        model_context_windows: HashMap::new(),
+        model_effort_levels: HashMap::new(),
+        request_contract: Some(RequestContract::ChatGptResponses),
+        model_aliases: HashMap::from([(
+            "gpt-5.6".to_string(),
+            "gpt-5.6-sol".to_string(),
+        )]),
+        model_defaults: ModelSpec::default(),
+        model_specs: openai_responses_model_specs(false, false),
+    }
+}
+
+/// The models a ChatGPT account is offered on either ChatGPT route: what the Codex
+/// backend serves one (it refuses every older model, gpt-5.5 and before, gpt-4.1, gpt-4o,
+/// o3, o4-mini, with HTTP 400 model_not_found: "not supported when using Codex with a
+/// ChatGPT account"). The plan route's own list for an account (`GET /v1/models` with its
+/// token) is not read yet: a model it does not serve is refused at the first request.
+fn chatgpt_plan_models() -> Vec<String> {
+    [
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
@@ -697,46 +803,41 @@ pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 ("glm-5.3-flash[1m]".to_string(), glm_flash_spec),
             ]),
         },
+        // Sign in with ChatGPT (OpenAI's flow for open-source apps that run locally): the
+        // user's ChatGPT plan pays for Responses API requests made with their token.
         ProviderProfile {
-            id: "chatgpt".to_string(),
+            id: CHATGPT_PLAN_PROFILE.to_string(),
             builtin: None,
             display_name: "ChatGPT".to_string(),
-            api_provider: ApiProvider::ChatGpt,
-            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            api_provider: ApiProvider::OpenAi,
+            base_url: "https://api.openai.com/v1".to_string(),
             default_model: CHATGPT_DEFAULT_MODEL.to_string(),
-            // Only what the backend serves a ChatGPT account: it refuses every older
-            // model (gpt-5.5 and before, gpt-4.1, gpt-4o, o3, o4-mini) with HTTP 400
-            // model_not_found ("not supported when using Codex with a ChatGPT account").
-            models: vec![
-                "gpt-6.1-sol".to_string(),
-                "gpt-6-astra".to_string(),
-                "gpt-6-sol".to_string(),
-                "gpt-6-luna".to_string(),
-                "gpt-5.6-sol".to_string(),
-                "gpt-5.6-terra".to_string(),
-                "gpt-5.6-luna".to_string(),
-            ],
-            env_vars: vec!["CHATGPT_ACCESS_TOKEN".to_string()],
+            models: chatgpt_plan_models(),
+            env_vars: Vec::new(),
             requires_api_key: true,
             login_url: Some("https://chatgpt.com".to_string()),
             oauth_flow: Some(OAuthFlow {
-                authorize_url: "https://auth.openai.com/oauth/authorize".to_string(),
-                token_url: "https://auth.openai.com/oauth/token".to_string(),
-                client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
-                scope: "openid profile email offline_access".to_string(),
+                authorize_url: "https://auth.openai.com/api/accounts/authorize".to_string(),
+                token_url: "https://auth.openai.com/api/accounts/oauth/token".to_string(),
+                // The registration entrypoint: the callback names the client issued.
+                client_id: "dynamic_agent_client".to_string(),
+                scope: "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
+                    .to_string(),
                 audience: String::new(),
-                redirect_uri: Some("http://localhost:1455/auth/callback".to_string()),
+                redirect_uri: Some("http://127.0.0.1:1455/auth/callback".to_string()),
                 callback_host: Some("127.0.0.1".to_string()),
-                protocol: OAuthProtocol::Generic,
+                protocol: OAuthProtocol::ChatGptPlan,
+                authorize_params: BTreeMap::new(),
+                issuer: Some("https://auth.openai.com".to_string()),
             }),
             notes: Some(
-                "ChatGPT/Codex login opens an OpenAI OAuth flow; paste the callback URL or authorization code if browser callback is unavailable."
+                "Sign in with ChatGPT: requests use your ChatGPT plan through the OpenAI API; review and limit usage at chatgpt.com/settings/usage."
                     .to_string(),
             ),
             context_window: Some(272_000),
             model_context_windows: HashMap::new(),
             model_effort_levels: HashMap::new(),
-            request_contract: Some(RequestContract::ChatGptResponses),
+            request_contract: Some(RequestContract::ChatGptPlan),
             model_aliases: HashMap::from([(
                 "gpt-5.6".to_string(),
                 "gpt-5.6-sol".to_string(),
@@ -835,6 +936,8 @@ pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 redirect_uri: Some("http://localhost:53692/callback".to_string()),
                 callback_host: Some("127.0.0.1".to_string()),
                 protocol: OAuthProtocol::AnthropicClaude,
+                authorize_params: BTreeMap::new(),
+                issuer: None,
             }),
             notes: Some("Claude Pro/Max subscription OAuth is the default /login flow. ANTHROPIC_API_KEY continues to use standard API-key billing.".to_string()),
             context_window: Some(200_000),
@@ -1024,6 +1127,15 @@ pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             model_specs: HashMap::new(),
         },
     ];
+    // Right after the plan route, where it stood before that route came.
+    #[cfg(feature = "codex-signin")]
+    {
+        let at = profiles
+            .iter()
+            .position(|profile| profile.id == CHATGPT_PLAN_PROFILE)
+            .map_or(0, |at| at + 1);
+        profiles.insert(at, chatgpt_codex_profile());
+    }
     hydrate_builtin_model_specs(&mut profiles);
     profiles
 }
@@ -1770,10 +1882,7 @@ pub fn resolve_model_spec(profile: &ProviderProfile, model: &str) -> ResolvedMod
         prompt_cache: capability(
             explicit.and_then(|spec| spec.capabilities.prompt_cache),
             defaults.capabilities.prompt_cache,
-            matches!(
-                contract,
-                RequestContract::OpenAiResponses | RequestContract::ChatGptResponses
-            ),
+            contract.is_responses(),
         ),
         pricing: explicit
             .and_then(|spec| spec.pricing.clone())
@@ -1863,7 +1972,7 @@ pub fn provider_request_url(base_url: &str, contract: RequestContract) -> String
                 format!("{base}/v1/chat/completions")
             }
         }
-        RequestContract::OpenAiResponses => {
+        RequestContract::OpenAiResponses | RequestContract::ChatGptPlan => {
             if base.ends_with("/v1") {
                 format!("{base}/responses")
             } else {
@@ -1950,6 +2059,9 @@ impl ProviderRequestBody {
 
 /// The model a ChatGPT sign-in uses unless one is chosen.
 pub const CHATGPT_DEFAULT_MODEL: &str = "gpt-6.1-sol";
+
+/// The built-in profile of Sign in with ChatGPT (`RequestContract::ChatGptPlan`).
+pub const CHATGPT_PLAN_PROFILE: &str = "chatgpt-plan";
 
 pub fn normalize_chatgpt_model_slug(model: &str) -> String {
     let trimmed = model.trim();

@@ -77,6 +77,7 @@ fn contract_tag(contract: Contract) -> u8 {
         Contract::OpenAiChatCompletions => 1,
         Contract::OpenAiResponses => 2,
         Contract::ChatGptResponses => 3,
+        Contract::ChatGptPlan => 4,
     }
 }
 fn contract(tag: u8) -> Result<Contract, Error> {
@@ -85,6 +86,7 @@ fn contract(tag: u8) -> Result<Contract, Error> {
         1 => Ok(Contract::OpenAiChatCompletions),
         2 => Ok(Contract::OpenAiResponses),
         3 => Ok(Contract::ChatGptResponses),
+        4 => Ok(Contract::ChatGptPlan),
         _ => Err(Error::Checkpoint),
     }
 }
@@ -94,6 +96,7 @@ fn contract_name(tag: u8) -> Result<&'static str, Error> {
         Contract::OpenAiChatCompletions => Ok("openai-chat-completions"),
         Contract::OpenAiResponses => Ok("openai-responses"),
         Contract::ChatGptResponses => Ok("chatgpt-responses"),
+        Contract::ChatGptPlan => Ok("chatgpt-plan"),
     }
 }
 

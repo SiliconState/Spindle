@@ -131,7 +131,7 @@ try {
   assert.equal(step(first, 'b.reopen').ok, true, JSON.stringify(step(first, 'b.reopen')));
   assert.equal(step(first, 'b.reopen').count, 80, 'idle close/reopen waits for Chrome to release the same worker\'s Web Lock');
   const { id: _a, ...pool } = step(first, 'b.pool');
-  assert.deepEqual(pool, { ok: true, full: 'ENOSPC', before: 1, notDir: 'EISDIR', after: 4, gone: true, kept: 'kept' }, 'the pool grows and removes trees');
+  assert.deepEqual(pool, { ok: true, full: 'ENOSPC', before: 1, notDir: 'EISDIR', after: 4, gone: true, kept: 'kept', grew: 64 }, 'the pool grows as asked and removes trees; one left to itself grows by itself');
 
   const second = await run('reopen');
   const status = step(second, 'c.status');

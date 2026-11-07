@@ -333,6 +333,24 @@ assert.equal(w3.need.size, 1, 'only the hard-linked file comes from Spindle agai
 const w4 = await inWorkspace('t1', thread, 'cat a.txt d/moved.txt; ls -l run.sh | cut -c1-10');
 assert.deepEqual(w4.result.output.split('\n'), ['ALPHA', 'charlie', '-rwxr-xr-x'], 'what Spindle did not take is not seen: its files come again, none stale');
 assert.equal(w4.need.size, 2, 'the two files the untaken command changed come from Spindle');
+// Packages and caches (a .venv, node_modules, __pycache__) stay on the share between
+// commands and never enter the workspace: a command that makes them reports only its
+// other files; the next command finds them as left; one the workspace listed from before
+// (an older version put it there) is dropped from it.
+await put('.venv/stale.txt', 'from before\n');
+const w5 = await inWorkspace('t1', thread, 'mkdir -p .venv/lib node_modules/pkg node_modules/.bin src/__pycache__; echo pkg > .venv/lib/p.py; echo dep > node_modules/pkg/index.js; ln -s ../pkg/index.js node_modules/.bin/pkg; echo pyc > src/__pycache__/m.pyc; echo src > src/m.py; cat .venv/stale.txt');
+assert.equal(w5.result.code, 0, w5.result.output);
+assert.equal(w5.result.output, 'from before', 'what the workspace listed under .venv was placed once');
+assert.deepEqual(names(w5.changes), { writes: ['src/m.py'], deletes: ['.venv/stale.txt'] }, 'package and cache files are no writes; the listed one is dropped');
+assert.ok(!thread.files.has('.venv/stale.txt'), 'and leaves the workspace');
+const w6 = await inWorkspace('t1', thread, 'cat .venv/lib/p.py node_modules/pkg/index.js src/__pycache__/m.pyc .venv/stale.txt src/m.py; readlink node_modules/.bin/pkg; cat node_modules/.bin/pkg; echo more > .venv/lib/q.py');
+assert.equal(w6.result.code, 0, w6.result.output);
+assert.deepEqual(w6.result.output.split('\n'), ['pkg', 'dep', 'pyc', 'from before', 'src', '../pkg/index.js', 'dep'], 'the next command finds the packages and caches as the last one left them, their links too');
+assert.equal(w6.need.size, 0, 'nothing came from Spindle for them');
+assert.deepEqual(names(w6.changes), { writes: [], deletes: [] }, 'nor does a change under them count');
+const w7 = await inWorkspace('t1', thread, 'rm -r .venv node_modules; ls');
+assert.deepEqual(names(w7.changes), { writes: [], deletes: [] });
+assert.deepEqual(w7.result.output.split('\n'), ['a.txt', 'd', 'hard.sh', 'n.txt', 'run.sh', 'src'], 'removed, they are gone for good');
 // A larger workspace: its first command against the next (a quick one each).
 const big = { files: new Map() };
 const filler = 'x'.repeat(16 * 1024);

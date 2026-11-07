@@ -281,6 +281,16 @@ fn take_text(bytes: &mut &[u8], limit: usize) -> Result<String> {
 
 /// A whole manifest; only its one canonical encoding is accepted.
 pub fn decode_tree(bytes: &[u8]) -> Result<Tree> {
+    let tree = parse_tree(bytes)?;
+    if encode_tree(&tree).map_err(|_| Error::Incompatible)? != bytes {
+        return Err(Error::Incompatible);
+    }
+    Ok(tree)
+}
+
+/// `decode_tree` without the canonical check (re-encoding the whole manifest), for a
+/// manifest already decoded whole on this connection.
+fn parse_tree(bytes: &[u8]) -> Result<Tree> {
     if bytes.len() > crate::artifact::MAX_OBJECT {
         return Err(Error::Incompatible);
     }
@@ -334,19 +344,21 @@ pub fn decode_tree(bytes: &[u8]) -> Result<Tree> {
             _ => return Err(Error::Incompatible),
         }
     }
-    if !remaining.is_empty() || encode_tree(&tree).map_err(|_| Error::Incompatible)? != bytes {
+    if !remaining.is_empty() {
         return Err(Error::Incompatible);
     }
     Ok(tree)
 }
 
-/// Digests pinned by any stage of `scope`, in one pass over its pins.
-pub(crate) fn scope_pins(db: &Connection, scope: &str) -> Result<HashSet<String>> {
-    let mut query = db.prepare_cached(
-        "SELECT p.digest FROM staging_pins p JOIN artifact_stages s ON s.id=p.stage WHERE s.scope=?1",
-    )?;
-    let digests = query.query_map([scope], |row| crate::bounded_label(row, 0))?;
-    Ok(digests.collect::<rusqlite::Result<_>>()?)
+/// Whether some stage of `scope` pins `digest`: the digest's own pins (index
+/// `staging_pins_digest`, the outer loop of the CROSS JOIN), each stage found by its id,
+/// so the cost is that object's pins, never the scope's.
+pub(crate) fn pinned_in_scope(db: &Connection, scope: &str, digest: &str) -> Result<bool> {
+    Ok(db
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM staging_pins p CROSS JOIN artifact_stages s ON s.id=p.stage WHERE p.digest=?1 AND s.scope=?2)",
+        )?
+        .query_row(params![digest, scope], |row| row.get(0))?)
 }
 
 /// Roots already proven complete on this connection. Objects and pins are immutable
@@ -372,18 +384,7 @@ pub(crate) fn validate_tree_root(db: &Connection, scope: &str, root: &str) -> Re
     if !valid_digest(root) {
         return Err(Error::Invalid);
     }
-    let fresh: bool = db.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE name='spindle_valid_objects')",
-        [],
-        |row| row.get(0),
-    )?;
-    db.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS spindle_valid_roots(scope TEXT NOT NULL, root TEXT NOT NULL, PRIMARY KEY(scope,root));
-         CREATE TEMP TABLE IF NOT EXISTS spindle_valid_objects(digest TEXT PRIMARY KEY);",
-    )?;
-    if fresh {
-        known_files(db)?;
-    }
+    remembered(db)?;
     let known: bool = db
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM temp.spindle_valid_roots WHERE scope=?1 AND root=?2)",
@@ -401,36 +402,56 @@ pub(crate) fn validate_tree_root(db: &Connection, scope: &str, root: &str) -> Re
             .optional()?
     };
     let bytes = bytes.ok_or(Error::Invalid)?;
+    // A root proven on this connection was hashed and decoded whole then (objects are
+    // immutable until garbage collection, which forgets them): parsed again only.
+    if known {
+        return parse_tree(&bytes);
+    }
     if object_digest(&bytes) != root {
         return Err(Error::Incompatible);
     }
     let tree = decode_tree(&bytes)?;
-    if !known {
-        let pinned = scope_pins(db, scope)?;
-        let mut verified = db.prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM temp.spindle_valid_objects WHERE digest=?1)",
-        )?;
-        let mut stored = db.prepare_cached(crate::artifact::STORED)?;
-        let mut remember =
-            db.prepare_cached("INSERT OR IGNORE INTO temp.spindle_valid_objects VALUES(?1)")?;
-        for entry in &tree.files {
-            if !pinned.contains(&entry.object) {
-                return Err(Error::Incompatible);
-            }
-            if verified.query_row([&entry.object], |row| row.get(0))? {
-                continue;
-            }
-            let bytes =
-                stored.query_row([&entry.object], |row| crate::artifact::object_at(row, 0))?;
-            if object_digest(&bytes) != entry.object {
-                return Err(Error::Incompatible);
-            }
-            remember.execute([&entry.object])?;
+    drop(bytes);
+    let mut verified = db.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM temp.spindle_valid_objects WHERE digest=?1)",
+    )?;
+    let mut stored = db.prepare_cached(crate::artifact::STORED)?;
+    let mut remember =
+        db.prepare_cached("INSERT OR IGNORE INTO temp.spindle_valid_objects VALUES(?1)")?;
+    for entry in &tree.files {
+        if !pinned_in_scope(db, scope, &entry.object)? {
+            return Err(Error::Incompatible);
         }
-        db.prepare_cached("INSERT OR IGNORE INTO temp.spindle_valid_roots VALUES(?1,?2)")?
-            .execute(params![scope, root])?;
+        if verified.query_row([&entry.object], |row| row.get(0))? {
+            continue;
+        }
+        let bytes = stored.query_row([&entry.object], |row| crate::artifact::object_at(row, 0))?;
+        if object_digest(&bytes) != entry.object {
+            return Err(Error::Incompatible);
+        }
+        remember.execute([&entry.object])?;
     }
+    db.prepare_cached("INSERT OR IGNORE INTO temp.spindle_valid_roots VALUES(?1,?2)")?
+        .execute(params![scope, root])?;
     Ok(tree)
+}
+
+/// This connection's memo of roots and objects already proven (`validate_tree_root`),
+/// made on first use with the files of the last validated revision (`known_files`).
+pub(crate) fn remembered(db: &Connection) -> Result<()> {
+    let fresh: bool = db.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE name='spindle_valid_objects')",
+        [],
+        |row| row.get(0),
+    )?;
+    db.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS spindle_valid_roots(scope TEXT NOT NULL, root TEXT NOT NULL, PRIMARY KEY(scope,root));
+         CREATE TEMP TABLE IF NOT EXISTS spindle_valid_objects(digest TEXT PRIMARY KEY);",
+    )?;
+    if fresh {
+        known_files(db)?;
+    }
+    Ok(())
 }
 
 /// The files of the last validated revision's workspace (the head an earlier open
@@ -485,14 +506,9 @@ impl Store {
             return Err(Error::Paused);
         }
         let bytes = encode_tree(tree)?;
-        if !tree.files.is_empty() {
-            let pinned = scope_pins(&self.db, &stage.scope);
-            let pinned = self.workspace_result(pinned)?;
-            if tree
-                .files
-                .iter()
-                .any(|entry| !pinned.contains(&entry.object))
-            {
+        for entry in &tree.files {
+            let pinned = pinned_in_scope(&self.db, &stage.scope, &entry.object);
+            if !self.workspace_result(pinned)? {
                 return Err(Error::Invalid);
             }
         }

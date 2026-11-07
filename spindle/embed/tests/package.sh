@@ -24,7 +24,7 @@ node -e 'if (+process.versions.node.split(".")[0] < 20) {
 }'
 
 cargo build --locked -p spindle-embed --target wasm32-unknown-unknown
-wasm=target/wasm32-unknown-unknown/debug/spindle_embed.wasm
+wasm=${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/debug/spindle_embed.wasm
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 "$bindgen" --target nodejs --out-dir "$out/node" "$wasm"
