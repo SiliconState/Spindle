@@ -1,5 +1,9 @@
 # Spindle for Browser
 
+Version 0.1.8 adds OpenAI's Sign in with ChatGPT alongside the legacy Codex sign-in
+in source/GitHub builds. It also includes the reviewed credential-refresh, task-file
+delivery and restart/storage fixes. The store edition omits the Codex client.
+
 Spindle running inside your browser, tested on Chrome, Edge and Brave: a side-panel extension
 (Manifest V3; Chrome's names below cover the other browsers' too) whose threads are
 sessions of Spindle's embedded package (`embed/`), kept in the browser's private storage

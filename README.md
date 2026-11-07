@@ -148,9 +148,11 @@ Interrupted? `spindle --dir ../demo continue`. The web UI:
 
 **Current source and released zip.** The source includes OpenAI's Sign in with
 ChatGPT and keeps **ChatGPT (Codex)** in the source/GitHub edition. The store edition
-(`SPINDLE_STORE=1`) omits the legacy Codex client. The released 0.1.7 zip below
-predates these and other source changes; build from source until the next version
-is published. A new release needs a new manifest version and matching tag.
+(`SPINDLE_STORE=1`) omits the legacy Codex client. Version 0.1.8 is prepared for
+release with these changes plus reviewed credential-refresh, background-task file
+delivery and restart/storage fixes. Until its release workflow publishes the zips,
+the download below remains on 0.1.7. A new release needs a new manifest version
+and matching tag.
 
 **Spindle for Browser 0.1.7.** Download `spindle-browser-0.1.7.zip` from the
 [latest release](https://github.com/SiliconState/Spindle/releases/latest), unzip it, and load

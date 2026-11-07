@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Spindle Atlas: the architecture on three plates</title>
-<meta name="description" content="An illustrated map of Spindle: every surface and the host boundary, the turn route from transport to committed head, the schema-20 store and the Dext engine, and Spindle for Browser's local-first engine.">
+<meta name="description" content="An illustrated map of Spindle: every surface and the host boundary, the turn route from transport to committed head, the schema-20/21 store and the Dext engine, and Spindle for Browser's local-first engine.">
 <meta name="color-scheme" content="light dark">
 <script>
 // Before anything paints: the kept theme, or the system's (followed as it changes).
@@ -340,7 +340,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
     <div class="kicker">Spindle / Dext engine / architecture atlas</div>
     <h1>Spindle <span class="slash">/</span><br>Dext Engine</h1>
     <p class="dek">The whole system on three plates: every surface and the host it reaches, the route a turn takes to a committed head, the store and engine underneath, and Spindle for Browser, which runs the same engine inside your browser.</p>
-    <div class="revision">Schema 20 · API v1 · drawn from the source of Spindle for Browser 0.1.7, November 2026</div>
+    <div class="revision">Schema 20/21 · API v1 · drawn from the source of Spindle for Browser 0.1.7, November 2026</div>
   </div>
   <div class="hero-side">
     <div class="theme" role="group" aria-label="Theme">
@@ -349,12 +349,12 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
       <button type="button" data-set-theme="dim">DIM</button>
       <button type="button" data-set-theme="system">SYSTEM</button>
     </div>
-    <div class="stamp">Schema 20<br>API v1<br>Browser 0.1.7</div>
+    <div class="stamp">Schema 20/21<br>API v1<br>Browser 0.1.7</div>
   </div>
 </header>
 
 <div class="facts">
-  <div class="fact"><b>20</b><span>SQLite schema</span></div>
+  <div class="fact"><b>20/21</b><span>SQLite schema</span></div>
   <div class="fact"><b>32 MiB</b><span>max step payload</span></div>
   <div class="fact"><b>1,048,576</b><span>admission ceiling</span></div>
   <div class="fact"><b>50,000</b><span>files per workspace</span></div>
@@ -374,9 +374,9 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
       <div class="section-num">01</div>
       <div>
         <h2>Full host map</h2>
-        <p>Seven surfaces and the preview sandbox, one host boundary, one schema-20 store, and the four Dext engine crates underneath. The browser and the web app are first-class here, not side notes.</p>
+        <p>Seven surfaces and the preview sandbox, one host boundary, one schema-20/21 store, and the four Dext engine crates underneath. The browser and the web app are first-class here, not side notes.</p>
       </div>
-      <div class="section-meta">Schema 20 · API v1</div>
+      <div class="section-meta">Schema 20/21 · API v1</div>
     </div>
 
     <div class="legend">
@@ -493,12 +493,12 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
         <div class="flowline"><span>proposal → revision → attempt → receipt; View reads committed state</span></div>
 
         <div class="lane store">
-          <div class="lane-head"><span><b class="lane-num">03</b> DURABLE SUBSTRATE</span><span class="lane-note">schema 20</span></div>
+          <div class="lane-head"><span><b class="lane-num">03</b> DURABLE SUBSTRATE</span><span class="lane-note">schema 20/21</span></div>
           <div class="nodes three">
             <article class="node">
-              <h3>Schema 20</h3>
+              <h3>Schema 20/21</h3>
               <code>lib.rs · transition.rs</code>
-              <p>WAL + FULL, owner lock, migrations from 14–19, previous schema 19, validation watermark, provider refusals.</p>
+              <p>WAL + FULL, owner lock, migrations from 14–19, schema 20 until a step exceeds eight intents, then schema 21; validation watermark and provider refusals.</p>
               <span class="tag">1M ADMITS</span>
             </article>
             <article class="node">
@@ -602,7 +602,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
         <div class="invariant"><b>Commit</b><span>WAL + FULL, one owner lock</span></div>
         <div class="invariant"><b>Payload</b><span>32 MiB per step</span></div>
         <div class="invariant"><b>Admissions</b><span>1,048,576 maximum</span></div>
-        <div class="invariant"><b>Proposal</b><span>up to 8 intents</span></div>
+        <div class="invariant"><b>Proposal</b><span>up to 256 intents</span></div>
         <div class="invariant"><b>Contract</b><span>API v1 across transports</span></div>
       </div>
     </div>
@@ -612,14 +612,14 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
         <div class="section-num">01w</div>
         <div>
           <h2>The Spindle Works</h2>
-          <p>The illustrated host plate: API and browser gate, session/driver, schema-20 vault, codec, object silo, broker, effect yard, rewind, and the Dext engine.</p>
+          <p>The illustrated host plate: API and browser gate, session/driver, schema-20/21 vault, codec, object silo, broker, effect yard, rewind, and the Dext engine.</p>
         </div>
         <div class="section-meta">Illustrated host plate</div>
       </div>
       <div class="works-frame" tabindex="0" role="region" aria-label="The Spindle Works plate (scrolls sideways)">
       <svg class="works-svg" viewBox="0 0 1200 800" role="img" aria-labelledby="hostWorksTitle hostWorksDesc">
         <title id="hostWorksTitle">The Spindle Works</title>
-        <desc id="hostWorksDesc">An isometric works: API and browser gate, session and driver desk, schema-20 authority vault, codec press, object silo, broker gate, jobs/packs/HTTP effect yard, Dext engine tower, and a separate reference model.</desc>
+        <desc id="hostWorksDesc">An isometric works: API and browser gate, session and driver desk, schema-20/21 authority vault, codec press, object silo, broker gate, jobs/packs/HTTP effect yard, Dext engine tower, and a separate reference model.</desc>
         <defs>
           <pattern id="hostGrid" width="26" height="26" patternUnits="userSpaceOnUse">
             <path d="M26 0H0V26" fill="none" stroke="var(--grid)" stroke-width="1"/>
@@ -637,7 +637,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
         <line x1="30" y1="48" x2="1170" y2="48" class="thin"/>
         <text x="30" y="76" class="h1">THE SPINDLE WORKS</text>
         <text x="30" y="96" class="sub">proposal → revision → reserve → effect → receipt → head</text>
-        <text x="1170" y="76" text-anchor="end" class="code">SCHEMA 20 / API V1</text>
+        <text x="1170" y="76" text-anchor="end" class="code">SCHEMA 20/21 / API V1</text>
         <text x="1170" y="94" text-anchor="end" class="code">32 MiB / 1M ADMITS</text>
 
         <ellipse cx="600" cy="545" rx="450" ry="116" fill="var(--shadow)" opacity=".42"/>
@@ -700,7 +700,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
           <text x="455" y="587" text-anchor="middle" class="code">TURN CONTINUATION</text>
         </g>
 
-        <!-- Schema 20 vault -->
+        <!-- Schema 20/21 vault -->
         <g id="host-vault">
           <g transform="translate(650 520) scale(.55)">
             <polygon class="iso-top" points="0,-40 120,0 0,40 -120,0"/>
@@ -712,7 +712,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
           <ellipse cx="650" cy="504" rx="54" ry="20" fill="var(--iso-left)" stroke="var(--ink)" stroke-width="1.2"/>
           <path d="M596 449H704M596 468H704M596 487H704" class="thin"/>
           <text x="650" y="475" text-anchor="middle" class="label">AUTHORITY</text>
-          <text x="650" y="342" text-anchor="middle" class="code">AUTHORITY.SQLITE / SCHEMA 20</text>
+          <text x="650" y="342" text-anchor="middle" class="code">AUTHORITY.SQLITE / SCHEMA 20/21</text>
           <text x="650" y="358" text-anchor="middle" class="small">32 MiB PAYLOAD · 1,048,576 ADMITS</text>
           <text x="650" y="374" text-anchor="middle" class="small">WAL + FULL · ONE OWNER.LOCK</text>
           <path d="M650 380V420" class="thin"/>
@@ -836,7 +836,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
 
     <div class="notes">
       <article class="note"><b>01 / GATE</b><h3>Every surface, one gate</h3><p>CLI, HTTP, stdio, Rust API, the extension and embed share the API v1 contract; the web app talks to the host's /api. Pairing/device tokens and optional Access sit in front.</p></article>
-      <article class="note"><b>02 / VAULT</b><h3>Schema 20</h3><p>WAL + FULL, owner lock, migrations from 14–19 (a copy kept first), 32 MiB steps, one million admissions.</p></article>
+      <article class="note"><b>02 / VAULT</b><h3>Schema 20/21</h3><p>WAL + FULL, owner lock, migrations from 14–19 (a copy kept first), 32 MiB steps, one million admissions.</p></article>
       <article class="note"><b>03 / AUTHORITY</b><h3>Commit, then reserve</h3><p>Proposal → revision and intents → broker attempt → effect → receipt → head. The driver sends and runs nothing itself: the host does.</p></article>
     </div>
 
@@ -959,7 +959,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
         <text x="480" y="470" class="tiny">operations serialize per thread</text>
         <rect x="480" y="488" width="300" height="64" fill="var(--panel)" stroke="var(--line)"/>
         <text x="492" y="507" class="code-blue">spindle_embed_bg.wasm</text>
-        <text x="492" y="523" class="tiny">embedded host · schema-20 sessions</text>
+        <text x="492" y="523" class="tiny">embedded host · schema-20/21 sessions</text>
         <text x="492" y="539" class="tiny">driver · store · API methods</text>
         <rect x="480" y="566" width="135" height="50" class="gold"/>
         <text x="492" y="585" class="tiny">OPFS pool</text>
@@ -1168,7 +1168,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
           <text x="696" y="550" text-anchor="middle" class="small">engine-worker.mjs</text>
           <text x="696" y="565" text-anchor="middle" class="small">one worker · all threads</text>
           <text x="696" y="580" text-anchor="middle" class="code">spindle_embed_bg.wasm</text>
-          <text x="696" y="595" text-anchor="middle" class="small">driver · schema-20 sessions</text>
+          <text x="696" y="595" text-anchor="middle" class="small">driver · schema-20/21 sessions</text>
           <text x="696" y="616" text-anchor="middle" class="code">BroadcastChannel fanout</text>
         </g>
 
@@ -1275,22 +1275,22 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
 
     <div class="detail-grid">
       <article class="detail-card">
-        <h3>Schema 20</h3>
-        <p><code>SCHEMA = 20</code>, <code>LEGACY_SCHEMAS = [14,15,16,17,18,19]</code>, <code>PREVIOUS_SCHEMA = 19</code>. A native open migrates in place after copying the store to <code>authority.vN.sqlite</code>; browser stores and imports migrate 19 in one checked transaction. WAL and <code>synchronous=FULL</code> remain the store profile.</p>
+        <h3>Schema 20/21</h3>
+        <p><code>SCHEMA = 21</code>, <code>PREVIOUS_SCHEMA = 20</code>, <code>LEGACY_SCHEMAS = [14,15,16,17,18,19]</code>. Stores begin at schema 20 and widen to 21 when a step exceeds eight intents, up to 256. A native migration copies the old store to <code>authority.vN.sqlite</code>; embedded schema 19 migrates in place in one checked transaction. WAL and <code>synchronous=FULL</code> remain the store profile.</p>
         <div class="cap-list">
           <div class="cap"><b>Payload</b><span>32 MiB</span></div>
           <div class="cap"><b>Admissions</b><span>1,048,576</span></div>
           <div class="cap"><b>Workspace files</b><span>50,000</span></div>
           <div class="cap"><b>Object</b><span>64 MiB</span></div>
           <div class="cap"><b>Objects total</b><span>16 GiB</span></div>
-          <div class="cap"><b>Effects / proposal</b><span>8</span></div>
+          <div class="cap"><b>Effects / proposal</b><span>256</span></div>
         </div>
       </article>
       <article class="detail-card">
         <h3>Capabilities contract</h3>
         <p><code>CAPABILITIES</code> advertises transactional receipts and revision-pinned file maps, but still says no native execution, no Dext engine, no durable rewind, no power-loss certification, no backup restore. The code exists; the public contract is deliberately conservative.</p>
         <div class="cap-list">
-          <div class="cap"><b>Schema</b><span>20</span></div>
+          <div class="cap"><b>Schema</b><span>20/21</span></div>
           <div class="cap"><b>API</b><span>v1</span></div>
           <div class="cap"><b>Browser</b><span>0.1.7</span></div>
           <div class="cap"><b>Chromium</b><span>116+</span></div>
@@ -1299,7 +1299,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
         </div>
       </article>
       <article class="detail-card">
-        <h3>The schema-20 pipeline</h3>
+        <h3>The schema-20/21 pipeline</h3>
         <p>The host has a shared turn driver and embedded host, reads helpers, protocol/meta/spend modules, connect and thread services, browser PKCE onboarding, and the browser extension's WASM host. The store still owns the atomic admission → revision → intent → attempt → receipt chain.</p>
       </article>
       <article class="detail-card warn">
@@ -1312,7 +1312,7 @@ code{font-family:inherit;font-size:.92em;color:var(--ink);background:var(--code)
     <div class="detail-grid" style="margin-top:10px">
       <article class="detail-card">
         <h3>Approvals held to the page</h3>
-        <p>Before acting is Full (the default), Auto (asks before what sends or submits) or Ask (before every action). An action you allow carries what the question showed: the tab, the page's document (where Chrome says which it is; else its address), the part's description, or the dialog. The service worker checks it just before acting; if the page reloaded or moved on, nothing is done and the thread is told.</p>
+        <p>Before acting is Auto by default (asks before what sends or submits), Ask (before every action), or Full (no confirmation; existing installs retain their earlier choice). An action you allow carries what the question showed: the tab, the page's document (where Chrome says which it is; else its address), the part's description, or the dialog. The service worker checks it just before acting; if the page reloaded or moved on, nothing is done and the thread is told.</p>
       </article>
       <article class="detail-card">
         <h3>Names a crash cannot split</h3>

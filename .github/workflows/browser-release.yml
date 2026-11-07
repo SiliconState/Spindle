@@ -86,6 +86,7 @@ jobs:
             node chrome/tests/review_browser.mjs "$RUNNER_TEMP/spindle-browser"
           SPINDLE_BROWSER="$(command -v google-chrome)" \
             node chrome/tests/signin_vault.mjs "$RUNNER_TEMP/spindle-browser"
+          node chrome/tests/vault_host.mjs
           node --expose-gc chrome/tests/engine_renew.mjs "$RUNNER_TEMP/spindle-browser/web"
           node -e '
             const build = require(process.argv[1]);
@@ -126,6 +127,10 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/notes.md" <<EOF
           Spindle for Browser $VERSION, for Chrome, Edge and Brave, built from this tag by the browser release workflow.
+
+          **New in 0.1.8:** OpenAI's Sign in with ChatGPT, with ChatGPT (Codex) retained in the standard zip; credential refreshes respect sign-out and replacement; background task reports adopt their files together; file-merge warnings survive long answers; Stop keeps priority between tool steps. This release also carries the reviewed restart/storage and task-budget fixes.
+
+          **Compatibility:** stores remain schema 20 until a step needs more than eight intents, when they widen to schema 21 (up to 256). Older builds refuse widened stores and the new ChatGPT request contract. Keep a verified backup before updating if rollback matters.
 
           **Verify** it before you unzip it: \`sha256sum -c $ASSET.sha256\` (on macOS, \`shasum -a 256 -c $ASSET.sha256\`; on Windows, compare \`Get-FileHash $ASSET\` with the \`.sha256\` file), or \`gh attestation verify $ASSET -R $GITHUB_REPOSITORY\`.
 

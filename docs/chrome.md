@@ -13,11 +13,12 @@ place where a thread's commands, or the whole thread, can run.
 It is tested on Chrome, Edge and Brave (Chromium 116 or later, on desktop); this page uses Chrome's
 names, which Edge shares. In Edge, Brave or Opera, the panel and the messages it shows say that
 browser's name where they would say Chrome (`BROWSER` in
-[`page-tools.mjs`](../spindle/chrome/page-tools.mjs)). The manifest's current version is **0.1.7**
-([`manifest.json`](../spindle/chrome/manifest.json)); the release asset is
-`spindle-browser-0.1.7.zip`. This reference follows the current source; the linked
-0.1.7 release predates some source changes described below. Build from source for
-those changes. A new release needs a new manifest version and matching tag.
+[`page-tools.mjs`](../spindle/chrome/page-tools.mjs)). The manifest's current version is **0.1.8**
+([`manifest.json`](../spindle/chrome/manifest.json)); its release assets are
+`spindle-browser-0.1.8.zip` and `spindle-browser-store-0.1.8.zip`. A release is
+available once the matching `browser-v0.1.8` tag's workflow finishes and attaches
+its checked zips. The product page keeps its download on the last published release
+until then. Historical additions in 0.1.7 remain marked below.
 
 ## Contents
 

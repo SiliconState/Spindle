@@ -155,7 +155,8 @@ pull request, except those that change only the website or the release workflow:
 Two more workflows publish. [`pages.yml`](../.github/workflows/pages.yml) deploys `site/` to
 GitHub Pages when it changes. [`browser-release.yml`](../.github/workflows/browser-release.yml),
 on a `browser-v*` tag, builds both source/GitHub and store editions, tests the exact
-unpacked zips with `extension_real.mjs --scripted` and `signin_vault.mjs`, and tests
+unpacked zips with `extension_real.mjs --scripted` and `signin_vault.mjs`, runs the
+credential-refresh race regressions in `vault_host.mjs`, and tests
 the source zip with `review_browser.mjs` and
 `node --expose-gc chrome/tests/engine_renew.mjs UNPACKED/web`. It checks
 `build.json`'s version, edition and source fingerprints, then attests and
