@@ -107,6 +107,15 @@ setInterval(tick, 1000);
 // Committed model text renders as Markdown (built as elements, never parsed as HTML);
 // a person's text keeps its literal form with code fences as blocks; a preview still
 // being written stays literal text. Workspace paths in either open the file viewer.
+// A first prompt ends with the files its thread starts with, for the model (agent.rs
+// WORKSPACE_NOTE): named here, not printed in the person's own message.
+const WORKSPACE_NOTE = '\n\n[The workspace this thread starts with: ';
+function promptShown(text) {
+  const at = text.indexOf(WORKSPACE_NOTE);
+  if(at < 0) return text;
+  const count = text.slice(at + WORKSPACE_NOTE.length).split(' ')[0];
+  return `${text.slice(0, at)}\n\n(+ the list of the ${count} file(s) the thread started with, for the model)`;
+}
 function message(parent, role, text, preview = false, label = '') {
   const article = el('article', `message ${role}`); if(preview) article.classList.add('preview');
   const head = el('span','role-label',label || (role === 'user' ? 'YOU' : preview ? 'SPINDLE · LIVE PREVIEW' : 'SPINDLE'));
@@ -415,7 +424,7 @@ function render(data) {
       if(b.type === 'text' && typeof b.steer === 'string' && m.role === 'user') {const body = message($('history'),'user',b.steer,false,'YOU · WHILE RUNNING'); searchable.push({node:body.parentElement || body,text:b.steer});}
       else if(b.type === 'text' && b.text.trim()) {
         if(b.text.startsWith('[Earlier conversation compacted')) {const notice = el('div','notice',b.text); $('history').append(notice); searchable.push({node:notice,text:b.text});}
-        else {const body = message($('history'),m.role === 'user' ? 'user' : 'assistant',b.text); searchable.push({node:body.parentElement || body,text:b.text});}
+        else {const text = m.role === 'user' ? promptShown(b.text) : b.text; const body = message($('history'),m.role === 'user' ? 'user' : 'assistant',text); searchable.push({node:body.parentElement || body,text});}
       }
       if(b.type === 'tool_use' && (results.has(b.id) || !data.busy || historical)) {
         const result = results.get(b.id), shown = !result?.is_error && Array.isArray(result?.display) ? result.display.filter(item => item && typeof item.path === 'string') : [];
@@ -575,7 +584,7 @@ function preview(event, seq) {
   const catching = seq <= catchup;
   if(!catching) flushBuffered();
   switch(event.type) {
-    case 'prompt': if(!catching) message($('live'),'user',event.text); break;
+    case 'prompt': if(!catching) message($('live'),'user',promptShown(event.text)); break;
     case 'steered':
       if(catching) break;
       message($('live'),'user',event.text,false,'YOU · WHILE RUNNING');

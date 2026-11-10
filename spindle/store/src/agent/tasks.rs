@@ -15,7 +15,7 @@
 use super::{AppAnswer, AppCall, AppTools, Event, Observer, Session, Settings};
 use crate::agent::Result;
 pub(crate) use crate::driver::task_tool::refuse_conflicts;
-pub use crate::driver::task_tool::{MAX_DEPTH, NAME, Workspace, definition, refusal};
+pub use crate::driver::task_tool::{MAX_DEPTH, NAME, Workspace, definition, refusal, refused};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

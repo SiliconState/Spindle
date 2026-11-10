@@ -61,8 +61,22 @@ spindle --dir ./calc status       # where the session stands
 spindle --dir ./calc log          # the conversation so far
 spindle --dir ./calc files        # the versioned workspace
 spindle --dir ./calc cat calc.py  # one file at the head revision
+spindle --dir ./calc diff         # what the last turn changed, as a patch for `git apply`
 spindle --dir ./calc say "Add a power operator"
 ```
+
+While a turn runs, another shell can watch and steer it:
+
+```sh
+spindle --dir ./calc status                        # running, and what it waits on
+spindle --dir ./calc log --last                    # the model's latest reply
+spindle --dir ./calc steer "use pytest, not unittest"  # read at the turn's next step
+spindle --dir ./calc stop                          # the running command ends, recorded
+```
+
+Ctrl-C in the running shell is the same stop (exit status 130); `continue` goes on from
+it. A long prompt can come from standard input (`say -`) or a file (`--prompt-file
+FILE`).
 
 Useful options on `new` and `say`:
 
@@ -101,6 +115,7 @@ If `continue` reports an **unknown outcome**, the provider may or may not have r
 spindle --dir ./calc targets              # revisions you can go back to
 spindle --dir ./calc rewind 4             # conversation, files and app state together
 spindle --dir ./calc export ./out         # write the workspace to a directory
+spindle --dir ./calc diff 1 > work.patch  # everything since revision 1, for `git apply`
 spindle --dir ./calc export-session calc.spindle      # move the session into a bundle
 spindle --dir ./elsewhere import-session calc.spindle # continue it somewhere else
 spindle --dir ./calc usage                # spend per turn and per model
@@ -133,6 +148,7 @@ token itself. Never expose the loopback port directly. See [host.md](host.md).
 
 | Option | Use when |
 | --- | --- |
+| `spindle ... --json` (one JSON result per command, `next` naming the command that goes on) | A script or another agent driving the command line ([cli.md](cli.md#argument-parsing-output-and-exit-status)) |
 | `spindle api` (JSON-RPC 2.0 over stdio) with the [Node or Python client](clients.md) | A local app that can spawn a process |
 | HTTP `/v1` on `spindle serve` | A remote client, or several clients sharing a host |
 | The [embedded package](embedded.md) | A JavaScript app that should own storage and I/O itself, including in a browser |

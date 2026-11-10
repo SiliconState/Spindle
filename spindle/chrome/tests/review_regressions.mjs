@@ -31,7 +31,7 @@ const records = new Map();
 const messages = [];
 const warnings = [];
 const context = vm.createContext({
-  crypto: globalThis.crypto, console: { ...console, warn: (...args) => warnings.push(args) }, setTimeout, clearTimeout, Uint8Array, URL, URLSearchParams, btoa,
+  crypto: globalThis.crypto, console: { ...console, warn: (...args) => warnings.push(args) }, setTimeout, clearTimeout, performance, Uint8Array, URL, URLSearchParams, btoa,
   BroadcastChannel: class { postMessage(message) { messages.push(message); } },
   CHANNEL: 'test', self: { location: { href: 'chrome-extension://id/engine-worker.mjs' } }, linuxRunner: () => ({ warm() {}, forget() {} }), PAGE_TOOLS: [], uncertain, ASKING_NAMES, UPLOAD, typeOf, titleFrom, actionText, confirmMode, numbersIn, sends, BROWSER: 'Chrome', storeRefusal, firstGlue: {},
   refusedAnswer, RemoteClient, requestId, worthRepeating, MOVE, STEP_TEXT, Waiting, hostMoves, sentence, BUNDLE_MOST,
@@ -64,7 +64,7 @@ const context = vm.createContext({
     return next;
   },
 });
-vm.runInContext(`${engineSource}\nglobalThis.test = { turnTabsDone, tasksOpening, afterTurn, prepared, guided, setupOf, operate, ops, running, snapshot, restoreQueued, queued, renew, replaceFirst, creationSettings, pageTool, cancelPageTools, secretHeader, changeSites, grantsFor, underPrefix, withSecrets, beforeActing, actOnPage, ownedByTask, hostedFrame, answerHosted, endHosted, startHosted, admitHosted, sendHostedStop, hostedTurns, followed, pollHosted, setHost: (value) => { hostState = { connected: true, kind: 'browser', url: 'http://host' }; hostRemote = value; }, setClient: (value) => { client = value; poolOpening = Promise.resolve({ free: 100, rmSync() {} }); } };`, context);
+vm.runInContext(`${engineSource}\nglobalThis.test = { pointBefore, turnTabsDone, tasksOpening, afterTurn, prepared, guided, setupOf, operate, ops, running, snapshot, restoreQueued, queued, renew, replaceFirst, creationSettings, pageTool, cancelPageTools, secretHeader, changeSites, grantsFor, underPrefix, withSecrets, beforeActing, actOnPage, ownedByTask, hostedFrame, answerHosted, endHosted, startHosted, admitHosted, sendHostedStop, hostedTurns, followed, pollHosted, setHost: (value) => { hostState = { connected: true, kind: 'browser', url: 'http://host' }; hostRemote = value; }, setClient: (value) => { client = value; poolOpening = Promise.resolve({ free: 100, rmSync() {} }); } };`, context);
 const engine = context.test;
 const id = '0123456789abcdef';
 let entered = 0;
@@ -178,6 +178,82 @@ assert.equal(warnings.length, 1, 'missing history is reported, not silently lost
   targetsNow = () => { throw busy; };
   await assert.rejects(engine.operate('earlier', { id }), /^Error: The messages before the summary can be shown once this thread stops working$/);
   assert.equal(warnings.length, 1);
+}
+
+// The point before the last message, in a thread of thousands of steps, is found in a
+// few reads (it took a read at every rewind target, over a minute in a real one, and
+// the engine answered nothing meanwhile: "Spindle's engine is not answering"), also
+// when the same words were sent before. A turn that compacted after its message has no
+// such point, and says so as quickly; the engine answers between the reads. Rewind
+// still reads every target when halving misses.
+{
+  const say = (text) => ({ role: 'user', content: [{ type: 'text', text }] });
+  const step = (n) => ({ role: 'assistant', content: [{ type: 'text', text: `step ${n}` }] });
+  const earlier = Array.from({ length: 400 }, (_, n) => (n % 2 ? step(n) : say(`earlier ${n}`)));
+  const STEPS = 3000;
+  const SENT = 1000;
+  // The history at each revision: the earlier messages, the prompt sent at SENT, a step
+  // a revision since; compacted at `compacted` (the prompt kept after the summary).
+  const thread = ({ compacted = null, prompt = say('next') } = {}) => (revision) => {
+    if (revision < SENT) return earlier.slice(0, Math.min(earlier.length, revision));
+    if (compacted != null && revision >= compacted) return [say('[Earlier conversation compacted by spindle]'), prompt, ...Array.from({ length: revision - compacted }, (_, n) => step(n))];
+    return [...earlier, prompt, ...Array.from({ length: revision - SENT }, (_, n) => step(n))];
+  };
+  const targets = Array.from({ length: STEPS }, (_, n) => ({ revision: STEPS - n, kind: STEPS - n === SENT - 1 ? 'settled' : 'before_model' }));
+  let reads = 0;
+  let slow = 0;
+  let onRead = () => {};
+  const use = (historyAt) => engine.setClient({
+    async files(dir, revision) { return { revision: revision ?? STEPS, files: [{ path: 'kept.txt', digest: revision == null ? 'b' : 'a' }] }; },
+    async history(dir, revision, options) {
+      reads += 1;
+      onRead(reads);
+      // A long thread's read holds the engine's thread meanwhile.
+      for (const until = Date.now() + slow; Date.now() < until;);
+      const all = historyAt(revision ?? STEPS);
+      return { total: all.length, messages: options?.from != null ? all.slice(options.from) : all };
+    },
+    async targets() { return targets; },
+    async closeSession() {},
+  });
+
+  use(thread());
+  reads = 0;
+  const found = await engine.operate('turnFiles', { id: 'a1a1a1a1a1a1a1a1' });
+  assert.equal(JSON.stringify(found.before), JSON.stringify([['kept.txt', 'a']]), 'the point before the last message is found');
+  assert.ok(reads < 20, `found in a few reads, not one a target: ${reads}`);
+
+  use(thread({ compacted: 2000 }));
+  reads = 0;
+  slow = 25;
+  let pinged = null;
+  onRead = (n) => {
+    if (n === 4) setTimeout(() => engine.operate('ping', {}).then(() => { pinged = reads; }), 0);
+  };
+  const compacted = await engine.operate('turnFiles', { id: 'b2b2b2b2b2b2b2b2' });
+  const searched = reads;
+  slow = 0;
+  onRead = () => {};
+  assert.equal(compacted.before, null, 'a turn compacted after its message has no point before it');
+  assert.ok(searched < 20, `no point is said in a few reads too: ${searched}`);
+  assert.ok(pinged != null && pinged < searched, `the engine answers while it searches (ping answered after read ${pinged} of ${searched})`);
+
+  // The same words sent before ("continue", say): the point is found as quickly.
+  const twice = thread({ prompt: say('earlier 0') });
+  use(twice);
+  reads = 0;
+  assert.equal(await engine.pointBefore('/threads/c3c3c3c3c3c3c3c3', twice(STEPS), earlier.length), SENT - 1);
+  assert.ok(reads < 20, `the same words sent before are no harder to find: ${reads}`);
+
+  // Rewound past the message to send another, then forward again to after it: halving
+  // can land in the other message's steps; Rewind reads on and finds the point.
+  const once = thread();
+  const rewound = (revision) => (revision >= 1300 && revision < 1700
+    ? [...earlier, say('another'), ...Array.from({ length: revision - 1300 }, (_, n) => step(n))]
+    : once(revision));
+  use(rewound);
+  assert.equal(await engine.pointBefore('/threads/c3c3c3c3c3c3c3c3', rewound(STEPS), earlier.length), null);
+  assert.equal(await engine.pointBefore('/threads/c3c3c3c3c3c3c3c3', rewound(STEPS), earlier.length, { thorough: true }), SENT - 1);
 }
 
 // A page tool call goes to Chrome and comes back with Chrome's answer; cut off by the
@@ -3159,4 +3235,4 @@ assert.equal(sentence(Object.assign(new Error('busy: a command is running'), { k
   records.delete('kv:sites');
 }
 
-console.log('review-regressions passed: waiting messages kept on disk (until their turn has taken them; restored at start, held, unless taken), a message stopped before its turn began coming back held, a message to a thread that takes none refused at once, the tab a question is about named and pinned, an allowed action held to the page, part or dialog the question showed (refused before acting once the tab reloaded, moved on or shows another dialog; Auto looks nothing up for one that sends nothing), a message coming back (Take back, rewind, a failed send) only into its own thread\'s box, an unreadable Before acting asking, a script\'s question withdrawn when its command ends, icon buttons named Send asked about, moves rolled back after a lost first request and a refusal only a new key gets (never after a lost answer), a move back waiting on its own export, a snapshot holding threads as they are when it answers, the host /v1 client (event stream parsing and resuming, commands sent again with their request ID, bundles in and out), connect PKCE and its state, moves to the host and back cut at every step (one live copy each time), operation races, Before acting (Full, Auto, Ask; allowed, refused, ended), the Dim theme (the old Dark shows Dim), site secret headers checked (names, values, HTTPS only) and named to the package without their values, reset safety, early Stop, a message with files waiting for the turn to end, a turn stopped part way taking a reply (text alone) and Retry after a stopped step, gateway bounds/redirects (the extension store told as closed), IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too, and for actions without the debugger), Before acting kept when site access is taken back, Return asked about as Enter, one action per tab, uncertain actions unknown (engine, its document and the background)');
+console.log('review-regressions passed: waiting messages kept on disk (until their turn has taken them; restored at start, held, unless taken), a message stopped before its turn began coming back held, a message to a thread that takes none refused at once, the tab a question is about named and pinned, an allowed action held to the page, part or dialog the question showed (refused before acting once the tab reloaded, moved on or shows another dialog; Auto looks nothing up for one that sends nothing), a message coming back (Take back, rewind, a failed send) only into its own thread\'s box, an unreadable Before acting asking, a script\'s question withdrawn when its command ends, icon buttons named Send asked about, moves rolled back after a lost first request and a refusal only a new key gets (never after a lost answer), a move back waiting on its own export, a snapshot holding threads as they are when it answers, the host /v1 client (event stream parsing and resuming, commands sent again with their request ID, bundles in and out), connect PKCE and its state, moves to the host and back cut at every step (one live copy each time), operation races, Before acting (Full, Auto, Ask; allowed, refused, ended), the Dim theme (the old Dark shows Dim), site secret headers checked (names, values, HTTPS only) and named to the package without their values, reset safety, early Stop, a message with files waiting for the turn to end, a turn stopped part way taking a reply (text alone) and Retry after a stopped step, gateway bounds/redirects (the extension store told as closed), IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too, and for actions without the debugger), Before acting kept when site access is taken back, Return asked about as Enter, one action per tab, uncertain actions unknown (engine, its document and the background), the point before a message found by halving in a long thread (the same words sent before, a compaction after it; Rewind reading on past a rewind) with the engine answering meanwhile');

@@ -60,6 +60,7 @@ use `--workspace --all-features` to include `spindle-store` and `spindle-embed`.
 | `embedded.rs` | Native/embedded parity, shared usage and budgets (nested calls, summaries and task trees), queued tasks, stopped reports, resume and settings fit |
 | `bench.rs` | Ignored local benchmark of the embedded host built natively: small sessions, long history reads/reopens/exports, compaction, timings and peak resident memory |
 | `host_tools.rs`, `self_edit.rs` | Host tools and self-edit threads end to end through `spindle serve` |
+| `cli.rs` | The `spindle` command line end to end (Linux): a turn driven and read back from a second process (`status`, `log`, `files`, `diff`, `--json`), an unreachable provider counted refused and never uncertain, refused command lines that change nothing, and a prompt from standard input |
 
 `power_loss.rs` runs a sample of crash points by default; `SPINDLE_POWER_LOSS=all` sweeps
 every point and takes much longer.

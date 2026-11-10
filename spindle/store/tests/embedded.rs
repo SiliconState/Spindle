@@ -2099,6 +2099,171 @@ fn stopping_the_task_a_turn_waits_for_tells_the_turn_so_and_it_goes_on() {
     );
 }
 
+/// The fake's catalog with `remote`, a chat route at `base`: off loopback (not a local
+/// server) its model has no reasoning off switch, so an effort `off` cannot be asked of
+/// it; on loopback, `off` turns thinking off.
+fn remote_catalog(base: &str) -> Catalog {
+    let mut catalog = catalog_json(&fake().base);
+    catalog["providers"].as_array_mut().unwrap().push(json!({
+        "id": "remote", "display_name": "Remote", "api_provider": "openai",
+        "request_contract": "openai-chat-completions", "base_url": base,
+        "default_model": "remote-model", "models": ["remote-model"], "requires_api_key": false,
+        "model_specs": {"remote-model": {"context_window": 200000, "max_output_tokens": 4096}}}));
+    Catalog::from_json(&catalog).unwrap()
+}
+
+/// Memory sessions on `remote_catalog`, `remote` off loopback.
+fn with_remote() -> Embedded {
+    Embedded::new(
+        Box::new(MemoryPlaces),
+        remote_catalog("https://remote.invalid/v1"),
+    )
+}
+
+#[test]
+fn a_task_call_its_model_cannot_run_is_answered_so_and_the_turn_goes_on() {
+    // The model asks for tasks with an effort the task's model does not take, in the
+    // foreground and in the background: each is refused as a failed result before any
+    // of it starts (once, each start failed its first request and the turn stopped for
+    // good: "the task cannot go on by itself").
+    let host = with_remote();
+    let mut app = App::new(&host).script(
+        "t",
+        vec![
+            Reply::Call("task", json!({"prompt": "say hi", "effort": "off"})),
+            Reply::Call(
+                "task",
+                json!({"prompt": "say hi later", "effort": "off", "background": true}),
+            ),
+            Reply::Text("went on without them"),
+        ],
+    );
+    app.call(
+        "create",
+        json!({"dir": "t", "provider": "remote", "tasks": true}),
+    );
+    let reply = app.call("prompt", json!({"dir": "t", "text": "[t:refusedtask] go"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    assert_eq!(
+        app.run.requests.len(),
+        3,
+        "the parent's three requests, none of a task's"
+    );
+    for (index, request) in app.run.requests[1..].iter().enumerate() {
+        assert!(
+            request.contains("the task's effort cannot be asked of its model")
+                && request.contains("has no reasoning off switch"),
+            "request {}: {request}",
+            index + 2
+        );
+    }
+    let status = app.call("status", json!({"dir": "t"}));
+    assert_eq!(status["result"]["complete"], true, "{status}");
+    let tasks = app.call("tasks", json!({"dir": "t"}));
+    assert_eq!(
+        tasks["result"]["tasks"],
+        json!([]),
+        "nothing of them kept: {tasks}"
+    );
+}
+
+#[test]
+fn a_task_call_the_policy_refuses_is_answered_so_on_both_hosts() {
+    // Tasks may use one model only, one the session's own is not: the model's call is
+    // refused as a failed result before it is dispatched, and the turn goes on, on
+    // both hosts alike.
+    let (requests, _, outcome) = native(
+        "policytask",
+        vec![
+            Reply::Call("task", json!({"prompt": "x"})),
+            Reply::Text("went on"),
+        ],
+        |settings| {
+            settings.tasks = true;
+            settings.task_policy.models = vec!["only-this".into()];
+        },
+        None,
+        None,
+        "go",
+    );
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        requests[1].contains("not permitted by tasks.models"),
+        "{}",
+        requests[1]
+    );
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host).script(
+        "p",
+        vec![
+            Reply::Call("task", json!({"prompt": "x"})),
+            Reply::Text("went on"),
+        ],
+    );
+    app.call(
+        "create",
+        json!({"dir": "p", "provider": "fake", "tasks": {"models": ["only-this"]}}),
+    );
+    let reply = app.call("prompt", json!({"dir": "p", "text": "[t:policytask2] go"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    assert_eq!(app.run.requests.len(), 2);
+    assert!(app.run.requests[1].contains("not permitted by tasks.models"));
+}
+
+/// Sessions in `root` on `remote_catalog(base)`.
+fn remote_at(root: &Path, base: &str) -> Embedded {
+    Embedded::new(
+        Box::new(DirPlaces(root.to_path_buf())),
+        remote_catalog(base),
+    )
+}
+
+#[test]
+fn a_task_call_left_waiting_on_a_task_that_cannot_start_is_answered_so() {
+    // A turn's task call was dispatched (its provider then a local server, where `off`
+    // turns thinking off), and the app stopped with the task's first request out.
+    // Opened again where that effort cannot be asked of its model (the same provider, now
+    // remote), the task can never make a request again: every continue once failed on it
+    // ("the task cannot go on by itself") and the turn went no further. The call is
+    // answered so, a failed result, and the turn goes on.
+    let root = temp_root("waitingtask");
+    {
+        let host = remote_at(&root, "http://127.0.0.1:9/v1");
+        let mut app = App::new(&host).script(
+            "w",
+            vec![Reply::Call(
+                "task",
+                json!({"prompt": "say hi", "effort": "off"}),
+            )],
+        );
+        app.call(
+            "create",
+            json!({"dir": "w", "provider": "remote", "tasks": true}),
+        );
+        // The task's first request is left unanswered: the app stopped.
+        app.hold = 2;
+        let line = json!({"jsonrpc": "2.0", "id": 9, "method": "prompt",
+            "params": {"dir": "w", "text": "[t:waitingtask] go"}});
+        let frames = host.handle(line.to_string().as_bytes());
+        app.drive(frames);
+        assert_eq!(app.run.requests.len(), 2, "the parent's, then the task's");
+    }
+    let host = remote_at(&root, "https://remote.invalid/v1");
+    let mut app = App::new(&host).script("w", vec![Reply::Text("went on without it")]);
+    let continued = app.call("continue", json!({"dir": "w"}));
+    assert!(continued.get("result").is_some(), "{continued}");
+    assert_eq!(app.run.requests.len(), 1, "{:?}", app.run.requests);
+    assert!(
+        app.run.requests[0].contains("The task could not run")
+            && app.run.requests[0].contains("has no reasoning off switch"),
+        "{}",
+        app.run.requests[0]
+    );
+    let status = app.call("status", json!({"dir": "w"}));
+    assert_eq!(status["result"]["complete"], true, "{status}");
+}
+
 #[test]
 fn a_task_that_cannot_run_here_is_refused_before_anything_is_kept() {
     let host = embedded(Box::new(MemoryPlaces));
@@ -4383,6 +4548,206 @@ fn a_stopped_turn_goes_on_with_another_model_from_its_last_request() {
     assert_eq!(status["result"]["complete"], true, "{status}");
     let first = app.call("targets", json!({"dir": "m", "until": "settled"}));
     assert_eq!(first["result"]["prompt"], "[t:switch2] write it", "{first}");
+}
+
+/// A catalog with a second provider whose requests are of another contract (OpenAI
+/// Responses, beside the fake's chat completions), and a session host over `root` on it.
+fn two_contracts(root: &Path) -> Embedded {
+    let mut catalog = catalog_json(&fake().base);
+    catalog["providers"].as_array_mut().unwrap().push(json!({
+        "id": "other", "display_name": "Other", "api_provider": "openai",
+        "request_contract": "openai-responses", "base_url": fake().base,
+        "default_model": "other-model", "models": ["other-model"], "requires_api_key": false,
+        "model_specs": {"other-model": {"context_window": 200000, "max_output_tokens": 4096}}}));
+    Embedded::new(
+        Box::new(DirPlaces(root.to_path_buf())),
+        Catalog::from_json(&catalog).unwrap(),
+    )
+}
+
+/// A reply of the second provider (`two_contracts`) to request `id` of `session`: `text`,
+/// as OpenAI Responses events.
+fn responses_reply(host: &Embedded, session: &str, id: u64, text: &str) -> Vec<Value> {
+    let events = [
+        json!({"type": "response.output_text.delta", "delta": text}),
+        json!({"type": "response.completed", "response": {"status": "completed", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 2}}}),
+    ];
+    let stream: String = events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect();
+    let (mut frames, streaming) = host.chunk(session, id, stream.as_bytes());
+    if streaming {
+        let done = json!({"kind": "response", "status": 200, "content_type": "text/event-stream"});
+        frames.extend(
+            host.deliver(session, id, answer_of(&done).unwrap())
+                .unwrap(),
+        );
+    }
+    frames
+}
+
+/// A turn of session `dir` on the fake provider that wrote a file, then lost its next
+/// response (the outcome unknown: the provider ran out, the connection broke).
+fn stopped_after_a_file(root: &Path, dir: &str, tag: &str) {
+    let host = two_contracts(root);
+    let mut app = App::new(&host).script(
+        dir,
+        vec![
+            Reply::Text("first done"),
+            Reply::Call("write_file", json!({"path": "a.txt", "content": "kept"})),
+        ],
+    );
+    app.call("create", json!({"dir": dir, "provider": "fake"}));
+    app.call(
+        "prompt",
+        json!({"dir": dir, "text": format!("[t:{tag}1] first")}),
+    );
+    app.hold = 3;
+    let line = json!({"jsonrpc": "2.0", "id": 9, "method": "prompt",
+        "params": {"dir": dir, "text": format!("[t:{tag}2] write it")}});
+    let frames = host.handle(line.to_string().as_bytes());
+    app.drive(frames);
+    assert_eq!(app.run.requests.len(), 3);
+}
+
+/// Back to the point just before the turn's lost request, as the app does to go on with
+/// another model (the turn's work stays).
+fn back_before_its_request(app: &mut App<'_>, dir: &str) {
+    let turn = app.call("targets", json!({"dir": dir, "until": "settled"}));
+    assert_eq!(
+        turn["result"]["targets"][0]["kind"], "before_model",
+        "{turn}"
+    );
+    let before = turn["result"]["targets"][0]["revision"].as_u64().unwrap();
+    let rewound = app.call("rewind", json!({"dir": dir, "revision": before}));
+    assert!(rewound.get("result").is_some(), "{rewound}");
+}
+
+#[test]
+fn a_stopped_turn_goes_on_with_a_provider_of_another_contract() {
+    let root = temp_root("contract");
+    stopped_after_a_file(&root, "c", "contract");
+    let host = two_contracts(&root);
+    let mut app = App::new(&host);
+    // The other provider answers in its own wire format (OpenAI Responses events).
+    app.hook = Some(Box::new(|host, session, id, _| {
+        Some(responses_reply(host, session, id, "finished on the other"))
+    }));
+    back_before_its_request(&mut app, "c");
+    let changed = app.call(
+        "settings",
+        json!({"dir": "c", "provider": "other", "model": "other-model"}),
+    );
+    assert_eq!(changed["result"]["provider"], "other", "{changed}");
+    // It goes on with the turn (once refused: "turn state rejected the step (Binding)").
+    let continued = app.call("continue", json!({"dir": "c"}));
+    assert!(continued.get("result").is_some(), "{continued}");
+    assert_eq!(app.run.requests.len(), 1, "one fresh request");
+    let sent: Value = serde_json::from_str(&app.run.requests[0]).unwrap();
+    assert_eq!(sent["model"], "other-model", "{sent}");
+    assert!(
+        sent.get("input").is_some(),
+        "an OpenAI Responses request: {sent}"
+    );
+    assert!(
+        app.run.requests[0].contains("write it"),
+        "the turn's history goes with it"
+    );
+    // Its work so far stays, and the turn ends on the other provider.
+    let read = app.call("read", json!({"dir": "c", "path": "a.txt"}));
+    assert_eq!(read["result"]["content"], "kept", "{read}");
+    let status = app.call("status", json!({"dir": "c"}));
+    assert_eq!(status["result"]["complete"], true, "{status}");
+    let history = app.call("history", json!({"dir": "c"}));
+    assert!(
+        history.to_string().contains("finished on the other"),
+        "{history}"
+    );
+    // The session opens again as it was left.
+    drop(app);
+    drop(host);
+    let host = two_contracts(&root);
+    let mut app = App::new(&host);
+    let status = app.call("status", json!({"dir": "c"}));
+    assert_eq!(status["result"]["complete"], true, "{status}");
+}
+
+#[test]
+fn a_turn_refused_for_good_goes_on_with_another_provider() {
+    // Its provider refuses every request part way through a turn (out of credits, say),
+    // through all its automatic retries: the turn stops there.
+    let root = temp_root("outofcredit");
+    let host = two_contracts(&root);
+    let mut replies = vec![
+        Reply::Text("first done"),
+        Reply::Call("write_file", json!({"path": "a.txt", "content": "kept"})),
+    ];
+    replies.extend(std::iter::repeat_n(Reply::Refused, 7));
+    let mut app = App::new(&host).script("o", replies);
+    app.call("create", json!({"dir": "o", "provider": "fake"}));
+    app.call(
+        "prompt",
+        json!({"dir": "o", "text": "[t:outofcredit1] first"}),
+    );
+    let refused = app.call(
+        "prompt",
+        json!({"dir": "o", "text": "[t:outofcredit2] write it"}),
+    );
+    assert!(
+        refused.to_string().contains("refused before any reply"),
+        "{refused}"
+    );
+    assert_eq!(
+        app.run.requests.len(),
+        9,
+        "two answered, then the refused request and its 6 automatic retries"
+    );
+    // The user picks another provider: back to before the refused request, then on.
+    app.hook = Some(Box::new(|host, session, id, index| {
+        (index >= 10).then(|| responses_reply(host, session, id, "done elsewhere"))
+    }));
+    back_before_its_request(&mut app, "o");
+    let changed = app.call(
+        "settings",
+        json!({"dir": "o", "provider": "other", "model": "other-model"}),
+    );
+    assert_eq!(changed["result"]["provider"], "other", "{changed}");
+    let continued = app.call("continue", json!({"dir": "o"}));
+    assert!(continued.get("result").is_some(), "{continued}");
+    assert_eq!(
+        app.run.requests.len(),
+        10,
+        "one request to the other provider"
+    );
+    let sent: Value = serde_json::from_str(&app.run.requests[9]).unwrap();
+    assert_eq!(sent["model"], "other-model", "{sent}");
+    assert!(
+        sent.get("input").is_some(),
+        "an OpenAI Responses request: {sent}"
+    );
+    let read = app.call("read", json!({"dir": "o", "path": "a.txt"}));
+    assert_eq!(read["result"]["content"], "kept", "{read}");
+    let status = app.call("status", json!({"dir": "o"}));
+    assert_eq!(status["result"]["complete"], true, "{status}");
+}
+
+#[test]
+fn retry_at_a_point_a_rewind_made_asks_for_the_turns_last_request_again() {
+    let root = temp_root("forkretry");
+    stopped_after_a_file(&root, "r", "forkretry");
+    let host = two_contracts(&root);
+    let mut app = App::new(&host).script("r", vec![Reply::Text("done again")]);
+    back_before_its_request(&mut app, "r");
+    // Its last request (the turn's first, made before the rewind) is asked again: the
+    // turn starts over with its message (once: "the turn's last request was not found").
+    let retried = app.call("retry", json!({"dir": "r"}));
+    assert!(retried.get("result").is_some(), "{retried}");
+    assert_eq!(app.run.requests.len(), 1, "{:?}", app.run.requests);
+    assert!(app.run.requests[0].contains("[t:forkretry2] write it"));
+    let status = app.call("status", json!({"dir": "r"}));
+    assert_eq!(status["result"]["complete"], true, "{status}");
 }
 
 #[test]

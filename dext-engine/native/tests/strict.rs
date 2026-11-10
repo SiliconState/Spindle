@@ -47,12 +47,15 @@ fn namespace_candidate_is_private_and_output_is_sealed_after_exit() {
     assert!(!format!("{output:?}").contains("diagnostic"));
 }
 
+/// The host's files (its own users among them: the run's /etc/passwd names only itself)
+/// and variables stay out, nothing outside the run's loopback is reachable, and the
+/// runtime is read-only.
 #[test]
 fn strict_child_cannot_read_host_files_write_runtime_or_reach_outside_its_loopback() {
     let host = std::env::temp_dir().join(format!("spindle-host-secret-{}", std::process::id()));
     std::fs::write(&host, b"fixture not a real secret").unwrap();
     let script = format!(
-        "import os,socket,threading\nassert not os.path.exists({host:?})\nassert not os.path.exists('/home')\nassert not os.path.exists('/etc/passwd')\nassert not os.path.exists('/proc/1/root/home')\nassert set(os.environ)=={{'HOME','PATH','TMPDIR','PWD','LC_CTYPE'}}\nassert os.environ['PWD']=='/workspace' and os.environ['LC_CTYPE']=='C.UTF-8'\nfor domain in [socket.AF_INET,socket.AF_INET6,socket.AF_UNIX]:\n socket.socket(domain).close()\nsocket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0).close()\ntry: socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 15); raise AssertionError('uevent netlink allowed')\nexcept PermissionError: pass\nserver=socket.socket(); server.bind(('127.0.0.1',0)); server.listen()\nthreading.Thread(target=lambda: server.accept()[0].sendall(b'loopback'),daemon=True).start()\nclient=socket.create_connection(server.getsockname()); assert client.recv(8)==b'loopback'\nunix=socket.socket(socket.AF_UNIX); unix.bind('/tmp/s'); unix.listen()\ntry: socket.create_connection(('1.1.1.1',53),timeout=2); raise AssertionError('outside reachable')\nexcept OSError: pass\ntry: open('/usr/spindle-escape','w'); raise AssertionError('runtime write allowed')\nexcept OSError: pass\nprint('isolated')"
+        "import os,socket,threading\nassert not os.path.exists({host:?})\nassert not os.path.exists('/home')\nassert [line.split(':')[0] for line in open('/etc/passwd')]==['spindle','nobody']\nassert [line.split(':')[0] for line in open('/etc/group')]==['spindle','nogroup']\nassert not os.path.exists('/proc/1/root/home')\nassert set(os.environ)=={{'HOME','PATH','TMPDIR','PWD','LC_CTYPE','USER','EMAIL','PYTHONDONTWRITEBYTECODE'}}\nassert os.environ['PWD']=='/workspace' and os.environ['LC_CTYPE']=='C.UTF-8'\nfor domain in [socket.AF_INET,socket.AF_INET6,socket.AF_UNIX]:\n socket.socket(domain).close()\nsocket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0).close()\ntry: socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 15); raise AssertionError('uevent netlink allowed')\nexcept PermissionError: pass\nserver=socket.socket(); server.bind(('127.0.0.1',0)); server.listen()\nthreading.Thread(target=lambda: server.accept()[0].sendall(b'loopback'),daemon=True).start()\nclient=socket.create_connection(server.getsockname()); assert client.recv(8)==b'loopback'\nunix=socket.socket(socket.AF_UNIX); unix.bind('/tmp/s'); unix.listen()\ntry: socket.create_connection(('1.1.1.1',53),timeout=2); raise AssertionError('outside reachable')\nexcept OSError: pass\ntry: open('/usr/spindle-escape','w'); raise AssertionError('runtime write allowed')\nexcept OSError: pass\nprint('isolated')"
     );
     let output = executor()
         .execute(
@@ -778,6 +781,7 @@ fn strict_run_resolves_alternatives_and_streams_output_to_the_observer() {
                 observe: Some(&observe),
                 toolchain: None,
                 local_ipc: false,
+                loopback: None,
             },
         )
         .unwrap();
@@ -813,6 +817,7 @@ fn networked_run_allows_only_internet_sockets_and_socketpairs() {
                 observe: None,
                 toolchain: None,
                 local_ipc: false,
+                loopback: None,
             },
         )
         .unwrap();
@@ -1165,4 +1170,93 @@ fd=os.open(\"a.txt\",os.O_RDWR)\nm=mmap.mmap(fd,0)\nm[0]\nm[0:5]=b\"ALPHA\"\nm.c
         SealedEntry::Unchanged { .. }
     ));
     assert_eq!(output.files().len(), 20_002);
+}
+
+/// Runs without the network that share a `Loopback` reach a server a job of theirs
+/// started; a run with a loopback of its own, or none, does not, and neither does the
+/// host's own loopback.
+#[test]
+fn runs_sharing_a_loopback_reach_a_job_server_and_nothing_else_does() {
+    use dext_native::strict::{JobState, Loopback};
+    let executor = executor();
+    let shared = Loopback::new().expect("this host makes user and network namespaces");
+    let other = Loopback::new().unwrap();
+    let empty = BTreeMap::new();
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let server = format!(
+        "import socket\ns=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1',{port})); s.listen()\nprint('listening', flush=True)\nwhile True:\n c,_=s.accept(); c.sendall(b'from the job'); c.close()"
+    );
+    let job = executor
+        .start_job(
+            &BTreeMap::new(),
+            &["/usr/bin/python3".into(), "-c".into(), server],
+            Duration::from_secs(60),
+            RunOptions {
+                loopback: Some(&shared),
+                ..RunOptions::default()
+            },
+            &[],
+            &mut Tree(&empty),
+        )
+        .unwrap();
+    let never = AtomicBool::new(false);
+    let mut page = job.read(0, 4096, Duration::from_secs(10), &never);
+    while !String::from_utf8_lossy(&page.bytes).contains("listening") {
+        assert_eq!(page.state, JobState::Running);
+        page = job.read(0, 4096, Duration::from_secs(10), &never);
+    }
+    let client = format!(
+        "import socket,sys\ntry:\n print(socket.create_connection(('127.0.0.1',{port}),timeout=3).recv(64).decode())\nexcept OSError as e:\n print('unreachable', type(e).__name__)"
+    );
+    let reach = |loopback: Option<&Loopback>| {
+        let output = executor
+            .execute_with(
+                &BTreeMap::new(),
+                &["/usr/bin/python3".into(), "-c".into(), client.clone()],
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+                RunOptions {
+                    loopback,
+                    ..RunOptions::default()
+                },
+            )
+            .unwrap();
+        String::from_utf8_lossy(output.stdout()).trim().to_string()
+    };
+    assert_eq!(reach(Some(&shared)), "from the job");
+    assert!(reach(Some(&other)).starts_with("unreachable"));
+    assert!(reach(None).starts_with("unreachable"));
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    job.stop();
+}
+
+/// An isolated run has a user name, git finds an identity, Python writes no bytecode
+/// into the workspace, and a failing command's exit code is told.
+#[test]
+fn isolated_runs_name_their_user_and_report_exit_codes() {
+    let output = executor()
+        .execute(
+            &BTreeMap::new(),
+            &[
+                "/bin/bash".into(),
+                "-c".into(),
+                "whoami; echo \"$EMAIL $PYTHONDONTWRITEBYTECODE\"; grep -c . /etc/passwd /etc/group; exit 7".into(),
+            ],
+            Duration::from_secs(10),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(!output.success());
+    assert_eq!(output.exit_code(), Some(7));
+    assert_eq!(output.signal(), None);
+    assert_eq!(
+        String::from_utf8_lossy(output.stdout()),
+        "spindle\nspindle@localhost 1\n/etc/passwd:2\n/etc/group:2\n"
+    );
+    let killed = run("kill -TERM $$").unwrap();
+    assert!(!killed.success());
+    assert!(killed.exit_code().is_some() || killed.signal().is_some());
 }

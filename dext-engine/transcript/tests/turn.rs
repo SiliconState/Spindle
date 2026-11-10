@@ -253,6 +253,74 @@ fn recovery_budget_limits_and_cancel_do_not_silently_restart_or_finish() {
     );
 }
 
+fn request_as(state: &TurnContinuation, contract: &str) -> PreparedRequest<Vec<u8>> {
+    PreparedRequest::new(
+        Identity {
+            effect: state.next_model_id().unwrap(),
+            provider: "other".into(),
+            contract: contract.into(),
+            endpoint: "https://other.invalid/responses".into(),
+            model: "other-model".into(),
+            credential_scope: "operator/credential-version".into(),
+            configuration: "policy-v1".into(),
+        },
+        Encoding::Json,
+        b"frozen native request".to_vec(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_turn_resting_between_requests_goes_on_with_another_contract() {
+    // Started on the OpenAI API; after its tools the session's model changed to one
+    // of another provider (ChatGPT): its next request is that provider's.
+    let waiting = prepare(&initial(Some(4)));
+    let tools = waiting
+        .apply_model(&response(&waiting, 1, "tool_use"), "route-v1")
+        .unwrap();
+    let Effect::Tool { id, call } = tools.pending_effects().unwrap().remove(0) else {
+        panic!("tool");
+    };
+    let after = restore(&tools.apply_tool(&id, result(&call.id)).unwrap());
+    assert_eq!(after.control().phase(), Phase::AfterTools);
+    // A contract no request is built for is refused, and the turn stays as it was.
+    let before = after.checkpoint().unwrap();
+    assert!(
+        after
+            .prepare(request_as(&after, "made-up"), "route-v1")
+            .is_err()
+    );
+    assert_eq!(after.checkpoint().unwrap(), before);
+    let switched = restore(
+        &after
+            .prepare(request_as(&after, "chatgpt-responses"), "route-v1")
+            .unwrap(),
+    );
+    let Effect::Model { id, waiting } = switched.pending_effects().unwrap().remove(0) else {
+        panic!("model");
+    };
+    assert_eq!(id, "lineage-1/turn-1/m/2");
+    assert_eq!(waiting.request().identity().contract, "chatgpt-responses");
+    // Its reply is taken under the contract it was asked with, and the turn goes on.
+    let review = restore(
+        &switched
+            .apply_model(&response(&switched, 0, "stop"), "route-v1")
+            .unwrap(),
+    );
+    assert_eq!(review.control().phase(), Phase::FinalReview);
+    // A forked rest (a rewind before the request, then a new model) switches the same way.
+    let forked = after.fork_before_model("rewound".into()).unwrap();
+    let rerun = restore(
+        &forked
+            .prepare(request_as(&forked, "anthropic-messages"), "route-v1")
+            .unwrap(),
+    );
+    let Effect::Model { id, .. } = rerun.pending_effects().unwrap().remove(0) else {
+        panic!("model");
+    };
+    assert_eq!(id, "rewound/m/2");
+}
+
 #[test]
 fn foreign_image_scope_and_wrong_request_identity_are_refused_without_changing_baseline() {
     let state = initial(None);

@@ -178,6 +178,8 @@ pub enum ModelError {
     Interrupted,
     Deadline,
     Transport,
+    /// No connection was made, so nothing was sent (a known outcome, never billed).
+    Unsent,
     Http(u16),
     Protocol,
     Exhausted,
@@ -193,6 +195,7 @@ impl From<dext_native::model_effect::AttemptError> for ModelError {
             Native::Interrupted => Self::Interrupted,
             Native::Deadline => Self::Deadline,
             Native::Transport => Self::Transport,
+            Native::Unsent => Self::Unsent,
             Native::Http(status) => Self::Http(status),
             Native::Protocol => Self::Protocol,
             Native::Exhausted => Self::Exhausted,

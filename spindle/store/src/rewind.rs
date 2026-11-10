@@ -431,6 +431,23 @@ fn status(db: &Connection, scope: &str, command: &str) -> Result<Option<RewindSt
         .transpose()
 }
 
+/// The execution a rewind `command` of `scope` forks the turn under: its next request
+/// is a new effect, so a result recorded for the one it replaces is never adopted.
+#[cfg(feature = "dext-turn")]
+pub(crate) fn fork_identity(scope: &str, command: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"spindle-rewind-execution-v1\0");
+    for field in [scope, command] {
+        hash.update((field.len() as u32).to_be_bytes());
+        hash.update(field.as_bytes());
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[cfg(feature = "dext-turn")]
 fn fork(
     db: &Connection,
@@ -439,7 +456,6 @@ fn fork(
     target: u64,
 ) -> Result<(Vec<u8>, String, RewindTargetKind)> {
     use dext_core::turn::{Phase, Stop};
-    use sha2::{Digest, Sha256};
     let (engine, bytes, root): (String, Vec<u8>, Option<String>) = db
         .query_row(
             "SELECT engine,continuation,workspace FROM revisions WHERE revision=?1 AND scope=?2",
@@ -473,17 +489,7 @@ fn fork(
     };
     let root = root.ok_or(Error::Unsupported)?;
     crate::workspace::validate_root(db, scope, &root)?;
-    let mut hash = Sha256::new();
-    hash.update(b"spindle-rewind-execution-v1\0");
-    for field in [scope, command] {
-        hash.update((field.len() as u32).to_be_bytes());
-        hash.update(field.as_bytes());
-    }
-    let identity = hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let identity = fork_identity(scope, command);
     let next = match kind {
         RewindTargetKind::Settled => state.fork_settled(identity),
         RewindTargetKind::BeforeModel => state.fork_before_model(identity),
@@ -1533,6 +1539,37 @@ impl Store {
                 .into_iter()
                 .map(|(revision, kind)| RewindTarget { revision, kind })
                 .collect())
+        })();
+        self.rewind_result(result)
+    }
+
+    #[cfg(feature = "dext-turn")]
+    /// Where the rewinds of `scope` forked its turn from, by the execution each forked
+    /// it under (`fork_identity`): the revision whose turn ran under the execution it
+    /// had then (a cancelled rewind forked nothing, and its execution is no turn's).
+    pub fn fork_sources(&mut self, scope: &str) -> Result<std::collections::HashMap<String, u64>> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        if !crate::valid_label(scope) {
+            return Err(Error::Invalid);
+        }
+        let result = (|| -> Result<_> {
+            let mut query = self
+                .db
+                .prepare_cached("SELECT command,target FROM rewinds WHERE scope=?1")?;
+            let rows = query.query_map([scope], |row| {
+                Ok((
+                    crate::bounded_label(row, 0)?,
+                    crate::nonnegative_id(row, 1)?,
+                ))
+            })?;
+            let mut sources = std::collections::HashMap::new();
+            for row in rows {
+                let (command, target) = row?;
+                sources.insert(fork_identity(scope, &command), target);
+            }
+            Ok(sources)
         })();
         self.rewind_result(result)
     }

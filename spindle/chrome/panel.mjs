@@ -201,9 +201,10 @@ let next = 0;
 /** The engine's last snapshot (catalog, threads, info), null until it answers. */
 let engine = null;
 
-/** How long an answer may take: moving whole sessions, and freeing space (a whole
- * store read, written and checked; a moved thread's file checked whole), longer. */
-const PATIENCE = { export: 300_000, import: 300_000, earlierOpen: 300_000, catalog: 120_000, compact: 600_000, freeSealed: 300_000, toHost: 300_000, hostConnect: 120_000 };
+/** How long an answer may take: moving whole sessions, freeing space (a whole store
+ * read, written and checked; a moved thread's file checked whole), and going back to
+ * before a message (which can read every point a long thread can go back to), longer. */
+const PATIENCE = { export: 300_000, import: 300_000, earlierOpen: 300_000, catalog: 120_000, compact: 600_000, freeSealed: 300_000, toHost: 300_000, hostConnect: 120_000, rewindTo: 600_000 };
 
 function ask(op, args = {}, timeout = PATIENCE[op] ?? 60_000) {
   const id = ++next;

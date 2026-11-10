@@ -110,7 +110,7 @@ before it runs anything ([`strict_tool`](../spindle/store/src/broker.rs)).
 |---|---|---|---|
 | `bash` | `command`, `timeout`, `max_output` | Command 1 byte to 16 KiB, no NUL. Timeout 1-1800 s, default 30. Result window 8 KiB, with `max_output` clamped to 4096-32768 bytes. | strict executor |
 | `run_code` | `language` (`python`, `javascript`, `typescript`), `code`, `timeout`, `max_output` | Script up to 64 KiB (16 KiB on Windows), not blank, no NUL. Timeout default 60 s, max 1800. Result window as for `bash`. | strict executor, brokered |
-| `read_output` | `artifact`, `offset`, `limit` | Byte offset (default 0), `limit` 1 byte to 256 KiB (default 8 KiB). Not charged to the turn budget. | store |
+| `read_output` | `artifact`, `offset`, `limit`, `tail`, `find` | Byte offset (default 0), `limit` 1 byte to 256 KiB (default 8 KiB). `tail` (1 byte to 256 KiB) reads the last bytes instead; `find` (1-200 bytes of text) lists the lines from `offset` on that hold it. Not charged to the turn budget. | store |
 | `read_file` | `path`, `offset`, `limit`, `max_output` | First line `offset` (1-based, default 1), `limit` lines (default 2000). Window default 8 KiB, max 256 KiB. UTF-8 text only. | store |
 | `write_file` | `path`, `content` | Content up to 1 MiB. Parent directories are implied. | store |
 | `edit_file` | `path`, `old_string`, `new_string`, `replace_all` | `old_string` must not be empty and must occur exactly once, unless `replace_all` is true. Each string is limited to 1 MiB. | store |
@@ -127,7 +127,21 @@ A tool input with a field the tool does not define is refused.
 
 ### Results, the turn's output budget and `read_output`
 
-A command produces stdout, then stderr. The model reads that output in a bounded window
+A command's result is its stdout, then its stderr under a `[stderr]` line
+([`run_output`](../spindle/store/src/broker.rs)); the two streams are read apart, so how
+they interleaved is not known. The result then says how the run ended
+([`run_ended`](../spindle/store/src/broker.rs)):
+
+- a failed run ends with `[exit status N]`, `[ended by signal N]`, or `[failed]` when
+  neither is known;
+- a run of 10 s or more also says how long it took in whole seconds, succeeded or not
+  (`[exit status 0 after 42 s]`, `[exit status 2 after 3 min 5 s]`). A shorter run's
+  time is left out, so identical runs record identical steps;
+- a run stopped by its own `timeout` says its limit, that `timeout` can be up to
+  1,800 s, and that servers and long builds belong in `start_job`.
+
+The exit code is also the stored result's `exit_code`, and a run of 10 s or more has its
+time as `duration_ms` ([API.md](API.md)). The model reads the output in a bounded window
 built by [`record_sealed`](../spindle/store/src/broker.rs) and
 [`fit_result`](../spindle/store/src/broker.rs):
 
@@ -144,8 +158,13 @@ built by [`record_sealed`](../spindle/store/src/broker.rs) and
   `[turn output budget used up; page the retained output with read_output]`.
 - `read_output` returns a byte window of retained output and does not run anything
   again. The store serves a digest only when a recorded tool result in the same scope
-  names it as its artifact ([`retained_output`](../spindle/store/src/broker.rs)). A
-  page ends with `[output bytes A..B/TOTAL; next offset=B]`.
+  names it as its artifact ([`retained_output`](../spindle/store/src/broker.rs)), and
+  only by its whole 64-hex digest (a shortened one is refused saying so). A page ends
+  with `[output bytes A..B/TOTAL; next offset=B]`. `tail` reads the last bytes
+  ([`retained_tail`](../spindle/store/src/broker.rs)). `find` lists each line from
+  `offset` on that holds the text as `@OFFSET: line`, at most 200 lines within `limit`,
+  so a failure in a long build log is found without paging through it
+  ([`retained_search`](../spindle/store/src/broker.rs)).
 - `read_file`, `read_output`, `read_job` and the host tools are not charged to the
   budget, because they page through data the store or the job already holds.
 
@@ -295,10 +314,11 @@ becomes the attempt label `dext-strict-bash-v1-<digest>`.
 |---|---|
 | Namespaces | New user, PID, IPC, UTS and cgroup namespaces, plus a network namespace unless the run has `network`. Also `--disable-userns`, `--die-with-parent`, `--new-session` and `--cap-drop ALL`. |
 | Filesystem | `/usr` read-only, with `/bin`, `/lib` and `/lib64` as links into it. `/etc/alternatives` read-only when present. Fresh `/proc` and `/dev`. A 1 GiB tmpfs at `/tmp`. The private copy bound at `/workspace`, which is the working directory. |
-| Environment | Cleared, then `PATH=/usr/bin:/bin`, `HOME=/tmp` and `TMPDIR=/tmp`. No provider credentials. |
+| Environment | Cleared, then `PATH=/usr/bin:/bin`, `HOME=/tmp`, `TMPDIR=/tmp`, `USER=spindle`, `EMAIL=spindle@localhost` (git's last resort for an author, below the repository's own `user.email`, so `git commit` works in a fresh repository) and `PYTHONDONTWRITEBYTECODE=1` (so Python writes no `__pycache__` into the workspace; host runs get it too). No provider credentials. |
+| Identity | The run is the user `spindle`: its own read-only `/etc/passwd` and `/etc/group` (sealed memory files), so `whoami`, `id`, `ls -l` and git find a name. |
 | Interpreters | `/bin/bash`, `/usr/bin/python3` and `/usr/bin/node`, from the host's `/usr`. |
 | seccomp | Wrong-architecture and x32 calls kill the process. `socket()` is limited by address family (see the network row). io_uring, ptrace, process_vm, pidfd_getfd, every mount API, unshare, setns, bpf, the kernel keyring calls, perf_event_open and userfaultfd fail with EPERM ([`network_filter`](../dext-engine/native/src/strict.rs)). |
-| Network off | A private network namespace with only its own loopback. AF_INET and AF_INET6 sockets work, and so do AF_UNIX and route-netlink sockets. Nothing outside the namespace is reachable. |
+| Network off | A private network namespace with only loopback, shared by the session's runs and jobs ([Background jobs](#background-jobs)). AF_INET and AF_INET6 sockets work, and so do AF_UNIX and route-netlink sockets. Nothing outside the namespace is reachable: no other interface, and neither the host's loopback nor another session's. |
 | Network on | The host's network namespace, AF_INET and AF_INET6 sockets only. Host AF_UNIX, abstract and netlink sockets stay unreachable. `/etc/resolv.conf`, `hosts`, `nsswitch.conf`, `gai.conf`, `/etc/ssl` and `/etc/ca-certificates` are mounted read-only. |
 | Process setup | Parent-death signal SIGKILL, a check that the parent is still the owner, `no_new_privs`, and every inherited descriptor closed except those the run needs ([`confine`](../dext-engine/native/src/strict.rs)). |
 | rlimits | No core files. File size 1 GiB (4 GiB with the toolchain). CPU time: the timeout times the number of cores, plus 10 s, per process. Address space 256 GiB. Data 4 GiB (16 GiB with the toolchain). Processes: the user's current count plus 1024 (4096 with the toolchain), unless a cgroup caps them. |
@@ -412,9 +432,18 @@ The newest 64 KiB of each job's output and its state are also saved in `store/jo
 at the end, up to 64 jobs per store. After a restart, `read_job` returns this tail clearly
 labelled as saved output, not a live job; it is never exported in a session bundle.
 Receipts record only what the model saw. Recovery still reports the job as lost and
-never restarts it. Without `network`, each sandboxed job
-has its own private network, so a later `bash` call cannot reach a server the job
-started.
+never restarts it.
+
+Without `network`, a session's sandboxed runs and jobs share one private loopback
+network, where the host lets an unprivileged process make a user and network namespace
+([`jobs::loopback`](../spindle/store/src/jobs.rs), engine
+[`Loopback`](../dext-engine/native/src/strict.rs)). It is held by its namespace
+descriptors in the Spindle process for that process's lifetime, one per session, and
+dropped when the session is deleted. A later `bash` or `run_code` call reaches a server
+a job started on localhost, and nothing else does. Where the host cannot make one, each
+run has a network of its own, and `start_job`'s result says later commands cannot reach
+it. With `network` (or on the host runner) the server is reachable on the host's
+localhost.
 
 ## Host tools
 
@@ -444,10 +473,11 @@ whose owner died is sealed as interrupted and is never run again.
   checked again at that point. `name` renames the thread and needs a host that keeps
   thread names.
 - **`spindle_source`** and **`spindle_install`** are offered with `builtin_tools: all`,
-  but they work only when the serving host offers Spindle's own source
-  (`spindle serve --dev-source`). They check out or update the source under `spindle/`
-  in the workspace, and record an install request that a person confirms. Without such
-  a host, they reply that they are unavailable. See [host.md](host.md).
+  and only where the host serving the session has Spindle's own source
+  (`spindle serve --dev-source`, or a self-edit thread); command-line sessions and hosts
+  without it never list them. They check out or update the source under `spindle/` in
+  the workspace, and record an install request that a person confirms. See
+  [host.md](host.md).
 
 ## App tools
 
@@ -558,6 +588,11 @@ answered through the app-tool path, and a child session gives the answer.
   and it is not offered `task`.
 - **Model policy.** `tasks.models`, when not empty, lists the only models a task may
   use. Other models are refused before anything starts.
+- **Effort.** A call whose model does not take its effort (such as `off` where the
+  model has no off switch) is refused the same way, on both hosts
+  ([`task_effort_refusal`](../spindle/store/src/shape.rs)): answered as failed with
+  the reason, and the turn goes on. Starting an existing task again with an effort its
+  model does not take is refused too.
 
 ### Running, merging and conflicts
 
@@ -614,7 +649,10 @@ parent's next `continue` finds the same task and resumes it. A task stopped on i
 by marking it stopped, stays stopped until it is explicitly restarted. Sometimes a task
 cannot go on by itself, for example because a request in it has an unknown outcome. Its
 call is then left unanswered, with a message to settle the task in its own session
-before continuing the parent. This unanswered-call rule applies to foreground
+before continuing the parent. A call whose task could never make a request (its input,
+the task policy or its model's efforts refuse it) is not left so: it is answered as
+failed ("The task could not run: ...") before any of it starts, or, for a call
+dispatched before, when the session next goes on. This unanswered-call rule applies to foreground
 tasks. A background child that stops without an answer, including a provider failure,
 unknown send or worker crash, retains a stopped report so the parent goes on; its
 `answer` row may hold `{content, failed: true}` as the reason. Explicitly starting

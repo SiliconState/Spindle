@@ -47,7 +47,7 @@ pub use host_tools::{
 };
 
 const SCOPE: &str = "operator";
-pub use crate::driver::DROPPED;
+pub use crate::driver::{DROPPED, UNREACHED};
 const COMPACTED: &str = "[Earlier conversation compacted by spindle to stay within session limits]";
 /// How long the one summary request of a model-written compaction may take (its text
 /// and bounds are shared with the embedded host: `driver::summary_input`).
@@ -117,6 +117,66 @@ fn shelf_guidance() -> String {
      To propose a change, write the note in the workspace and ask the operator to keep \
      it (the file viewer's Shelf button)."
         .into()
+}
+
+/// What every native thread is told about the machine its commands run on: what it can
+/// count on, how to check for the rest (ripgrep, often missing, among them), and who
+/// git commits as in the sandbox. The same text on every host, so a session's requests
+/// do not depend on what a machine happens to have installed.
+fn environment_guidance() -> &'static str {
+    " Commands have bash with the usual Unix tools (coreutils, grep, sed, awk, find); \
+     anything else (python3, node, git, rg...) is there only if this host installed it, \
+     so check with `command -v NAME` before relying on it, and search with grep -rn where \
+     rg is missing. In the sandbox (Linux), commands run as the user spindle and git \
+     commits as Spindle <spindle@localhost> unless the repository names its own author."
+}
+
+/// Ends a session's first prompt when its workspace starts with files: their list, so
+/// the model starts from what is there (its first look would otherwise be an `ls`).
+pub const WORKSPACE_NOTE: &str = "\n\n[The workspace this thread starts with: ";
+
+/// Paths `workspace_note` lists; the rest are counted.
+const NOTE_PATHS: usize = 150;
+
+/// The note a first prompt ends with for `files` (none for an empty workspace): each
+/// path with its size, git metadata counted rather than listed.
+fn workspace_note(files: &[File]) -> String {
+    let mut paths: Vec<(&str, usize)> = files
+        .iter()
+        .map(|(path, bytes, _)| (path.as_str(), bytes.len()))
+        .collect();
+    if paths.is_empty() {
+        return String::new();
+    }
+    paths.sort_unstable();
+    let total: usize = paths.iter().map(|(_, size)| size).sum();
+    let git = paths
+        .iter()
+        .filter(|(path, _)| path.starts_with(".git/"))
+        .count();
+    let shown: Vec<String> = paths
+        .iter()
+        .filter(|(path, _)| !path.starts_with(".git/"))
+        .take(NOTE_PATHS)
+        .map(|(path, size)| format!("{path}  {}", crate::human_size(*size)))
+        .collect();
+    let listed = shown.len() + git;
+    let mut note = format!(
+        "{WORKSPACE_NOTE}{} file(s), {}]\n{}",
+        paths.len(),
+        crate::human_size(total),
+        shown.join("\n")
+    );
+    if git > 0 {
+        note.push_str(&format!("\n.git/  ({git} files of a git repository)"));
+    }
+    if listed < paths.len() {
+        note.push_str(&format!(
+            "\n... and {} more (list them with ls or find)",
+            paths.len() - listed
+        ));
+    }
+    note
 }
 
 /// The operator's shelf when it holds notes (an empty or missing one is not offered).
@@ -764,6 +824,10 @@ pub(crate) fn execute_code_model_with_credentials(
                 if let AttemptError::Http(status) = &error {
                     refused.store(*status, Ordering::SeqCst);
                 }
+                // No connection was made: nothing was sent, so the call did not run.
+                if error == AttemptError::Unsent {
+                    sent.store(false, Ordering::SeqCst);
+                }
                 provider_error(error)
             })?;
         let response =
@@ -844,8 +908,13 @@ fn store_open_error(store: &Path, error: Error) -> String {
     store_error(error)
 }
 
+/// Where a turn stands when its model request in flight has an unknown outcome: only
+/// `retry` sends it again (`continue` refuses, to never bill twice unasked).
+const UNKNOWN_MODEL_WAIT: &str = "waiting on a model request whose outcome is unknown \
+(run `spindle retry` to send it again from the point before it; it may be billed again)";
+
 /// Another owner, or a connection briefly holding SQLite's lock, has the store.
-const LOCKED: &str = "another spindle process or connection is using this session's store; \
+pub const LOCKED: &str = "another spindle process or connection is using this session's store; \
 wait for it to finish, then run the command again";
 
 /// A full disk or quota. Nothing saved is lost: the step that failed is repeated (or
@@ -2056,7 +2125,11 @@ impl Session {
             }
             None => Start::Same,
         };
-        self.start_turn(text, start)?;
+        let text = match &start {
+            Start::Import(files, _, _) => format!("{text}{}", workspace_note(files)),
+            _ => text.to_string(),
+        };
+        self.start_turn(&text, start)?;
         self.drive()
     }
 
@@ -2089,7 +2162,11 @@ impl Session {
             None if first => Start::Import(files, vec![], vec![]),
             _ => Start::Add(files),
         };
-        self.start_turn(text, start)?;
+        let text = match &start {
+            Start::Import(files, _, _) => format!("{text}{}", workspace_note(files)),
+            _ => text.to_string(),
+        };
+        self.start_turn(&text, start)?;
         self.drive()
     }
 
@@ -2363,6 +2440,17 @@ impl Session {
                 "the last turn stopped ({}); rewind to a target first (`spindle targets`)",
                 stop_text(stop)
             )),
+            Phase::ModelWait
+                if !self.settings()?.resend_unknown
+                    && !self
+                        .store
+                        .reconciliation()
+                        .map_err(store_error)?
+                        .unresolved_attempts
+                        .is_empty() =>
+            {
+                Err(format!("the last turn is {UNKNOWN_MODEL_WAIT}"))
+            }
             _ => Err("a turn is still in progress; run `spindle continue`".into()),
         }
     }
@@ -2597,6 +2685,14 @@ impl Session {
         .then(|| watch.point.load(Ordering::SeqCst));
         let rejection = match &outcome {
             Err(Error::Model(crate::ModelError::Http(_))) => self.transport.take_rejection(),
+            // No connection: nothing was sent, so it is recorded as refused (known).
+            Err(Error::Model(crate::ModelError::Unsent)) => {
+                Some(dext_native::model_effect::Rejection {
+                    status: driver::UNREACHED,
+                    retry_after: None,
+                    body: self.transport.take_failure().unwrap_or_default(),
+                })
+            }
             _ => None,
         };
         let unparsed = match &outcome {
@@ -2606,6 +2702,9 @@ impl Session {
         Ok(driver::ModelSent {
             outcome: outcome.map_err(|error| match error {
                 Error::Model(crate::ModelError::Http(status)) => driver::ModelFailure::Http(status),
+                Error::Model(crate::ModelError::Unsent) => {
+                    driver::ModelFailure::Http(driver::UNREACHED)
+                }
                 Error::Model(
                     error @ (crate::ModelError::Transport | crate::ModelError::Deadline),
                 ) => driver::ModelFailure::Dropped(model_error(error)),
@@ -2748,6 +2847,8 @@ impl Session {
                 }),
             // The broker enables this for run_code's language runtimes only.
             local_ipc: false,
+            // The broker gives offline runs their session's loopback network.
+            loopback: None,
         };
         let mut code_host = if need.call.name == "run_code" && live {
             Some(
@@ -2803,27 +2904,13 @@ impl Session {
         queued: bool,
         revision: u64,
     ) -> Result<crate::meta::TaskRun> {
-        if let Some(why) = tasks::refusal(input) {
+        // Its input, the task policy, and a model and effort it can make a request with:
+        // the app's tasks are refused up front as the model's are.
+        if let Some(why) = self.task_call_refusal(input)? {
             return Err(why);
         }
         let settings = self.settings()?;
-        if tasks::depth(&self.dir) >= settings.task_policy.max_depth {
-            return Err("task depth limit reached".into());
-        }
         tasks::validate_input(&self.dir, key, input)?;
-        let model = input["model"]
-            .as_str()
-            .or(input["settings"]["model"].as_str())
-            .unwrap_or(&settings.model);
-        if !settings.task_policy.models.is_empty()
-            && !settings
-                .task_policy
-                .models
-                .iter()
-                .any(|allowed| allowed == model)
-        {
-            return Err(format!("model `{model}` is not permitted by tasks.models"));
-        }
         let input = tasks::identity_input(input).to_string().into_bytes();
         if let Some(record) = self
             .store
@@ -3020,6 +3107,31 @@ impl Session {
         Ok(())
     }
 
+    /// Why a `task` call of this session's model cannot run (its input, the task policy,
+    /// or a model or effort its task cannot make a request with), or None. Asked before
+    /// a call's task is registered or started (`run_task_batch`): running it would only
+    /// repeat it.
+    fn task_call_refusal(&self, input: &Value) -> Result<Option<String>> {
+        if let Some(why) = tasks::refusal(input) {
+            return Ok(Some(why));
+        }
+        let settings = self.settings()?;
+        if tasks::depth(&self.dir) >= settings.task_policy.max_depth {
+            return Ok(Some("task depth limit reached".into()));
+        }
+        if let Some(why) = crate::driver::task_tool::model_refusal(
+            &settings.task_policy.models,
+            &settings.model,
+            input,
+        ) {
+            return Ok(Some(why));
+        }
+        // Its model and effort as its first request would ask them (`child_settings`).
+        Ok(task_effort_refusal(&settings, input, |model| {
+            self.credentials.route(&settings.provider, Some(model))
+        }))
+    }
+
     fn run_task_batch(&mut self, needs: Vec<driver::AppNeed>) -> Result<()> {
         let base_revision = needs
             .first()
@@ -3030,6 +3142,17 @@ impl Session {
         let limit = self.settings()?.task_policy.max_running;
         let mut results = Vec::new();
         for need in needs {
+            // A call its task cannot run for, begun or not: answered so, a failed result
+            // the model reads, and its turn goes on (nothing more is registered, nothing
+            // starts). Left waiting, the call would meet the same refusal on every continue.
+            if let Some(why) = self.task_call_refusal(&need.call.input)? {
+                let reservation = self
+                    .driver
+                    .reserve_app(&mut self.store, &need)
+                    .map_err(store_error)?;
+                results.push((need, reservation, Some(Ok(tasks::refused(&why))), true));
+                continue;
+            }
             let queued = need.call.input["background"] == true;
             let record = self.register_task_run(
                 &need.id,
@@ -3057,7 +3180,7 @@ impl Session {
             } else {
                 None
             };
-            results.push((need, reservation, answer));
+            results.push((need, reservation, answer, false));
         }
         let parent = &self.dir;
         let interrupt = &self.interrupt;
@@ -3067,8 +3190,9 @@ impl Session {
         for chunk in results.chunks_mut(limit) {
             std::thread::scope(|scope| {
                 let mut running = Vec::new();
-                for (need, reservation, result) in chunk {
-                    if need.call.input["background"] != true
+                for (need, reservation, result, refused) in chunk {
+                    if !*refused
+                        && need.call.input["background"] != true
                         && matches!(reservation, crate::broker::AppReservation::Reserved { .. })
                     {
                         let base = &base;
@@ -3101,7 +3225,7 @@ impl Session {
                 }
             });
         }
-        for (mut need, reservation, result) in results {
+        for (mut need, reservation, result, refused) in results {
             let mut waiting = None;
             need.request.expected_revision = self.store.snapshot().map_err(store_error)?.revision;
             let outcome = match reservation {
@@ -3110,10 +3234,23 @@ impl Session {
                     match result.ok_or("task worker returned no outcome")? {
                         Ok(mut answer) => {
                             if need.call.input["background"] != true {
-                                self.retain_task_answer(&need.id, &need.call.input, &answer)?;
-                                let current =
-                                    self.task_workspace_at(need.request.expected_revision)?;
-                                tasks::refuse_conflicts(&base, &current, &mut answer);
+                                // A refused call keeps its answer in the task run an earlier
+                                // start registered, if any (it ends there), and brings no files.
+                                let registered = !refused
+                                    || self
+                                        .store
+                                        .task_runs()
+                                        .map_err(store_error)?
+                                        .iter()
+                                        .any(|run| run.task == need.id);
+                                if registered {
+                                    self.retain_task_answer(&need.id, &need.call.input, &answer)?;
+                                }
+                                if !refused {
+                                    let current =
+                                        self.task_workspace_at(need.request.expected_revision)?;
+                                    tasks::refuse_conflicts(&base, &current, &mut answer);
+                                }
                             }
                             self.driver.record_app(&mut self.store, &need, answer)
                         }
@@ -3495,6 +3632,11 @@ impl Session {
             .count();
         let phase = match state.control().phase() {
             Phase::Stopped(stop) => stop_text(stop).to_string(),
+            Phase::ModelWait
+                if !report.unresolved_attempts.is_empty() && !settings.resend_unknown =>
+            {
+                UNKNOWN_MODEL_WAIT.into()
+            }
             Phase::ModelWait => "waiting for a model response (run `spindle continue`)".into(),
             Phase::ToolsWait => "running commands (run `spindle continue`)".into(),
             _ => "between steps (run `spindle continue`)".into(),
@@ -3949,14 +4091,23 @@ impl driver::Env for NativeEnv {
             .credentials
             .route(&config.provider, Some(&config.model))?;
         route.learned_limit = learned;
+        let source_offered = config.self_edit
+            || self
+                .observer
+                .host()
+                .is_some_and(|host| host.offers_source());
         let mut guidance = if config.self_edit {
             Some(self_edit_guidance())
         } else {
-            self.observer
-                .host()
-                .filter(|host| host.offers_source())
-                .map(|_| source_guidance())
+            source_offered.then(source_guidance)
         };
+        let environment = environment_guidance();
+        if !environment.is_empty() {
+            match &mut guidance {
+                Some(text) => text.push_str(environment),
+                None => guidance = Some(environment.trim_start().to_string()),
+            }
+        }
         if config.toolchain && shelf_of(self.observer.host().as_deref()).is_some() {
             guidance
                 .get_or_insert_with(String::new)
@@ -3971,13 +4122,23 @@ impl driver::Env for NativeEnv {
                 route,
                 guidance,
                 tasks_offered: tasks::offered(config, &self.dir),
+                source_offered,
                 subscription,
                 identity,
             },
         )
     }
     fn refusal(&self, settings: &Settings, name: &str, input: &Value) -> Option<String> {
-        offered_refusal(settings, tasks::offered(settings, &self.dir), name, input)
+        let offered = tasks::offered(settings, &self.dir);
+        offered_refusal(settings, offered, name, input).or_else(|| {
+            (offered && name == tasks::NAME)
+                .then(|| {
+                    task_effort_refusal(settings, input, |model| {
+                        self.credentials.route(&settings.provider, Some(model))
+                    })
+                })
+                .flatten()
+        })
     }
     fn app_dispatch(
         &self,
@@ -4112,6 +4273,7 @@ mod tests {
                 route,
                 guidance: Some("Host guidance.".into()),
                 tasks_offered: true,
+                source_offered: false,
                 subscription,
                 identity: Some(dext_provider_catalog::claude_subscription::ClaudeIdentity {
                     device_id: "device".into(),

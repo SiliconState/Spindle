@@ -198,6 +198,26 @@ pub fn messages_from(view: &mut ReadView<'_>, revision: Option<u64>, from: usize
         json!({"head": head, "revision": revision, "messages": messages, "total": total, "app_details": details}),
     )
 }
+/// The head, the revision read (the head when None) and its conversation.
+pub fn transcript_on(
+    view: &mut ReadView<'_>,
+    revision: Option<u64>,
+) -> Result<(u64, u64, Vec<Message>)> {
+    let (head, revision, continuation) = view
+        .read(|view| {
+            let (head, revision, continuation, _) = at(view, revision)?;
+            Ok((head, revision, continuation))
+        })
+        .map_err(|_| no_revision(revision))?;
+    if revision == 0 {
+        return Ok((head, revision, vec![]));
+    }
+    let transcript = restore(&continuation)?
+        .into_transcript()
+        .map_err(|_| "unreadable transcript".to_string())?;
+    Ok((head, revision, transcript.messages))
+}
+
 /// Messages from index `from` on in their JSON form, a `show` result's cards (`display`)
 /// included though its call (the message before it) is not.
 fn window(messages: &[Message], from: usize) -> Vec<Value> {

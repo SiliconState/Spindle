@@ -348,7 +348,7 @@ tool effects `<execution>/m/<ordinal>/t/<position>`.
 |---|---|
 | `new` | Starts a turn over a transcript. |
 | `next_model_id` | The effect id the next request must carry. |
-| `prepare` | Begins a round and wraps a `PreparedRequest` whose effect id and contract match, in a waiting `ResponseContinuation`. At the step limit it stops with `Iterations` instead. |
+| `prepare` | Begins a round and wraps a `PreparedRequest` whose effect id matches, in a waiting `ResponseContinuation`. Nothing is in flight between requests, so the turn goes on with the contract its next request names (a model switched part way to another provider's, the OpenAI API to ChatGPT say), and the wait and its reply are checked against that contract. A contract it does not know is `Binding`. At the step limit it stops with `Iterations` instead. |
 | `apply_model` | Applies a recorded response, runs the recovery decision and moves to tools, final review, a retry or a stop. |
 | `guard_tool` | Runs the runtime pre-dispatch guards for one pending call; a verdict is recorded as that call's result without running it. |
 | `refuse_tool` | Records a host refusal (unknown tool, rejected input) as an error result. |
@@ -462,6 +462,11 @@ the native transport record the same bytes for the same stream.
   with the status the same refusal would have had before the stream (529 overloaded, 429
   rate limit, 400 invalid request or context length, 504 timeout, otherwise 500).
   `take_rejection` returns the status, `Retry-After` and up to 4096 bytes of body.
+- A request for which no connection could be made (refused, an unknown host, a TLS or
+  proxy refusal before any of it was sent: `reqwest`'s `is_connect`) is
+  `AttemptError::Unsent`: known never to have reached the provider, so a host may record
+  it as refused and send it again without risking a double charge. `take_failure` says
+  where it went and why.
 - A stream that cannot be parsed is `AttemptError::Protocol`. `take_failure` returns why,
   once: the parser's words (which event, what was wrong, or the error the provider
   streamed after output began), on one line, at most 600 characters. `finish_explained`
@@ -512,10 +517,16 @@ forbidden) and executes it from there, so replacing the file on disk cannot chan
 runs. Each run gets:
 
 - New user, PID, IPC, UTS and cgroup namespaces, and a new network namespace unless the
-  run has `network`; nested user namespaces disabled; all capabilities dropped; a new
-  session; the helper dies with its parent.
-- A cleared environment with only `PATH=/usr/bin:/bin`, `HOME=/tmp` and `TMPDIR=/tmp`
-  (plus `SPINDLE_RPC_FDS` for brokered runs and the toolchain variables below).
+  run has `network` or joins a shared `Loopback` (below); nested user namespaces
+  disabled; all capabilities dropped; a new session; the helper dies with its parent.
+  The helper itself also leads a session of its own, so a Ctrl-C at the host's terminal
+  reaches the host alone (which records the run as stopped), never the helper or the
+  command.
+- A cleared environment with only `PATH=/usr/bin:/bin`, `HOME=/tmp`, `TMPDIR=/tmp`,
+  `USER=spindle`, `EMAIL=spindle@localhost` and `PYTHONDONTWRITEBYTECODE=1` (plus
+  `SPINDLE_RPC_FDS` for brokered runs and the toolchain variables below), and its own
+  `/etc/passwd` and `/etc/group` naming that user (sealed read-only memory files bound by
+  bubblewrap), so `whoami`, `id`, `ls -l` and git find a name.
 - `/usr` read-only with `/bin`, `/lib`, `/lib64` as links into it, `/etc/alternatives`
   read-only when present, fresh `/proc` and `/dev`, a 1 GiB tmpfs at `/tmp`
   (`SANDBOX_TMP`), and the candidate workspace bound at `/workspace` (the working
@@ -577,11 +588,13 @@ runs. Each run gets:
   and named in stderr. Non-UTF-8 names,
   invalid paths, or too many entries or bytes make the run fail with the reason.
 
+A sealed run's `SealedOutput` carries its `exit_code` (an isolated run's is
+bubblewrap's, which passes the command's on) or, when a signal ended it, its `signal`.
 A run that ends without a sealed tree returns an `io::Error` carrying a `RunFailure`
 (`run_failure` extracts it) with the reason and the output printed so far; its kind is
-`TimedOut`, `FileTooLarge`, `OutOfMemory`, `InvalidData` (changes that cannot be sealed)
-or `Other` (setup failures, which say that nothing ran), and nothing the run changed is
-kept. `sweep_abandoned_candidates` removes candidates (`spindle-candidate-<hex>` in the
+`TimedOut` (a run stopped by its own deadline has the reason `DEADLINE_EXCEEDED`),
+`FileTooLarge`, `OutOfMemory`, `InvalidData` (changes that cannot be sealed) or `Other`
+(setup failures, which say that nothing ran), and nothing the run changed is kept. `sweep_abandoned_candidates` removes candidates (`spindle-candidate-<hex>` in the
 scratch root) whose owner lock is free, which only frees disk. The reuse and
 shared-mapping cases are checked by
 [`strict_reuse.rs`](../dext-engine/native/tests/strict_reuse.rs) and
@@ -603,6 +616,19 @@ host run unless a delegated cgroup is in use. The network cannot be withheld.
 | `observe` | Callback that receives raw output chunks with their stream (1 stdout, 2 stderr) as a preview. |
 | `toolchain` | Host Rust toolchain: rustup home read-only at `/opt/rustup`, cargo binaries read-only at `/opt/cargo/bin`, a private persistent cache at `/cache` (`CARGO_TARGET_DIR=/cache/target`), a fresh tmpfs `CARGO_HOME` per run with git checkouts from the cache and the host registry as a copy-on-write overlay, read-only `sources` mounted at `/<name>`, and `CARGO_NET_OFFLINE=true` unless `network`. |
 | `local_ipc` | Kept for compatibility; socket pairs are allowed in every run. |
+| `loopback` | A `Loopback` an isolated run without `network` joins instead of a network of its own. |
+
+**Shared loopback.** `Loopback::new` makes one private network with only `lo`, up: a
+child unshares a user and network namespace, writes its id maps and brings `lo` up, and
+its namespace descriptors keep the network alive with no process in it. A run given it
+joins it with `setns` just before it executes (after the cgroup and confinement hooks),
+and bubblewrap then skips `--unshare-net`, so a server one run (or a background job)
+starts on localhost is reachable from the next, and nothing outside it is: there is no
+other interface and the host's own loopback is not in it. `new` fails where the host
+lets no unprivileged process make a user and network namespace; callers then give each
+run its own network, as without it. Checked by
+`runs_sharing_a_loopback_reach_a_job_server_and_nothing_else_does` in
+[`strict.rs`](../dext-engine/native/tests/strict.rs).
 
 **Brokered runs.** `execute_brokered` and `execute_tree` with `brokered` give the command
 a request/reply channel to the host: on Unix two dedicated pipes named by

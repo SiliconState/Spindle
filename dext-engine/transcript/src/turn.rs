@@ -90,6 +90,11 @@ fn contract(tag: u8) -> Result<Contract, Error> {
         _ => Err(Error::Checkpoint),
     }
 }
+/// The tag of the contract a request names (`contract_name`'s inverse, over every tag
+/// `contract` knows, so a contract added there is found here too).
+fn named_contract(name: &str) -> Option<u8> {
+    (0..=u8::MAX).find(|&tag| contract_name(tag).is_ok_and(|known| known == name))
+}
 fn contract_name(tag: u8) -> Result<&'static str, Error> {
     match contract(tag)? {
         Contract::AnthropicMessages => Ok("anthropic-messages"),
@@ -328,11 +333,16 @@ impl TurnContinuation {
             return Ok(next);
         }
         next.control = next.control.prepare_request().map_err(|_| Error::State)?;
-        if request.identity().effect != next.model_id(next.control.request_ordinal())
-            || request.identity().contract != contract_name(self.header.contract)?
-        {
+        if request.identity().effect != next.model_id(next.control.request_ordinal()) {
             return Err(Error::Binding);
         }
+        // The turn rests between requests here (nothing is in flight, so nothing is
+        // bound to the contract it started with): it goes on with the contract its next
+        // request is built for, as when the session's model changed to one of another
+        // provider part way (the OpenAI API to ChatGPT, say). The wait and its reply are
+        // checked against the contract taken here.
+        next.header.contract =
+            named_contract(&request.identity().contract).ok_or(Error::Binding)?;
         let waiting = ModelWait::new(request).start().map_err(|_| Error::State)?;
         next.state = State::Model(ResponseContinuation::waiting(transcript.clone(), waiting)?);
         next.checkpoint()?;

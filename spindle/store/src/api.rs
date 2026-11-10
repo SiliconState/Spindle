@@ -200,6 +200,7 @@ fn recovery_with(dir: &Path, probe: bool) -> Result<Value> {
                     let (outcome, next, why) = match view.attempt(&id)? {
                         None => ("not_sent", "continue", "the next model request was prepared and never sent"),
                         Some((_, _, true)) => ("recorded", "continue", "its reply is saved; continue adopts it without sending"),
+                        Some(_) if view.rejection(&id)?.is_some_and(|(status, _)| status == crate::driver::UNREACHED) => ("refused", "continue", "no connection to the provider could be made, so nothing was sent; continue sends it"),
                         Some(_) if view.rejection(&id)?.is_some() => ("refused", "continue", "the provider refused it before answering; continue sends it again"),
                         // With nothing to rewind to, only `retry` (a fresh store) can send it.
                         Some(_) if resend && view.has_target() => ("unknown", "continue", "it was sent and no reply was saved: continue sends it again by itself (resend_unknown; it may be billed twice)"),
@@ -423,6 +424,22 @@ pub fn head_state(dir: &Path) -> Result<Value> {
             .unwrap_or(Value::Null)
     };
     Ok(state)
+}
+
+/// Whether a process holds the session in `dir` now (its owner lock is taken): a turn
+/// may be running there. Read without taking it.
+pub fn held(dir: &Path) -> bool {
+    view(dir).is_ok_and(|view| view.owner_alive())
+}
+
+/// The conversation committed at `revision` (the head when None), with the head and
+/// the revision read, without the owner lock.
+pub fn history_at(
+    dir: &Path,
+    revision: Option<u64>,
+) -> Result<(u64, u64, Vec<dext_transcript::Message>)> {
+    let mut view = view(dir).map_err(|_| no_revision(revision))?;
+    crate::reads::transcript_on(&mut view, revision)
 }
 
 /// The conversation committed at `revision` (the head when None), in stable form, from

@@ -631,6 +631,7 @@ impl Settings {
             tasks,
             runner: self.builtin_tools == BuiltinTools::Files
                 && self.runner != crate::driver::Runner::None,
+            source: self.self_edit,
         }
     }
 }
@@ -647,6 +648,10 @@ pub(crate) struct Offer<'a> {
     /// `bash` (and `read_output`, which pages its retained output) beside the file
     /// tools, run by the session's runner (embedded hosts).
     pub(crate) runner: bool,
+    /// `spindle_source` and `spindle_install`, offered only where the host serving the
+    /// session has Spindle's source (a self-edit thread, `serve --dev-source`): anywhere
+    /// else they could only refuse.
+    pub(crate) source: bool,
 }
 
 impl Offer<'_> {
@@ -658,12 +663,14 @@ impl Offer<'_> {
         instructions: None,
         tasks: false,
         runner: false,
+        source: false,
     };
     /// The tools offered: the built-in ones chosen, then the app's in their order.
     pub(crate) fn tools(&self, network: bool, toolchain: bool) -> Vec<(String, String, Value)> {
         let mut tools: Vec<_> = tool_specs(network, toolchain)
             .into_iter()
             .filter(|(name, _, _)| self.offers(name))
+            .filter(|(name, _, _)| self.source || !SOURCE_TOOLS.contains(name))
             .map(|(name, description, schema)| (name.to_string(), description, schema))
             .collect();
         if self.tasks {
@@ -715,6 +722,9 @@ impl Offer<'_> {
         text
     }
 }
+
+/// The host tools that need Spindle's source on the host (`Offer::source`).
+const SOURCE_TOOLS: [&str; 2] = ["spindle_source", "spindle_install"];
 
 pub(crate) const FILES_SYSTEM: &str = "You are an assistant working in a workspace of files with the \
      read_file, write_file and edit_file tools. \
@@ -827,11 +837,13 @@ pub(crate) fn tool_specs(network: bool, toolchain: bool) -> Vec<(&'static str, S
         ),
         (
             "read_output",
-            "Read a byte window of retained tool output without executing anything again. Use the artifact digest returned by the original result; offset is zero-based, limit defaults to 8192 bytes (max 262144). Tool output shares a 256 KiB turn budget; paging with read_output and read_file is not charged.".into(),
+            "Read retained tool output without executing anything again. Use the whole artifact digest the original result names; offset is zero-based, limit defaults to 8192 bytes (max 262144). tail reads the last N bytes instead. find lists the lines (from offset on) that contain the text, each with the byte offset it starts at, to read around with offset. Tool output shares a 256 KiB turn budget; paging with read_output and read_file is not charged.".into(),
             json!({"type":"object","properties":{
                 "artifact":{"type":"string"},
                 "offset":{"type":"integer","minimum":0},
-                "limit":{"type":"integer","minimum":1,"maximum":262144}
+                "limit":{"type":"integer","minimum":1,"maximum":262144},
+                "tail":{"type":"integer","minimum":1,"maximum":262144},
+                "find":{"type":"string","minLength":1,"maxLength":200}
             },"required":["artifact"],"additionalProperties":false}),
         ),
         (
@@ -895,8 +907,10 @@ pub(crate) fn tool_specs(network: bool, toolchain: bool) -> Vec<(&'static str, S
                     "Internet access is available; a server it starts on localhost is \
                      reachable from later bash calls."
                 } else {
-                    "Each run has its own private network, so later bash calls cannot reach a \
-                     server the job starts: exercise it inside the job's own command."
+                    "Without internet access the session's commands share one private \
+                     loopback network where the host allows it, so later bash and run_code \
+                     calls can reach a server the job starts on localhost (the start result \
+                     says if they cannot)."
                 },
                 crate::broker::JOB_SECS,
                 dext_native::limits::MAX_JOB_SECS
@@ -950,6 +964,40 @@ pub(crate) fn tool_specs(network: bool, toolchain: bool) -> Vec<(&'static str, S
     ];
     specs.extend(host_specs());
     specs
+}
+
+/// Why a `task` call's task could not make its first request, or None: its model (the
+/// one it names, else the session's) as `route` resolves it on the session's provider,
+/// and its effort (the one it names, else the session's) as that model takes it. `off`
+/// where the model has no off switch, say, would fail the task's first request every
+/// time it started. Asked by both hosts beside `offered_refusal`, before anything of
+/// the task is kept.
+pub(crate) fn task_effort_refusal(
+    config: &Settings,
+    input: &Value,
+    route: impl FnOnce(&str) -> Result<Route>,
+) -> Option<String> {
+    let model = input["model"]
+        .as_str()
+        .or(input["settings"]["model"].as_str())
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or(&config.model);
+    let effort = match input["effort"]
+        .as_str()
+        .or(input["settings"]["effort"].as_str())
+    {
+        Some(effort) => match Effort::parse(effort) {
+            Some(effort) => effort,
+            None => return Some(format!("`{effort}` is not an effort")),
+        },
+        None => config.effort,
+    };
+    match route(model) {
+        Ok(route) => reasoning(&route, effort)
+            .err()
+            .map(|why| format!("the task's effort cannot be asked of its model: {why}")),
+        Err(why) => Some(why),
+    }
 }
 
 /// Why a call cannot run under `config`'s offer, or None: an app tool needs an object
@@ -1329,6 +1377,8 @@ pub(crate) struct RequestShape {
     pub(crate) route: Route,
     pub(crate) guidance: Option<String>,
     pub(crate) tasks_offered: bool,
+    /// The host serves `spindle_source` and `spindle_install` (`Offer::source`).
+    pub(crate) source_offered: bool,
     pub(crate) subscription: bool,
     pub(crate) identity: Option<dext_provider_catalog::claude_subscription::ClaudeIdentity>,
 }
@@ -1350,7 +1400,10 @@ pub(crate) fn prepared_request(
         shape.guidance.as_deref(),
         config.effort,
         &transcript,
-        config.offer(shape.tasks_offered),
+        Offer {
+            source: shape.source_offered,
+            ..config.offer(shape.tasks_offered)
+        },
     )?;
     let identity = Identity {
         effect,

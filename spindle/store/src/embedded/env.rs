@@ -286,13 +286,23 @@ impl driver::Env for Facts {
                 route,
                 guidance: None,
                 tasks_offered: self.tasks_offered(config),
+                source_offered: false,
                 subscription: false,
                 identity: None,
             },
         )
     }
     fn refusal(&self, settings: &Settings, name: &str, input: &Value) -> Option<String> {
-        shape::offered_refusal(settings, self.tasks_offered(settings), name, input)
+        let offered = self.tasks_offered(settings);
+        shape::offered_refusal(settings, offered, name, input).or_else(|| {
+            (offered && name == crate::driver::task_tool::NAME)
+                .then(|| {
+                    shape::task_effort_refusal(settings, input, |model| {
+                        self.catalog.route(&settings.provider, Some(model))
+                    })
+                })
+                .flatten()
+        })
     }
     fn app_dispatch(
         &self,

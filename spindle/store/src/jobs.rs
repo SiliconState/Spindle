@@ -5,7 +5,7 @@
 //! (the newest `KEPT_TAIL` bytes, with its state) is kept in the store's `job-output`
 //! folder as it runs, so after a restart `read_job` gives that, said as such, instead
 //! of nothing; a session's export never carries it.
-use dext_native::strict::{Job, JobState};
+use dext_native::strict::{Job, JobState, Loopback};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -63,7 +63,65 @@ pub fn session_key(store: &Path) -> String {
 /// Stops and forgets the jobs of the store in `store` (a session being deleted, whose
 /// store may not be open). Returns how many were still running.
 pub fn stop_store_jobs(store: &Path) -> usize {
-    stop_all(&session_key(store))
+    let key = session_key(store);
+    loopbacks().remove(&key);
+    stop_all(&key)
+}
+
+/// Each session's loopback network (`Loopback`), shared by its isolated runs and jobs
+/// without the network for as long as this process lives (or the session is deleted).
+type Loopbacks = BTreeMap<String, Arc<Loopback>>;
+
+static LOOPBACKS: Mutex<Loopbacks> = Mutex::new(BTreeMap::new());
+
+/// Set once this host refused to make one for good (namespaces not permitted or not
+/// supported, no /bin/sh to make them in): every run then has a network of its own. A passing failure (no file
+/// descriptors or processes left) is tried again next time.
+static NO_LOOPBACK: AtomicBool = AtomicBool::new(false);
+
+fn loopbacks() -> MutexGuard<'static, Loopbacks> {
+    LOOPBACKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The loopback network `session`'s runs share, made on first use; None where this
+/// host cannot make one (each run then gets a network namespace of its own).
+pub(crate) fn loopback(session: &str) -> Option<Arc<Loopback>> {
+    if NO_LOOPBACK.load(Ordering::SeqCst) {
+        return None;
+    }
+    let mut loopbacks = loopbacks();
+    if let Some(loopback) = loopbacks.get(session) {
+        return Some(loopback.clone());
+    }
+    match Loopback::new() {
+        Ok(loopback) => {
+            let loopback = Arc::new(loopback);
+            loopbacks.insert(session.to_string(), loopback.clone());
+            Some(loopback)
+        }
+        Err(error) => {
+            #[cfg(unix)]
+            let lasting = matches!(
+                error.raw_os_error(),
+                Some(libc::EPERM | libc::EACCES | libc::EINVAL | libc::ENOSPC | libc::ENOSYS)
+            );
+            #[cfg(not(unix))]
+            let lasting = false;
+            let refused = lasting
+                || matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::Unsupported
+                        | std::io::ErrorKind::NotFound
+                );
+            if refused {
+                NO_LOOPBACK.store(true, Ordering::SeqCst);
+            }
+            None
+        }
+    }
 }
 
 pub(crate) fn insert(session: &str, id: String, entry: Entry) {

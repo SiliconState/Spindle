@@ -68,7 +68,9 @@ request, or not. Spindle states this instead of guessing.
 | **`resend_unknown` setting** | Opt-in consent: Continue and a dropped send during a turn retry it automatically, up to three times (waiting 1, 2 and 4 seconds), when a rewind target exists. Each resend may be billed. |
 
 A *refusal* (an HTTP error from the provider) is a known outcome, not an unknown one: it is
-recorded, and retries follow the provider's `Retry-After` where given.
+recorded, and retries follow the provider's `Retry-After` where given. A request for which
+no connection could be made at all is known never to have been sent, and is recorded as a
+refusal too (status 599), never as an uncertain send.
 
 ```mermaid
 stateDiagram-v2

@@ -1411,3 +1411,14 @@ test('steps fold into one row, Stop takes Send\'s place, a steered message is a 
   assert.deepEqual(sent.map(c => c.data.session), ['a']);
   assert(!('expected_revision' in sent[0].data), 'a delete names no revision of another thread');
 });
+
+test('a first prompt names the files it carries for the model instead of showing them', async () => {
+  const note = '\n\n[The workspace this thread starts with: 3 file(s), 1.2 KiB]\na.py  10 bytes\nb.py  20 bytes\nREADME.md  1.1 KiB';
+  const messages = [{role:'user',content:[{type:'text',text:`Fix the tests.${note}`}]},{role:'assistant',content:[{type:'text',text:'Done.'}]}];
+  const a = await app(path => path.endsWith('/snapshot') ? response(state({messages})) : undefined);
+  await a.subject.openThread('a');
+  const shown = textOf(a.nodes.get('history'));
+  assert.match(shown, /Fix the tests\./);
+  assert.match(shown, /the list of the 3 file\(s\) the thread started with/);
+  assert.doesNotMatch(shown, /README\.md/);
+});

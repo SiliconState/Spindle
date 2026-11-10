@@ -43,6 +43,12 @@ const MODEL_IMPLEMENTATION: &str = "dext-provider-v1";
 const MAX_PROVIDER_RETRIES: u32 = 6;
 const MAX_DROPPED_RETRIES: u32 = 3;
 pub const DROPPED: u16 = 0;
+/// The status a request is recorded refused with when no connection could be made: it
+/// was never sent, so it is a known outcome (599 is the informal "network connect
+/// timeout" status; a store keeps only HTTP-range statuses).
+pub const UNREACHED: u16 = 599;
+/// Automatic retries of a request no connection could be made for (after 1, 2 and 4 s).
+const MAX_UNREACHED_RETRIES: u32 = 3;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(300);
 const COMPACT_KEEP_SHARE: usize = 4;
 /// A model summary under this many bytes, for a dropped part over eight times as
@@ -330,8 +336,12 @@ impl Step<'_> {
         let overflow = context_overflow(status, &rejection.body);
         // A ChatGPT plan's refusal (its usage limit among them, a 429) is final.
         let plan_refused = dext_core::recovery::chatgpt_plan_refusal(&rejection.body).is_some();
-        let transient =
-            !plan_refused && matches!(status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529);
+        let unreached = status == UNREACHED;
+        let transient = !plan_refused
+            && matches!(
+                status,
+                408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529 | UNREACHED
+            );
         // A refusal that states the model's output limit: remember it and ask for less.
         let lowered = (|| -> Result<bool> {
             let config = self.settings()?;
@@ -355,6 +365,13 @@ impl Step<'_> {
         } else {
             String::new()
         };
+        if unreached && *attempts >= MAX_UNREACHED_RETRIES {
+            return Err(format!(
+                "{}{said}{tried}. Nothing was sent; once the provider is reachable, `spindle \
+                 continue` sends the request.",
+                http_error(status)
+            ));
+        }
         if !(overflow || transient || lowered) || *attempts >= MAX_PROVIDER_RETRIES {
             let refused = plan_limit(&rejection.body).unwrap_or_else(|| http_error(status));
             return Err(format!(
@@ -368,6 +385,13 @@ impl Step<'_> {
             .map_err(store_error)?
             .is_empty()
         {
+            if unreached {
+                return Err(format!(
+                    "{}{said}. Nothing was sent; once the provider is reachable, `spindle \
+                     retry` sends the session's first request.",
+                    http_error(status)
+                ));
+            }
             return Err(format!(
                 "{}{said}. The session's first request was refused before any reply{tried}; \
                  `spindle retry` sends it again.",
@@ -377,6 +401,9 @@ impl Step<'_> {
         *attempts += 1;
         let wait = if overflow || lowered {
             Duration::ZERO
+        } else if unreached {
+            // A provider that is down: tried again soon, then the turn says so.
+            Duration::from_secs(1 << (*attempts - 1))
         } else {
             rejection
                 .retry_after
@@ -2440,12 +2467,32 @@ impl Step<'_> {
         if ordinal == 0 {
             return Err("no model step of this turn to retry; continue sends its request".into());
         }
-        let request = format!("{}/m/{ordinal}", state.execution());
-        let prepared = self
-            .store
-            .intent_revision(&request)
-            .map_err(store_error)?
-            .ok_or("the turn's last request was not found")?;
+        // A rewind to just before the turn's next request (a retry, or another model
+        // chosen there) forks the turn under a fresh execution: its last request was made
+        // under the execution it was forked from (perhaps a fork itself). A fork is
+        // taken out of `sources` once followed, so the search ends.
+        let mut execution = state.execution().to_string();
+        let mut sources = None;
+        let prepared = loop {
+            let request = format!("{execution}/m/{ordinal}");
+            if let Some(revision) = self.store.intent_revision(&request).map_err(store_error)? {
+                break revision;
+            }
+            if sources.is_none() {
+                sources = Some(self.store.fork_sources(SCOPE).map_err(store_error)?);
+            }
+            let Some(source) = sources
+                .as_mut()
+                .and_then(|sources| sources.remove(&execution))
+            else {
+                return Err("the turn's last request was not found".into());
+            };
+            let snapshot = self.store.snapshot_at(SCOPE, source).map_err(store_error)?;
+            execution = crate::turn::restored(&snapshot.continuation)
+                .map_err(turn_error)?
+                .execution()
+                .to_string();
+        };
         let targets = self.store.rewind_targets(SCOPE).map_err(store_error)?;
         match targets.iter().find(|target| target.revision < prepared) {
             Some(target) => self.retry_to(*target, false).map(Retry::InPlace),
@@ -2992,6 +3039,8 @@ pub(crate) fn model_error(error: crate::ModelError) -> String {
         crate::ModelError::Http(status) => format!("the provider returned HTTP {status}"),
         crate::ModelError::Deadline => "the provider did not answer in time".into(),
         crate::ModelError::Transport => "the connection to the provider failed".into(),
+        crate::ModelError::Unsent => "could not connect to the provider; nothing was sent".into(),
+        crate::ModelError::Interrupted => "stopped while waiting for the provider's reply".into(),
         crate::ModelError::Protocol => "the provider stream could not be parsed".into(),
         crate::ModelError::Exhausted => "the provider response was too large".into(),
         other => format!("provider attempt failed ({other:?})"),
@@ -3534,6 +3583,7 @@ pub(crate) const CHATGPT_USAGE: &str = "https://chatgpt.com/settings/usage";
 
 fn http_error(status: u16) -> String {
     match status {
+        UNREACHED => "could not connect to the provider".into(),
         401 | 403 => "the provider rejected the credentials".into(),
         429 => "the provider rate-limited the request (HTTP 429)".into(),
         _ => format!("the provider returned HTTP {status}"),

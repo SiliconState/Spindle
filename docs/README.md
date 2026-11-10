@@ -18,7 +18,7 @@ implement what each page describes.
 
 | Document | What it covers |
 | --- | --- |
-| [CLI](cli.md) | Every `spindle` command and flag |
+| [CLI](cli.md) | Every `spindle` command and flag, `--json` results and exit statuses, steering and stopping a running turn from another shell, patches with `diff` |
 | [API](API.md) | The versioned public API: JSON-RPC methods, HTTP `/v1` routes, events, data types, errors |
 | [Clients](clients.md) | The Node.js and Python clients, and the fetch-only `RemoteClient` |
 | [Testing](testing.md) | Test suites, how to run them, CI and dependency policy |
@@ -32,7 +32,7 @@ implement what each page describes.
 | [Tools and execution](tools.md) | Built-in tools, sandboxed commands, background jobs, images, app tools, tasks, code mode | [`agent/`](../spindle/store/src/agent), [`code_mode.rs`](../spindle/store/src/code_mode.rs) |
 | [Web UI host](host.md) | `spindle serve`: listener, pairing and one-click connect, remote access, threads a browser brings, previews, self-edit, web UI | [`serve/`](../spindle/store/src/serve), [`ui/`](../spindle/store/ui) |
 | [Embedded package](embedded.md) | WebAssembly sessions in a JS app; Node/OPFS storage, budgets, background tasks, capabilities and moving sessions | [`embed/`](../spindle/embed), [`embedded/`](../spindle/store/src/embedded) |
-| [Browser extension](chrome.md) | Spindle for Browser 0.1.8 (historical 0.1.7 additions marked so): panel, storage controls, file previews and preview choices, sealed credentials, page tools and Before acting, threads on your host, build and tests | [`chrome/`](../spindle/chrome) |
+| [Browser extension](chrome.md) | Spindle for Browser 0.1.8 (0.1.7 additions, and changes after 0.1.8, marked so): panel, storage controls, file previews and preview choices, sealed credentials, page tools and Before acting, threads on your host, build and tests | [`chrome/`](../spindle/chrome) |
 | [Browser Linux](browser-linux.md) | The v86 and WebAssembly Linuxes that run commands in the browser | [`chrome/linux`](../spindle/chrome/linux), [`chrome/wasm-linux`](../spindle/chrome/wasm-linux) |
 | [Engine crates](engine.md) | `dext-core`, `dext-transcript`, `dext-native`, `dext-provider`; provider catalog and wire formats | [`dext-engine/`](../dext-engine) |
 

@@ -2930,8 +2930,14 @@ fn strict_workspace_dispatch_reopens_and_publishes_exact_root_and_continuation_t
             panic!("strict ingress")
         };
         let block: Block = serde_json::from_slice(&bytes).unwrap();
+        // A failed run says how it ended; its exit code and time are in the metadata.
         assert!(
-            matches!(&block, Block::ToolResult { tool_use_id, content, is_error: Some(error), .. } if tool_use_id == "workspace-call" && content == "old" && *error == (exit != 0))
+            matches!(&block, Block::ToolResult { tool_use_id, content, is_error: Some(error), metadata } if tool_use_id == "workspace-call"
+                && content == &(if exit == 0 { "old".to_string() } else { "old\n[exit status 7]".to_string() })
+                && *error == (exit != 0)
+                && metadata.exit_code == Some(exit)
+                && metadata.duration_ms.is_none()),
+            "{block:?}"
         );
         let before = state(&mut store);
         let after = before.apply_tool(&request.intent.id, vec![block]).unwrap();
@@ -8104,7 +8110,10 @@ fn strict_bounds_record_contained_failures_and_long_output_is_truncated() {
     use std::sync::atomic::AtomicBool;
     let executor = strict_executor();
     for (command, expected) in [
-        ("printf partial > input.txt; sleep 30", "deadline exceeded"),
+        (
+            "printf partial > input.txt; sleep 30",
+            "ran past its 5 s timeout and was stopped (`timeout` can be up to 1800 s",
+        ),
         (
             "printf partial > input.txt; echo before; head -c 9000000 /dev/zero",
             "output limit exceeded",

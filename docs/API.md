@@ -80,7 +80,7 @@ error rather than having the option silently dropped.
 
 | stdio `info.features` | HTTP `GET /v1` `features` |
 | --- | --- |
-| `events`, `expected_head`, `steering`, `attachments`, `import`, `revisions`, `export`, `doctor`, `usage`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `session_transfer`, `capabilities` | `commands`, `receipts`, `expected_head`, `events`, `steering`, `attachments`, `revisions`, `archive`, `targets`, `providers`, `bearer_tokens`, `usage`, `preview`, `preview_github`, `models`, `self_edit`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `runner`, `run_stop`, `targeted_stop`, `runner_tokens`, `threads`, `connect`, `preview_scripts`, `preview_contained` |
+| `events`, `expected_head`, `steering`, `attachments`, `import`, `revisions`, `export`, `doctor`, `usage`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `session_transfer`, `capabilities` | `commands`, `receipts`, `expected_head`, `events`, `steering`, `attachments`, `revisions`, `archive`, `targets`, `providers`, `bearer_tokens`, `usage`, `preview`, `preview_github`, `models`, `self_edit`, `display`, `steer_now`, `app_tools`, `state`, `recover`, `tasks`, `runner`, `run_stop`, `targeted_stop`, `runner_tokens`, `threads`, `connect`, `preview_scripts`, `preview_contained`, `new_attachments` |
 
 Some HTTP features name a group of additions: `runner` is `/v1/runner` and `/v1/run`;
 `run_stop` is a named run's status and stop routes; `runner_tokens` is
@@ -88,7 +88,8 @@ Some HTTP features name a group of additions: `runner` is `/v1/runner` and `/v1/
 `running_request` on the session object; `threads` is `POST /v1/threads`, the export
 route, the `moved` state and browser tokens
 ([Bringing threads to the host](#bringing-threads-to-the-host)); `connect` is
-[one-click connect](#one-click-connect).
+[one-click connect](#one-click-connect); `new_attachments` is `POST /v1/uploads` and
+`attachments` on the `new` command (a thread that starts with files).
 
 ### Session addressing
 
@@ -508,7 +509,8 @@ session is undone; anything they did elsewhere is the app's to undo).
 
 Starts or finds a task: a session of its own under the session's `tasks/`
 directory, working on a copy of the session's files. The same `task` id finds the
-same task again; a later start under the same id with different input fails.
+same task again; a later start under the same id with different input fails, and so
+does one whose model does not take its effort.
 
 | Param | Type | Required | Notes |
 | --- | --- | --- | --- |
@@ -1265,7 +1267,7 @@ content}` with content blocks:
 | `redacted_thinking` | none. |
 | `reasoning` | none (provider-specific reasoning items are opaque). |
 | `tool_use` | `id`, `name`, `input`. |
-| `tool_result` | `tool_use_id`, `content`, `is_error`, `exit_code`, `duration_ms`; on a successful `show` result also `display` (its cards). |
+| `tool_result` | `tool_use_id`, `content`, `is_error`, `exit_code`, `duration_ms`; on a successful `show` result also `display` (its cards). `exit_code` is set for a native command run (`bash` or `run_code`) recorded by a build after 0.1.8, and `duration_ms` for one that ran 10 s or more; both are null for other tools, older results, a run a signal ended (no exit code) and a shorter run's time. A failed run's `content` ends with `[exit status N]` too ([tools.md](tools.md#results-the-turns-output-budget-and-read_output)). |
 | `image` | `path`, `media_type`, `width`, `height`, `sha256`. |
 | `image_artifact` | `digest`, `size`, `width`, `height`. |
 | `partial` | `text`. |
@@ -1329,7 +1331,7 @@ engine, auth, limits}`. `auth` is `bearer` or `cookie`, as this request authenti
 | `steer_bytes` | 16384. |
 | `queued_steers` | 32. |
 | `upload_bytes` | 8 MiB per upload. |
-| `uploads_per_day` | 64 MiB of uploads a session keeps waiting to be attached. |
+| `uploads_per_day` | 64 MiB of uploads a session keeps waiting to be attached (and the same for the host's own uploads for `new`). |
 | `attachments` | 32 per message. |
 | `sessions` | 64 sessions per host. |
 | `running` | 4 sessions running at once. |
@@ -1383,6 +1385,7 @@ route.
 | `POST` | `/v1/sessions/:id/steer` | T | Body `{text, now}`: `202 {queued}`. `409 not_running`, `409 nothing_waiting` (`now` alone), `429 rate_limited`. | `steer` |
 | `POST` | `/v1/sessions/:id/app_tool_result` | T | Body: `call` plus an [answer](#app-tool-answer): `200 {accepted: true}`; `409 conflict` when the call is not waiting. | `app_tool_result` |
 | `POST` | `/v1/sessions/:id/upload` | T | Raw body (1 byte to 8 MiB): `{digest, size}`, for a later `say`'s `attachments`. Uploads older than a day are cleared. | none |
+| `POST` | `/v1/uploads` | T | Raw body (1 byte to 8 MiB): `{digest, size}`, for a `new` command's `attachments`. These are the host's own uploads (`HOST/uploads`), not a thread's: kept a day, 64 MiB a day (feature `new_attachments`). | none |
 | `POST` | `/v1/sessions/:id/export` | T | Body `{keep?}` (or empty): the thread's session bundle, `application/octet-stream`. Without `keep` the thread moves back to its client. See [Bringing threads to the host](#bringing-threads-to-the-host). | `export_session` |
 | `POST` | `/v1/threads` | T | Raw session bundle with an `Idempotency-Key` header: `201 {session, fit, replayed: false}`, a new session of this host's. See [Bringing threads to the host](#bringing-threads-to-the-host). | `import_session` |
 | `POST` | `/v1/connect/token` | none | Body `{code, verifier}`: `{token, client}`, a browser token. See [One-click connect](#one-click-connect). | none |
@@ -1497,7 +1500,7 @@ admission is used.
 
 | `kind` | Fields besides `request_id` and `kind` | Effect |
 | --- | --- | --- |
-| `new` | `text` (required), `provider` (required), `name`, `model`, `network`, `toolchain`, `effort`, `compaction`, `max_usd`, `tools`, `builtin_tools`, `instructions`, `resend_unknown`, `tasks`, `state` | Creates a session (isolation `required`) and runs `text` as its first prompt. `name` defaults to the first non-blank line of `text` (60 characters). The receipt's `session` is the new id. |
+| `new` | `text` (required), `provider` (required), `attachments`, `name`, `model`, `network`, `toolchain`, `effort`, `compaction`, `max_usd`, `tools`, `builtin_tools`, `instructions`, `resend_unknown`, `tasks`, `state` | Creates a session (isolation `required`) and runs `text` as its first prompt. `attachments` (feature `new_attachments`) is `[{path, digest}]` of `POST /v1/uploads` uploads, at most 32: the workspace the thread starts with, listed for the model at the end of its first prompt; a self-edit thread takes none. `name` defaults to the first non-blank line of `text` (60 characters). The receipt's `session` is the new id. |
 | `say` | `session`, `text`, `attachments`, `state`, `expected_head` | A prompt. `attachments` is `[{path, digest}]` of earlier uploads. On a turn stopped part way, a message that goes on with it, as stdio `prompt` does: with `attachments` it fails (see [After a stop](#after-a-stop)). |
 | `continue` | `session`, `until`, `expected_head` | As stdio `continue`; `until` may only be `"unknown"`. |
 | `retry` | `session`, `expected_head` | As stdio `retry`. |
@@ -1510,7 +1513,7 @@ admission is used.
 | `delete` | `session` | Deletes the session; its event streams end with `deleted`. |
 
 `state` (a merge patch of at most 1 MiB) goes only with `new` and `say`;
-`attachments` only with `say`. Turn-like kinds run in a worker after admission and
+`attachments` only with `say` and `new`. Turn-like kinds run in a worker after admission and
 report through the event stream (`command_done`) and their receipt. At most 4
 sessions run at once (`409 busy` beyond that); a session already running refuses
 another command with `409 busy`, except `stop` and a `settings` change, which is

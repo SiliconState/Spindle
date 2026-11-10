@@ -87,6 +87,7 @@ check them.
   output-limits.json         older file, read only to seed metadata
   usage.json  usage.lock     native spend mirror and cross-process lock
   cache/                     build cache and task-slot locks (never bundled)
+  inbox/                     steer and stop messages from other spindle processes (never bundled)
   store/
     authority.sqlite         the store
     authority.sqlite-wal     SQLite write-ahead log (while open, or after a crash)
@@ -109,6 +110,7 @@ check them.
 | `pending-settings.json` | `settings` tool | A mirror of the `pending_settings` metadata, removed when nothing is queued. |
 | `output-limits.json` | older builds | Read only to seed the `output_limits` metadata. |
 | `usage.json`, `usage.lock` | native spend accounting | Mirror and cross-process lock; both hosts share the ledger format in the store's `usage` metadata. |
+| `inbox/` | `spindle steer`, `spindle stop` ([`cli_control.rs`](../spindle/store/src/cli_control.rs)) | Private (0700, files 0600). Messages another process leaves for the turn a command-line process runs, each written whole and renamed in, and `listening`, the pid of the process taking them, while it does. The running process takes them every 100 ms and removes each before it is given; a sender withdraws one not taken within 5 s. |
 | `tasks/<key>/` | task tool | A task's own session directory. `<key>` is the first 10 bytes of the SHA-256 of the task key, as 20 lowercase hex digits ([`agent/tasks.rs`](../spindle/store/src/agent/tasks.rs)). It holds `task.json`, the task's identity record. |
 | `store.abandoned-N/` | retry | When the very first request of a session must be retried, the whole store is renamed aside (its unknown request stays on record there) and a fresh store starts the same prompt. |
 

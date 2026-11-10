@@ -67,10 +67,7 @@ impl Slot {
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(limit(
-                    std::io::ErrorKind::TimedOut,
-                    "strict invocation deadline exceeded",
-                ));
+                return Err(limit(std::io::ErrorKind::TimedOut, DEADLINE_EXCEEDED));
             }
             std::thread::sleep((deadline - now).min(Duration::from_millis(25)));
         }
@@ -232,6 +229,9 @@ impl Default for TreeLimits {
         }
     }
 }
+
+/// The reason a run stopped by its own deadline carries (`RunFailure::reason`).
+pub const DEADLINE_EXCEEDED: &str = "strict invocation deadline exceeded";
 
 /// Why a run ended without a sealed tree, with the output it produced: its candidate
 /// was discarded (nothing it changed is kept), so hosts can record this as a failed
@@ -424,6 +424,9 @@ pub struct SealedOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     success: bool,
+    /// The command's exit code, or None when a signal ended it (`signal`).
+    exit_code: Option<i32>,
+    signal: Option<i32>,
     helper: [u8; 32],
 }
 impl std::fmt::Debug for SealedOutput {
@@ -485,14 +488,24 @@ impl SealedOutput {
     pub fn success(&self) -> bool {
         self.success
     }
+    /// The exit code the command ended with (an isolated run's is bubblewrap's, which
+    /// passes the command's on), or None when a signal ended it.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+    /// The signal that ended the command, if one did.
+    pub fn signal(&self) -> Option<i32> {
+        self.signal
+    }
     pub fn helper_digest(&self) -> &[u8; 32] {
         &self.helper
     }
 }
 
 /// Per-run options. Without `network` an isolated run gets a private network namespace
-/// with only its own loopback: AF_UNIX, AF_INET/AF_INET6 and route-netlink sockets work
-/// (local servers, asyncio, child-process IPC) but nothing outside is reachable.
+/// with only its own loopback (or `loopback`'s, shared with other runs given it):
+/// AF_UNIX, AF_INET/AF_INET6 and route-netlink sockets work (local servers, asyncio,
+/// child-process IPC) but nothing outside is reachable.
 /// `network` shares the host network namespace (internet and host loopback services)
 /// and allows AF_INET/AF_INET6 sockets only: an opted-in run can have external
 /// effects that no rewind or discard undoes. `observe` receives raw chunks as they
@@ -507,6 +520,9 @@ pub struct RunOptions<'a> {
     /// runtimes use to spawn child processes) are now allowed in every run. A pair has
     /// no address, so it cannot reach host sockets.
     pub local_ipc: bool,
+    /// An isolated run without `network` joins this loopback network instead of one of
+    /// its own, so it reaches servers its session's jobs started there.
+    pub loopback: Option<&'a Loopback>,
 }
 
 /// Host Rust toolchain exposed to a run: rustup toolchains and cargo binaries
@@ -1012,19 +1028,23 @@ impl StrictExecutor {
                 let directory = std::fs::File::open(workspace)?;
                 let filter = network_filter(options.network)?;
                 let (status_read, status_write) = pipe()?;
+                let (passwd, group) = identity_files()?;
                 let command = isolated_command(
                     helper,
                     &Mounts {
                         directory: directory.as_raw_fd(),
                         filter: filter.as_raw_fd(),
                         status: status_write.as_raw_fd(),
+                        passwd: passwd.as_raw_fd(),
+                        group: group.as_raw_fd(),
                         rpc: rpc_variable.as_deref(),
+                        shared_loopback: !options.network && options.loopback.is_some(),
                     },
                     argv,
                     options,
                     sources,
                 );
-                inherited.extend([directory, filter, status_write]);
+                inherited.extend([directory, filter, status_write, passwd, group]);
                 reports = Some(status_read);
                 command
             }
@@ -1060,10 +1080,18 @@ impl StrictExecutor {
             let inherit: Vec<libc::c_int> = inherited.iter().map(|file| file.as_raw_fd()).collect();
             confine(
                 &mut command,
-                !isolated,
                 inherit,
                 ProcessLimits::for_run(options.toolchain.is_some(), timeout, pids_capped),
             );
+        }
+        // After the cgroup and confinement hooks: bubblewrap starts inside the session's
+        // loopback network (its user namespace first, which owns that network).
+        #[cfg(target_os = "linux")]
+        if isolated
+            && !options.network
+            && let Some(loopback) = options.loopback
+        {
+            loopback.enter_on_exec(&mut command);
         }
         #[cfg(windows)]
         let caps = {
@@ -1075,7 +1103,7 @@ impl StrictExecutor {
         };
         #[cfg(not(windows))]
         let caps = crate::process_tree::TreeCaps::default();
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         let _ = isolated;
         #[cfg(not(any(unix, windows)))]
         let _ = timeout;
@@ -1378,10 +1406,7 @@ impl StrictExecutor {
                             ));
                         }
                         if Instant::now() >= deadline {
-                            return Err(limit(
-                                std::io::ErrorKind::TimedOut,
-                                "strict invocation deadline exceeded",
-                            ));
+                            return Err(limit(std::io::ErrorKind::TimedOut, DEADLINE_EXCEEDED));
                         }
                         std::thread::sleep(Duration::from_millis(5));
                     }
@@ -1566,6 +1591,11 @@ impl StrictExecutor {
             stdout,
             stderr,
             success: status.success(),
+            exit_code: status.code(),
+            #[cfg(unix)]
+            signal: std::os::unix::process::ExitStatusExt::signal(&status),
+            #[cfg(not(unix))]
+            signal: None,
             helper: self.digest,
         })
     }
@@ -3033,15 +3063,12 @@ fn user_tasks() -> u64 {
 
 /// Unix pre-exec setup. Linux: parent-death signal, owner check, no new privileges,
 /// closed descriptors and rlimits for every run. Other Unix systems apply the
-/// rlimits they support. Host runs lead their own session so the whole process
-/// group can be killed when the run ends.
+/// rlimits they support. Every run leads its own session: a host run's whole process
+/// group can be killed when the run ends, and a Ctrl-C at the owner's terminal reaches
+/// the owner alone (which records the run as stopped), never bubblewrap or the command
+/// directly, which would end the run as an ordinary failure first.
 #[cfg(unix)]
-fn confine(
-    command: &mut std::process::Command,
-    host: bool,
-    inherit: Vec<libc::c_int>,
-    limits: ProcessLimits,
-) {
+fn confine(command: &mut std::process::Command, inherit: Vec<libc::c_int>, limits: ProcessLimits) {
     use std::os::unix::process::CommandExt;
     #[cfg(target_os = "linux")]
     let owner = unsafe { libc::getpid() };
@@ -3056,7 +3083,7 @@ fn confine(
                     return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
                 }
             }
-            if host && libc::setsid() < 0 {
+            if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             #[cfg(target_os = "linux")]
@@ -3330,8 +3357,201 @@ struct Mounts<'a> {
     filter: libc::c_int,
     /// bubblewrap's JSON status reports (the command's exit code once it started).
     status: libc::c_int,
+    /// `/etc/passwd` and `/etc/group` naming the run's user (`identity_files`).
+    passwd: libc::c_int,
+    group: libc::c_int,
     /// `SPINDLE_RPC_FDS` for brokered runs.
     rpc: Option<&'a str>,
+    /// The run joins its session's loopback network (`Loopback`) instead of a network
+    /// namespace of its own.
+    shared_loopback: bool,
+}
+
+/// Name of the user an isolated run is, in its `/etc/passwd`, and the address `git`
+/// commits with when the workspace's repository names nobody (`EMAIL` is git's last
+/// resort, below the repository's own `user.email`).
+#[cfg(target_os = "linux")]
+const SANDBOX_USER: &str = "spindle";
+#[cfg(target_os = "linux")]
+const SANDBOX_EMAIL: &str = "spindle@localhost";
+
+/// `/etc/passwd` and `/etc/group` for an isolated run: its own user (the same ids it
+/// has inside, home /tmp) and the overflow ids unmapped files show as, so `whoami`,
+/// `id`, `ls -l` and git find a name. Sealed read-only memfds, mounted by bubblewrap.
+#[cfg(target_os = "linux")]
+fn identity_files() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let passwd = format!(
+        "{SANDBOX_USER}:x:{uid}:{gid}:Spindle:/tmp:/bin/bash\n\
+         nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+    );
+    let group = format!("{SANDBOX_USER}:x:{gid}:\nnogroup:x:65534:\n");
+    Ok((
+        sealed_memfd(c"spindle-passwd", passwd.as_bytes())?,
+        sealed_memfd(c"spindle-group", group.as_bytes())?,
+    ))
+}
+
+/// A read-only memfd holding `bytes`, sealed against change, positioned at its start.
+#[cfg(target_os = "linux")]
+fn sealed_memfd(name: &std::ffi::CStr, bytes: &[u8]) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(bytes)?;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// One private loopback network that a session's isolated runs and background jobs
+/// without `network` share, so a server a job starts on localhost is reachable from
+/// the session's later commands (and from nothing else: there is no other interface,
+/// and the host's own loopback is not in it). It is held by its namespace descriptors
+/// alone (no process): it lasts while this value or a command inside it does.
+/// Runs without it get a network namespace each, as before.
+pub struct Loopback {
+    #[cfg(target_os = "linux")]
+    user: std::fs::File,
+    #[cfg(target_os = "linux")]
+    net: std::fs::File,
+}
+
+impl std::fmt::Debug for Loopback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Loopback").finish_non_exhaustive()
+    }
+}
+
+impl Loopback {
+    /// A new network with only `lo`, up. Fails where this host lets no unprivileged
+    /// process make a user and network namespace; callers then run each command in its
+    /// own network instead.
+    #[cfg(target_os = "linux")]
+    pub fn new() -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let uid_map = format!("{uid} {uid} 1");
+        let gid_map = format!("{gid} {gid} 1");
+        let owner = unsafe { libc::getpid() };
+        // A child makes the namespaces (a threaded process cannot join a new user
+        // namespace) and waits on its stdin while they are opened here.
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read line"])
+            .env_clear()
+            .current_dir("/")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != owner {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+                }
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                write_proc(c"/proc/self/setgroups", b"deny")?;
+                write_proc(c"/proc/self/uid_map", uid_map.as_bytes())?;
+                write_proc(c"/proc/self/gid_map", gid_map.as_bytes())?;
+                loopback_up()
+            })
+        };
+        let mut child = command.spawn()?;
+        let opened = (|| {
+            let ns = |kind: &str| std::fs::File::open(format!("/proc/{}/ns/{kind}", child.id()));
+            Ok::<_, std::io::Error>(Self {
+                user: ns("user")?,
+                net: ns("net")?,
+            })
+        })();
+        drop(child.stdin.take());
+        let _ = child.wait();
+        opened
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn new() -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a shared loopback network needs Linux namespaces",
+        ))
+    }
+
+    /// Makes `command` start inside this network: it joins the user namespace that
+    /// owns it, then the network itself, just before it runs. Registered after the
+    /// cgroup and confinement hooks; the descriptors are still open in the child then.
+    #[cfg(target_os = "linux")]
+    fn enter_on_exec(&self, command: &mut std::process::Command) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let (user, net) = (self.user.as_raw_fd(), self.net.as_raw_fd());
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setns(user, libc::CLONE_NEWUSER) != 0
+                    || libc::setns(net, libc::CLONE_NEWNET) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+        };
+    }
+}
+
+/// Writes `bytes` to a /proc file in one write (as the id maps need), from a pre-exec
+/// hook: only async-signal-safe calls.
+#[cfg(target_os = "linux")]
+fn write_proc(path: &std::ffi::CStr, bytes: &[u8]) -> std::io::Result<()> {
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let written = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+        let error = std::io::Error::last_os_error();
+        libc::close(fd);
+        if written != bytes.len() as isize {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Brings `lo` up in the calling process's new network namespace (pre-exec hook).
+#[cfg(target_os = "linux")]
+fn loopback_up() -> std::io::Result<()> {
+    unsafe {
+        let socket = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if socket < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut request: libc::ifreq = std::mem::zeroed();
+        for (slot, byte) in request.ifr_name.iter_mut().zip(b"lo\0") {
+            *slot = *byte as libc::c_char;
+        }
+        let up = libc::ioctl(socket, libc::SIOCGIFFLAGS, &mut request) == 0 && {
+            request.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+            libc::ioctl(socket, libc::SIOCSIFFLAGS, &request) == 0
+        };
+        let error = std::io::Error::last_os_error();
+        libc::close(socket);
+        if !up {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// bubblewrap invocation: private namespaces, read-only system, the workspace copy
@@ -3350,7 +3570,7 @@ fn isolated_command(
         .env_clear()
         .current_dir("/")
         .args(["--unshare-user", "--unshare-pid"])
-        .args((!options.network).then_some("--unshare-net"))
+        .args((!options.network && !mounts.shared_loopback).then_some("--unshare-net"))
         .args([
             "--unshare-ipc",
             "--unshare-uts",
@@ -3370,6 +3590,16 @@ fn isolated_command(
             "--setenv",
             "TMPDIR",
             "/tmp",
+            "--setenv",
+            "USER",
+            SANDBOX_USER,
+            "--setenv",
+            "EMAIL",
+            SANDBOX_EMAIL,
+            // Bytecode caches would be written into the workspace and kept as its files.
+            "--setenv",
+            "PYTHONDONTWRITEBYTECODE",
+            "1",
             "--ro-bind",
             "/usr",
             "/usr",
@@ -3395,6 +3625,12 @@ fn isolated_command(
         .arg(SANDBOX_TMP.to_string())
         .args(["--tmpfs", "/tmp", "--json-status-fd"])
         .arg(mounts.status.to_string())
+        .arg("--ro-bind-data")
+        .arg(mounts.passwd.to_string())
+        .arg("/etc/passwd")
+        .arg("--ro-bind-data")
+        .arg(mounts.group.to_string())
+        .arg("/etc/group")
         .arg("--bind-fd")
         .arg(mounts.directory.to_string())
         .args(["/workspace", "--chdir", "/workspace"]);
@@ -3517,7 +3753,9 @@ fn host_command(
         .env("USERPROFILE", &home)
         .env("TMPDIR", &tmp)
         .env("TEMP", &tmp)
-        .env("TMP", &tmp);
+        .env("TMP", &tmp)
+        // Bytecode caches would be written into the workspace and kept as its files.
+        .env("PYTHONDONTWRITEBYTECODE", "1");
     if std::env::var_os("LANG").is_none() {
         command.env("LANG", "C.UTF-8");
     }

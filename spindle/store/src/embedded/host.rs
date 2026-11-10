@@ -2603,37 +2603,51 @@ impl Host {
                 .driver
                 .reserve_app(&mut self.store, &need)
                 .map_err(store_error)?;
+            let reserved = matches!(reservation, AppReservation::Reserved { .. });
             let mut call = TaskCall {
                 need,
                 reservation: Some(reservation),
                 child: None,
                 result: None,
             };
+            // A call its task cannot run for (its policy, model or effort), begun or
+            // not: answered so, a failed result the model reads, and its turn goes on.
+            // Left waiting, the call would meet the same refusal on every continue. One
+            // answered already keeps its answer, and nothing of it starts here either.
+            if let Some(why) = self.task_refusal(&call.need.call.input, &settings) {
+                if reserved {
+                    call.result = Some(Ok(task_tool::refused(&why)));
+                }
+                calls.push(call);
+                continue;
+            }
             // In the background: registered, started beside this session, and answered
             // at once; its own answer is read to this session once it ends.
             if call.need.call.input["background"] == true {
-                let refused = self.task_refusal(&call.need.call.input, &settings);
-                let started = match refused {
-                    Some(why) => Err(why),
-                    None => self.register_task_run(
+                let started = self
+                    .register_task_run(
                         &call.need.id,
                         &call.need.call.input,
                         base_revision,
                         true,
                         Some(call.need.id.clone()),
-                    ),
-                }
-                .and_then(|revision| {
-                    let record = self.task_run(&call.need.id)?;
-                    let running = self.background.iter().any(|task| task.run == call.need.id);
-                    if record.state == "finished" || running {
-                        return Ok(());
-                    }
-                    if record.state == "stopped" {
-                        self.store.resume_task(&call.need.id).map_err(store_error)?;
-                    }
-                    self.start_background(&call.need.id, &call.need.call.input, revision, &settings)
-                });
+                    )
+                    .and_then(|revision| {
+                        let record = self.task_run(&call.need.id)?;
+                        let running = self.background.iter().any(|task| task.run == call.need.id);
+                        if record.state == "finished" || running {
+                            return Ok(());
+                        }
+                        if record.state == "stopped" {
+                            self.store.resume_task(&call.need.id).map_err(store_error)?;
+                        }
+                        self.start_background(
+                            &call.need.id,
+                            &call.need.call.input,
+                            revision,
+                            &settings,
+                        )
+                    });
                 let label = format!("{}#{}", self.label, task_key(&call.need.id));
                 call.result = Some(started.and_then(|()| {
                     AppAnswer::from_json(&json!({"content": format!(
@@ -3008,22 +3022,10 @@ impl Host {
         {
             return Some(why);
         }
-        if let Some(model) = input["model"]
-            .as_str()
-            .or(input["settings"]["model"].as_str())
-            .filter(|model| !model.trim().is_empty())
-            && let Err(why) = self.facts.catalog.route(&settings.provider, Some(model))
-        {
-            return Some(why);
-        }
-        if let Some(effort) = input["effort"]
-            .as_str()
-            .or(input["settings"]["effort"].as_str())
-            && driver::Effort::parse(effort).is_none()
-        {
-            return Some(format!("`{effort}` is not an effort"));
-        }
-        None
+        // Its model and effort as its first request would ask them (`start_child`).
+        crate::shape::task_effort_refusal(settings, input, |model| {
+            self.facts.catalog.route(&settings.provider, Some(model))
+        })
     }
 
     /// Starts task `run` (registered, `queued`) in the background over the workspace
@@ -4612,6 +4614,7 @@ fn wire_error(error: AttemptError) -> ModelError {
         AttemptError::Interrupted => ModelError::Interrupted,
         AttemptError::Deadline => ModelError::Deadline,
         AttemptError::Transport => ModelError::Transport,
+        AttemptError::Unsent => ModelError::Unsent,
         AttemptError::Http(status) => ModelError::Http(status),
         AttemptError::Protocol => ModelError::Protocol,
         AttemptError::Exhausted => ModelError::Exhausted,

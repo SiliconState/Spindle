@@ -9,15 +9,18 @@ speaks JSON-RPC over stdio (`spindle api`), signs in to model providers through 
 credential store, and replaces itself safely (`spindle upgrade` / `spindle rollback`).
 The ground truth for everything below is the parser in
 [`cli.rs`](../spindle/store/src/cli.rs); terminal prompts for session packs live in
-[`cli_ui.rs`](../spindle/store/src/cli_ui.rs) and binary replacement in
+[`cli_ui.rs`](../spindle/store/src/cli_ui.rs), steering and stopping another process's
+turn in [`cli_control.rs`](../spindle/store/src/cli_control.rs), patches in
+[`cli_diff.rs`](../spindle/store/src/cli_diff.rs) and binary replacement in
 [`upgrade.rs`](../spindle/store/src/upgrade.rs).
 
 - [Synopsis](#synopsis)
-- [Global option and environment](#global-option-and-environment)
+- [Global options and environment](#global-options-and-environment)
 - [Argument parsing, output and exit status](#argument-parsing-output-and-exit-status)
 - [Command overview](#command-overview)
 - [Running a session](#running-a-session): `new`, `say`, `continue`, `retry`
-- [Inspecting a session](#inspecting-a-session): `status`, `usage`, `log`, `targets`, `files`, `cat`
+- [Reaching a running turn](#reaching-a-running-turn): `steer`, `stop`, Ctrl-C
+- [Inspecting a session](#inspecting-a-session): `status`, `usage`, `log`, `targets`, `files`, `cat`, `diff`
 - [Rewinding](#rewinding): `rewind`
 - [Moving work out](#moving-work-out): `export`, `export-session`, `import-session`
 - [Checking and repairing](#checking-and-repairing): `doctor`
@@ -31,18 +34,20 @@ The ground truth for everything below is the parser in
 ## Synopsis
 
 ```text
-spindle [--dir DIR] <command> [options] [arguments]
-spindle help | --help | -h
+spindle [--dir DIR] [--json] <command> [options] [arguments]
+spindle help [COMMAND] | COMMAND --help | --help | -h
 ```
 
 The binary is built from the `spindle/` workspace with the `cli` feature of the
 `spindle-store` crate (`cargo build --release -p spindle-store --features cli --bin spindle`).
 See [getting-started.md](getting-started.md) for a first session.
 
-## Global option and environment
+## Global options and environment
 
-`--dir DIR` is the only global option and must come **before** the command. Without it,
-`DIR` is `$SPINDLE_DIR`, or `./.spindle` when that is unset.
+`--dir DIR`, `--json` and `--help` (or `-h`) are global: they may come before or after
+the command, anywhere before a `--`. Without `--dir`, `DIR` is `$SPINDLE_DIR`, or
+`./.spindle` when that is unset. `--json` is described under
+[output and exit status](#argument-parsing-output-and-exit-status).
 
 | Command group | What `DIR` is |
 | --- | --- |
@@ -69,26 +74,52 @@ printed ([Providers and sign-in](#providers-and-sign-in)).
 ## Argument parsing, output and exit status
 
 - After the command, options may appear in any order and anywhere among the
-  arguments. Every word that is not a recognized option is positional. For `new` and
-  `say` all positional words are joined with single spaces into the `PROMPT`, so
-  quoting the prompt is optional.
-- A command that takes no arguments (`status`, `log`, `doctor`, `version`, ...)
-  refuses any extra word or option with `unexpected arguments` followed by the usage
-  text. The exceptions: `providers` and `help` ignore anything after them, and `api` or
-  `code-receipts` followed by anything is reported as an `unknown command`. Commands
-  that take arguments ignore recognized options that do not apply to them (for
-  example `--import` on `say`).
-- `help`, `--help` and `-h` print the usage text to standard output and exit 0.
-- Any error is printed to standard error as `spindle: MESSAGE` and the process exits
-  with status 1. A missing command prints the usage text the same way.
+  arguments. Only words that begin with `--` are options (Spindle has no one-letter
+  options, so `-5` or `-v` in a prompt are words). Every other word is positional. For
+  `new` and `say` the positional words are joined with single spaces into the
+  `PROMPT`, so quoting the prompt is optional. Prompt words that begin with `--` go
+  after a `--`; everything after it is a word.
+- A `PROMPT` (and `steer`'s `TEXT`) is the words given, `-` alone to read standard
+  input, or `--prompt-file FILE`; giving both words and a file is refused.
+- Each command takes only its own options ([`options_of`](../spindle/store/src/cli.rs)).
+  Any other option is refused with exit status 2 and nothing is done, never ignored or
+  sent as part of the prompt; the message says whether the option belongs to another
+  command. A command that takes no arguments (`status`, `usage`, `providers`,
+  `version`, ...) refuses any extra word the same way, and so do `api` and
+  `code-receipts`.
+- `help` and `--help` (or `-h`) print the usage text to standard output and exit 0.
+  `spindle help COMMAND` and `spindle COMMAND --help` print just that command's
+  synopsis and do nothing else.
+- Any error is printed to standard error as `spindle: MESSAGE`.
 - `doctor` exits 1 when any check fails (`some checks failed`).
-- `login`, `logout` and `auth` exit with the status of Dext's auth handler: 0 on
-  success, 2 for an unknown `auth` subcommand.
+- `login`, `logout` and `auth` take their own arguments (Dext's) and exit with the
+  status of Dext's auth handler: 0 on success, 2 for an unknown `auth` subcommand.
 - `serve` runs until it is stopped. Under a supervisor it exits with status 75 to be
   restarted ([host.md](host.md#operations)).
 
-Model text, tool calls and results go to standard output. Questions asked by session
-packs go to standard error ([What a run prints](#what-a-run-prints)).
+Exit status for every other command:
+
+| Status | Meaning |
+| --- | --- |
+| 0 | Done. |
+| 1 | Failed (the message says why and, for a turn, what goes on). |
+| 2 | Bad arguments: an unknown or misplaced option, a missing or extra word, a missing command (the usage text is printed). |
+| 130 | Stopped by the user: Ctrl-C, SIGTERM or `spindle stop` reached the running turn ([Reaching a running turn](#reaching-a-running-turn)). |
+
+`--json` (on `new`, `say`, `continue`, `retry`, `rewind`, `steer`, `stop`, `status`,
+`log`, `files`, `diff`, `usage`, `targets`, `providers` and `version`; refused with exit
+status 2 elsewhere) prints one JSON object on standard output. For a turn command the
+narration goes to standard error and the object says how the turn ended: `session`,
+`head`, `phase`, `complete`, `stopped`, `rewound`, `answer` (the model's final reply,
+when the turn completed), `cost` (`turn` and `thread`), `unsent` (messages the turn
+ended without reading), `stopped_by_user`, `next` (the command that goes on: `say`,
+`continue`, `retry`, `rewind`, or `wait` while another process holds the session)
+with `why`, and `error` when the turn failed. A command that fails before any
+turn runs prints `{"error", "exit"}` instead (and its message on standard error), so a
+caller always gets one object.
+
+Without `--json`, model text, tool calls and results go to standard output. Questions
+asked by session packs go to standard error ([What a run prints](#what-a-run-prints)).
 
 ## Command overview
 
@@ -98,6 +129,8 @@ packs go to standard error ([What a run prints](#what-a-run-prints)).
 | `say` | Send the next prompt, optionally changing settings. |
 | `continue` | Resume an interrupted run. |
 | `retry` | Re-run an interrupted model call from the point before it. |
+| `steer` | Give the turn another process runs a message. |
+| `stop` | Stop the turn another process runs. |
 | `status` | Where the session stands. |
 | `usage` | Spend per turn and per model. |
 | `log` | The conversation so far. |
@@ -105,6 +138,7 @@ packs go to standard error ([What a run prints](#what-a-run-prints)).
 | `rewind` | Go back to a target, restoring its workspace. |
 | `files` | List the workspace at the head. |
 | `cat` | Print one workspace file. |
+| `diff` | What changed between revisions, as a patch `git apply` takes. |
 | `export` | Write the head workspace and app state to a directory. |
 | `export-session` | Move (or copy) the whole session into a bundle file. |
 | `import-session` | Continue a bundled session in `DIR`. |
@@ -138,6 +172,7 @@ flowchart LR
     targets --> rewind["spindle rewind REVISION"]
     rewind -->|"settled target"| idle
     rewind -->|"before a model request"| stopped
+    run -->|"spindle stop or Ctrl-C"| stopped
     idle --> exp["spindle export-session"]
     exp --> imp["spindle --dir NEW import-session"]
     imp --> idle
@@ -169,9 +204,13 @@ created, so a provider that cannot send refuses the command with its reason.
 | `--effort LEVEL` | `default` | Reasoning effort: `default` (Spindle's per-provider default), `off`, `low`, `medium`, `high`, `xhigh`, `max`. The levels from `low` add 2K, 6K, 16K, 32K and 64K reasoning tokens on top of the answer cap. A level the model does not take is refused. |
 | `--compaction model\|digest` | `model` | How older history is compacted: `model` asks the session's model for a summary (one extra request; the digest stands in if it fails); `digest` builds a deterministic digest with no extra request. |
 | `--max-usd USD\|none` | `none` | Dollar budget for the thread. Accepts `5`, `0.50` or `$5`; `none`, `off` and `unlimited` clear it. A model request whose worst case would pass the budget is not sent; `continue` sends it once the budget is raised. |
+| `--prompt-file FILE` | none | Read the prompt from a file instead of the command line (or give `-` as the prompt to read standard input). |
 
-Settings are explained in [concepts.md](concepts.md) and [driver.md](driver.md); the
-sandbox in [tools.md](tools.md).
+The session's first prompt ends with a list of the files its workspace starts with (each
+with its size, at most 150 listed, a `.git/` folder counted rather than listed), so the
+model starts from what is there; the terminal and `log` name that list rather than
+print it. Settings are explained in [concepts.md](concepts.md) and
+[driver.md](driver.md); the sandbox in [tools.md](tools.md).
 
 ### `say`
 
@@ -180,7 +219,9 @@ spindle [--dir DIR] say [options] PROMPT
 ```
 
 Sends the next prompt to the session in `DIR`. It accepts the same options as `new`
-except `--import`, plus `--no-network` and `--no-toolchain`. Settings change only
+except `--import`, plus `--no-network` and `--no-toolchain`. While another process runs
+the session, `say` (like `targets` and `rewind`) refuses and says what can be done
+meanwhile: read it, or `steer` and `stop` it. Settings change only
 between turns: `say` works only when the last turn finished. If it stopped early,
 rewind to a target first; if it is still in progress, run `continue`. The new settings
 are saved before the prompt runs. One exception: a turn that a Stop cut off part way (the
@@ -222,18 +263,58 @@ spindle [--dir DIR] retry [--max-usd USD|none]
 Re-runs an interrupted model request from the point before it; the new request may be
 billed again. When the interrupted request was the session's very first one, there is
 no earlier point: the old store is kept aside (its path is printed) and the same prompt
-restarts in a fresh store over the same files.
+restarts in a fresh store over the same files. `status` and a refused `say` name
+`retry`, not `continue`, when the model request in flight has an unknown outcome.
+
+## Reaching a running turn
+
+```text
+spindle [--dir DIR] steer [--now] TEXT
+spindle [--dir DIR] stop
+```
+
+While one process runs a turn (`new`, `say`, `continue` or `retry`), another can reach
+it through the session's private `inbox/` folder, which the running process reads every
+100 ms ([`cli_control.rs`](../spindle/store/src/cli_control.rs)):
+
+- `steer TEXT` gives the running turn a message, read at its next step as the web
+  host's steering is; `--now` also cuts the reply being written. A message is at most
+  64 KiB (a longer one is refused: send it with `say` once the turn ends).
+- `stop` asks the turn to stop: the running command is ended and recorded as stopped,
+  never left as a crash, and `continue` goes on from there.
+- Ctrl-C (or SIGTERM) in the running process is the same stop. The process exits with
+  status 130 and names the command that goes on (`retry` when the stop cut a model
+  request off); a second Ctrl-C quits at once. Each command run leads a session of its
+  own, so a terminal's Ctrl-C reaches Spindle, never the command directly.
+
+Where no command-line turn takes messages, `steer` and `stop` say so, leave nothing and
+exit 1: nothing runs the session, or `spindle serve` or `spindle api` holds it (they
+take messages their own way). A message the running process does not take within 5 s
+(its turn ending, or 32 messages already waiting) is withdrawn, and the sender says
+nothing was sent. A message it took but its turn ended without reading is named in that
+process's output (and its `--json` result's `unsent`).
 
 ## Inspecting a session
 
+`status`, `usage`, `log`, `files`, `cat` and `diff` read committed revisions without the
+session's lock, so they also work while another process runs a turn; `targets` does not.
+
 | Command | Output |
 | --- | --- |
-| `status` | Session directory, provider and model, revision and owner epoch, prompts in the current history, state, workspace file count, isolation mode, reasoning level, token usage, cost, budget, and counts of uncertain (possibly billed), unresolved, refused and abandoned requests when there are any. |
-| `usage [--json]` | A per-turn table (revision, cost, calls, input, cached, output tokens, prompt), a per-model table and a total line that splits parent, nested and compaction spend and counts subscription, unpriced and refused calls. `--json` prints the same report as JSON. |
-| `log` | The conversation: prompts prefixed `> ` (messages sent while a turn ran are marked `(while running)`), model text, one line per tool call and the first lines of each result. |
+| `status` | Session directory, provider and model, revision and owner epoch, prompts in the current history, state, workspace file count, isolation mode, reasoning level, token usage, cost, budget, and counts of uncertain (possibly billed), unresolved, refused and abandoned requests when there are any. A session another process holds is marked running there, with what it waits on. With `--json` it also carries `held` (another process holds the session), `running` (its turn is under way), and `next` and `why` (the command that goes on). |
+| `usage` | A per-turn table (revision, cost, calls, input, cached, output tokens, prompt), a per-model table and a total line that splits parent, nested and compaction spend and counts subscription, unpriced and refused calls. `--json` prints the same report as JSON. |
+| `log [--last] [--revision N]` | The conversation: prompts prefixed `> ` (messages sent while a turn ran are marked `(while running)`), model text, one line per tool call and the first lines of each result. `--last` prints only the model's last reply (a finished turn's answer); `--revision N` the conversation as revision `N` held it. |
 | `targets` | One line per rewind target: its revision, its kind (`after a finished turn` or `before a model request`) and what came last. |
-| `files` | Size and path of every file in the head workspace. |
-| `cat PATH` | The raw bytes of one head workspace file, on standard output. |
+| `files [--revision N]` | Size and path of every file in the head workspace (or revision `N`'s). |
+| `cat [--revision N] PATH` | The raw bytes of one workspace file, at the head or as revision `N` held it, on standard output. |
+| `diff [FROM [TO]] [--stat]` | What changed, as a patch for `git apply`: by default what the last turn changed; `FROM` alone, from revision `FROM` to the head; `FROM TO` between two revisions. `--stat` prints files and line counts instead. |
+
+`diff` writes a git patch ([`cli_diff.rs`](../spindle/store/src/cli_diff.rs)): new and
+deleted files, mode changes, symbolic links (mode `120000`) and missing final newlines as
+git writes them, so `spindle diff 1 > work.patch && git -C PROJECT apply work.patch`
+carries a session's work into a checkout. It leaves out `.git/`, binary files and names
+a patch cannot hold, naming each on standard error (`spindle cat PATH > FILE` copies a
+binary one).
 
 ## Rewinding
 
@@ -252,7 +333,7 @@ re-runs that request. Rewind semantics are in [store.md](store.md) and
 
 | Command | Effect |
 | --- | --- |
-| `export DIR` | Writes the head workspace to `DIR/workspace/` and the session's app state to `DIR/state.json`. `DIR` must be absent or empty. |
+| `export DIR` | Writes the head workspace to `DIR/workspace/` and the session's app state to `DIR/state.json`, and says so. `DIR` must be absent or empty. |
 | `export-session FILE [--keep]` | Writes the whole session (its store and every task's store, with their side files) to the bundle `FILE`, which must not exist. Without `--keep` the session **moves**: this copy is sealed and no longer opens, and work continues where the bundle is imported. With `--keep` both copies remain; continue only one of them. A running background task refuses the export. |
 | `import-session FILE` | Imports a bundle into `DIR` (absent or empty) and prints its head and file count. |
 
@@ -434,11 +515,12 @@ events as they happen:
 | `... PROVIDER / MODEL (step N)` | A model request starts. |
 | model text | Streamed as it arrives; `(the provider withdrew the text above)` if the provider retracts it. |
 | `    [tokens in N out M]`, `    [cost ...]` | Usage and cost of the call, the turn and the thread. Subscription and unpriced calls are labelled as such. |
-| a tool call description | One line per tool call, followed by live output prefixed `  \| `. The live preview is capped at 4 KiB per call; the recorded result keeps a paged output window. |
+| a tool call description | One line per tool call, followed by live output prefixed `  \| `. The live preview is capped at 4 KiB per call; the recorded result keeps a paged output window, and a command's exit line (`[exit status 3]`) is always shown. |
 | `  \| (reusing the recorded result; not run again)` | A tool result recorded before a restart is reused. |
 | `(reusing the recorded response; nothing was re-sent)` | A recorded model response is reused. |
 | `(no isolation: ...)` | Commands run directly on the host under `--isolation auto`. |
 | `(the provider refused the request with HTTP N; ...)` | A retry after a provider refusal, with any wait or history compaction. |
+| `(the turn ended before reading your message: ...)` | A `steer` message the turn took but never read; send it with `say`. |
 | `[REASON] after N model step(s); revision R; workspace: F file(s).` | The run stopped, followed by the next useful command. |
 
 When standard input is a terminal, questions from session packs are asked on the

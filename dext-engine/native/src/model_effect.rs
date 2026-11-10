@@ -129,7 +129,8 @@ impl ModelTransport {
     }
 
     /// Why the most recent `AttemptError::Protocol` from this transport was raised (the
-    /// parser's words, or the reply's type when it was not an event stream), taken once.
+    /// parser's words, or the reply's type when it was not an event stream), or why an
+    /// `AttemptError::Unsent` connection could not be made, taken once.
     pub fn take_failure(&self) -> Option<String> {
         self.failure
             .lock()
@@ -210,7 +211,15 @@ impl ModelTransport {
             let response = tokio::time::timeout(self.deadlines.first_byte, request.send())
                 .await
                 .map_err(|_| AttemptError::Deadline)?
-                .map_err(|_| AttemptError::Transport)?;
+                .map_err(|error| {
+                    // No connection, so nothing of the request left: said, not unknown.
+                    if error.is_connect() {
+                        self.set_failure(Some(connect_failure(&error)));
+                        AttemptError::Unsent
+                    } else {
+                        AttemptError::Transport
+                    }
+                })?;
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let retry_after = response
@@ -298,4 +307,31 @@ impl ModelTransport {
             }
         }
     }
+}
+
+/// Why a connection could not be made: the host it was made to and the innermost cause
+/// (`127.0.0.1:8080: Connection refused (os error 111)`); clipped, without secrets (a
+/// request URL here holds none: credentials travel in headers).
+fn connect_failure(error: &reqwest::Error) -> String {
+    let mut cause: &dyn std::error::Error = error;
+    while let Some(source) = cause.source() {
+        cause = source;
+    }
+    let to = error
+        .url()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| match url.port_or_known_default() {
+                    Some(port) => format!("{host}:{port}: "),
+                    None => format!("{host}: "),
+                })
+        })
+        .unwrap_or_default();
+    let said: String = cause
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    format!("{to}{said}")
 }

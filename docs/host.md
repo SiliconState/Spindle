@@ -282,7 +282,7 @@ checks its receipt before accepting more work.
 | Threads running at once | 4; a fifth run is refused with `four sessions are already running` |
 | Prompt and steering message size | 1 to 16384 bytes |
 | Messages waiting for a running turn | 32 |
-| Attachment upload | 8 MiB each, 32 per message, at most 64 MiB of a thread's uploads from the last day waiting to be attached (`HOST/sessions/ID/uploads`, removed after a day) |
+| Attachment upload | 8 MiB each, 32 per message, at most 64 MiB of a thread's uploads from the last day waiting to be attached (`HOST/sessions/ID/uploads`, removed after a day); the same for the host's own uploads for new threads (`HOST/uploads`) |
 | Receipts | kept a week (a deleted thread's for an hour), at most 8192 |
 
 Command kinds on `/api` are those of `/v1` plus the self-edit kinds `promote`,
@@ -611,7 +611,7 @@ installing it.
 `spindle --dir HOST serve ...` again whenever it exits. The host exits with status 75
 when it wants to be restarted. Promotion and browser rollback also require the running
 binary to live in `HOST/bin/`. With the binary at `HOST/bin/spindle`, the default
-code-mode policy path resolves to `HOST/code-policy.json` ([cli.md](cli.md#global-option-and-environment)).
+code-mode policy path resolves to `HOST/code-policy.json` ([cli.md](cli.md#global-options-and-environment)).
 
 | Action | How | Conditions | Effect |
 | --- | --- | --- | --- |
@@ -650,6 +650,7 @@ failures go to standard error.
 | `serve.lock` | Locked by the running `serve`; one host per directory. |
 | `host.sqlite` (with `-wal`, `-shm`) | Mode 0600. Tables `sessions` (thread id, name, legacy self-edit flag), `commands` (request id, thread, payload digest, state, error), `submissions` (payloads), `command_times`, `devices` (device and API-token hashes, labels, times), `owners` (which browser token brought a thread) and `threads` (each brought thread's idempotency key, bundle digest, state and fit). |
 | `sessions/ID/` | One session directory per thread: `store/` and settings ([store.md](store.md)), plus `uploads/`, `install-request.json`, `host-sync/` and `moved.spindle`, the kept bundle of a thread that moved back to its client. |
+| `uploads/` | Files uploaded with `POST /v1/uploads` for a `new` command's `attachments`, kept a day (64 MiB a day). |
 | `trash/ID/` | A deleted thread's directory until it is removed. |
 | `incoming/` | Thread bundles being uploaded, imports being staged and copies being exported; emptied when the host opens. |
 | `skin/` | `active.css`, `staged.css` and `versions/`. |

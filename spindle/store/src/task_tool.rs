@@ -59,6 +59,23 @@ pub fn identity(input: &Value) -> Value {
     Value::Object(kept)
 }
 
+/// The answer to a `task` call its task cannot run for (its input, the session's task
+/// policy, or a model or effort it cannot make a request with), whether or not it had
+/// begun: a failed result its model reads, so the turn goes on. Starting or continuing
+/// the task would only meet the same refusal, so the call is never left waiting on it.
+pub fn refused(why: &str) -> AppAnswer {
+    AppAnswer::Result {
+        content: format!("The task could not run: {}.", why.trim_end_matches('.')),
+        failed: true,
+        writes: vec![],
+        deletes: vec![],
+        links: vec![],
+        directories: vec![],
+        state: None,
+        details: None,
+    }
+}
+
 /// Why a task's model is refused by the session's `tasks.models` (none: any model).
 pub fn model_refusal(models: &[String], default: &str, input: &Value) -> Option<String> {
     let model = input["model"]

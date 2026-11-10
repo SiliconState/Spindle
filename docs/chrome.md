@@ -153,7 +153,7 @@ The engine's operations (`ops` in [`engine-worker.mjs`](../spindle/chrome/engine
 | `tasks`, `taskStop` | List child tasks and stop one, including while the parent only waits for reports. |
 | `storage`, `compact`, `dropAside`, `freeSealed`, `reclaimLost` | Per-thread disk use (and, since 0.1.7, the bytes no file name leads to), return free database pages, remove set-aside first attempts, remove a moved thread's sealed copy after checking its bundle, or (since 0.1.7) free those unreadable bytes. |
 | `open` | A thread's status and history (optionally from a message index). For a thread whose commands run in the browser it also warms the wasm Linux (when the build carries it), and v86 only if the thread ran a command there in the last 24 hours. |
-| `rewindTo` | Takes the thread back to just before one of the user's messages, searching the last 8192 rewind targets, and returns that message and its attachments. |
+| `rewindTo` | Takes the thread back to just before one of the user's messages, searching the last 8192 rewind targets, and returns that message and its attachments. After 0.1.8 it first narrows the targets to the histories that begin as the thread's does through that message (a history only grows until a compaction starts it again), and reads every target only when that misses; the panel waits up to ten minutes for it. |
 | `earlier` | The history before a compaction summary. |
 | `restart` | Starts an unfinished turn over, optionally with other settings, or hands its message back. |
 | `settings`, `efforts`, `rename` | Change a thread's settings; list a model's efforts; rename. |
@@ -658,7 +658,12 @@ It goes with the thread when the thread is deleted. See `backToBox` in
 lists the whole workspace once as a tree in a card folded until the user opens it, just above
 the last turn's final answer (at the end when the turn ended without one), marking files as new
 or edited (`turnFiles` compares digests
-with the workspace before the turn), whether a file tool or a command made them. Scratch files (`isScratch`:
+with the workspace before the turn), whether a file tool or a command made them. Finding
+the point before the turn (`pointBefore`) read the history at every recent rewind target
+until one matched, which on a long thread whose last turn compacted held the engine for
+over a minute ("Spindle's engine is not answering"); after 0.1.8 it narrows the targets
+the same way as `rewindTo` (a few reads), and long searches let the engine answer other
+asks between reads. Scratch files (`isScratch`:
 `.txt`, `.py`, `.pyc`, `.log`, `.tmp`, and anything under `test/`, `tests/`, `__pycache__/` or
 `.cache/`) are hidden until shown. Cards of pages, pictures, Markdown files and (since
 0.1.7) documents sit below their run of steps; a page's or document's card has a button that
@@ -875,7 +880,11 @@ defaults for new threads are kept in the panel's `localStorage` (`spindle-new`).
 
 For a stopped, failed or interrupted thread, saving this page restarts from its
 newest safe before-model or settled target, keeping earlier history; only a true
-first turn starts afresh, with its old copy retained. Otherwise it
+first turn starts afresh, with its old copy retained. After 0.1.8, the turn then goes on
+with the new model even when it is another provider's that speaks another wire contract
+(the OpenAI API to ChatGPT, say, after running out of credits): 0.1.8 refused that step
+("turn state rejected the step (Binding)"), and Retry after such a restart could say "the
+turn's last request was not found". Otherwise it
 uses `settings`, which the package refuses while a turn runs; a spend limit alone may also
 change between the steps of an unfinished turn. Background
 tasks must end or be stopped before a restart.

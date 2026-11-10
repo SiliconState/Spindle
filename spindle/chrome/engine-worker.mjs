@@ -1804,14 +1804,56 @@ let turnFilesKept = { key: null, value: null };
  * store lists no points to go back to meanwhile. */
 const NOT_WHILE_WORKING = 'The messages before the summary can be shown once this thread stops working';
 
+/** Lets what waits on the engine go first (a panel's `ping`, another thread's work)
+ * between the reads of a long search: each history read holds the engine's one wasm
+ * thread for as long as it takes (tens of milliseconds in a long thread). At most every
+ * 20 ms: Chrome holds a timer set from a timer back 4 ms, so one per read of a short
+ * history would make a search of thousands of them seconds slower. (By the monotonic
+ * clock: a wall clock set back would stop them until it caught up.) */
+let othersWent = -Infinity;
+async function letOthersGo() {
+  if (performance.now() - othersWent < 20) return;
+  await new Promise((done) => setTimeout(done, 0));
+  othersWent = performance.now();
+}
+
 /** The rewind target whose history is `shown`'s first `at` messages: the point just
- * before message `at`. Newest first, among the last 8192 steps (each read only to its
- * count first; the whole history of one with the right count). */
-async function pointBefore(dir, shown, at) {
+ * before message `at`, among the last 8192 steps; null when none is. A history only
+ * grows until a compaction starts it again from a summary, so each history since both
+ * message `at` and `shown`'s last compaction begins as `shown` does through the
+ * message, and no other one does. Halving the targets (newest first) on that finds the
+ * newest whose history does not, in a few reads however many steps the thread took;
+ * compared whole, it is the point before the message, or there is none (as when the
+ * turn compacted after its message). Reading every target took over a minute in a long
+ * thread, the engine answering nothing meanwhile. A rewind past the message and on
+ * again breaks that order and can hide the point: `thorough` then reads every target,
+ * newest first (its length first, the whole only for one of that length), as Rewind
+ * needs; without it (marking what a turn changed) the point is then not found. */
+async function pointBefore(dir, shown, at, { thorough = false } = {}) {
   const before = JSON.stringify(shown.slice(0, at));
-  for (const target of await client.targets(dir, { limit: 8192 })) {
-    // Its length first (asked from the end: no messages come back), the whole compared
-    // only for a point of that length.
+  const through = JSON.stringify(shown.slice(0, at + 1));
+  const targets = await client.targets(dir, { limit: 8192 });
+  const begun = (messages) => messages.length > at && JSON.stringify(messages.slice(0, at + 1)) === through;
+  // The histories of targets before `low` begin so, those from `high` on do not;
+  // `without` is the one at targets[high], once one is read.
+  let low = 0;
+  let high = targets.length;
+  let without = null;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    await letOthersGo();
+    const messages = (await client.history(dir, targets[middle].revision)).messages ?? [];
+    if (begun(messages)) {
+      low = middle + 1;
+    } else {
+      high = middle;
+      without = messages;
+    }
+  }
+  if (without && JSON.stringify(without) === before) return targets[high].revision;
+  if (!thorough) return null;
+  for (const target of targets) {
+    await letOthersGo();
     const { total } = await client.history(dir, target.revision, { from: at });
     if (total !== at) continue;
     if (JSON.stringify((await client.history(dir, target.revision)).messages ?? []) === before) return target.revision;
@@ -2162,7 +2204,7 @@ const ops = {
         if (STARTED_WITH.test(text)) throw failure('invalid', 'This thread started with the files of another thread, which came with its first message; to begin again with them, start a new thread with these files (the thread menu)');
         return { text, files, first: true };
       }
-      const target = await pointBefore(dir, shown, at);
+      const target = await pointBefore(dir, shown, at, { thorough: true });
       if (target == null) throw failure('not_found', 'Spindle no longer holds the point before that message (it keeps the last 8192 steps); start a new thread with its files instead');
       await client.rewind(dir, target);
       await forgetUnlisted(id);
@@ -2191,6 +2233,7 @@ const ops = {
       });
       for (const target of targets) {
         if (revision != null && target.revision >= revision) continue;
+        await letOthersGo();
         const history = await client.history(dir, target.revision);
         if (JSON.stringify(history.messages?.[0] ?? null) !== summary) return { revision: target.revision, history };
       }

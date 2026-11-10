@@ -175,8 +175,9 @@ fn finish<S: Read>(
 const MAX_HEAD: usize = 16384;
 
 fn upload(path: &str) -> bool {
-    (path.starts_with("/api/sessions/") || path.starts_with("/v1/sessions/"))
-        && path.ends_with("/upload")
+    ((path.starts_with("/api/sessions/") || path.starts_with("/v1/sessions/"))
+        && path.ends_with("/upload"))
+        || path == "/v1/uploads"
 }
 
 /// `/v1` bodies that carry an app's data: an app tool's answer (up to 4 MiB of text,

@@ -50,6 +50,7 @@ const FEATURES: &[&str] = &[
     "runner_tokens",
     "threads",
     "connect",
+    "new_attachments",
 ];
 /// Command kinds v1 admits (`/api` also has the self-edit `promote`, `rollback` and
 /// `update`).
@@ -666,6 +667,11 @@ fn dispatch(
             let (status, receipt) = command(host, &request.body, owner)?;
             send(stream, status, &receipt, extra)
         }
+        // Files for a `new` command's `attachments` (a thread's own go to its upload).
+        ("POST", ["uploads"]) => {
+            let saved = host.upload_new(&request.body).map_err(bad)?;
+            send(stream, 200, &saved, extra)
+        }
         ("GET", ["usage"]) => {
             // Minutes east of UTC that "today" is counted in, as /api/usage takes it.
             let offset = request
@@ -905,6 +911,7 @@ fn dispatch(
             | ["providers"]
             | ["models"]
             | ["commands"]
+            | ["uploads"]
             | ["receipts", _]
             | ["threads"],
         ) => Err(not_allowed()),
@@ -1076,6 +1083,7 @@ fn fields(kind: &str) -> &'static [&'static str] {
     match kind {
         "new" => &[
             "text",
+            "attachments",
             "name",
             "provider",
             "model",

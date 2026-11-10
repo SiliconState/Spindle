@@ -427,6 +427,14 @@ pub const MAX_FILE_TOOL_TEXT: usize = 1024 * 1024;
 /// `limit` respectively); windows are exempt from the turn's output budget.
 #[cfg(feature = "driver")]
 pub const MAX_READ_WINDOW: usize = 256 * 1024;
+/// Longest text `read_output` finds.
+pub const MAX_FIND: usize = 200;
+/// Most matching lines one `read_output` search lists.
+#[cfg(feature = "workspace-tools")]
+const MAX_FOUND: usize = 200;
+/// Characters of each matching line a search shows.
+#[cfg(feature = "workspace-tools")]
+const MAX_FOUND_LINE: usize = 300;
 
 /// Tool output one prompt's turn keeps in its transcript across bash and run_code
 /// results (paging with read_file and read_output is not charged). Larger output is
@@ -649,6 +657,10 @@ enum StrictTool<'a> {
         artifact: String,
         offset: usize,
         limit: usize,
+        /// The last `tail` bytes instead of a window from `offset`.
+        tail: Option<usize>,
+        /// Lines holding this text (from `offset` on), each with its byte offset.
+        find: Option<&'a str>,
     },
     Write {
         path: String,
@@ -1139,6 +1151,22 @@ fn strict_tool(effect: &Effect) -> Result<StrictTool<'_>> {
                     .filter(|n| (1..=MAX_READ_WINDOW as u64).contains(n))
                     .ok_or(Error::Invalid)? as usize,
             },
+            tail: match input.get("tail") {
+                None => None,
+                Some(n) => Some(
+                    n.as_u64()
+                        .filter(|n| (1..=MAX_READ_WINDOW as u64).contains(n))
+                        .ok_or(Error::Invalid)? as usize,
+                ),
+            },
+            find: match input.get("find") {
+                None => None,
+                Some(text) => Some(
+                    text.as_str()
+                        .filter(|text| !text.is_empty() && text.len() <= MAX_FIND)
+                        .ok_or(Error::Invalid)?,
+                ),
+            },
         },
         "write_file" => StrictTool::Write {
             path: path()?,
@@ -1332,8 +1360,8 @@ pub fn strict_tool_refusal(name: &str, input: &serde_json::Value) -> Option<Stri
             dext_native::limits::MAX_RUN_SECS
         ),
         "read_output" => format!(
-            "read_output input must have an output artifact digest, byte offset (default 0) and limit (1-{} bytes)",
-            MAX_READ_WINDOW
+            "read_output input must be {{\"artifact\": the 64-hex digest a result names, \"offset\": optional byte offset (default 0), \"limit\": optional 1-{} bytes, \"tail\": optional last 1-{} bytes, \"find\": optional text of 1-{MAX_FIND} bytes}}",
+            MAX_READ_WINDOW, MAX_READ_WINDOW
         ),
         "read_file" => format!(
             "read_file input must be {{\"path\": {PATH}, \"offset\"/\"limit\": optional positive line counts, \"max_output\": optional window bytes (4096-{})}}",
@@ -1374,7 +1402,7 @@ fn strict_fields(name: &str) -> Option<&'static [&'static str]> {
         "bash" => &["command", "timeout", "max_output"],
         "run_code" => &["language", "code", "timeout", "max_output"],
         "read_file" => &["path", "offset", "limit", "max_output"],
-        "read_output" => &["artifact", "offset", "limit"],
+        "read_output" => &["artifact", "offset", "limit", "tail", "find"],
         "write_file" => &["path", "content"],
         "edit_file" => &["path", "old_string", "new_string", "replace_all"],
         "start_job" => &["command", "timeout"],
@@ -1525,6 +1553,75 @@ struct Recorded {
     success: bool,
     root: String,
     trailer: String,
+}
+
+/// How a command run ended, kept in its result's metadata (`exit_code`, and
+/// `duration_ms` for a long run: a short one's time would make each recorded step
+/// differ between otherwise identical runs).
+#[cfg(feature = "dext-strict-workspace")]
+struct RunFacts {
+    exit_code: Option<i32>,
+    duration: Option<std::time::Duration>,
+}
+
+/// Where a run's stderr begins in its result, after its stdout: the two are read
+/// apart, so how they interleaved is not known.
+#[cfg(feature = "dext-strict-workspace")]
+pub const STDERR_LABEL: &str = "[stderr]";
+
+/// Runs at least this long say how long they took (in whole seconds), shorter ones not.
+#[cfg(feature = "dext-strict-workspace")]
+const SAY_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a run printed, as its result reads: stdout, then stderr under `STDERR_LABEL`.
+#[cfg(feature = "dext-strict-workspace")]
+fn run_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(stdout).into_owned();
+    if !stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(STDERR_LABEL);
+        text.push('\n');
+        text.push_str(&String::from_utf8_lossy(stderr));
+    }
+    text
+}
+
+/// The line that ends a finished run's result: a failed run's exit status (or the
+/// signal that ended it), and how long a long run took (succeeded or not); else nothing.
+#[cfg(feature = "dext-strict-workspace")]
+fn run_ended(sealed: &dext_native::strict::SealedOutput, elapsed: std::time::Duration) -> String {
+    let took = match elapsed >= SAY_DURATION {
+        true => format!(" after {}", seconds(elapsed)),
+        false => String::new(),
+    };
+    match (sealed.success(), sealed.exit_code(), sealed.signal()) {
+        (true, _, _) if elapsed >= SAY_DURATION => format!("\n[exit status 0{took}]"),
+        (true, _, _) => String::new(),
+        (false, _, Some(signal)) => format!("\n[ended by signal {signal}{took}]"),
+        (false, Some(code), None) => format!("\n[exit status {code}{took}]"),
+        (false, None, None) => format!("\n[failed{took}]"),
+    }
+}
+
+/// A run's deadline passed: what was allowed and the ways on.
+#[cfg(feature = "dext-strict-workspace")]
+fn timed_out(timeout: u64) -> String {
+    format!(
+        "the command ran past its {timeout} s timeout and was stopped (`timeout` can be up to \
+         {} s; for a server or a long build use start_job)",
+        dext_native::limits::MAX_RUN_SECS
+    )
+}
+
+/// A long run's time as people read it: 12 s, 3 min 5 s.
+#[cfg(feature = "dext-strict-workspace")]
+fn seconds(elapsed: std::time::Duration) -> String {
+    match elapsed.as_secs() {
+        whole @ 0..120 => format!("{whole} s"),
+        whole => format!("{} min {} s", whole / 60, whole % 60),
+    }
 }
 
 /// Why a finished run's changes were not kept when the store filled up meanwhile.
@@ -1951,7 +2048,7 @@ impl Store {
         request: &DispatchRequest,
         interrupt: &AtomicBool,
         executor: &dext_native::strict::StrictExecutor,
-        mut options: dext_native::strict::RunOptions<'_>,
+        options: dext_native::strict::RunOptions<'_>,
         mut authorize: A,
         host: Option<&mut dyn crate::code_mode::Host>,
     ) -> Result<DispatchOutcome>
@@ -2017,6 +2114,20 @@ impl Store {
             id: request.attempt.id.clone(),
             scope: request.scope.clone(),
             owner_epoch: request.owner_epoch,
+        };
+        // Isolated runs and jobs without the network share the session's loopback
+        // network, so a later command reaches a server a job started (made on the first
+        // command, not for file tools).
+        let runs = matches!(
+            tool,
+            StrictTool::Bash { .. } | StrictTool::Code { .. } | StrictTool::JobStart { .. }
+        );
+        let loopback = (runs && !options.network && executor.isolated())
+            .then(|| crate::jobs::loopback(&self.job_session()))
+            .flatten();
+        let mut options = dext_native::strict::RunOptions {
+            loopback: loopback.as_deref(),
+            ..options
         };
         let prepared = match tool {
             StrictTool::Bash { command, timeout } => {
@@ -2105,6 +2216,7 @@ impl Store {
             code: host,
             failed: None,
         };
+        let started = std::time::Instant::now();
         let executed = executor.execute_tree(
             &inputs,
             &argv,
@@ -2119,26 +2231,27 @@ impl Store {
         if let Some(error) = run.failed.take() {
             return self.broker_result(Err(error));
         }
-        let output = |stdout: &[u8], stderr: &[u8]| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(stdout),
-                String::from_utf8_lossy(stderr)
-            )
-        };
+        let elapsed = started.elapsed();
+        let output = |stdout: &[u8], stderr: &[u8]| run_output(stdout, stderr);
         // Whatever ended the run (its own bounds, unsealable output, a sandbox that
         // could not start), the executor already discarded the candidate, so the call is
         // recorded as a failed result over the unchanged base with its output and reason.
         // Only an interrupted owner leaves the attempt to be sealed as interrupted.
+        let mut facts = RunFacts {
+            exit_code: None,
+            duration: (elapsed >= SAY_DURATION).then_some(elapsed),
+        };
         let recorded = match executed {
             Ok(sealed) => {
                 if sealed.helper_digest() != executor.helper_digest() {
                     return Err(Error::Conflict);
                 }
+                facts.exit_code = sealed.exit_code();
                 let content = output(sealed.stdout(), sealed.stderr());
+                let ended = run_ended(&sealed, elapsed);
                 if atomic && !sealed.success() {
                     Recorded {
-                        trailer: format!("\n[{DISCARDED_SCRIPT}]"),
+                        trailer: format!("{ended}\n[{DISCARDED_SCRIPT}]"),
                         ..failed(content)
                     }
                 } else {
@@ -2147,10 +2260,10 @@ impl Store {
                             content,
                             success: sealed.success(),
                             root,
-                            trailer: String::new(),
+                            trailer: ended,
                         },
                         Ok(Err(reason)) => Recorded {
-                            trailer: format!("\n{reason}; {UNSEALED_RUN}"),
+                            trailer: format!("{ended}\n{reason}; {UNSEALED_RUN}"),
                             ..failed(content)
                         },
                         // The store failed keeping its changes: what the run printed is
@@ -2159,12 +2272,12 @@ impl Store {
                         Err(error) => {
                             let recorded = Recorded {
                                 trailer: format!(
-                                    "\nthe store could not keep its changes; {UNSEALED_RUN}"
+                                    "{ended}\nthe store could not keep its changes; {UNSEALED_RUN}"
                                 ),
                                 ..failed(content)
                             };
                             return self
-                                .record_strict(request, &call_id, &helper, &base, recorded)
+                                .record_run(request, &call_id, &helper, &base, recorded, facts)
                                 .map_err(|_| error);
                         }
                     }
@@ -2195,6 +2308,12 @@ impl Store {
                         String::new(),
                     ),
                 };
+                // The run's own deadline, said with the limit and the ways on.
+                let reason = if reason == dext_native::strict::DEADLINE_EXCEEDED {
+                    timed_out(timeout)
+                } else {
+                    reason
+                };
                 let ending = if matches!(
                     error.kind(),
                     std::io::ErrorKind::TimedOut
@@ -2212,7 +2331,7 @@ impl Store {
                 }
             }
         };
-        self.record_strict(request, &call_id, &helper, &base, recorded)
+        self.record_run(request, &call_id, &helper, &base, recorded, facts)
     }
 
     /// A host tool (`crate::turn::HOST_TOOLS`) under the strict workspace adapter's
@@ -2530,6 +2649,7 @@ impl Store {
                 details: details.as_deref(),
                 max_output,
             }),
+            None,
             None,
         )
     }
@@ -2953,11 +3073,27 @@ impl Store {
                 artifact,
                 offset,
                 limit,
+                tail,
+                find,
             } => {
-                return match self.retained_output(&stage.scope, artifact, *offset, *limit) {
+                if !crate::artifact::valid_digest(artifact) {
+                    return Ok(Err(
+                        "`artifact` is the whole 64-hex digest a result names after `read_output artifact=`"
+                            .into(),
+                    ));
+                }
+                let page = match (find, tail) {
+                    (Some(text), _) => {
+                        self.retained_search(&stage.scope, artifact, *offset, text, *limit)
+                    }
+                    (None, Some(tail)) => self.retained_tail(&stage.scope, artifact, *tail),
+                    (None, None) => self.retained_output(&stage.scope, artifact, *offset, *limit),
+                };
+                return match page {
                     Ok(page) => Ok(Ok((page, base.to_string()))),
                     Err(Error::Invalid) => Ok(Err(
-                        "no retained output artifact or invalid output window".into(),
+                        "no output is retained under that digest in this session, or the offset is past its end"
+                            .into(),
                     )),
                     Err(error) => Err(error),
                 };
@@ -3213,13 +3349,23 @@ impl Store {
         } else {
             String::from_utf8_lossy(&first.bytes).into_owned()
         };
+        // Whether this session's later commands can reach a server the job starts.
+        let reach = if options.network || !executor.isolated() {
+            "A server it starts on localhost is reachable from later commands."
+        } else if options.loopback.is_some() {
+            "A server it starts on localhost is reachable from this session's later \
+             commands (they share a private loopback network; nothing outside can reach it)."
+        } else {
+            "Later commands cannot reach a server it starts (each run has a network of its \
+             own on this host): exercise the server inside the job's own command."
+        };
         Ok(match settled.state {
             JobState::Running => (
                 format!(
                     "Started background job {id} (lifetime {lifetime} s). It runs over a \
                      snapshot of the workspace as it was now; files it changes are not \
-                     saved. Read its output with read_job {{\"job\": \"{id}\"}}, end it \
-                     with stop_job. First output:\n{printed}"
+                     saved. {reach} Read its output with read_job {{\"job\": \"{id}\"}}, \
+                     end it with stop_job. First output:\n{printed}"
                 ),
                 true,
             ),
@@ -3390,6 +3536,71 @@ impl Store {
         ))
     }
 
+    /// The last `tail` bytes of retained output (`retained_output` from its length).
+    #[cfg(feature = "workspace-tools")]
+    pub fn retained_tail(&mut self, scope: &str, artifact: &str, tail: usize) -> Result<String> {
+        self.retained_output(scope, artifact, 0, 1)?;
+        let (length, _) = self.broker_result(crate::artifact::object_range(
+            &self.db, scope, artifact, 0, 0,
+        ))?;
+        self.retained_output(scope, artifact, length.saturating_sub(tail), tail)
+    }
+
+    /// The lines of retained output from `offset` on that hold `find`, each with the
+    /// byte offset it starts at (to read around it with `retained_output`), as many as
+    /// `limit` bytes of listing hold (at most `MAX_FOUND` lines).
+    #[cfg(feature = "workspace-tools")]
+    pub fn retained_search(
+        &mut self,
+        scope: &str,
+        artifact: &str,
+        offset: usize,
+        find: &str,
+        limit: usize,
+    ) -> Result<String> {
+        // Authorizes the digest for this scope, and the offset against its length.
+        self.retained_output(scope, artifact, offset, 1)?;
+        let (length, bytes) = self.broker_result(crate::artifact::object_range(
+            &self.db,
+            scope,
+            artifact,
+            offset,
+            usize::MAX,
+        ))?;
+        let needle = find.as_bytes();
+        let mut listing = String::new();
+        let (mut matched, mut shown) = (0usize, 0usize);
+        let mut at = offset;
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let start = at;
+            at += line.len();
+            if needle.len() > line.len() || !line.windows(needle.len()).any(|part| part == needle) {
+                continue;
+            }
+            matched += 1;
+            let text: String = String::from_utf8_lossy(line)
+                .trim_end_matches(['\n', '\r'])
+                .chars()
+                .take(MAX_FOUND_LINE)
+                .collect();
+            let entry = format!("@{start}: {text}\n");
+            if shown < MAX_FOUND && listing.len() + entry.len() <= limit {
+                listing.push_str(&entry);
+                shown += 1;
+            }
+        }
+        Ok(match matched {
+            0 => {
+                format!("[no line holds `{find}` from offset {offset} on ({length} bytes in all)]")
+            }
+            _ => format!(
+                "{listing}[{shown} of {matched} line(s) holding `{find}` from offset {offset} on; \
+                 {length} bytes in all; each line's byte offset is after @, so offset=N reads \
+                 from there]"
+            ),
+        })
+    }
+
     #[cfg(feature = "workspace-tools")]
     fn record_strict(
         &mut self,
@@ -3399,7 +3610,30 @@ impl Store {
         base: &str,
         recorded: Recorded,
     ) -> Result<DispatchOutcome> {
-        self.record_sealed(request, call_id, helper, base, recorded, None, None)
+        self.record_sealed(request, call_id, helper, base, recorded, None, None, None)
+    }
+
+    /// `record_strict` for a command run, with how it ended in the result's metadata.
+    #[cfg(feature = "dext-strict-workspace")]
+    fn record_run(
+        &mut self,
+        request: &DispatchRequest,
+        call_id: &str,
+        helper: &str,
+        base: &str,
+        recorded: Recorded,
+        facts: RunFacts,
+    ) -> Result<DispatchOutcome> {
+        self.record_sealed(
+            request,
+            call_id,
+            helper,
+            base,
+            recorded,
+            None,
+            None,
+            Some(facts),
+        )
     }
 
     /// `record_strict` for a call the user's stop ended: its result carries
@@ -3421,6 +3655,7 @@ impl Store {
             recorded,
             None,
             Some(STOPPED_STATUS),
+            None,
         )
     }
 
@@ -3439,6 +3674,8 @@ impl Store {
         recorded: Recorded,
         app: Option<AppReceipt<'_>>,
         status: Option<&'static str>,
+        #[cfg(feature = "dext-strict-workspace")] facts: Option<RunFacts>,
+        #[cfg(not(feature = "dext-strict-workspace"))] facts: Option<()>,
     ) -> Result<DispatchOutcome> {
         let patch = app.as_ref().and_then(|app| app.patch);
         let details = app.as_ref().and_then(|app| app.details);
@@ -3549,6 +3786,32 @@ impl Store {
                 ..Default::default()
             },
         };
+        #[cfg(feature = "dext-strict-workspace")]
+        let block = match (block, facts) {
+            (
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    mut metadata,
+                },
+                Some(facts),
+            ) => {
+                metadata.exit_code = facts.exit_code;
+                metadata.duration_ms = facts
+                    .duration
+                    .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64);
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    metadata,
+                }
+            }
+            (block, _) => block,
+        };
+        #[cfg(not(feature = "dext-strict-workspace"))]
+        let _ = facts;
         let result = serde_json::to_vec(&block).map_err(|_| Error::Invalid)?;
         crate::fits(result.len())?;
         let recorded = (|| -> Result<()> {

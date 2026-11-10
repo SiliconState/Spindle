@@ -19,6 +19,9 @@ pub enum AttemptError {
     Interrupted,
     Deadline,
     Transport,
+    /// The connection could not be made (refused, unresolved, TLS or proxy refusal), so
+    /// no byte of the request was sent: a known outcome, never billed.
+    Unsent,
     Http(u16),
     Protocol,
     Exhausted,

@@ -1388,10 +1388,23 @@ impl Host {
             .as_array()
             .is_some_and(|list| !list.is_empty())
         {
-            if kind != "say" {
-                return Err(bad("attach files to a message in an existing thread"));
-            }
-            self.attachments(id, &data["attachments"]).map_err(bad)?;
+            match kind {
+                "say" => self.attachments(id, &data["attachments"]).map_err(bad)?,
+                // A new thread's files were uploaded to the host (`POST /v1/uploads`).
+                "new" if !data["dev"].as_bool().unwrap_or(false) => {
+                    self.new_attachments(&data["attachments"]).map_err(bad)?
+                }
+                "new" => {
+                    return Err(bad(
+                        "a self-edit thread starts with Spindle's source and takes no attachments",
+                    ));
+                }
+                _ => {
+                    return Err(bad(
+                        "attach files to `say`, or to `new` from `POST /v1/uploads`",
+                    ));
+                }
+            };
         }
         if kind == "update" && self.source.is_none() {
             return Err(bad("self-edit is not configured on this host"));
@@ -1918,7 +1931,8 @@ impl Host {
                         })
                         .collect()
                 } else {
-                    vec![]
+                    // The workspace a new thread starts with: the host uploads it names.
+                    self.new_attachments(&data["attachments"])?
                 };
                 Session::create(&dir, settings, files, observer)?
             } else {
@@ -1981,7 +1995,9 @@ impl Host {
                 "retry" => session.retry(),
                 _ => {
                     let outcome = match kind {
-                        "new" | "say" => self
+                        // A new thread's attachments are its starting workspace already.
+                        "new" => session.prompt(&prompt),
+                        "say" => self
                             .attachments(id, &data["attachments"])
                             .and_then(|files| session.prompt_with_files(&prompt, files)),
                         "continue" if data["until"] == "unknown" => session.resume_until_unknown(),
@@ -2727,111 +2743,158 @@ impl Host {
     /// Stores an uploaded file for a later message's attachments, by content digest,
     /// beside the thread (private; uploads older than a day are cleared on the way).
     fn upload(&self, id: &str, bytes: &[u8]) -> std::result::Result<Value, String> {
-        if bytes.is_empty() || bytes.len() > MAX_UPLOAD {
-            return Err(format!("a file must be 1–{MAX_UPLOAD} bytes"));
-        }
         // Never recreates a thread directory a deletion has just moved away.
-        let dir = self.dir(id).join("uploads");
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&dir) {
-            Ok(()) => spindle_store::durable::sync_parent(&dir).map_err(err)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err("thread not found".into());
-            }
-            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
-                return Err(err(error));
-            }
-            _ => {}
-        }
-        private_dir(&dir)?;
-        let digest = hash(bytes);
-        let mut kept = 0u64;
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let Ok(meta) = entry.metadata() else {
-                    continue;
-                };
-                let old = meta
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.elapsed().ok())
-                    .is_some_and(|age| age > Duration::from_secs(86_400));
-                if old {
-                    let _ = std::fs::remove_file(entry.path());
-                } else if entry.file_name() != digest.as_str() {
-                    kept += meta.len();
-                }
-            }
-        }
-        let target = dir.join(&digest);
-        // The same file again: it is already here, so it only stays a day longer (never
-        // rewritten while a turn may be reading it).
-        if std::fs::read(&target).is_ok_and(|saved| hash(&saved) == digest) {
-            let _ = File::options()
-                .write(true)
-                .open(&target)
-                .and_then(|file| file.set_modified(SystemTime::now()));
-            return Ok(json!({"digest":digest,"size":bytes.len()}));
-        }
-        if kept + bytes.len() as u64 > MAX_UPLOADS {
-            return Err(format!(
-                "this thread's uploads from the last day already hold {}; send the attached message first",
-                spindle_store::human_size(kept as usize)
-            ));
-        }
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let pending = dir.join(format!("{digest}.{}.tmp", random()?));
-        options
-            .open(&pending)
-            .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
-            .and_then(|()| std::fs::rename(&pending, &target))
-            .and_then(|()| spindle_store::durable::sync_dir(&dir))
-            .map_err(|error| {
-                let _ = std::fs::remove_file(&pending);
-                err(error)
-            })?;
-        Ok(json!({"digest":digest,"size":bytes.len()}))
+        upload_into(
+            &self.dir(id).join("uploads"),
+            bytes,
+            "thread not found",
+            "this thread's uploads",
+            "send the attached message first",
+        )
     }
+
+    /// Stores an uploaded file for a `new` command's attachments: the host's own
+    /// uploads, kept as a thread's are (`HOST/uploads`, a day, `MAX_UPLOADS` a day).
+    fn upload_new(&self, bytes: &[u8]) -> std::result::Result<Value, String> {
+        upload_into(
+            &self.root.join("uploads"),
+            bytes,
+            "host directory not found",
+            "uploads for new threads",
+            "start the threads they are for first, or try again tomorrow",
+        )
+    }
+
     /// A message's attachments, `[{path, digest}]` of earlier uploads, read back and
     /// checked against their digests.
     fn attachments(&self, id: &str, list: &Value) -> Result<Vec<(String, Vec<u8>, bool)>> {
-        let Some(list) = list.as_array() else {
-            return Ok(vec![]);
-        };
-        if list.len() > MAX_ATTACHMENTS {
-            return Err(format!("at most {MAX_ATTACHMENTS} attachments"));
-        }
-        let mut files = vec![];
-        for item in list {
-            let path = item["path"]
-                .as_str()
-                .filter(|p| spindle_store::workspace::valid_path(p))
-                .ok_or("attachment path must be a workspace path (no empty, . or .. parts)")?;
-            let digest = item["digest"]
-                .as_str()
-                .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
-                .ok_or("attachment digest required")?;
-            let bytes = std::fs::read(self.dir(id).join("uploads").join(digest))
-                .map_err(|_| format!("the upload for {path} is gone; attach it again"))?;
-            if hash(&bytes) != digest {
-                return Err(format!("the upload for {path} changed; attach it again"));
-            }
-            files.push((path.to_string(), bytes, false));
-        }
-        Ok(files)
+        attachments_in(&self.dir(id).join("uploads"), list)
     }
+
+    /// A `new` command's attachments, from the host's uploads (`upload_new`).
+    fn new_attachments(&self, list: &Value) -> Result<Vec<(String, Vec<u8>, bool)>> {
+        attachments_in(&self.root.join("uploads"), list)
+    }
+}
+
+/// Stores `bytes` in the uploads directory `dir` (made private if missing, though never
+/// its parent: `missing` says so) under their digest; uploads older than a day go on
+/// the way, and those of the last day hold at most `MAX_UPLOADS` (`what` names them,
+/// `then` says what makes room).
+fn upload_into(
+    dir: &Path,
+    bytes: &[u8],
+    missing: &str,
+    what: &str,
+    then: &str,
+) -> std::result::Result<Value, String> {
+    if bytes.is_empty() || bytes.len() > MAX_UPLOAD {
+        return Err(format!("a file must be 1–{MAX_UPLOAD} bytes"));
+    }
+    let dir = dir.to_path_buf();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(&dir) {
+        Ok(()) => spindle_store::durable::sync_parent(&dir).map_err(err)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(missing.into());
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+            return Err(err(error));
+        }
+        _ => {}
+    }
+    private_dir(&dir)?;
+    let digest = hash(bytes);
+    let mut kept = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let old = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(86_400));
+            if old {
+                let _ = std::fs::remove_file(entry.path());
+            } else if entry.file_name() != digest.as_str() {
+                kept += meta.len();
+            }
+        }
+    }
+    let target = dir.join(&digest);
+    // The same file again: it is already here, so it only stays a day longer (never
+    // rewritten while a turn may be reading it).
+    if std::fs::read(&target).is_ok_and(|saved| hash(&saved) == digest) {
+        let _ = File::options()
+            .write(true)
+            .open(&target)
+            .and_then(|file| file.set_modified(SystemTime::now()));
+        return Ok(json!({"digest":digest,"size":bytes.len()}));
+    }
+    if kept + bytes.len() as u64 > MAX_UPLOADS {
+        return Err(format!(
+            "{what} from the last day already hold {}; {then}",
+            spindle_store::human_size(kept as usize)
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let pending = dir.join(format!("{digest}.{}.tmp", random()?));
+    options
+        .open(&pending)
+        .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
+        .and_then(|()| std::fs::rename(&pending, &target))
+        .and_then(|()| spindle_store::durable::sync_dir(&dir))
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&pending);
+            err(error)
+        })?;
+    Ok(json!({"digest":digest,"size":bytes.len()}))
+}
+
+/// Attachments `[{path, digest}]` read back from the uploads directory `dir` and
+/// checked against their digests.
+fn attachments_in(dir: &Path, list: &Value) -> Result<Vec<(String, Vec<u8>, bool)>> {
+    let Some(list) = list.as_array() else {
+        return Ok(vec![]);
+    };
+    if list.len() > MAX_ATTACHMENTS {
+        return Err(format!("at most {MAX_ATTACHMENTS} attachments"));
+    }
+    let mut files = vec![];
+    for item in list {
+        let path = item["path"]
+            .as_str()
+            .filter(|p| spindle_store::workspace::valid_path(p))
+            .ok_or("attachment path must be a workspace path (no empty, . or .. parts)")?;
+        let digest = item["digest"]
+            .as_str()
+            .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or("attachment digest required")?;
+        let bytes = std::fs::read(dir.join(digest))
+            .map_err(|_| format!("the upload for {path} is gone; attach it again"))?;
+        if hash(&bytes) != digest {
+            return Err(format!("the upload for {path} changed; attach it again"));
+        }
+        files.push((path.to_string(), bytes, false));
+    }
+    Ok(files)
+}
+
+impl Host {
     /// Thread-list status of an idle thread, cached until its store changes on disk.
     fn summary(&self, id: &str) -> Value {
         let store = self.dir(id).join("store");
@@ -3308,6 +3371,7 @@ fn sandboxed_gate(
                 network: false,
                 observe: Some(&observe),
                 local_ipc: true,
+                loopback: None,
                 toolchain: Some(Toolchain {
                     rustup_home: &rustup,
                     cargo_home: &cargo,
