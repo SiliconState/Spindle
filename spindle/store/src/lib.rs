@@ -1942,14 +1942,14 @@ impl Store {
     /// through the owner's connection (a WAL's frames included, nothing left to
     /// replay: the image is a rollback-journal database). What a session bundle
     /// carries. Refused inside a transaction.
-    pub fn image(&self) -> Result<Vec<u8>> {
+    pub fn image(&mut self) -> Result<Vec<u8>> {
         self.image_with(&[])
     }
 
     /// `image`, with `metadata` (key, value) in the copy instead of this store's: a
     /// session moving to a host it runs differently on (other settings) carries them,
     /// while this store keeps its own.
-    pub fn image_with(&self, metadata: &[(&str, &[u8])]) -> Result<Vec<u8>> {
+    pub fn image_with(&mut self, metadata: &[(&str, &[u8])]) -> Result<Vec<u8>> {
         if self.paused {
             return Err(Error::Paused);
         }

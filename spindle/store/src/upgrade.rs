@@ -492,7 +492,11 @@ fn copy_store(session: &Path, copy: &Path) -> Result<()> {
         .map_err(|error| format!("cannot snapshot {}: {error}", session.display()))?;
     // Online backup preserves rowids used by receipt validation/accounting watermarks.
     source
-        .backup(rusqlite::MAIN_DB, copy.join("store/authority.sqlite"), None)
+        .backup(
+            rusqlite::MAIN_DB,
+            copy.join("store/authority.sqlite"),
+            None::<fn(rusqlite::backup::Progress)>,
+        )
         .map_err(|error| format!("cannot snapshot {}: {error}", session.display()))?;
     std::fs::File::create(copy.join("store/owner.lock")).map_err(|error| error.to_string())?;
     Ok(())

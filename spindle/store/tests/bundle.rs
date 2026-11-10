@@ -183,7 +183,7 @@ fn an_image_is_refused_unless_it_is_this_builds_whole_valid_store() {
     let mut wal = image.clone();
     wal[18] = 2;
     wal[19] = 2;
-    let foreign = Connection::open_in_memory().unwrap();
+    let mut foreign = Connection::open_in_memory().unwrap();
     foreign.execute_batch("CREATE TABLE t(x)").unwrap();
     let foreign = foreign.serialize(rusqlite::MAIN_DB).unwrap().to_vec();
     // The second page's b-tree header (pages are 4096 bytes).
@@ -219,7 +219,7 @@ fn an_image_is_refused_unless_it_is_this_builds_whole_valid_store() {
     ));
 }
 
-fn files(store: &Store) -> Vec<BundleFile> {
+fn files(store: &mut Store) -> Vec<BundleFile> {
     vec![BundleFile {
         path: STORE.into(),
         bytes: store.image().unwrap(),
@@ -352,11 +352,11 @@ fn a_bundle_round_trips_with_mirrors_filled_and_the_store_last() {
 fn a_damaged_cut_foreign_or_escaping_bundle_is_refused() {
     let mut store = memory();
     history(&mut store);
-    let good = bundle::write(files(&store)).unwrap().bytes;
+    let good = bundle::write(files(&mut store)).unwrap().bytes;
     read_both(&good).unwrap();
     // A copy's bundle (its stores checked as far as the bundle records them) is the same
     // bundle, byte for byte: only how much was checked before writing it differs.
-    assert_eq!(bundle::write_copy(files(&store)).unwrap().bytes, good);
+    assert_eq!(bundle::write_copy(files(&mut store)).unwrap().bytes, good);
     let mut flipped = good.clone();
     let middle = flipped.len() / 2;
     flipped[middle] ^= 1;
@@ -524,7 +524,7 @@ fn a_manifest_is_checked_before_any_file_and_no_sidecar_is_held_past_its_size() 
     let mut store = memory();
     history(&mut store);
     let image = store.image().unwrap();
-    let good = bundle::write(files(&store)).unwrap().bytes;
+    let good = bundle::write(files(&mut store)).unwrap().bytes;
     let length = u32::from_le_bytes(good[20..24].try_into().unwrap()) as usize;
     let base: serde_json::Value = serde_json::from_slice(&good[24..24 + length]).unwrap();
     let manifest = |files: &[(&str, &[u8], bool)]| {

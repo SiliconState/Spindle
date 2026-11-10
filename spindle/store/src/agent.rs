@@ -1068,7 +1068,7 @@ fn bundle_tasks(
         if !std::fs::symlink_metadata(&store_dir).is_ok_and(|meta| meta.is_dir()) {
             continue;
         }
-        let store = Store::open(&store_dir).map_err(|error| match error {
+        let mut store = Store::open(&store_dir).map_err(|error| match error {
             // A native owner's fence (or none): some host is running the task now.
             Error::Locked
                 if crate::fence_note(&store_dir)

@@ -3377,9 +3377,14 @@ impl Step<'_> {
             self.store.put_object(&stage, bytes).map_err(store_error)?;
         }
         let tree = planned_tree(tree, &files);
+        // Only a tree the store cannot take is the files' fault; a disk that filled
+        // while its manifest was written (or any other storage failure) says so.
         self.store
             .stage_tree(&stage, &tree)
-            .map_err(|_| BAD_FILES.into())
+            .map_err(|error| match error {
+                Error::Invalid => BAD_FILES.into(),
+                other => store_error(other),
+            })
     }
     pub(crate) fn ensure_idle(&mut self) -> Result<()> {
         if self.store.head_revision().map_err(store_error)? == 0 {

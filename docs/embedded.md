@@ -78,8 +78,10 @@ they ask for and calls back in with the result.
 The crate [`spindle/embed/Cargo.toml`](../spindle/embed/Cargo.toml) depends on
 `spindle-store` with only the `embedded` feature, `rusqlite` (bundled SQLite), and on
 wasm targets `wasm-bindgen`, `js-sys`, `sqlite-wasm-rs` (the SQLite build `rusqlite`
-uses on `wasm32-unknown-unknown`, which the VFS registers with) and `getrandom` with
-its JavaScript backend. `wasm-bindgen` is pinned to an exact version (`=0.2.129`), and
+uses on `wasm32-unknown-unknown`, which the VFS registers with; its `wasm-bindgen`
+feature links in the JavaScript clock, Web Crypto randomness and sleep its own memory
+VFS uses) and `getrandom` with its JavaScript backend. Native and wasm builds bundle the
+same SQLite (3.54.1). `wasm-bindgen` is pinned to an exact version (`=0.2.129`), and
 the wasm-bindgen CLI that generates the JavaScript glue must match it exactly.
 
 Requirements: the Rust target `wasm32-unknown-unknown`, clang (which compiles SQLite for that

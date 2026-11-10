@@ -3372,7 +3372,7 @@ impl Host {
                 "task {label} is {NEVER_BEGAN} (`task_drop`)"
             )));
         }
-        let store = place
+        let mut store = place
             .open(false)
             .map_err(|error| failed(open_error(place.as_ref(), error)))?;
         let mut files = vec![BundleFile {
@@ -4556,7 +4556,7 @@ fn bundle_tasks(
     keys.sort();
     for key in keys {
         let child = storage.child(&key);
-        let store = match child.open(false) {
+        let mut store = match child.open(false) {
             Ok(store) => store,
             Err(Error::Locked) => {
                 return Err(format!(
