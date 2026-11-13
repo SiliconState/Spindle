@@ -8,7 +8,8 @@ effects a revision proposes (intents) with their reservations (attempts) and res
 and a content-addressed object store for workspace files. Large values are compressed
 deterministically and deduplicated into shared chunks. Every write is one `IMMEDIATE`
 transaction fenced by an owner epoch, every chunk and object read is checked against its
-digest, and an open validates the records added since the last open before it accepts work.
+digest, and an open validates the records added since the last open before it accepts work
+(chunks are checked as they are read).
 This page describes what is on disk, the schema, how a revision commits, how content is
 addressed and encoded, rewind, crash safety, store images and session bundles, and the
 dependency-free reference model that states the lifecycle rules.
@@ -378,9 +379,17 @@ Garbage collection removes only stages, pins and objects (see
 ### Validation
 
 `validate_all` checks the stored records against each other. A normal open checks
-proposals and receipts in full only above the `validated` watermark; counts and bounds,
-every object reached by newly validated records against its digest, the metadata
-values and the ownership and rewind records are checked on every open. Already
+revisions, proposals, intents and receipts (strict receipts with theirs), which never
+change once written, only above the `validated` watermark, there in full and against
+their bounds; a revision numbered below zero, or a proposal, intent, consumed admission
+or applied receipt at or below zero, which no watermark reaches, is refused wherever it is.
+Counts, the bounds of the other tables
+but `chunks`, every object reached by newly validated records against its digest, every
+task's base (pinned in its scope; the files of a validated revision's workspace were
+hashed by the open that validated it), the metadata values and the ownership and rewind
+records are checked on every open. An open does not scan `chunks`, which hold most of a
+store's bytes: each chunk is checked (its types, size and digest) whenever it is read, as
+those of the values an open validates are, and a malformed one is refused there. Already
 validated workspace files are reused from the watermark. `Store::check_integrity` (what `spindle doctor` runs), every migration and every
 store image check is full: `PRAGMA quick_check` over every page, every chunk against its
 digest, and every admission and receipt value decoded. Among the checks:

@@ -381,6 +381,43 @@ pub(crate) fn validate_root(db: &Connection, scope: &str, root: &str) -> Result<
 /// workspace (`known_files`), so a reopen hashes (and inflates) only the files written
 /// since, never the whole workspace again.
 pub(crate) fn validate_tree_root(db: &Connection, scope: &str, root: &str) -> Result<Tree> {
+    prove_tree(db, scope, root, false, None)
+}
+
+/// Whether `root` is the workspace of a revision at or below `since` (the validation
+/// watermark): the open that validated that revision hashed each of its files.
+pub(crate) fn validated_root(db: &Connection, root: &str, since: i64) -> Result<bool> {
+    Ok(db
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM revisions WHERE workspace=?1 AND revision BETWEEN 1 AND ?2)",
+        )?
+        .query_row(params![root, since], |row| row.get(0))?)
+}
+
+/// `validate_root` for each of many roots of `scope` in one pass (a store's tasks'
+/// bases, which share most of their files): a file proven for one (pinned in `scope`,
+/// matching its digest) is in `proven` and not proven again for the next, and the files
+/// of a root `hashed` (`validated_root`) count as matching their digests, as the last
+/// validated revision's do (`known_files`); each manifest and pin is still checked. A
+/// root so proven is known on this connection after, as one hashed here is.
+pub(crate) fn validate_root_among(
+    db: &Connection,
+    scope: &str,
+    root: &str,
+    hashed: bool,
+    proven: &mut HashSet<String>,
+) -> Result<()> {
+    prove_tree(db, scope, root, hashed, Some(proven)).map(|_| ())
+}
+
+/// `validate_tree_root`, and `validate_root_among` with the files it proved so far.
+fn prove_tree(
+    db: &Connection,
+    scope: &str,
+    root: &str,
+    hashed: bool,
+    mut proven: Option<&mut HashSet<String>>,
+) -> Result<Tree> {
     if !valid_digest(root) {
         return Err(Error::Invalid);
     }
@@ -419,17 +456,26 @@ pub(crate) fn validate_tree_root(db: &Connection, scope: &str, root: &str) -> Re
     let mut remember =
         db.prepare_cached("INSERT OR IGNORE INTO temp.spindle_valid_objects VALUES(?1)")?;
     for entry in &tree.files {
+        if proven
+            .as_deref()
+            .is_some_and(|proven| proven.contains(&entry.object))
+        {
+            continue;
+        }
         if !pinned_in_scope(db, scope, &entry.object)? {
             return Err(Error::Incompatible);
         }
-        if verified.query_row([&entry.object], |row| row.get(0))? {
-            continue;
+        if !hashed && !verified.query_row([&entry.object], |row| row.get(0))? {
+            let bytes =
+                stored.query_row([&entry.object], |row| crate::artifact::object_at(row, 0))?;
+            if object_digest(&bytes) != entry.object {
+                return Err(Error::Incompatible);
+            }
+            remember.execute([&entry.object])?;
         }
-        let bytes = stored.query_row([&entry.object], |row| crate::artifact::object_at(row, 0))?;
-        if object_digest(&bytes) != entry.object {
-            return Err(Error::Incompatible);
+        if let Some(proven) = proven.as_deref_mut() {
+            proven.insert(entry.object.clone());
         }
-        remember.execute([&entry.object])?;
     }
     db.prepare_cached("INSERT OR IGNORE INTO temp.spindle_valid_roots VALUES(?1,?2)")?
         .execute(params![scope, root])?;

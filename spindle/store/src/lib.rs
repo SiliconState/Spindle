@@ -856,6 +856,8 @@ fn validate_schema(db: &Connection, from: i64) -> Result<()> {
 /// Every row's column types and label shapes. `since`: the (revision, receipt row)
 /// watermark the last open validated (`validated`); rows of the append-only tables at
 /// or below it were checked then and never change, so only newer ones are (None: all).
+/// Given it (an open), chunks are left to their reads (each is checked whole as it is
+/// read) and objects to `artifact::validate_storage`, which checks the same in its pass.
 fn validate_row_types(db: &Connection, since: Option<(i64, i64)>) -> Result<()> {
     // Fixed schema identifiers only; never interpolate caller-controlled SQL.
     let tables = [
@@ -950,6 +952,10 @@ fn validate_row_types(db: &Connection, since: Option<(i64, i64)>) -> Result<()> 
         ),
     ];
     for (table, integers, labels, blobs, optional_labels) in tables {
+        // On open: chunks to their reads and full checks, objects to their one pass.
+        if since.is_some() && matches!(table, "chunks" | "objects") {
+            continue;
+        }
         // Each table's newer rows, by the key the watermark bounds.
         let newer = match (since, table) {
             (
@@ -1162,10 +1168,11 @@ fn check_pages(db: &Connection) -> Result<()> {
 }
 
 /// Validates the stored records: in full (every chunk, receipt and admission value
-/// too), or (on open) only revisions and receipts newer than those recorded in
-/// `validated` by the last open; older ones were checked then, and every chunk is
-/// checked against its digest whenever it is read. Returns the head revision and newest
-/// receipt row the store now covers.
+/// too), or (on open) only the history newer than what `validated` records the last
+/// open checked (revisions, their proposals and intents, receipts: never changed once
+/// written, older ones were checked then), the rest whole but for chunks, each of which
+/// is checked (its types, size and digest) whenever it is read. Returns the head
+/// revision and newest receipt row the store now covers.
 fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
     let (since, receipts_since): (i64, i64) = if full {
         (0, 0)
@@ -1177,27 +1184,35 @@ fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
         )?
     };
     let invalid: i64 = db.query_row(
-        "SELECT (SELECT count(*) FROM chunks WHERE length(digest)!=32 OR length(bytes)>?1 OR length(bytes)<2)
-              + (SELECT count(*) FROM attempt_failures f LEFT JOIN receipts q ON q.attempt=f.attempt WHERE q.attempt IS NOT NULL OR f.status NOT BETWEEN 100 AND 599 OR typeof(f.detail)!='text' OR length(CAST(f.detail AS BLOB))>4096)
+        "SELECT (SELECT count(*) FROM attempt_failures f LEFT JOIN receipts q ON q.attempt=f.attempt WHERE q.attempt IS NOT NULL OR f.status NOT BETWEEN 100 AND 599 OR typeof(f.detail)!='text' OR length(CAST(f.detail AS BLOB))>4096)
               + (SELECT count(*) FROM validated WHERE id!=1 OR revision<0 OR receipt<0 OR revision>(SELECT revision FROM head WHERE id=1))
-              + (SELECT count(*) FROM app_state s WHERE s.revision<=0 OR length(s.value)>?2 OR NOT EXISTS(SELECT 1 FROM revisions r WHERE r.revision=s.revision))
+              + (SELECT count(*) FROM app_state s WHERE s.revision<=0 OR length(s.value)>?1 OR NOT EXISTS(SELECT 1 FROM revisions r WHERE r.revision=s.revision))
               + (SELECT count(*) FROM opens WHERE epoch>(SELECT epoch FROM realm WHERE id=1))
               + (1-(SELECT count(*) FROM opens))
               + (1-(SELECT count(*) FROM instance WHERE id=1 AND length(identity)=16 AND identity!=zeroblob(16)))
               + (SELECT count(*) FROM retry_delays WHERE millis<0)
-              + (SELECT count(*) FROM app_details d LEFT JOIN attempts a ON a.id=d.attempt WHERE a.id IS NULL OR substr(a.implementation,1,20)!='spindle-app-tool-v1-' OR length(d.value)>?2)
-              + (SELECT count(*) FROM app_patches p LEFT JOIN attempts a ON a.id=p.attempt WHERE a.id IS NULL OR substr(a.implementation,1,20)!='spindle-app-tool-v1-' OR length(p.patch)>?2)",
-        params![
-            codec::stored_bound(codec::CHUNK_MAX) as i64,
-            codec::stored_bound(transition::MAX_STATE) as i64
-        ],
+              + (SELECT count(*) FROM app_details d LEFT JOIN attempts a ON a.id=d.attempt WHERE a.id IS NULL OR substr(a.implementation,1,20)!='spindle-app-tool-v1-' OR length(d.value)>?1)
+              + (SELECT count(*) FROM app_patches p LEFT JOIN attempts a ON a.id=p.attempt WHERE a.id IS NULL OR substr(a.implementation,1,20)!='spindle-app-tool-v1-' OR length(p.patch)>?1)",
+        [codec::stored_bound(transition::MAX_STATE) as i64],
         |r| r.get(0),
     )?;
     if invalid != 0 {
         return Err(Error::Incompatible);
     }
     if full {
-        // Every chunk against its digest, and the stored values no other check decodes.
+        // Every chunk's types and bounds, then each against its digest. An open does not
+        // scan them: a chunk is checked so (`bounded_blob`, its digest) whenever it is
+        // read, the table holds most of a store's bytes, and scanning it made opening a
+        // long thread take seconds; a chunk whose digest is malformed no read ever finds.
+        let chunks: i64 = db.query_row(
+            "SELECT count(*) FROM chunks WHERE typeof(digest)!='blob' OR typeof(bytes)!='blob' OR length(digest)!=32 OR length(bytes)>?1 OR length(bytes)<2",
+            [codec::stored_bound(codec::CHUNK_MAX) as i64],
+            |r| r.get(0),
+        )?;
+        if chunks != 0 {
+            return Err(Error::Incompatible);
+        }
+        // The stored values no other check decodes.
         let mut chunks = db.prepare("SELECT digest,bytes FROM chunks")?;
         let mut rows = chunks.query([])?;
         while let Some(row) = rows.next()? {
@@ -1218,8 +1233,12 @@ fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
             }
         }
     }
+    // Objects before the checks that read some of them (tasks' bases, new workspace
+    // roots): an open checks their row types in this pass (`validate_row_types` leaves
+    // them to it), so a malformed one is refused as such before any is read.
+    artifact::validate_storage(db, full)?;
     meta::validate(db)?;
-    meta::validate_tasks(db)?;
+    meta::validate_tasks(db, since)?;
     transition::validate_storage(db, since, receipts_since, full)?;
     // App details are written with their receipt: on open, those recorded since the
     // last one.
@@ -1238,7 +1257,6 @@ fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
     }
     drop(rows);
     drop(details);
-    artifact::validate_storage(db, full)?;
     ownership::validate_storage(db)?;
     rewind::validate_storage(db, since)?;
     Ok(db.query_row(
