@@ -1012,9 +1012,12 @@ function renderMessages(box, thread, messages, offset, { running = false, revisi
         const card = toolCard(block.name, block.input, block.id);
         const steps = stepsIn(box);
         steps.list.append(card);
-        if (result) settle(card, resultText(result.content), Boolean(result.is_error));
+        // Its run of steps is counted once all of it is drawn (below), not again with each
+        // step: counting a long run's whole list at every one of its steps made a thread
+        // slow to open.
+        if (result) settle(card, resultText(result.content), Boolean(result.is_error), { recount: false });
         else if (running && main) pendingCards.push(card);
-        else settle(card, '(no result was recorded)', true);
+        else settle(card, '(no result was recorded)', true, { recount: false });
         if (block.name === 'task') steps.append(taskBlock(card, result ? resultText(result.content) : null));
         const made = result && !result.is_error && wroteFile(card, false);
         if (made) {
@@ -1637,7 +1640,10 @@ function stateText(card) {
     : failed && card.classList.contains('retried') ? 'failed → retried ✓' : failed ? 'failed' : 'done';
 }
 
-function settle(card, text, failed) {
+/** A step's row as it ended: its time, result and actions. `recount`: its run of steps
+ * counts its steps again now (false while a history is drawn, which counts each run once
+ * at its end). */
+function settle(card, text, failed, { recount = true } = {}) {
   card.classList.remove('running');
   card.classList.toggle('failed', failed);
   if (card.started != null) {
@@ -1681,7 +1687,7 @@ function settle(card, text, failed) {
   relabel(card);
   stateText(card);
   const steps = card.closest('.steps');
-  if (steps) updateSteps(steps);
+  if (steps && recount) updateSteps(steps);
   if (shot && current) picture(card, current, shot);
 }
 

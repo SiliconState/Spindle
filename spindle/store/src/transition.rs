@@ -176,9 +176,10 @@ fn foreign_fault(db: &Connection, full: bool) -> Result<bool> {
     Ok(false)
 }
 
-/// Counts and bounds always; proposals, intents and receipt roots in full only above
-/// revision `since` and receipt row `receipts_since` (the last full pass); foreign keys
-/// as `foreign_fault` checks them.
+/// Counts always; the history's bounds, and its proposals, intents and receipt roots
+/// checked whole, only above revision `since` and receipt row `receipts_since` (what the
+/// last open validated; both 0 in a full check, and with `full` every row's bounds);
+/// foreign keys as `foreign_fault` checks them.
 pub(crate) fn validate_storage(
     db: &Connection,
     since: i64,
@@ -200,10 +201,22 @@ pub(crate) fn validate_storage(
     let head: i64 =
         crate::cached_row(db, "SELECT revision FROM head WHERE id=1", [], |r| r.get(0))?;
     let max: i64 = crate::cached_row(db, "SELECT max(revision) FROM revisions", [], |r| r.get(0))?;
+    // The history's rows never change once written: those at or below the watermark were
+    // checked by the open that validated them, so only newer ones are read (the first
+    // revision is checked exactly by `validate_records`); in full, every row (`0>-1`,
+    // true for each). No revision may be below zero, where no watermark reaches.
+    let (revision_key, receipt_key, after, receipts_after) = if full {
+        ("0", "0", -1, -1)
+    } else {
+        ("revision", "q.rowid", since, receipts_since)
+    };
     let invalid: i64 = crate::cached_row(
         db,
-        "SELECT count(*) FROM revisions WHERE revision<0 OR length(continuation)>?1 OR length(engine) NOT BETWEEN 1 AND 128",
-        [crate::codec::stored_bound(MAX_PAYLOAD) as i64],
+        &format!(
+            "SELECT (SELECT count(*) FROM revisions WHERE revision<0)
+                  + (SELECT count(*) FROM revisions WHERE {revision_key}>?2 AND (length(continuation)>?1 OR length(engine) NOT BETWEEN 1 AND 128))"
+        ),
+        params![crate::codec::stored_bound(MAX_PAYLOAD) as i64, after],
         |r| r.get(0),
     )?;
     let foreign_fault = foreign_fault(db, full)?;
@@ -222,7 +235,12 @@ pub(crate) fn validate_storage(
     {
         return Err(Error::Incompatible);
     }
-    validate_records(db, since)?;
+    validate_records(
+        db,
+        since,
+        (revision_key, after),
+        (receipt_key, receipts_after),
+    )?;
     let mut receipts = db.prepare("SELECT r.scope,q.workspace FROM receipts q JOIN attempts a ON q.attempt=a.id JOIN intents i ON a.effect=i.id JOIN revisions r ON i.revision=r.revision WHERE q.workspace IS NOT NULL AND q.rowid>?1")?;
     let mut rows = receipts.query([receipts_since])?;
     while let Some(row) = rows.next()? {
@@ -233,22 +251,36 @@ pub(crate) fn validate_storage(
     Ok(())
 }
 
-fn validate_records(db: &Connection, since: i64) -> Result<()> {
+/// The history's bounds, of its rows above the watermark only (`revision_key` above
+/// `after`, `receipt_key` above `receipts_after`: the key each row is numbered by and the
+/// last one validated, as `validate_storage` sets them; receipts are `q`, and a strict
+/// receipt goes with its receipt), and that none of it is numbered at or below zero;
+/// then each proposal above revision `since`.
+fn validate_records(
+    db: &Connection,
+    since: i64,
+    (revision_key, after): (&str, i64),
+    (receipt_key, receipts_after): (&str, i64),
+) -> Result<()> {
     let invalid: i64 = crate::cached_row(db,
-        "SELECT
-          (SELECT count(*) FROM intents WHERE revision<=0 OR position<0 OR position>=?3 OR length(id) NOT BETWEEN 1 AND 128 OR length(adapter) NOT BETWEEN 1 AND 128 OR length(input)>?1)
-        + (SELECT count(*) FROM receipts WHERE length(result)>?1)
+        &format!("SELECT
+          (SELECT count(*) FROM intents WHERE revision<=0)
+        + (SELECT count(*) FROM intents WHERE {revision_key}>?4 AND (position<0 OR position>=?3 OR length(id) NOT BETWEEN 1 AND 128 OR length(adapter) NOT BETWEEN 1 AND 128 OR length(input)>?1))
+        + (SELECT count(*) FROM receipts q WHERE {receipt_key}>?5 AND length(result)>?1)
         + (SELECT count(*) FROM attempts WHERE owner_epoch<=0 OR owner_epoch>(SELECT epoch FROM realm WHERE id=1) OR length(id) NOT BETWEEN 1 AND 128 OR length(implementation) NOT BETWEEN 1 AND 128 OR length(grant_reference) NOT BETWEEN 1 AND 128)
         + (SELECT count(*) FROM cancellations WHERE epoch<=0 OR epoch>(SELECT epoch FROM realm WHERE id=1) OR length(scope) NOT BETWEEN 1 AND 128 OR length(command_id) NOT BETWEEN 1 AND 128 OR NOT EXISTS(SELECT 1 FROM admissions WHERE admissions.scope=cancellations.scope))
         + (SELECT count(*) FROM image_executions e JOIN attempts a ON e.attempt=a.id WHERE e.state NOT BETWEEN 0 AND 3 OR length(e.worker)!=64 OR e.worker GLOB '*[^0-9a-f]*' OR a.implementation!='dext-read-image-v1-'||e.worker)
-        + (SELECT count(*) FROM strict_receipts s JOIN receipts q ON q.attempt=s.attempt JOIN attempts a ON a.id=s.attempt JOIN intents i ON i.id=a.effect JOIN revisions r ON r.revision=i.revision WHERE length(s.helper)!=64 OR s.helper GLOB '*[^0-9a-f]*' OR a.implementation NOT IN ('dext-strict-bash-v1-'||s.helper,'dext-host-bash-v1-'||s.helper,'spindle-app-tool-v1-'||s.helper) OR q.workspace IS NULL OR q.workspace!=s.root OR NOT EXISTS(SELECT 1 FROM revisions b WHERE b.workspace=s.base AND b.scope=r.scope))
-        + (SELECT count(*) FROM proposals WHERE length(canonical)>?2 OR revision<=0)
+        + (SELECT count(*) FROM strict_receipts s JOIN receipts q ON q.attempt=s.attempt JOIN attempts a ON a.id=s.attempt JOIN intents i ON i.id=a.effect JOIN revisions r ON r.revision=i.revision WHERE {receipt_key}>?5 AND (length(s.helper)!=64 OR s.helper GLOB '*[^0-9a-f]*' OR a.implementation NOT IN ('dext-strict-bash-v1-'||s.helper,'dext-host-bash-v1-'||s.helper,'spindle-app-tool-v1-'||s.helper) OR q.workspace IS NULL OR q.workspace!=s.root OR NOT EXISTS(SELECT 1 FROM revisions b WHERE b.workspace=s.base AND b.scope=r.scope)))
+        + (SELECT count(*) FROM proposals WHERE revision<=0)
+        + (SELECT count(*) FROM proposals WHERE {revision_key}>?4 AND length(canonical)>?2)
         + (SELECT count(*) FROM consumed WHERE revision<=0)
-        + (SELECT count(*) FROM applied_receipts WHERE revision<=0)",
+        + (SELECT count(*) FROM applied_receipts WHERE revision<=0)"),
         [
             crate::codec::stored_bound(MAX_PAYLOAD) as i64,
             crate::codec::stored_bound(crate::MAX_CANONICAL) as i64,
             MAX_EFFECTS as i64,
+            after,
+            receipts_after,
         ],
         |r| r.get(0),
     )?;
@@ -281,20 +313,32 @@ fn validate_records(db: &Connection, since: i64) -> Result<()> {
     }
     let epoch: i64 = crate::cached_row(db, "SELECT epoch FROM realm WHERE id=1", [], |r| r.get(0))?;
     // Records up to `since` were validated before; only each scope's newest revision
-    // among them matters for the chain after it (one grouped query, so their records
-    // are never read).
-    let mut scope_revisions = std::collections::BTreeMap::new();
-    let mut statement = db.prepare(
-        "SELECT scope,max(revision) FROM revisions WHERE revision BETWEEN 1 AND ?1 GROUP BY scope",
-    )?;
+    // among them matters for the chain after it, and only for the scopes revised since:
+    // read newest first and only until each of those is found (usually at once; a scope
+    // new since then is never found, and the read goes back to the first revision).
+    let mut wanted = BTreeSet::new();
+    let mut statement = db.prepare("SELECT DISTINCT scope FROM revisions WHERE revision>?1")?;
     let mut rows = statement.query([since])?;
     while let Some(row) = rows.next()? {
-        let scope: String = crate::bounded_label(row, 0)?;
-        let revision: i64 = row.get(1)?;
-        scope_revisions.insert(scope, revision as u64);
+        wanted.insert(crate::bounded_label(row, 0)?);
     }
     drop(rows);
     drop(statement);
+    let mut scope_revisions = std::collections::BTreeMap::new();
+    if !wanted.is_empty() {
+        let mut statement = db.prepare(
+            "SELECT scope,revision FROM revisions WHERE revision BETWEEN 1 AND ?1 ORDER BY revision DESC",
+        )?;
+        let mut rows = statement.query([since])?;
+        while scope_revisions.len() < wanted.len() {
+            let Some(row) = rows.next()? else { break };
+            let scope: String = crate::bounded_label(row, 0)?;
+            if wanted.contains(&scope) && !scope_revisions.contains_key(&scope) {
+                let revision: i64 = row.get(1)?;
+                scope_revisions.insert(scope, revision as u64);
+            }
+        }
+    }
     let mut statement = db.prepare(
         "SELECT id,canonical,revision FROM proposals WHERE revision>?1 ORDER BY revision",
     )?;

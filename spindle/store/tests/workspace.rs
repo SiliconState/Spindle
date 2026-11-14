@@ -472,6 +472,108 @@ fn reopen_checks_the_files_written_since_the_last_open() {
     }
 }
 
+/// An object row of the wrong types (its bytes not a blob) is refused by an open as a
+/// malformed record, before any check that reads objects reaches it.
+#[test]
+fn a_malformed_object_row_is_refused_as_incompatible_on_open() {
+    let realm = Realm::new();
+    let mut store = Store::open(&realm.0).unwrap();
+    let input = admission(&mut store, "one");
+    let stage = stage(&mut store);
+    let object = store.put_object(&stage, b"file").unwrap();
+    let root = store
+        .stage_file_map(&stage, &[file("file.txt", &object)])
+        .unwrap();
+    let proposed = proposal(&mut store, input, Some(root), b"one");
+    store.commit_proposal(&proposed).unwrap();
+    drop(store);
+    let db = rusqlite::Connection::open(realm.0.join("authority.sqlite")).unwrap();
+    db.execute("UPDATE objects SET bytes='text' WHERE digest=?1", [&object])
+        .unwrap();
+    drop(db);
+    let error = Store::open(&realm.0).err();
+    assert!(matches!(error, Some(Error::Incompatible)), "{error:?}");
+}
+
+/// A task's base that a validated revision names (the workspace it started from) has its
+/// files' digests trusted at open, as that revision's own are (an earlier open hashed
+/// them; their reads still refuse damage), but every file's pin in the task's scope is
+/// still checked.
+#[test]
+fn a_task_base_a_validated_revision_names_is_trusted_for_digests_not_pins() {
+    for (damage, task) in [
+        (None, true),
+        (Some("digest"), true),
+        (Some("pins"), true),
+        (Some("pins"), false),
+    ] {
+        let realm = Realm::new();
+        let mut store = Store::open(&realm.0).unwrap();
+        let input = admission(&mut store, "one");
+        // A scope a stage can move to and still belong to an admitted one.
+        store
+            .admit(&Command {
+                scope: "other".into(),
+                id: "elsewhere".into(),
+                lineage: 0,
+                kind: "edit".into(),
+                payload: b"elsewhere".to_vec(),
+            })
+            .unwrap();
+        let stage = stage(&mut store);
+        let object = store.put_object(&stage, b"file").unwrap();
+        let root = store
+            .stage_file_map(&stage, &[file("file.txt", &object)])
+            .unwrap();
+        let proposed = proposal(&mut store, input, Some(root.clone()), b"one");
+        store.commit_proposal(&proposed).unwrap();
+        drop(store);
+        // This open validates the revision and its files.
+        drop(Store::open(&realm.0).unwrap());
+        let db = rusqlite::Connection::open(realm.0.join("authority.sqlite")).unwrap();
+        if task {
+            db.execute(
+                "INSERT INTO task_runs VALUES('task',NULL,X'7B7D',?1,1,0,'running',NULL,NULL,NULL)",
+                [&root],
+            )
+            .unwrap();
+        }
+        match damage {
+            Some("digest") => {
+                db.execute("UPDATE objects SET bytes=X'00' WHERE digest=?1", [&object])
+                    .unwrap();
+            }
+            Some(_) => {
+                // The file pinned only in another scope (its manifest still in this one).
+                db.execute_batch("INSERT INTO artifact_stages VALUES('moved','other',1)")
+                    .unwrap();
+                db.execute(
+                    "UPDATE staging_pins SET stage='moved' WHERE digest=?1",
+                    [&object],
+                )
+                .unwrap();
+            }
+            None => {}
+        }
+        drop(db);
+        let opened = Store::open(&realm.0);
+        match (damage, task) {
+            (Some("pins"), true) => {
+                let error = opened.err();
+                assert!(
+                    matches!(error, Some(Error::Incompatible)),
+                    "a task base's file pins unchecked: {error:?}"
+                );
+            }
+            (Some("digest"), _) => assert!(matches!(
+                opened.unwrap().read_object("operator", &object),
+                Err(Error::Incompatible)
+            )),
+            _ => assert!(opened.is_ok(), "{damage:?}, task {task}"),
+        }
+    }
+}
+
 /// Trees that profile v1 can hold keep its encoding (and so their root digests); links,
 /// empty directories and Linux names use v2. Both reopen, and links are only text.
 #[test]

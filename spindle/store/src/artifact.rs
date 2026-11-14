@@ -409,21 +409,24 @@ pub(crate) fn valid_digest(value: &str) -> bool {
 /// too. An open leaves that to the reads: every object is checked against its digest
 /// when it is read, so a long store's open never inflates and hashes all of them.
 pub(crate) fn validate_storage(db: &Connection, full: bool) -> Result<()> {
-    let (count, bytes): (i64, i64) = db.query_row(
-        "SELECT count(*),coalesce(sum(length(bytes)),0) FROM objects",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+    // Objects in one pass (each `size` lies past its bytes, so reading it reads them):
+    // their count and bytes, their bounds, and their row types (`validate_row_types`
+    // leaves them to this pass on open).
+    let (count, bytes, malformed): (i64, i64, i64) = db.query_row(
+        "SELECT count(*),coalesce(sum(length(bytes)),0),coalesce(sum(typeof(bytes)!='blob' OR typeof(digest)!='text' OR length(CAST(digest AS BLOB))>128 OR instr(digest,char(0))>0 OR digest GLOB '*[^A-Za-z0-9_.:/-]*' OR length(digest)=0 OR typeof(size) NOT IN ('null','integer') OR length(bytes)>?1 OR size<=length(bytes) OR size>?1 OR length(digest)!=64 OR digest GLOB '*[^0-9a-f]*'),0) FROM objects",
+        [MAX_OBJECT as i64],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let stages: i64 = db.query_row("SELECT count(*) FROM artifact_stages", [], |r| r.get(0))?;
     let pins: i64 = db.query_row("SELECT count(*) FROM staging_pins", [], |r| r.get(0))?;
     let provenance: i64 =
         db.query_row("SELECT count(*) FROM image_provenance", [], |r| r.get(0))?;
-    let invalid: i64 = db.query_row(
-        "SELECT (SELECT count(*) FROM objects WHERE typeof(size) NOT IN ('null','integer') OR length(bytes)>?1 OR size<=length(bytes) OR size>?1 OR length(digest)!=64 OR digest GLOB '*[^0-9a-f]*')
-         + (SELECT count(*) FROM artifact_stages WHERE owner_epoch<=0 OR owner_epoch>(SELECT epoch FROM realm WHERE id=1) OR length(id) NOT BETWEEN 1 AND 128 OR length(scope) NOT BETWEEN 1 AND 128 OR NOT EXISTS(SELECT 1 FROM admissions a WHERE a.scope=artifact_stages.scope))
+    let invalid: i64 = malformed
+        + db.query_row(
+            "SELECT (SELECT count(*) FROM artifact_stages WHERE owner_epoch<=0 OR owner_epoch>(SELECT epoch FROM realm WHERE id=1) OR length(id) NOT BETWEEN 1 AND 128 OR length(scope) NOT BETWEEN 1 AND 128 OR NOT EXISTS(SELECT 1 FROM admissions a WHERE a.scope=artifact_stages.scope))
          + (SELECT count(*) FROM objects o WHERE NOT EXISTS(SELECT 1 FROM staging_pins p WHERE p.digest=o.digest))
-         + (SELECT count(*) FROM image_provenance v WHERE length(v.digest)!=64 OR length(v.worker)!=64 OR length(v.source)!=64 OR v.width NOT BETWEEN 1 AND 1568 OR v.height NOT BETWEEN 1 AND 1568 OR v.owner_epoch<=0 OR v.owner_epoch>(SELECT epoch FROM realm WHERE id=1) OR NOT EXISTS(SELECT 1 FROM staging_pins p JOIN artifact_stages s ON p.stage=s.id WHERE p.digest=v.digest AND s.scope=v.scope))", [MAX_OBJECT as i64], |r| r.get(0),
-    )?;
+         + (SELECT count(*) FROM image_provenance v WHERE length(v.digest)!=64 OR length(v.worker)!=64 OR length(v.source)!=64 OR v.width NOT BETWEEN 1 AND 1568 OR v.height NOT BETWEEN 1 AND 1568 OR v.owner_epoch<=0 OR v.owner_epoch>(SELECT epoch FROM realm WHERE id=1) OR NOT EXISTS(SELECT 1 FROM staging_pins p JOIN artifact_stages s ON p.stage=s.id WHERE p.digest=v.digest AND s.scope=v.scope))", [], |r| r.get::<_, i64>(0),
+        )?;
     if stages > MAX_STAGES
         || provenance > MAX_STAGES
         || count > MAX_OBJECTS

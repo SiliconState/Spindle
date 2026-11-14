@@ -1317,7 +1317,9 @@ async function within(id, work) {
 }
 
 /** How long an idle thread's session stays open: reads one after another (a page's
- * preview reading what it refers to, say) share one opening, not one each. */
+ * preview reading what it refers to, say) share one opening, not one each. Not longer:
+ * a session open when Chrome stops (quit, say) was not closed cleanly, and the next open
+ * of its store checks every page of it. */
 const REST_AFTER_MS = 2_000;
 const resting = new Map();
 
@@ -1797,8 +1799,11 @@ function announceVault() {
   vaultState().then((state) => send({ type: 'vault', vault: state }));
 }
 
-/** The last turnFiles answer, by thread and revision (asked again at every turn's end). */
-let turnFilesKept = { key: null, value: null };
+/** The last turnFiles answer of each of the threads asked about last, by thread (each
+ * for one revision; asked again at every turn's end): going back to a thread does not
+ * look for its last turn's start again (seconds of reads in a long thread). */
+const turnFilesKept = new Map();
+const TURN_FILES_KEPT = 8;
 
 /** Said when the messages before a summary are asked for while the thread works: a
  * store lists no points to go back to meanwhile. */
@@ -1891,7 +1896,7 @@ async function checkCreation(provider, settings) {
 /** A first turn's old record survives a reset, even if the engine stops during it. */
 async function replaceFirst(id, provider, settings) {
   await checkCreation(provider, settings);
-  turnFilesKept = { key: null, value: null };
+  turnFilesKept.delete(id);
   // A name of its own (its time and a random part): no reset writes over another's.
   const backup = `prior:${id}:${String(Date.now()).padStart(15, '0')}:${crypto.randomUUID()}`;
   // Checked whole: if the reset fails, this is what the thread comes back from. On disk
@@ -2715,7 +2720,8 @@ const ops = {
     const dir = dirOf(id);
     const now = await client.files(dir);
     const key = `${id}@${now.revision}`;
-    if (turnFilesKept.key === key) return turnFilesKept.value;
+    const kept = turnFilesKept.get(id);
+    if (kept?.key === key) return kept.value;
     const shown = (await client.history(dir)).messages ?? [];
     // The last message the user wrote (not steering, not a compaction's summary).
     const at = shown.findLastIndex((message) => message.role === 'user' && (message.content ?? []).some((block) =>
@@ -2736,7 +2742,12 @@ const ops = {
       }
     }
     const value = { ...now, before };
-    if (lasting) turnFilesKept = { key, value };
+    if (lasting) {
+      // Asked about last: the last to go.
+      turnFilesKept.delete(id);
+      turnFilesKept.set(id, { key, value });
+      if (turnFilesKept.size > TURN_FILES_KEPT) turnFilesKept.delete(turnFilesKept.keys().next().value);
+    }
     return value;
   }),
 
