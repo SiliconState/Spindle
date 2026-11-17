@@ -175,13 +175,23 @@ const timings = (() => {
     return new Map();
   }
 })();
+/** Written at most once a second (and as the page goes or is hidden), not at each step:
+ * each write is every timing kept, thousands of them as JSON. */
+let timingsWrite = 0;
+function writeTimings() {
+  clearTimeout(timingsWrite);
+  timingsWrite = 0;
+  try {
+    sessionStorage.setItem('spindle-step-times', JSON.stringify([...timings]));
+  } catch {}
+}
+addEventListener('pagehide', () => { if (timingsWrite) writeTimings(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden && timingsWrite) writeTimings(); });
 function keepTiming(id, span) {
   if (!id) return;
   timings.set(id, span);
   while (timings.size > 4000) timings.delete(timings.keys().next().value);
-  try {
-    sessionStorage.setItem('spindle-step-times', JSON.stringify([...timings]));
-  } catch {}
+  timingsWrite ||= setTimeout(writeTimings, 1000);
 }
 /** Tabs the open thread's steps told about (their titles and addresses) and the parts of
  * pages they read, for naming the page (and the button, the field) a browser step acted
@@ -282,7 +292,12 @@ channel.onmessage = ({ data }) => {
   }
   else if (data?.type === 'ready') {
     if (engine) engineRestarted();
-    else connect();
+    else {
+      // A hello asked before the engine listened went nowhere: asked again now, not once
+      // it has timed out.
+      ask('hello', {}, 5_000).then((snapshot) => { if (!engine) apply(snapshot); }, () => {});
+      connect();
+    }
   }
 };
 // Answers come on this page's own channel; events on the shared one.
@@ -293,15 +308,23 @@ let connecting = null;
 function connect() {
   connecting ??= (async () => {
     banner(null);
+    // The engine's document is made at once when none is open (as after the browser
+    // started), not after a first hello has waited for it in vain. A failure to make it
+    // is said only once that hello went unanswered (an engine that answers runs).
+    const starting = startEngine().then(() => null, (failed) => failed);
     for (let attempt = 0; attempt < 60 && !engine; attempt++) {
       try {
-        apply(await ask('hello', {}, 500));
+        const snapshot = await ask('hello', {}, 500);
+        if (!engine) apply(snapshot);
       } catch (error) {
         if (error.kind !== 'timeout') {
           banner(error.message, [['Restart engine', restartEngine]]);
           return;
         }
-        if (attempt === 0) await startEngine().catch((failed) => banner(`Spindle's engine could not start: ${failed.message}`));
+        if (attempt === 0) {
+          const failed = await starting;
+          if (failed) banner(`Spindle's engine could not start: ${failed.message}`);
+        }
       }
     }
     if (!engine) banner("Spindle's engine is not answering.", [['Restart engine', askRestartEngine]]);
@@ -873,9 +896,28 @@ function pausePlayers() {
  * the user's messages among them, where the running turn started (null: not known),
  * and whether a compaction changed the history since. */
 let shown = { total: 0, prompts: [], turnFrom: null, compacted: false };
-/** A long history opens on its last turns; the rest shows when asked. */
+/** A long history opens on its last turns, at most TAIL_TURNS of them holding at most
+ * TAIL_STEPS steps between them (the last turn whole, however many it took); the rest
+ * shows when asked. Counted in turns alone, an agent's thread (a few messages, hundreds
+ * of steps each) drew all of it, tens of thousands of nodes, at every open. */
 const TAIL_TURNS = 30;
+const TAIL_STEPS = 120;
 const COMPACTED = '[Earlier conversation compacted';
+
+/** Where the part of `messages` a thread opens on begins (0: all of it). */
+function tailStart(messages) {
+  let steps = 0;
+  let turns = 0;
+  let start = 0;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    for (const block of messages[index].content ?? []) if (block.type === 'tool_use') steps += 1;
+    if (!isPrompt(messages[index])) continue;
+    turns += 1;
+    if (turns > 1 && (turns > TAIL_TURNS || steps > TAIL_STEPS)) return start;
+    start = index;
+  }
+  return 0;
+}
 
 /** Draws a thread's history: all of it, or (`from`) only its messages from that index on
  * in place of what was shown of them. False when the view holds no place for `from`
@@ -928,11 +970,8 @@ function renderHistory({ thread, history, running, bundle, moving, away }, { fro
   } else {
     box.replaceChildren();
     shown.prompts = [];
-    const prompts = messages.flatMap((message, index) => (isPrompt(message) ? [index] : []));
-    if (prompts.length > TAIL_TURNS) {
-      start = prompts[prompts.length - TAIL_TURNS];
-      box.append(earlierButton(thread, start));
-    }
+    start = tailStart(messages);
+    if (start > 0) box.append(earlierButton(thread, start));
   }
   // One workspace card, for the workspace as it is now: an earlier one goes.
   for (const card of box.querySelectorAll('.workspace-card')) card.remove();
@@ -952,6 +991,12 @@ function renderHistory({ thread, history, running, bundle, moving, away }, { fro
   // The last turn's pictures show (a few); its pages and Markdown files stay folded, to
   // open on demand (they showed while the turn worked on them).
   turnCards.filter((card) => card.preview && card.isConnected && kindOf(card.dataset.path) === 'picture').slice(-3).forEach((card) => card.preview());
+  // Its screenshots are read now, ready in their shut runs of steps; earlier turns' only
+  // when their run is opened (a long history held hundreds, each a read of the engine).
+  const lastPrompt = [...box.querySelectorAll(':scope > .message-wrap.user:not(.steer)')].at(-1);
+  for (let node = lastPrompt ? lastPrompt.nextElementSibling : box.firstElementChild; node; node = node.nextElementSibling) {
+    if (node.classList.contains('steps')) pictureRun(node);
+  }
   pictures.slice(-4).forEach((card) => card.preview());
   // Once no turn runs: the workspace, just above the turn's final answer (at the end when
   // the turn ended without one). It marks what the turn made or changed.
@@ -1009,14 +1054,15 @@ function renderMessages(box, thread, messages, offset, { running = false, revisi
         box.append(messageNode('assistant', block.text));
       } else if (block.type === 'tool_use') {
         const result = results.get(block.id);
-        const card = toolCard(block.name, block.input, block.id);
+        const waits = !result && running && main;
+        const card = toolCard(block.name, block.input, block.id, false, { labelled: waits });
         const steps = stepsIn(box);
         steps.list.append(card);
         // Its run of steps is counted once all of it is drawn (below), not again with each
         // step: counting a long run's whole list at every one of its steps made a thread
         // slow to open.
         if (result) settle(card, resultText(result.content), Boolean(result.is_error), { recount: false });
-        else if (running && main) pendingCards.push(card);
+        else if (waits) pendingCards.push(card);
         else settle(card, '(no result was recorded)', true, { recount: false });
         if (block.name === 'task') steps.append(taskBlock(card, result ? resultText(result.content) : null));
         const made = result && !result.is_error && wroteFile(card, false);
@@ -1065,6 +1111,7 @@ function stepsIn(box, open = false) {
       group.dataset.user = '1';
       group.wanted = group.open;
     }
+    if (group.open) pictureRun(steps);
   });
   steps.append(group);
   steps.group = group;
@@ -1167,7 +1214,7 @@ function mergeRepeats(steps) {
   }
   for (const card of steps.list.querySelectorAll(':scope > .tool:not(.merged)')) {
     const many = card.followers.length;
-    const tag = card.querySelector('.tool-count');
+    const tag = card.row.count;
     tag.hidden = !many;
     tag.textContent = `×${many + 1}`;
     paintTime(card);
@@ -1497,7 +1544,7 @@ function tidyTables(box) {
  * words (in the tense of where it is; a page step's address on hover), how long it took;
  * opened, a picture it took, its input and output a line each, and copy, view and
  * download. `id`: its call's id; `live`: seen starting now (it is timed). */
-function toolCard(name, input, id = null, live = false) {
+function toolCard(name, input, id = null, live = false, { labelled = true } = {}) {
   const card = el('details', 'tool running');
   card.dataset.tool = name;
   if (id) card.dataset.id = id;
@@ -1511,9 +1558,12 @@ function toolCard(name, input, id = null, live = false) {
   const summary = el('summary');
   const count = el('span', 'tool-count');
   count.hidden = true;
-  summary.append(el('span', 'tool-icon'), el('span', 'tool-label'), el('span', 'tool-where'), count, el('span', 'tool-time'),
-    el('span', 'tool-name', name), el('span', 'tool-state', 'running'));
-  summary.querySelector('.tool-where').className = 'tool-where sr-only';
+  // Its row's parts, kept: a history's hundreds of rows are labelled without looking each up.
+  card.row = {
+    summary, count, icon: el('span', 'tool-icon'), label: el('span', 'tool-label'), where: el('span', 'tool-where sr-only'),
+    time: el('span', 'tool-time'), state: el('span', 'tool-state', 'running'),
+  };
+  summary.append(card.row.icon, card.row.label, card.row.where, count, card.row.time, el('span', 'tool-name', name), card.row.state);
   card.append(summary);
   const detail = el('div', 'tool-detail');
   const lines = el('div', 'tool-lines');
@@ -1556,7 +1606,8 @@ function toolCard(name, input, id = null, live = false) {
   card.addEventListener('toggle', () => {
     for (const follower of card.followers ?? []) follower.classList.toggle('shown', card.open);
   });
-  relabel(card);
+  // `labelled` false: settled at once (a history's step), which labels it then.
+  if (labelled) relabel(card);
   return card;
 }
 
@@ -1593,13 +1644,12 @@ const KIND_ICONS = { command: 'command', code: 'code', file: 'file', folder: 'fo
 function relabel(card) {
   const state = card.classList.contains('running') ? 'running' : card.classList.contains('failed') ? 'failed' : 'done';
   const { label, short, kind, url, title, domain } = describe(card.dataset.tool, card.input ?? {}, state, knownTabs, knownParts);
-  card.querySelector('.tool-label').textContent = short;
+  card.row.label.textContent = short;
   card.pageUrl = url ?? null;
   // A page step's page, for screen readers (the row shows its site's icon).
-  card.querySelector('.tool-where').textContent = short !== label && (domain || title) ? ` on ${domain || title}` : '';
-  const summary = card.querySelector('summary');
-  summary.title = [label, title && title !== domain ? title : null, url].filter(Boolean).join('\n');
-  const place = card.querySelector('.tool-icon');
+  card.row.where.textContent = short !== label && (domain || title) ? ` on ${domain || title}` : '';
+  card.row.summary.title = [label, title && title !== domain ? title : null, url].filter(Boolean).join('\n');
+  const place = card.row.icon;
   const shows = state === 'running' ? 'spinner'
     : state === 'failed' ? (card.classList.contains('retried') ? 'retry' : 'x')
     : kind === 'page' && url ? `site ${url}` : KIND_ICONS[kind] ?? 'tool';
@@ -1608,6 +1658,9 @@ function relabel(card) {
     if (shows.startsWith('site ')) {
       const image = el('img', 'favicon');
       image.alt = '';
+      // Fetched once its row shows (most rows of a history are in shut groups).
+      image.loading = 'lazy';
+      image.decoding = 'async';
       image.src = faviconOf(url);
       image.onerror = () => place.replaceChildren(icon('globe', 14));
       place.replaceChildren(image);
@@ -1621,7 +1674,7 @@ function relabel(card) {
 /** A row's time: its own, or with the steps merged into it, theirs added; running, on the
  * clock. */
 function paintTime(card) {
-  const time = card.querySelector('.tool-time');
+  const time = card.row.time;
   if (card.followers?.length) {
     const all = [card, ...card.followers].map((one) => one.ms).filter(Number.isFinite);
     time.textContent = all.length ? duration(all.reduce((sum, ms) => sum + ms, 0)) : '';
@@ -1636,7 +1689,7 @@ const faviconOf = (url) => chrome.runtime.getURL(`_favicon/?pageUrl=${encodeURIC
 /** A step's state in words (read by screen readers; its icon shows it). */
 function stateText(card) {
   const failed = card.classList.contains('failed');
-  card.querySelector('.tool-state').textContent = card.classList.contains('running') ? 'running'
+  card.row.state.textContent = card.classList.contains('running') ? 'running'
     : failed && card.classList.contains('retried') ? 'failed → retried ✓' : failed ? 'failed' : 'done';
 }
 
@@ -1688,13 +1741,25 @@ function settle(card, text, failed, { recount = true } = {}) {
   stateText(card);
   const steps = card.closest('.steps');
   if (steps && recount) updateSteps(steps);
-  if (shot && current) picture(card, current, shot);
+  if (shot && current) {
+    // Read once its run of steps shows: a history's shut runs can hold hundreds, each a
+    // read from the engine that held up what the open thread asked for next.
+    card.shot = shot;
+    if (!steps || steps.group.open) picture(card, current, shot);
+  }
+}
+
+/** The pictures of a run of steps just opened, read now. */
+function pictureRun(steps) {
+  for (const card of steps.list.querySelectorAll('.tool')) {
+    if (card.shot && !card.pictured && current) picture(card, current, card.shot);
+  }
 }
 
 // The running steps' times go on as they run, and their groups' too.
 setInterval(() => {
   for (const card of document.querySelectorAll('#history .tool.running')) {
-    if (card.started != null) card.querySelector('.tool-time').textContent = clock(performance.now() - card.started);
+    if (card.started != null) card.row.time.textContent = clock(performance.now() - card.started);
   }
   for (const steps of document.querySelectorAll('#history .steps.running')) {
     if (Number.isFinite(steps.started)) steps.querySelector('.group-time').textContent = clock(Date.now() - steps.started);
@@ -1706,6 +1771,7 @@ setInterval(() => {
  * (read from the thread's workspace; a just-taken one may land there a moment after its
  * result). */
 async function picture(card, id, path, tries = 5) {
+  card.pictured = true;
   try {
     const { bytes } = await ask('read', { id, path });
     const url = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }));
@@ -1894,7 +1960,9 @@ function onEvent(id, event) {
     }
     case 'compacted':
       shown.compacted = true;
-      box.append(el('p', 'notice', `History compacted (${Math.round(event.before / 1024)} → ${Math.round(event.after / 1024)} KiB): earlier messages are folded into a summary the model goes on from.`));
+      box.append(el('p', 'notice', event.cleared
+        ? `History made room (${Math.round(event.before / 1024)} → ${Math.round(event.after / 1024)} KiB): long tool results of earlier steps were cleared; the conversation is kept.`
+        : `History compacted (${Math.round(event.before / 1024)} → ${Math.round(event.after / 1024)} KiB): earlier messages are folded into a summary the model goes on from.`));
       break;
     default:
       return;
@@ -3621,7 +3689,18 @@ function renderInstructionsSummary() {
   const summary = $('instructions-summary');
   summary.textContent = engine?.standing ? 'Set' : 'Add';
   summary.classList.toggle('add', !engine?.standing);
+  $('resend').setAttribute('aria-checked', String(engine?.resend !== false));
 }
+
+$('resend').onclick = async () => {
+  try {
+    apply(await ask('resend', { on: engine?.resend === false }));
+    renderInstructionsSummary();
+    toast(engine.resend ? 'A cut-off request goes again by itself, from each thread\'s next message.' : 'A cut-off request now stops its turn (Retry sends it again).');
+  } catch (error) {
+    toast(error.message);
+  }
+};
 
 /** Providers, one row each: a filled square (ready) or a hollow one (no key), its name and
  * site (or sign-in), and icons to change, add, sign in again or sign out; a key is typed

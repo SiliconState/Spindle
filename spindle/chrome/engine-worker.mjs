@@ -398,12 +398,22 @@ async function setupOf(id, settings) {
   ].filter(Boolean).join('\n');
 }
 
+/** Whether a thread sends a request whose reply was cut off (a dropped connection, a
+ * stream that broke, a provider that broke off saying it is overloaded) again by itself,
+ * up to three times, rather than stopping its turn until Retry: on unless the user
+ * turned it off (Settings, Your instructions). Such a request may have been billed
+ * already. */
+async function resendOn() {
+  return (await read('kv', 'resend').catch(() => null)) !== false;
+}
+
 /** Before a turn, a thread gets what is current, if it differs (if it cannot, the turn
  * goes on as it was): the guide's wording (for a thread made by an earlier build), the
  * user's standing instructions, the page tools as they are now (a thread offered some
- * has all), and, once, summaries its model writes when its history is compacted (a
- * thread made here by an earlier build compacted by digest: Chrome could do no better
- * then; threads made or imported since are marked `summaries` and keep their own). */
+ * has all), whether it sends a cut-off request again (`resendOn`), and, once, summaries
+ * its model writes when its history is compacted (a thread made here by an earlier
+ * build compacted by digest: Chrome could do no better then; threads made or imported
+ * since are marked `summaries` and keep their own). */
 async function freshen(dir) {
   try {
     const id = dir.slice(dirOf('').length);
@@ -422,6 +432,8 @@ async function freshen(dir) {
     if (offered.length && !current) changes.tools = [...tools.filter((tool) => !PAGE_NAMES.has(tool.name)), ...now];
     const summarized = (await read('threads', id))?.summaries;
     if (settings.compaction === 'digest' && !summarized) changes.compaction = 'model';
+    const resend = await resendOn();
+    if (Boolean(settings.resend_unknown) !== resend) changes.resend_unknown = resend;
     if (Object.keys(changes).length) await client.settings(dir, changes);
     if (!summarized) await touch(id, { summaries: true });
   } catch (error) {
@@ -565,6 +577,9 @@ function makeClient(saved) {
     if (!id) return;
     if (event?.type === 'task') noteTask(id, event);
     send({ type: 'event', thread: id, event });
+    // A background task that ended by itself, its thread otherwise idle: the thread's
+    // store rests, and its session closes, as after any use.
+    if (event?.type === 'task' && event.event?.type === 'stopped' && !running.has(id) && !using.has(id)) rest(id);
   });
   for (const name of ['work_error', 'app_tool_error']) made.on(name, (error) => console.error(`Spindle ${name}:`, error));
   return made;
@@ -1316,26 +1331,58 @@ async function within(id, work) {
   }
 }
 
-/** How long an idle thread's session stays open: reads one after another (a page's
- * preview reading what it refers to, say) share one opening, not one each. Not longer:
- * a session open when Chrome stops (quit, say) was not closed cleanly, and the next open
- * of its store checks every page of it. */
-const REST_AFTER_MS = 2_000;
+/** How long an idle thread's session stays open: going back to a thread (or reads one
+ * after another, a page's preview reading what it refers to) finds it open, its store
+ * not opened and checked again. A moment after its last use its store rests
+ * (`SETTLE_MS`, `restSession`): Chrome stopping (quit, say) while it is open then leaves
+ * it as a clean close does, so the next open does not check every page of it. Before
+ * stores rested, an open session at a quit cost the next open seconds, which held this
+ * to 2 seconds and made nearly every open of a thread a store's open. */
+const REST_AFTER_MS = 30_000;
+const SETTLE_MS = 250;
+/** Idle sessions kept open at once: going through threads in turn, the one idle longest
+ * closes as another comes to rest (each holds its store's cache in the engine's memory,
+ * which the engine gives back only once no session is open). */
+const IDLE_OPEN = 4;
+/** Idle threads' close timers, the one idle longest first. */
 const resting = new Map();
+const settling = new Map();
 
-/** Closes an idle thread's session once it has rested a moment; the package refuses to
- * close a running one. */
+/** Rests an idle thread's store in a moment, then closes its session once it has been
+ * idle a while (or once IDLE_OPEN others came to rest after it); the package refuses to
+ * rest or close a running one. */
 function rest(id) {
   clearTimeout(resting.get(id));
-  const timer = setTimeout(() => {
-    resting.delete(id);
+  // Set again below: the thread that came to rest last, last.
+  resting.delete(id);
+  clearTimeout(settling.get(id));
+  const settle = setTimeout(() => {
+    settling.delete(id);
     if (running.has(id) || using.has(id)) return;
-    client.closeSession(dirOf(id)).then(() => {
-      if (!running.size && !using.size) renewEngineSoon();
-    }, () => {});
-  }, REST_AFTER_MS);
+    Promise.resolve().then(() => client.restSession(dirOf(id))).catch(() => {});
+  }, SETTLE_MS);
+  settle?.unref?.();
+  settling.set(id, settle);
+  const timer = setTimeout(() => closeIdle(id), REST_AFTER_MS);
   timer?.unref?.();
   resting.set(id, timer);
+  for (const [oldest] of resting) {
+    if (resting.size <= IDLE_OPEN) break;
+    closeIdle(oldest);
+  }
+}
+
+/** Closes an idle thread's session now, its timers cleared (one in use or running stays
+ * open: its end rests it again). */
+function closeIdle(id) {
+  clearTimeout(resting.get(id));
+  resting.delete(id);
+  clearTimeout(settling.get(id));
+  settling.delete(id);
+  if (running.has(id) || using.has(id)) return;
+  client.closeSession(dirOf(id)).then(() => {
+    if (!running.size && !using.size) renewEngineSoon();
+  }, () => {});
 }
 
 /** Once the engine has rested a while, a grown instance is renewed (`renewEngine`). */
@@ -1757,6 +1804,7 @@ async function snapshot() {
   const catalogSaved = Boolean(await read('kv', 'catalog'));
   const sites = await sitesKept();
   const standing = (await read('kv', 'standing')) ?? '';
+  const resend = await resendOn();
   const relay = (await read('kv', 'relay')) ?? null;
   const vault = await vaultState();
   // Sign in with ChatGPT registrations kept (outliving a sign-out), by provider: the
@@ -1781,6 +1829,7 @@ async function snapshot() {
     sites,
     approvals: approvalsShown(),
     standing,
+    resend,
     relay,
     vault,
     registrations,
@@ -1833,12 +1882,23 @@ async function letOthersGo() {
  * thread, the engine answering nothing meanwhile. A rewind past the message and on
  * again breaks that order and can hide the point: `thorough` then reads every target,
  * newest first (its length first, the whole only for one of that length), as Rewind
- * needs; without it (marking what a turn changed) the point is then not found. */
+ * needs; without it (marking what a turn changed) the point is then not found.
+ * Without `thorough`, the newest targets are listed first (128, then 1024, then all):
+ * the point before the thread's last message is nearly always among them, and listing
+ * 8192 steps at once was one call of seconds in a long thread, every other thread's
+ * work waiting behind it. More are listed only while the oldest listed still holds the
+ * message (the point is older than the list). */
 async function pointBefore(dir, shown, at, { thorough = false } = {}) {
   const before = JSON.stringify(shown.slice(0, at));
   const through = JSON.stringify(shown.slice(0, at + 1));
-  const targets = await client.targets(dir, { limit: 8192 });
   const begun = (messages) => messages.length > at && JSON.stringify(messages.slice(0, at + 1)) === through;
+  let targets = [];
+  for (const limit of thorough ? [8192] : [128, 1024, 8192]) {
+    targets = await client.targets(dir, { limit });
+    if (limit === 8192 || targets.length === 0) break;
+    await letOthersGo();
+    if (!begun((await client.history(dir, targets.at(-1).revision)).messages ?? [])) break;
+  }
   // The histories of targets before `low` begin so, those from `high` on do not;
   // `without` is the one at targets[high], once one is read.
   let low = 0;
@@ -2051,6 +2111,8 @@ const ops = {
       await client.create(dir, provider, {
         ...(model && { model }), ...(effort && { effort }), runner: where, network: Boolean(network) && where !== 'none',
         ...(instructions && { instructions }), ...(tasks && { tasks: true }),
+        // A request cut off mid-reply goes again by itself unless the user said not to.
+        ...((await resendOn()) && { resend_unknown: true }),
         // A spending limit set for new threads (dollars, tasks included).
         ...(Number.isFinite(limit) && limit >= 0 && { max_usd: limit }),
         // Where history compacts, when the user set one for new threads (else the
@@ -2169,7 +2231,9 @@ const ops = {
     // and writes, not when the first command waits for it.
     warmFor(thread);
     return within(id, async () => {
-      const status = await client.status(dir);
+      // Its history with its status, from one read of the head (a long thread's is
+      // megabytes, read once).
+      const { history, ...status } = await client.status(dir, { history: { from: from ?? 0 } });
       // Its index entry follows the session's own settings (one made or imported before
       // the entry said whether tasks are on, say).
       // Kept in place (not as a change of the thread: its place in the list stays).
@@ -2179,7 +2243,7 @@ const ops = {
         entry = (await update('threads', id, (kept) => ({ ...kept, tasks }))) ?? thread;
         send({ type: 'thread', thread: entry });
       }
-      return { thread: entry, status, history: await client.history(dir, undefined, { from }), running: running.has(id), queued: queuedOf(id) };
+      return { thread: entry, status, history, running: running.has(id), queued: queuedOf(id) };
     });
   },
 
@@ -2233,14 +2297,20 @@ const ops = {
     return within(id, async () => {
       const shown = (await client.history(dir, revision ?? undefined)).messages ?? [];
       const summary = JSON.stringify(shown[0] ?? null);
-      const targets = await client.targets(dir, { limit: 8192 }).catch((error) => {
-        throw error?.kind === 'busy' ? failure('busy', NOT_WHILE_WORKING) : error;
-      });
-      for (const target of targets) {
-        if (revision != null && target.revision >= revision) continue;
-        await letOthersGo();
-        const history = await client.history(dir, target.revision);
-        if (JSON.stringify(history.messages?.[0] ?? null) !== summary) return { revision: target.revision, history };
+      // Newest first, a few at a time (as `pointBefore`): one listing of 8192 steps held
+      // the engine for seconds.
+      let read = 0;
+      for (const limit of [128, 1024, 8192]) {
+        const targets = await client.targets(dir, { limit }).catch((error) => {
+          throw error?.kind === 'busy' ? failure('busy', NOT_WHILE_WORKING) : error;
+        });
+        for (const target of targets.slice(read)) {
+          if (revision != null && target.revision >= revision) continue;
+          await letOthersGo();
+          const history = await client.history(dir, target.revision);
+          if (JSON.stringify(history.messages?.[0] ?? null) !== summary) return { revision: target.revision, history };
+        }
+        read = targets.length;
       }
       throw failure('not_found', 'Spindle no longer holds the messages before that summary');
     });
@@ -2820,6 +2890,13 @@ const ops = {
     const kept = String(text ?? '').trim().slice(0, 8000);
     if (kept) await write('kv', 'standing', kept);
     else await remove('kv', 'standing');
+    return snapshot();
+  },
+
+  /** Whether threads send a model request cut off mid-reply again by themselves
+   * (`resend_unknown`): new ones from now, the rest from their next turn. */
+  async resend({ on }) {
+    await write('kv', 'resend', Boolean(on));
     return snapshot();
   },
 

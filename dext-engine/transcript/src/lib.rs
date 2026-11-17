@@ -155,6 +155,23 @@ pub struct Message {
     pub content: Vec<Block>,
 }
 
+/// The one key of a tool call's input whose arguments were not a JSON object (malformed
+/// JSON, or JSON but not an object): `{"text": what the model sent (bounded), "error":
+/// why}`. A host refuses such a call, saying why, so the model sends it again.
+pub const UNPARSED_ARGUMENTS: &str = "__dext_unparsed_arguments";
+
+/// Why a tool call whose input holds `UNPARSED_ARGUMENTS` was not run (None: its input
+/// is the model's own arguments).
+pub fn unparsed_arguments_refusal(name: &str, input: &serde_json::Value) -> Option<String> {
+    let unparsed = input.get(UNPARSED_ARGUMENTS)?;
+    let error = unparsed["error"]
+        .as_str()
+        .unwrap_or("not a JSON object of arguments");
+    Some(format!(
+        "its arguments were {error}, so nothing was run: call `{name}` again with its arguments as one JSON object"
+    ))
+}
+
 pub const DEFAULT_INPUT_USD_PER_MTOK: f64 = 1.0;
 pub const DEFAULT_OUTPUT_USD_PER_MTOK: f64 = 5.0;
 pub const DEFAULT_CACHE_READ_USD_PER_MTOK: f64 = 0.1;

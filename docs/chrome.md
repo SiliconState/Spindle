@@ -152,7 +152,7 @@ The engine's operations (`ops` in [`engine-worker.mjs`](../spindle/chrome/engine
 | `stop`, `retry`, `resume` | Stop a turn; resend a request that was cut off; continue where Spindle knows it stopped. |
 | `tasks`, `taskStop` | List child tasks and stop one, including while the parent only waits for reports. |
 | `storage`, `compact`, `dropAside`, `freeSealed`, `reclaimLost` | Per-thread disk use (and, since 0.1.7, the bytes no file name leads to), return free database pages, remove set-aside first attempts, remove a moved thread's sealed copy after checking its bundle, or (since 0.1.7) free those unreadable bytes. |
-| `open` | A thread's status and history (optionally from a message index). For a thread whose commands run in the browser it also warms the wasm Linux (when the build carries it), and v86 only if the thread ran a command there in the last 24 hours. |
+| `open` | A thread's status and history (optionally from a message index), from one read of its head (`status` with `history`). For a thread whose commands run in the browser it also warms the wasm Linux (when the build carries it), and v86 only if the thread ran a command there in the last 24 hours. |
 | `rewindTo` | Takes the thread back to just before one of the user's messages, searching the last 8192 rewind targets, and returns that message and its attachments. After 0.1.8 it first narrows the targets to the histories that begin as the thread's does through that message (a history only grows until a compaction starts it again), and reads every target only when that misses; the panel waits up to ten minutes for it. |
 | `earlier` | The history before a compaction summary. |
 | `restart` | Starts an unfinished turn over, optionally with other settings, or hands its message back. |
@@ -217,9 +217,16 @@ cut short by a crash is never read as a wrong name; a slot whose header is found
 otherwise is kept apart (`lost`), never read or reused, until Settings, Storage frees it (see
 [Storage controls](#storage-controls)).
 
-A session is open only while something uses it. `within` counts users of a thread;
-`rest` closes it once no turn, task or operation is using it, releasing its in-memory
-state after two idle seconds. The pool starts with 96 slots and schedules 64 more
+A session is open only while something uses it, or was a moment ago. `within` counts
+users of a thread; `rest` marks its store resting (`restSession`) a quarter of a second
+after the last use, so a browser that quits with the session open leaves it as a clean
+close does (its next open checks no page again; see [store.md](store.md#the-open-record-and-crash-counting)),
+and closes the session, releasing its in-memory state, once it has been idle 30 seconds:
+going back to a thread meanwhile finds it open, its store not opened and checked again. At
+most four idle sessions stay open (`IDLE_OPEN`): another coming to rest closes the one idle
+longest at once. A background task that ends by itself rests its thread the same way. (Before stores rested,
+sessions closed after two idle seconds: one open when the browser quit cost its next open
+a check of every page.) The pool starts with 96 slots and schedules 64 more
 when fewer than 32 remain; before operations, `headroom` adds 96 when fewer than
 48 are free. Opening and growth serialize, and closing during growth releases its
 new handles. A synchronous allocation can still fail before growth finishes. After idle sessions close, a
@@ -861,6 +868,7 @@ Global settings are stored in IndexedDB and applied by the engine:
 | Sites scripts may call | Address prefixes, each with an optional secret header | `kv/sites`, `kv/site-secrets` (header names), `keys/:site:NAME` (sealed values) | Address prefixes that scripts' `spindle http` may reach: **Read it** allows `GET` and `HEAD`, **Read and change it** also `POST`, `PUT`, `PATCH`, `DELETE`. Adding one asks Chrome for that origin. The package checks each grant (`setHttpGrants`). See [Secret headers for sites](#secret-headers-for-sites). |
 | Your Spindle host | Address; **Connect**, or **Or paste a token** | `kv/host` (URL, and this browser's name there after Connect), `keys/:host` (sealed token) | Connect opens the host's own page to approve this browser (see [Running a thread on your Spindle host](#running-a-thread-on-your-spindle-host)). A pasted token comes from `spindle --dir HOST token new NAME --browser` (threads and commands) or `--runner` (commands only). Kept after the host answers. |
 | Your instructions | standing instructions | `kv/standing` | Up to 8000 characters, added to new threads at once and to other threads before their next turn. |
+| Your instructions | Send a cut-off request again (on unless turned off) | `kv/resend` | A thread's `resend_unknown` setting: new threads at once, others before their next turn. A model request whose reply was cut off (a dropped connection, or an error the provider streamed that says it passes) goes again by itself, up to three times, rather than stopping the turn until Retry; such a request may be billed twice. |
 | Appearance | Paper, neutral Light, Dim or System (Light or Dim as the system is); Textured or Plain | `localStorage` (`spindle-theme`, `spindle-texture`; `theme.js`) | The panel's look; Paper and Textured are the defaults. Dim is the dark theme, a soft charcoal. |
 | Storage | Thread sizes, Free, Free all, Remove first attempts, Linux snapshot, Unreadable (since 0.1.7) | OPFS and `bundles` | See [Storage controls](#storage-controls). |
 | About | The extension's version, the engine, build and Linux images, storage used; Open in a tab, Restart engine | — | **Open in a tab** opens `panel.html` in a tab (useful when Chrome cannot show a permission prompt in the side panel). **Restart engine** closes and restarts the offscreen engine, asking first while browser threads run. |

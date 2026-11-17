@@ -443,9 +443,12 @@ your key.
   part is folded into a summary the thread's own model writes (one request, on your key;
   if it fails, a shorter digest Spindle makes stands in), and the thread goes on from
   it. The conversation says so where it happened, shows the summary, and shows the
-  earlier messages themselves when asked (and hides them again on the same button). A
-  long thread opens on its last 30 turns (the
-  rest on a click), and a turn's end draws only that turn again. To start clean, the
+  earlier messages themselves when asked (and hides them again on the same button).
+  Before a summary is asked for, the long tool results of the part it would fold (pages
+  read, files, outputs) are cleared, each to a line saying what it was; when that alone
+  makes room, no summary is written. A long thread opens on its last turns, at most 30
+  holding at most 120 steps between them (the last turn whole; the rest on a click),
+  and a turn's end draws only that turn again. To start clean, the
   thread menu's **New thread with these files** starts a thread with this one's
   workspace and none of its conversation (its model too, to change in the model page).
 - **Moving:** a thread moves into a `.spindle` file (Thread menu, Move to a file) and

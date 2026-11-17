@@ -24,12 +24,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 enum Reply {
     Text(&'static str),
     Call(&'static str, Value),
+    /// Several tool calls in one reply: names and arguments.
+    Calls(Vec<(&'static str, Value)>),
     /// HTTP 429 with `Retry-After: 0`.
     Refused,
     /// The connection closes with no reply (an unknown outcome).
     HangUp,
     /// The reply begins, then the provider streams an error with this message.
     StreamError(&'static str),
+    /// The same with an error that does not pass (the request itself is refused).
+    StreamRefusal(&'static str),
 }
 
 fn chunks(delta: Value, index: usize) -> String {
@@ -69,15 +73,39 @@ fn wire(reply: &Reply, index: usize) -> Option<(u16, Option<&'static str>, Strin
                 index,
             ),
         )),
+        Reply::Calls(calls) => {
+            let calls: Vec<Value> = calls
+                .iter()
+                .enumerate()
+                .map(|(at, (name, arguments))| {
+                    json!({"index": at, "id": format!("call_{index}_{at}"), "type": "function",
+                    "function": {"name": name, "arguments": arguments.to_string()}})
+                })
+                .collect();
+            let body = chunks(json!({"tool_calls": calls}), index);
+            // `chunks` names the first call alone: each keeps the name given above.
+            Some((
+                200,
+                None,
+                body.replace(
+                    &format!("\"id\":\"call_{index}\""),
+                    &format!("\"id\":\"call_{index}_0\""),
+                ),
+            ))
+        }
         Reply::Refused => Some((
             429,
             Some("0"),
             r#"{"error":{"message":"rate limited","type":"rate_limit"}}"#.into(),
         )),
         Reply::HangUp => None,
-        Reply::StreamError(message) => {
+        Reply::StreamError(message) | Reply::StreamRefusal(message) => {
+            let code = match reply {
+                Reply::StreamError(_) => "server_error",
+                _ => "invalid_request_error",
+            };
             let began = json!({"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hel"},"finish_reason":null}]});
-            let error = json!({"error": {"code": "server_error", "message": message}});
+            let error = json!({"error": {"code": code, "message": message}});
             Some((200, None, format!("data: {began}\n\ndata: {error}\n\n")))
         }
     }
@@ -1482,6 +1510,250 @@ fn a_task_runs_as_a_child_session_and_its_files_merge_into_the_parent() {
     );
     let read = app.call("read", json!({"dir": "t", "path": "b.txt"}));
     assert_eq!(read["result"]["content"], "from the task", "{read}");
+}
+
+/// One reply asking for more tasks than `tasks.max_running` allows at once starts as
+/// many as it allows; each of the rest starts once one of them has ended, and the batch
+/// answers once all have. With room for both, they run side by side.
+#[test]
+fn tasks_beyond_the_running_limit_wait_for_a_place() {
+    for (most, together) in [(1, false), (2, true)] {
+        let host = embedded(Box::new(MemoryPlaces));
+        let sessions = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let seen = sessions.clone();
+        let mut app = App::new(&host)
+            .script(
+                "t",
+                vec![
+                    Reply::Calls(vec![
+                        ("task", json!({"prompt": "write a.txt"})),
+                        ("task", json!({"prompt": "write b.txt"})),
+                    ]),
+                    Reply::Text("both finished"),
+                ],
+            )
+            .script(
+                "#",
+                vec![
+                    Reply::Call("write_file", json!({"path": "a.txt", "content": "1"})),
+                    Reply::Call("write_file", json!({"path": "b.txt", "content": "2"})),
+                    Reply::Text("child done"),
+                    Reply::Text("child done"),
+                ],
+            );
+        app.hook = Some(Box::new(move |_, session, _, _| {
+            seen.borrow_mut().push(session.to_string());
+            None
+        }));
+        app.call(
+            "create",
+            json!({"dir": "t", "provider": "fake", "tasks": {"max_running": most}}),
+        );
+        let reply = app.call("prompt", json!({"dir": "t", "text": "[t:task] delegate"}));
+        assert!(reply.get("result").is_some(), "{reply}");
+        // The tasks' requests in order (they share one script, so how many each makes
+        // varies): one at a time, all of the first's come before any of the second's;
+        // side by side, they alternate.
+        let children: Vec<String> = sessions
+            .borrow()
+            .iter()
+            .filter(|s| s.contains('#'))
+            .cloned()
+            .collect();
+        let tasks: std::collections::BTreeSet<&String> = children.iter().collect();
+        assert_eq!(tasks.len(), 2, "{children:?}");
+        let turns = children
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count();
+        assert_eq!(turns == 1, !together, "{children:?}");
+        assert_eq!(
+            app.run.requests.len(),
+            children.len() + 2,
+            "parent, the tasks', parent"
+        );
+        let last = app.run.requests.last().unwrap();
+        assert_eq!(
+            last.matches("child done").count(),
+            2,
+            "both answers reach the parent"
+        );
+    }
+}
+
+/// Background tasks hold places too: one beyond the limit is answered that it did not
+/// start, and a task the turn waits for, finding the only place held by a background
+/// task, waits for that one to end, then runs and answers (it is not given up for having
+/// no work of the batch out meanwhile).
+#[test]
+fn a_task_waits_for_a_place_a_background_task_holds() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let sessions = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let seen = sessions.clone();
+    let mut app = App::new(&host)
+        .script(
+            "w",
+            vec![
+                Reply::Calls(vec![
+                    ("task", json!({"prompt": "count a", "background": true})),
+                    ("task", json!({"prompt": "count b", "background": true})),
+                    ("task", json!({"prompt": "write a.txt"})),
+                ]),
+                Reply::Text("all answered"),
+            ],
+        )
+        .script(
+            "#",
+            vec![
+                Reply::Text("background answer"),
+                Reply::Text("foreground answer"),
+            ],
+        );
+    app.hook = Some(Box::new(move |_, session, _, _| {
+        seen.borrow_mut().push(session.to_string());
+        None
+    }));
+    app.call(
+        "create",
+        json!({"dir": "w", "provider": "fake", "tasks": {"max_running": 1}}),
+    );
+    let reply = app.call("prompt", json!({"dir": "w", "text": "[t:w] delegate"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    let children: Vec<String> = sessions
+        .borrow()
+        .iter()
+        .filter(|s| s.contains('#'))
+        .cloned()
+        .collect();
+    assert_eq!(children.len(), 2, "one request each: {children:?}");
+    assert_ne!(children[0], children[1], "{children:?}");
+    let answered = app
+        .run
+        .requests
+        .iter()
+        .find(|body| body.contains("foreground answer"))
+        .expect("the waiting task ran and its answer reached the parent");
+    assert!(
+        answered.contains("tasks already run at once"),
+        "the second background task was refused: {answered}"
+    );
+    assert!(!answered.contains("did not finish"), "{answered}");
+    // The background task that ran (the refused one was never registered).
+    let tasks = app.call("tasks", json!({"dir": "w"}))["result"]["tasks"].clone();
+    assert_eq!(tasks.as_array().unwrap().len(), 1, "{tasks}");
+    assert_eq!(tasks[0]["state"], "finished", "{tasks}");
+}
+
+/// A call whose arguments are not a JSON object is kept and refused, saying why, and the
+/// model reads that and goes on: the reply is not lost.
+#[test]
+fn a_call_with_arguments_that_are_not_an_object_is_refused_and_the_turn_goes_on() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host).script(
+        "bad",
+        vec![
+            Reply::Call("write_file", json!("{\"path\": oops")),
+            Reply::Text("fixed it"),
+        ],
+    );
+    app.call("create", json!({"dir": "bad", "provider": "fake"}));
+    let reply = app.call("prompt", json!({"dir": "bad", "text": "[t:bad] go"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    assert_eq!(
+        app.run.requests.len(),
+        2,
+        "the refusal went back to the model"
+    );
+    assert!(
+        app.run.requests[1].contains(
+            "its arguments were JSON, but not an object of arguments, so nothing was run"
+        ),
+        "{}",
+        app.run.requests[1]
+    );
+    assert!(
+        app.run.events.iter().any(|e| e["type"] == "tool_refused"),
+        "{:?}",
+        app.run.events
+    );
+    let files = app.call("files", json!({"dir": "bad"}));
+    assert_eq!(files["result"]["files"], json!([]), "nothing was written");
+}
+
+/// A session's store rests between uses (`rest`): every method that only reads leaves it
+/// resting (the backend checks, in debug builds, that each wrote nothing), the next that
+/// may write ends the rest first, and nothing rests while the session runs. `status` with
+/// `history` gives what `history` alone does.
+#[test]
+fn a_session_rests_between_uses_and_reading_keeps_it_resting() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host).script(
+        "r",
+        vec![
+            Reply::Call("write_file", json!({"path": "a.txt", "content": "1"})),
+            Reply::Text("done"),
+            Reply::Text("again"),
+        ],
+    );
+    app.call(
+        "create",
+        json!({"dir": "r", "provider": "fake", "tasks": true}),
+    );
+    let reply = app.call("prompt", json!({"dir": "r", "text": "[t:r] go"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    let rested = app.call("rest", json!({"dir": "r"}));
+    assert_eq!(rested["result"]["rested"], true, "{rested}");
+    for (method, params) in [
+        ("open", json!({"dir": "r"})),
+        ("status", json!({"dir": "r"})),
+        ("status", json!({"dir": "r", "history": {"from": 1}})),
+        ("history", json!({"dir": "r"})),
+        ("files", json!({"dir": "r"})),
+        ("read", json!({"dir": "r", "path": "a.txt"})),
+        ("targets", json!({"dir": "r"})),
+        ("targets", json!({"dir": "r", "until": "settled"})),
+        ("tasks", json!({"dir": "r"})),
+        ("fit", json!({"dir": "r"})),
+        ("settings", json!({"dir": "r"})),
+        ("rest", json!({"dir": "r"})),
+    ] {
+        let reply = app.call(method, params.clone());
+        assert!(reply.get("result").is_some(), "{method} {params}: {reply}");
+    }
+    let both = app.call("status", json!({"dir": "r", "history": {"from": 0}}));
+    let alone = app.call("history", json!({"dir": "r"}));
+    assert_eq!(both["result"]["history"], alone["result"], "{both}");
+    assert!(
+        both["result"]["history"]["messages"]
+            .as_array()
+            .is_some_and(|m| !m.is_empty())
+    );
+    let from = app.call("status", json!({"dir": "r", "history": {"from": 1}}));
+    let alone = app.call("history", json!({"dir": "r", "from": 1}));
+    assert_eq!(from["result"]["history"], alone["result"], "{from}");
+    let refused = app.call("status", json!({"dir": "r", "history": {"since": 1}}));
+    assert!(refused.get("error").is_some(), "{refused}");
+    // A method that may write ends the rest, and the session goes on as before.
+    let reply = app.call("prompt", json!({"dir": "r", "text": "[t:r] more"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    assert_eq!(
+        app.call("rest", json!({"dir": "r"}))["result"]["rested"],
+        true
+    );
+    // Closing a resting session.
+    let closed = app.call("close", json!({"dir": "r"}));
+    assert_eq!(closed["result"]["closed"], true, "{closed}");
+    // A session at work does not rest: its request held unanswered, then stopped.
+    app.hold = app.run.requests.len() + 1;
+    let line = json!({"jsonrpc": "2.0", "id": 77, "method": "prompt",
+        "params": {"dir": "r", "text": "[t:r] once more"}});
+    let frames = host.handle(line.to_string().as_bytes());
+    app.drive(frames);
+    assert_eq!(
+        app.call("rest", json!({"dir": "r"}))["result"]["rested"],
+        false
+    );
+    app.call("stop", json!({"dir": "r"}));
 }
 
 #[test]
@@ -3825,6 +4097,60 @@ fn an_error_streamed_mid_reply_is_said_alike_by_both_hosts() {
             "native: {native}\nembedded: {embedded}"
         );
     }
+}
+
+/// In a session that resends (`resend_unknown`), a passing error the provider streams
+/// mid-reply (overloaded) is a dropped reply: the request goes again and the turn
+/// finishes. A lasting one (here, a refusal of the request's shape) still fails it.
+#[test]
+fn a_passing_error_streamed_mid_reply_is_sent_again_where_the_session_resends() {
+    let host = embedded(Box::new(MemoryPlaces));
+    // (A thread's very first request has no point before it to send it again from: the
+    // app starts that turn over instead. So each thread has a turn first.)
+    let mut app = App::new(&host)
+        .script(
+            "again",
+            vec![
+                Reply::Text("hello"),
+                Reply::StreamError("overloaded, try again"),
+                Reply::Text("done"),
+            ],
+        )
+        .script(
+            "lasting",
+            vec![
+                Reply::Text("hello"),
+                Reply::StreamRefusal("invalid request: unknown field"),
+                Reply::Text("never"),
+            ],
+        );
+    for dir in ["again", "lasting"] {
+        app.call(
+            "create",
+            json!({"dir": dir, "provider": "fake", "model": "fake-model", "resend_unknown": true}),
+        );
+        let first = app.call(
+            "prompt",
+            json!({"dir": dir, "text": format!("[t:{dir}] hi")}),
+        );
+        assert!(first.get("result").is_some(), "{first}");
+    }
+    let before = app.run.requests.len();
+    let reply = app.call("prompt", json!({"dir": "again", "text": "[t:again] go"}));
+    assert!(reply.get("result").is_some(), "{reply}");
+    assert_eq!(app.run.requests.len(), before + 2, "sent again once");
+    let reply = app.call(
+        "prompt",
+        json!({"dir": "lasting", "text": "[t:lasting] go"}),
+    );
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown field"),
+        "{reply}"
+    );
+    assert_eq!(app.run.requests.len(), before + 3, "not sent again");
 }
 
 // ---- a command the user stops ----------------------------------------------------------

@@ -504,10 +504,14 @@ video.file-media { background: #000; }
 body.dropping .composer-box { outline: 2px dashed var(--accent); outline-offset: 2px; }
 #bar { display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 2px 0 10px; border-bottom: 1px solid var(--hair); min-width: 0; }
 #status-mark { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; display: none; }
-#bar[data-mode="busy"] #status-mark { display: block; background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); animation: pulse 1.6s ease-in-out infinite; }
+/* The busy mark's ring grows and fades by transform and opacity, which the compositor
+   draws alone; a growing box-shadow repainted the panel at every frame of a turn
+   (measured: over 200 ms of each second's main thread beside a long history). */
+#bar[data-mode="busy"] #status-mark { display: block; position: relative; background: var(--accent); }
+#bar[data-mode="busy"] #status-mark::before { content: ""; position: absolute; inset: -3px; border-radius: 50%; background: var(--accent); opacity: .18; animation: pulse 1.6s ease-in-out infinite; }
 #bar[data-mode="stopped"] #status-mark { display: block; border-radius: 0; background: var(--danger); }
-@keyframes pulse { 50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 6%, transparent); } }
-@media (prefers-reduced-motion: reduce) { #bar[data-mode="busy"] #status-mark { animation: none; } }
+@keyframes pulse { 50% { transform: scale(1.34); opacity: .06; } }
+@media (prefers-reduced-motion: reduce) { #bar[data-mode="busy"] #status-mark::before { animation: none; } }
 #phase { min-width: 0; font-size: 12px; color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 #bar[data-mode="busy"] #phase { color: var(--ink); }
 #bar[data-mode="stopped"] #phase { color: var(--error); }

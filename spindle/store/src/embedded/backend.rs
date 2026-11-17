@@ -520,7 +520,11 @@ impl Embedded {
                         "that answer does not fit work {work} of {label}, which still waits"
                     ));
                 }
-                Some(true) => session.host.deliver(label, work, answer),
+                // (A store with work waited for never rests; woken all the same.)
+                Some(true) => match session.host.wake_store() {
+                    Ok(()) => session.host.deliver(label, work, answer),
+                    Err(why) => return Err(why),
+                },
             }
         };
         self.progressed(&dir, progress);
@@ -536,6 +540,7 @@ impl Embedded {
             let Some(session) = sessions.get_mut(&dir) else {
                 return (self.take_frames(), false);
             };
+            // (A store with work waited for never rests: nothing to wake here.)
             if !session.host.streams(label, work) {
                 return (self.take_frames(), false);
             }
@@ -862,6 +867,7 @@ impl Embedded {
                     .to_string(),
             ));
         }
+        session.host.wake_store().map_err(failed)?;
         // The spend ledger kept first (best effort, as `seal_session` keeps it): one
         // the app's `usage` saves between this export and the seal would otherwise move
         // the source state the seal checks.
@@ -926,6 +932,7 @@ impl Embedded {
             return Err(bad("`dir` names a session, not one of its tasks"));
         }
         let written = self.with_host(dir, |host| {
+            host.wake_store().map_err(failed)?;
             let (files, state) = host.task_bundle(task)?;
             crate::bundle::write_export(files, true, &state).map_err(failed)
         })?;
@@ -955,6 +962,7 @@ impl Embedded {
                     .to_string(),
             ));
         }
+        session.host.wake_store().map_err(failed)?;
         let head = crate::reads::head_on(&mut session.host.view()).map_err(failed)?["head"]
             .as_u64()
             .unwrap_or_default();
@@ -1166,8 +1174,62 @@ impl Embedded {
     }
 }
 
+/// Methods that only read a session's store: a store resting (`Store::rest`) stays so
+/// through them. Every other method that names a session ends its rest first (`wake`),
+/// before anything it does may write.
+const READS: [&str; 10] = [
+    "open", "status", "history", "files", "read", "targets", "tasks", "fit", "rest", "close",
+];
+
+impl Embedded {
+    /// Ends the rest of `dir`'s store, when it is open and rests, before what may write.
+    fn wake(&self, dir: &str) -> Result<(), Fault> {
+        match self.sessions.borrow_mut().get_mut(dir) {
+            Some(session) => session.host.wake_store().map_err(failed),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether `dir`'s store is open and rests with nothing written since.
+    fn resting(&self, dir: &str) -> bool {
+        self.sessions
+            .borrow()
+            .get(dir)
+            .is_some_and(|session| session.host.store_resting())
+    }
+}
+
 impl Backend for Embedded {
     fn call(&self, method: &str, params: Params, id: Option<Value>) -> Reply {
+        let dir = params
+            .0
+            .get("dir")
+            .and_then(Value::as_str)
+            .map(|dir| Self::top(dir).to_string());
+        // Settings that change something write them.
+        let reads = READS.contains(&method)
+            || (method == "settings" && params.0.keys().all(|key| key == "dir"));
+        if let Some(dir) = dir.as_deref().filter(|_| !reads)
+            && let Err(fault) = self.wake(dir)
+        {
+            return Reply::Now(Err(fault));
+        }
+        let rested = dir.as_deref().is_some_and(|dir| reads && self.resting(dir));
+        let reply = self.answer(method, params, id);
+        // A method said to read wrote while its store rested: it belongs off READS.
+        debug_assert!(
+            !rested
+                || dir.as_deref().is_some_and(
+                    |dir| self.resting(dir) || !self.sessions.borrow().contains_key(dir)
+                ),
+            "`{method}` wrote to a resting store"
+        );
+        reply
+    }
+}
+
+impl Embedded {
+    fn answer(&self, method: &str, params: Params, id: Option<Value>) -> Reply {
         let now = Reply::Now;
         let result = (|| -> Result<Reply, Fault> {
             Ok(match method {
@@ -1251,8 +1313,43 @@ impl Backend for Embedded {
                 }
                 "create" => now(self.create(params)),
                 "open" | "status" => {
+                    params.allow(&["dir", "history"])?;
+                    let dir = Self::dir(&params)?;
+                    // `history: {from}`: the conversation too (as `history` reads it), from
+                    // the same read of the head.
+                    match params.0.get("history") {
+                        None | Some(Value::Null) => now(self.status_of(&dir)),
+                        Some(Value::Object(history)) => {
+                            if let Some(key) = history.keys().find(|key| key.as_str() != "from") {
+                                return Err(bad(format!(
+                                    "`history.{key}` is not a key of `history`"
+                                )));
+                            }
+                            let from = match history.get("from") {
+                                None | Some(Value::Null) => 0,
+                                Some(from) => from
+                                    .as_u64()
+                                    .ok_or_else(|| bad("`history.from` must be a message index"))?,
+                            };
+                            let from = usize::try_from(from).unwrap_or(usize::MAX);
+                            now(self.with_host(&dir, |host| {
+                                host.status_with_history(from).map_err(failed)
+                            }))
+                        }
+                        Some(_) => return Err(bad("`history` must be an object (`{from}`)")),
+                    }
+                }
+                // The app stopped using the session for now: its store rests (an owner
+                // stopped from here on, its browser quit, closed it cleanly) unless
+                // something of it runs. The next call that may write ends the rest.
+                "rest" => {
                     params.allow(&["dir"])?;
-                    now(self.status_of(&Self::dir(&params)?))
+                    let dir = Self::dir(&params)?;
+                    let rested = match self.sessions.borrow_mut().get_mut(&dir) {
+                        Some(session) => session.host.rest_store().map_err(failed)?,
+                        None => false,
+                    };
+                    now(Ok(json!({"session": dir, "rested": rested})))
                 }
                 "close" => {
                     params.allow(&["dir"])?;

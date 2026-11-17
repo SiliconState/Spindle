@@ -388,7 +388,7 @@ impl<'a> ReadView<'a> {
         }
         let oldest = rows.last().map(|(revision, _)| *revision).unwrap_or(head);
         let mut line = std::collections::BTreeSet::new();
-        self.line(head, |revision, _| {
+        self.line_revisions(head, |revision| {
             line.insert(revision);
             revision <= oldest || line.len() >= 8192
         })?;
@@ -662,22 +662,28 @@ impl<'a> ReadView<'a> {
             return Ok(vec![]);
         };
         let mut line = std::collections::BTreeSet::new();
-        self.line(revision, |at, _| {
+        self.line_revisions(revision, |at| {
             line.insert(at);
             at <= oldest
         })?;
-        let mut details = Vec::new();
+        let on_line = rows.iter().filter(|(at, _)| line.contains(at)).count();
+        // Their values in one read (not one each: a long thread has hundreds), each
+        // decoded only when it is on the line.
+        let mut query = self.db.prepare("SELECT p.revision,d.value FROM app_details d JOIN attempts a ON a.id=d.attempt JOIN applied_receipts p ON p.attempt=a.id JOIN revisions r ON r.revision=p.revision WHERE r.scope=?1 AND p.revision<=?2 ORDER BY p.revision")?;
+        let mut values = query.query(params![SCOPE, revision.min(i64::MAX as u64) as i64])?;
+        let mut details = Vec::with_capacity(on_line);
         for (at, effect) in rows {
-            if !line.contains(&at) {
-                continue;
+            // The same rows in the same order (one snapshot: this view reads alone).
+            let row = values.next()?.ok_or(Error::Incompatible)?;
+            if crate::nonnegative_id(row, 0)? != at {
+                return Err(Error::Incompatible);
             }
-            let value = crate::cached_row(
-                &self.db,
-                "SELECT d.value FROM app_details d JOIN attempts a ON a.id=d.attempt JOIN applied_receipts p ON p.attempt=a.id WHERE a.effect=?1 AND p.revision=?2",
-                params![effect, at as i64],
-                |row| crate::packed_blob(&self.db, row, 0, crate::transition::MAX_STATE),
-            )?;
-            details.push((effect, value));
+            if line.contains(&at) {
+                details.push((
+                    effect,
+                    crate::packed_blob(&self.db, row, 1, crate::transition::MAX_STATE)?,
+                ));
+            }
         }
         Ok(details)
     }
@@ -756,6 +762,26 @@ impl<'a> ReadView<'a> {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The revisions on the line that leads to `head` (as `line` walks it), newest
+    /// first, none of them read; `visit` returns true to stop. For what needs only
+    /// which revisions are on the line: reading each, a long thread's history read
+    /// thousands of revisions to place its app details.
+    pub fn line_revisions(&mut self, head: u64, mut visit: impl FnMut(u64) -> bool) -> Result<()> {
+        let forks: std::collections::BTreeMap<u64, u64> = self
+            .forks()?
+            .into_iter()
+            .map(|fork| (fork.revision, fork.target))
+            .collect();
+        let mut revision = head;
+        while revision > 0 {
+            if visit(revision) {
+                break;
+            }
+            revision = predecessor(revision, &forks);
+        }
+        Ok(())
     }
 
     /// Walks the line that leads to `head`, newest first, giving each revision on it

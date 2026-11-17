@@ -937,7 +937,7 @@ history is what `history` returns.
 | `type` | Fields | Meaning |
 | --- | --- | --- |
 | `prompt` | `text` | A prompt was committed and starts the next turn. |
-| `compacted` | `before`, `after` | Older history was compacted; sizes are checkpoint bytes. |
+| `compacted` | `before`, `after`, `cleared` | Older history was compacted; sizes are checkpoint bytes. `cleared`: only the long tool results of its older part were cleared, the conversation kept (no summary). |
 | `model_step` | `provider`, `model`, `step` | A model request is about to be sent. |
 | `model_delta` | `text` | A streamed text preview delta. |
 | `model_text_withdrawn` | none | The provider withdrew the text preview it streamed. |
@@ -1070,7 +1070,7 @@ session object and each `tasks` entry.
 | Stop code | `stop_text` |
 | --- | --- |
 | `complete` | done |
-| `step_limit` | stopped: step limit reached |
+| `step_limit` | stopped: step limit reached (500 model requests in this turn; continuing it gives 500 more) |
 | `budget` | stopped: budget reached (defined by the engine; Spindle refuses over-budget requests with the `budget` error instead, so it does not occur) |
 | `tool_policy` | stopped by tool policy |
 | `content_filter` | stopped by the provider's content filter |

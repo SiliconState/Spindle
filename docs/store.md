@@ -242,6 +242,18 @@ thread is unwinding from a panic. `Store::crashes()` returns the count: a count 
 growing at one head means whatever runs next there keeps stopping its owner.
 `ReadView::open_record` exposes the same record to observers.
 
+An owner that keeps its store open while idle can mark it *resting* (`Store::rest`): between
+transactions, `closed=1` is written while the connection stays open, so an owner stopped then
+(a browser quit with the session open) leaves the store as a clean close does, and the next
+open neither runs `quick_check` over every page nor counts a crash. `Store::wake` writes
+`closed=0` before anything else is written, and dropping a resting store writes nothing.
+`Store::resting` also notices a write made since the rest began (the connection's change
+count). The embedded host rests a session's store on the app's `rest` call when nothing of
+it runs, and wakes it before any method but its reads (`open`, `status`, `history`, `files`,
+`read`, `targets`, `tasks`, `fit`, `close`, and `settings` without changes) and before a
+delivered answer (a session with work waited for never rests); in debug builds it asserts
+that those reads wrote nothing.
+
 ### The fenced handle
 
 Any SQLite, I/O, lock or validation failure (`Sql`, `Io`, `Locked`, `Incompatible`) during a
@@ -381,7 +393,9 @@ Garbage collection removes only stages, pins and objects (see
 `validate_all` checks the stored records against each other. A normal open checks
 revisions, proposals, intents and receipts (strict receipts with theirs), which never
 change once written, only above the `validated` watermark, there in full and against
-their bounds; a revision numbered below zero, or a proposal, intent, consumed admission
+their bounds; the row types of attempts, strict receipts and app details (written before
+or with their attempt's receipt, never changed) only for rows whose receipt the watermark
+does not cover; a revision numbered below zero, or a proposal, intent, consumed admission
 or applied receipt at or below zero, which no watermark reaches, is refused wherever it is.
 Counts, the bounds of the other tables
 but `chunks`, every object reached by newly validated records against its digest, every

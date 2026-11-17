@@ -620,7 +620,7 @@ function preview(event, seq) {
       break;
     case 'warning': $('live').append(el('div','notice warning',event.text)); break;
     case 'notice': $('live').append(el('div','notice',event.text)); break;
-    case 'compacted': $('live').append(el('div','notice',`Compacted history: ${Math.round(event.before/1024)} → ${Math.round(event.after/1024)} KiB. Older revisions remain inspectable.`)); break;
+    case 'compacted': $('live').append(el('div','notice',`${event.cleared ? 'Cleared long tool results from history' : 'Compacted history'}: ${Math.round(event.before/1024)} → ${Math.round(event.after/1024)} KiB. Older revisions remain inspectable.`)); break;
     case 'done':
     if(event.error) {lastError = event.error; toast(event.error);}
     // Messages sent while the run was busy that it ended without reading come back.
