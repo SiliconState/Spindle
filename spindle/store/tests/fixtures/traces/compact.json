@@ -116,6 +116,7 @@
     {
       "after": 1332,
       "before": 84600,
+      "cleared": false,
       "type": "compacted"
     },
     {
@@ -166,7 +167,7 @@
       {
         "command_id": "start",
         "kind": "dext-turn-v1",
-        "payload": "8d475a61e9a15f4c87f4c13b",
+        "payload": "7002fa7e4ab7931b9c87e2fb",
         "scope": "operator",
         "sequence": 1
       },
@@ -180,7 +181,7 @@
       {
         "command_id": "turn-r3",
         "kind": "dext-turn-v1",
-        "payload": "64ce582df931184cbb0fe408",
+        "payload": "246368f99bf78da19aad3b8a",
         "scope": "operator",
         "sequence": 3
       },
@@ -338,62 +339,62 @@
     ],
     "proposals": [
       {
-        "canonical": "3715b76bea9a1e2104c7c2b4",
+        "canonical": "843488aeb94fee28ca74275e",
         "id": "commit-start",
         "revision": 1
       },
       {
-        "canonical": "53e04ec3349c6f5f281b0726",
+        "canonical": "5bfaf794e6016b4eaca68fe9",
         "id": "adopt-r1",
         "revision": 2
       },
       {
-        "canonical": "67208abdd813d95c22872491",
+        "canonical": "1c402b230170d2f07b80c5cc",
         "id": "commit-finish-r2",
         "revision": 3
       },
       {
-        "canonical": "3d64815b1b99e1842fa6e550",
+        "canonical": "782e8070af935696b0fc5a40",
         "id": "commit-turn-r3",
         "revision": 4
       },
       {
-        "canonical": "f247d0214b98d858c83c47b1",
+        "canonical": "e20de2db8073dd297de501b9",
         "id": "adopt-r4",
         "revision": 5
       },
       {
-        "canonical": "47ba7aa652cd79df6e9f838e",
+        "canonical": "ffbfd8e25641a29d35c7bcb8",
         "id": "adopt-r5",
         "revision": 6
       },
       {
-        "canonical": "29543d1fda3ed98752db0302",
+        "canonical": "49d5bf76aee8d8a773cbb822",
         "id": "commit-prepare-r6",
         "revision": 7
       },
       {
-        "canonical": "529f5678326f6f2cb64c07cf",
+        "canonical": "a9b7be35c15339f50d911ae2",
         "id": "rewind-5",
         "revision": 8
       },
       {
-        "canonical": "7dbe422d9e29c1659ded246a",
+        "canonical": "3fbe758a16db9fa44643038c",
         "id": "commit-compact-r8",
         "revision": 9
       },
       {
-        "canonical": "4d373d9d6fd5c0c04239e99b",
+        "canonical": "368e17e5af488283a20518aa",
         "id": "commit-prepare-r9",
         "revision": 10
       },
       {
-        "canonical": "6292c3fafab4708118831d7c",
+        "canonical": "bb6056ba98e4b323aff8195e",
         "id": "adopt-r10",
         "revision": 11
       },
       {
-        "canonical": "2bd5f0563bc695ef216d176d",
+        "canonical": "6031833aa1346c89bfcbe3d1",
         "id": "commit-finish-r11",
         "revision": 12
       }
@@ -429,84 +430,84 @@
         "workspace": null
       },
       {
-        "continuation": "086b8bfdf036c1d3a0be885b",
+        "continuation": "b93dc5be2c81702115d43a6d",
         "engine": "dext-turn-v1",
         "revision": 1,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "3d91dfe53d6f82ee493d4c75",
+        "continuation": "37afb4f6f1c506ed9538e27d",
         "engine": "dext-turn-v1",
         "revision": 2,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "dd26d6fd0bb9843b2f42ca6c",
+        "continuation": "945b17a34f9717e18400c4c4",
         "engine": "dext-turn-v1",
         "revision": 3,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "4c7ba871650f5d0385b75377",
+        "continuation": "b92d54dd940b8623190d020d",
         "engine": "dext-turn-v1",
         "revision": 4,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "6feb6acbe677888a0f222442",
+        "continuation": "26675c141037c0115567d5c6",
         "engine": "dext-turn-v1",
         "revision": 5,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "78ac2d9c32094c6461e7439f",
+        "continuation": "42fe693d6189b335dd5b104b",
         "engine": "dext-turn-v1",
         "revision": 6,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "f2a9921fcdbd972e05e4a02c",
+        "continuation": "47f44a301974cfd4a65c9c50",
         "engine": "dext-turn-v1",
         "revision": 7,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "d943ea859b3da981a9f30a70",
+        "continuation": "a100c7c8b1cd8841045b0f63",
         "engine": "dext-turn-v1",
         "revision": 8,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "f01fdf2ecf82fff5c73eb948",
+        "continuation": "60c3b103f6f1d4883fcd9a4c",
         "engine": "dext-turn-v1",
         "revision": 9,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "712cc2f31af1f4d16b303e63",
+        "continuation": "ee7d8e7e59c43ffa1d8ae877",
         "engine": "dext-turn-v1",
         "revision": 10,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "9fce0e59dbee59ec82795744",
+        "continuation": "a89cb3fadd365935fa9b3e0e",
         "engine": "dext-turn-v1",
         "revision": 11,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "6476b67b57b2b7494e953a0e",
+        "continuation": "d8e96aae2e2c9d80a401814d",
         "engine": "dext-turn-v1",
         "revision": 12,
         "scope": "operator",
