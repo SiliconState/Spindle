@@ -458,6 +458,9 @@ struct Batch {
 struct TaskCall {
     need: driver::AppNeed,
     reservation: Option<AppReservation>,
+    /// Reserved, not started yet: as many tasks run at once as `tasks.max_running`
+    /// says, and this one starts when one of them ends (`start_waiting`).
+    waits: bool,
     child: Option<Box<Host>>,
     /// The child's answer, or why it cannot go on now.
     result: Option<std::result::Result<AppAnswer, String>>,
@@ -791,14 +794,15 @@ impl Host {
         if self.running.is_some() {
             return Err("a turn is running; settings change between turns".into());
         }
-        // A budget alone changes at any step (a request it refused is sent once it
-        // fits); it shapes no request. Anything else changes between turns.
-        let budget_only = {
+        // Budget and resend consent do not shape a frozen request, so either may change
+        // while a stopped turn waits for a model reply.
+        let control_only = {
             let mut now = self.settings()?;
             now.max_usd = settings.max_usd;
+            now.resend_unknown = settings.resend_unknown;
             now.to_json()? == settings.to_json()?
         };
-        if !budget_only {
+        if !control_only {
             self.ensure_settable()?;
         }
         let was = *lock(&self.facts.budget);
@@ -832,6 +836,33 @@ impl Host {
 
     pub fn running(&self) -> Option<&'static str> {
         self.running
+    }
+
+    /// Marks the store resting (`Store::rest`) when nothing of this session runs: no
+    /// operation, background task or work waited for. Returns whether it rests.
+    pub fn rest_store(&mut self) -> Result<bool> {
+        if self.running.is_some()
+            || self.waiting.is_some()
+            || !self.background.is_empty()
+            || !self.works.is_empty()
+            || self.detached
+        {
+            return Ok(false);
+        }
+        self.store.rest().map_err(store_error)
+    }
+
+    /// Ends a rest of the store (`Store::wake`) before anything may be written.
+    pub fn wake_store(&mut self) -> Result<()> {
+        if self.detached {
+            return Ok(());
+        }
+        self.store.wake().map_err(store_error)
+    }
+
+    /// Whether the store rests with nothing written since (`Store::resting`).
+    pub fn store_resting(&self) -> bool {
+        self.store.resting()
     }
 
     /// A request line from a script of the command running now (the code-mode bridge):
@@ -1568,6 +1599,10 @@ impl Host {
                         self.cancelled.extend(child.take_cancelled());
                         call.result = Some(Ok(AppAnswer::Stopped));
                     }
+                    // Never started: stopped as well.
+                    if std::mem::take(&mut call.waits) {
+                        call.result = Some(Ok(AppAnswer::Stopped));
+                    }
                 }
                 self.tasks_done(*batch)
             }
@@ -1960,9 +1995,7 @@ impl Host {
                 }
                 // What was wrong with the stream, so the failure says (not only that
                 // it could not be parsed).
-                Error::Model(ModelError::Protocol) => {
-                    ModelFailure::Failed(driver::unreadable(unparsed.as_deref()))
-                }
+                Error::Model(ModelError::Protocol) => driver::protocol_failure(unparsed.as_deref()),
                 other => ModelFailure::Failed(store_error(other)),
             }),
             streamed,
@@ -2597,6 +2630,10 @@ impl Host {
             .intent_revision;
         let base = self.tree_at(base_revision)?;
         let settings = self.settings()?;
+        // Tasks at once, those in the background too (as a native host's slots count
+        // them): one reply asking for dozens otherwise started them all together.
+        let most = settings.task_policy.max_running.max(1);
+        let mut begun = 0;
         let mut calls = Vec::with_capacity(needs.len());
         for need in needs {
             let reservation = self
@@ -2607,6 +2644,7 @@ impl Host {
             let mut call = TaskCall {
                 need,
                 reservation: Some(reservation),
+                waits: false,
                 child: None,
                 result: None,
             };
@@ -2622,7 +2660,21 @@ impl Host {
                 continue;
             }
             // In the background: registered, started beside this session, and answered
-            // at once; its own answer is read to this session once it ends.
+            // at once; its own answer is read to this session once it ends. With every
+            // place taken, it is answered that it did not start (the model starts it
+            // again later), not kept waiting behind tasks that may run for hours.
+            // (One begun before, whose run is recorded, goes on as it was.)
+            if call.need.call.input["background"] == true
+                && reserved
+                && self.background.len() + begun >= most
+                && self.task_run(&call.need.id).is_err()
+            {
+                call.result = Some(Ok(task_tool::refused(&format!(
+                    "{most} tasks already run at once (this session's tasks.max_running), so this one was not started: start it again once one of them has answered"
+                ))));
+                calls.push(call);
+                continue;
+            }
             if call.need.call.input["background"] == true {
                 let started = self
                     .register_task_run(
@@ -2658,40 +2710,98 @@ impl Host {
                 calls.push(call);
                 continue;
             }
+            // Started now while there is a place; otherwise it waits for one.
             if matches!(call.reservation, Some(AppReservation::Reserved { .. })) {
-                match self.start_child(&call.need.id, &call.need.call.input, &settings) {
-                    Ok(child) => call.child = Some(Box::new(child)),
-                    Err(why) => call.result = Some(Err(why)),
+                if self.background.len() + begun >= most {
+                    call.waits = true;
+                } else {
+                    begun += 1;
+                    match self.start_child(&call.need.id, &call.need.call.input, &settings) {
+                        Ok(child) => call.child = Some(Box::new(child)),
+                        Err(why) => call.result = Some(Err(why)),
+                    }
                 }
             }
             calls.push(call);
         }
         let mut batch = Batch { base, calls };
         let mut works = Vec::new();
-        for call in &mut batch.calls {
-            let Some(child) = &mut call.child else {
-                continue;
-            };
-            let input = &call.need.call.input;
-            let progress = child.run_task(input, &batch.base, || self.files_of(&batch.base));
-            match progress {
-                Ok(Progress::Waiting(more)) => works.extend(more),
-                Ok(_) => {
-                    child.finish();
-                    call.result = Some(child.task_answer(input, &batch.base));
-                }
-                Err(why) => {
-                    child.finish();
-                    call.result = Some(Err(why));
-                }
-            }
+        let Batch { base, calls } = &mut batch;
+        for call in calls.iter_mut() {
+            works.extend(self.run_child(call, base));
         }
-        if works.is_empty() {
+        works.extend(self.start_waiting(&mut batch)?);
+        // Every call ended: answered now. Otherwise the batch waits, for its tasks' work
+        // or (a call waiting for a place the session's background tasks hold) for one of
+        // those to end (`background_moved`).
+        if batch
+            .calls
+            .iter()
+            .all(|call| call.child.is_none() && !call.waits)
+        {
             return self.tasks_done(batch);
         }
         self.next_work += 1;
         self.waiting = Some((self.next_work, Waiting::Tasks(Box::new(batch))));
         Ok(Progress::Waiting(works))
+    }
+
+    /// Runs a task call's child (just started) to its first wait: the work it needs; or,
+    /// ended at once, its answer, the child let go of (as `after_child` lets one go).
+    fn run_child(&mut self, call: &mut TaskCall, base: &Tree) -> Vec<(String, u64, Work)> {
+        let Some(child) = &mut call.child else {
+            return vec![];
+        };
+        let input = &call.need.call.input;
+        let progress = child.run_task(input, base, || self.files_of(base));
+        let result = match progress {
+            Ok(Progress::Waiting(more)) => return more,
+            Ok(_) => {
+                child.finish();
+                child.task_answer(input, base)
+            }
+            Err(why) => {
+                child.finish();
+                Err(why)
+            }
+        };
+        let mut child = call.child.take().expect("run above");
+        self.cancelled.extend(child.take_cancelled());
+        call.result = Some(result);
+        vec![]
+    }
+
+    /// Starts the calls of `batch` that wait for a place (`TaskCall::waits`) as places
+    /// free, in order; one that ends at once frees its place for the next. The work the
+    /// started ones need.
+    fn start_waiting(&mut self, batch: &mut Batch) -> Result<Vec<(String, u64, Work)>> {
+        if !batch.calls.iter().any(|call| call.waits) {
+            return Ok(vec![]);
+        }
+        let settings = self.settings()?;
+        let most = settings.task_policy.max_running.max(1);
+        let mut works = Vec::new();
+        let Batch { base, calls } = batch;
+        loop {
+            let running =
+                self.background.len() + calls.iter().filter(|call| call.child.is_some()).count();
+            if running >= most {
+                break;
+            }
+            let Some(call) = calls.iter_mut().find(|call| call.waits) else {
+                break;
+            };
+            call.waits = false;
+            match self.start_child(&call.need.id, &call.need.call.input, &settings) {
+                Ok(child) => call.child = Some(Box::new(child)),
+                Err(why) => {
+                    call.result = Some(Err(why));
+                    continue;
+                }
+            }
+            works.extend(self.run_child(call, base));
+        }
+        Ok(works)
     }
 
     /// Under a budget, once per open (and again when a budget is set where there was
@@ -3007,6 +3117,30 @@ impl Host {
         if matches!(self.waiting, Some((_, Waiting::Background))) {
             self.waiting = None;
             return self.advance(None);
+        }
+        // A batch whose calls wait for a place: the ended task's goes to the next.
+        if let Some((_, Waiting::Tasks(batch))) = &self.waiting
+            && batch.calls.iter().any(|call| call.waits)
+        {
+            let Some((id, Waiting::Tasks(mut batch))) = self.waiting.take() else {
+                unreachable!("matched above");
+            };
+            let works = match self.start_waiting(&mut batch) {
+                Ok(works) => works,
+                Err(why) => {
+                    self.waiting = Some((id, Waiting::Tasks(batch)));
+                    return Err(why);
+                }
+            };
+            if batch
+                .calls
+                .iter()
+                .all(|call| call.child.is_none() && !call.waits)
+            {
+                return self.tasks_done(*batch);
+            }
+            self.waiting = Some((id, Waiting::Tasks(batch)));
+            return Ok(Progress::Waiting(works));
         }
         Ok(Progress::Waiting(vec![]))
     }
@@ -3978,12 +4112,26 @@ impl Host {
                 call.result = Some(Err(why));
             }
         }
-        if batch.calls.iter().any(|call| call.child.is_some()) {
-            return Ok(Progress::Waiting(vec![]));
-        }
-        let Some((_, Waiting::Tasks(batch))) = self.waiting.take() else {
+        let Some((id, Waiting::Tasks(mut batch))) = self.waiting.take() else {
             unreachable!("matched above");
         };
+        // Its place goes to the next call waiting for one.
+        let works = match self.start_waiting(&mut batch) {
+            Ok(works) => works,
+            Err(why) => {
+                self.waiting = Some((id, Waiting::Tasks(batch)));
+                return Err(why);
+            }
+        };
+        if !works.is_empty()
+            || batch
+                .calls
+                .iter()
+                .any(|call| call.child.is_some() || call.waits)
+        {
+            self.waiting = Some((id, Waiting::Tasks(batch)));
+            return Ok(Progress::Waiting(works));
+        }
         self.tasks_done(*batch)
     }
 
@@ -4202,8 +4350,23 @@ impl Host {
 
     /// `status`: where the session stands.
     pub fn status(&mut self) -> Result<Value> {
+        let head = crate::reads::head_on(&mut self.view())?;
+        self.status_of(head)
+    }
+
+    /// `status` with the conversation (`history` from message `from` on) beside it, both
+    /// from one read of the head: what an app shows as a session opens.
+    pub fn status_with_history(&mut self, from: usize) -> Result<Value> {
+        let (head, mut history) = crate::reads::head_and_messages(&mut self.view(), from)?;
+        crate::reads::annotate_display(&mut history["messages"]);
+        crate::reads::annotate_steering(&mut history["messages"]);
+        let mut value = self.status_of(head)?;
+        value["history"] = history;
+        Ok(value)
+    }
+
+    fn status_of(&mut self, mut value: Value) -> Result<Value> {
         let settings = self.settings()?;
-        let mut value = crate::reads::head_on(&mut self.view())?;
         let report = self.store.reconciliation().map_err(store_error)?;
         // From the head just read (its phase and stop), not the continuation again.
         let state = match value["phase"].as_str() {

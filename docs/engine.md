@@ -289,12 +289,20 @@ Source: [`transcript/src/`](../dext-engine/transcript/src). Depends on `dext-cor
   `image_reference` (workspace path, media type, width and height, source SHA-256),
   `image_artifact` (a scoped, digest-identified sanitized JPEG) and `partial_stream`.
 - `Usage`: token counts normalized into disjoint buckets `input`, `output`,
-  `cache_create`, `cache_read`, plus an optional provider-reported `cost_usd`. `parse`
+  `cache_create`, `cache_read`, plus an optional provider-reported `cost_usd`.
+  `cache_create_1h` is the one-hour subset of `cache_create`, never extra input tokens;
+  it is omitted from checkpoints when zero. `parse`
   reads Anthropic-style fields, `parse_openai` reads Chat Completions and Responses fields
   (cached tokens are moved out of `input`), and `parse_openai_timings` reads llama.cpp
   `timings` (`prompt_n`, `cache_n`, `predicted_n`). Without a reported cost,
   `estimated_cost_usd` uses default rates of 1 / 5 / 0.1 / 1.25 USD per million input,
-  output, cache-read and cache-write tokens.
+  output, cache-read and five-minute cache-write tokens; one-hour writes use 2 USD per
+  million tokens. Anthropic's `cache_creation` TTL breakdown is retained through streaming,
+  checkpoints and the spend ledger. Cumulative streaming updates merge each TTL bucket
+  independently: omitted, null or empty breakdowns never erase previously reported writes.
+  Older records without the breakdown keep their original
+  aggregate cache-write interpretation. Builds that predate this field may refuse a store or
+  bundle containing nonzero one-hour usage; a binary rollback is not a store downgrade.
 
 ### Checkpoint codecs
 
@@ -439,10 +447,21 @@ streamed one (OpenAI encrypts it afresh each time, so the two need not match). T
 terminal snapshot is budgeted as a whole against the 4 MiB reasoning cap, so one item
 may grow while another shrinks; an item id that appears twice in it fails the stream.
 
-Tool call arguments must parse as a JSON object. When the output-token limit cut a call
-off mid-JSON (`max_tokens` or `length`), the call is counted in `unfinished_tool_calls`
+Tool call arguments are a JSON object. When the output-token limit cut a call off
+mid-JSON (`max_tokens` or `length`), the call is counted in `unfinished_tool_calls`
 instead of failing the stream; an Anthropic tool block that was never explicitly stopped
-is never executable. Unrecognized events are counted in `unknown_events`. `finish` admits
+is never executable. A whole call with no arguments at all (`""`, as some servers send for
+a tool without parameters) gets an empty object; one whose arguments are malformed JSON,
+or JSON that is not an object, is kept with an input of one key,
+`dext_transcript::UNPARSED_ARGUMENTS` (`{"text": what was sent, at most 4 KiB, "error":
+why}`), which a host refuses (`unparsed_arguments_refusal`) so the model sends the call
+again, rather than the whole reply, already paid for, failing; only arguments over the
+buffer cap still fail it. A Chat Completions call without an id gets one made from its
+request identity (`call_dext_<digest>_<index>`), the same on replay of that request and
+different for another request even when the replies and provider metadata are identical.
+`WireAttempt` binds that identity; standalone parser callers use `request_identity`, and
+an id-less call without that binding is refused. Unrecognized events are counted in
+`unknown_events`. `finish` admits
 the blocks through `dext_core::response::ResponseProposal` and returns a
 `NativeResponse`. While parsing, `push_frame` returns `StreamUpdate` previews (text and
 thinking deltas); previews are never adopted, only the finished response is.
@@ -484,8 +503,9 @@ sends one attempt with reqwest.
   `content-type`, `accept`), and marks every value sensitive. It is never serialized.
 - `ModelTransport::new` builds a client with no proxy discovery, no redirects and no
   automatic retries. `Deadlines` default to 10 s connect, 60 s to first byte, 60 s idle
-  between chunks and 300 s total; each must be between zero and 600 s and none above the
-  total.
+  between chunks and 300 s total; each must be between zero and 3600 s (`MAX_DEADLINE`)
+  and none above the total. A loopback endpoint (a model on this machine) has at least
+  600 s (`LOCAL_FIRST_BYTE`, within the total) for its first byte.
 - `ModelTransport::take_failure` gives the same reason for its last `Protocol` error,
   and for a successful reply that was not an event stream, its stated content type
   (at most 120 characters).

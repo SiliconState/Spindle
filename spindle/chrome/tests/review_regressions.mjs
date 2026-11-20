@@ -64,9 +64,78 @@ const context = vm.createContext({
     return next;
   },
 });
-vm.runInContext(`${engineSource}\nglobalThis.test = { pointBefore, turnTabsDone, tasksOpening, afterTurn, prepared, guided, setupOf, operate, ops, running, snapshot, restoreQueued, queued, renew, replaceFirst, creationSettings, pageTool, cancelPageTools, secretHeader, changeSites, grantsFor, underPrefix, withSecrets, beforeActing, actOnPage, ownedByTask, hostedFrame, answerHosted, endHosted, startHosted, admitHosted, sendHostedStop, hostedTurns, followed, pollHosted, setHost: (value) => { hostState = { connected: true, kind: 'browser', url: 'http://host' }; hostRemote = value; }, setClient: (value) => { client = value; poolOpening = Promise.resolve({ free: 100, rmSync() {} }); } };`, context);
+vm.runInContext(`${engineSource}\nglobalThis.test = { resendOn, freshen, pointBefore, turnTabsDone, tasksOpening, afterTurn, prepared, guided, setupOf, operate, ops, running, snapshot, restoreQueued, queued, renew, replaceFirst, creationSettings, pageTool, cancelPageTools, secretHeader, changeSites, grantsFor, underPrefix, withSecrets, beforeActing, actOnPage, ownedByTask, hostedFrame, answerHosted, endHosted, startHosted, admitHosted, sendHostedStop, hostedTurns, followed, pollHosted, setHost: (value) => { hostState = { connected: true, kind: 'browser', url: 'http://host' }; hostRemote = value; }, setClient: (value) => { client = value; poolOpening = Promise.resolve({ free: 100, rmSync() {} }); } };`, context);
 const engine = context.test;
 const id = '0123456789abcdef';
+{
+  const originalRead = context.read;
+  const choices = [];
+  let settings = { instructions: '', tools: [], compaction: 'model', resend_unknown: false };
+  let updateFails = false;
+  records.set(`threads:${id}`, { id, summaries: true });
+  engine.setClient({
+    tools: { definitions: () => [] },
+    async status() { return { phase: 'model_wait', accepts_prompt: false, accepts_message: false }; },
+    async retry() { throw new Error('retry must not be sent'); },
+    async resume() { throw new Error('continue must not be sent'); },
+    async closeSession() {},
+    async create() { throw new Error('create must not be sent'); },
+    async settings(_dir, changes) {
+      if (changes && updateFails) throw new Error('consent update failed');
+      if (changes) { choices.push(changes); settings = { ...settings, ...changes }; }
+      return settings;
+    },
+  });
+  records.delete('kv:resend');
+  assert.equal(await engine.resendOn(), true, 'a missing choice uses the default');
+  records.set('kv:resend', false);
+  assert.equal(await engine.resendOn(), false);
+  for (const invalid of [null, 0, 'false', {}, []]) {
+    records.set('kv:resend', invalid);
+    await assert.rejects(engine.resendOn(), /saved automatic resend choice is invalid/);
+    await assert.rejects(engine.freshen(`/threads/${id}`), /saved automatic resend choice is invalid/);
+    assert.equal(choices.length, 0, 'an invalid stored choice never changes session consent');
+  }
+  records.set('kv:resend', false);
+  for (const enabled of [false, true]) {
+    settings.resend_unknown = enabled;
+    for (const name of ['AbortError', 'UnknownError']) {
+      context.read = async (store, key) => {
+        if (store === 'kv' && key === 'resend') throw Object.assign(new Error('preference unavailable'), { name });
+        return originalRead(store, key);
+      };
+      await assert.rejects(engine.resendOn(), /preference unavailable/);
+      await assert.rejects(engine.freshen(`/threads/${id}`), /preference unavailable/);
+      await assert.rejects(engine.operate('create', { provider: 'p', text: 'hello', runner: 'none' }), /preference unavailable/);
+      for (const op of ['retry', 'resume']) {
+        await engine.operate(op, { id });
+        await engine.running.get(id)?.done;
+        assert.equal(records.get(`threads:${id}`).note, 'preference unavailable', `${op} stops before sending`);
+      }
+      assert.equal(settings.resend_unknown, enabled, 'an unreadable preference leaves the session unchanged');
+      assert.equal(choices.length, 0, 'no setting is written before the preference is known');
+    }
+  }
+  context.read = originalRead;
+  settings.resend_unknown = true;
+  updateFails = true;
+  await assert.rejects(engine.freshen(`/threads/${id}`), /consent update failed/);
+  assert.equal(settings.resend_unknown, true, 'a failed consent update is not hidden');
+  assert.equal(choices.length, 0);
+  for (const op of ['retry', 'resume']) {
+    await engine.operate(op, { id });
+    await engine.running.get(id)?.done;
+    assert.equal(records.get(`threads:${id}`).note, 'consent update failed', `${op} stops on a failed consent write`);
+  }
+  updateFails = false;
+  await engine.freshen(`/threads/${id}`);
+  assert.equal(settings.resend_unknown, false, 'a readable opt-out is applied before the turn');
+  records.set('kv:resend', true);
+  await engine.freshen(`/threads/${id}`);
+  assert.equal(settings.resend_unknown, true);
+  records.delete('kv:resend');
+  records.delete(`threads:${id}`);
+}
 let entered = 0;
 const gate = deferred();
 engine.ops.probe = async () => { entered += 1; await gate.promise; return entered; };
@@ -1351,6 +1420,68 @@ delete globalThis.chrome;
   assert.equal(engine.queued.get(waiting).files[0].path, 'a.png');
   assert.equal(engine.queued.has(taken), false);
   await engine.operate('unqueue', { id: waiting });
+}
+
+// Recovery merges are one durable transaction, preserve send order, and replay once.
+{
+  const thread = 'e0e0e0e0e0e0e0e0';
+  const firstKey = `queued:${thread}:first`;
+  const secondKey = `queued:${thread}:second`;
+  const first = { thread, text: 'first', files: [{ path: 'first.txt', bytes: new Uint8Array([1]) }], attachmentNote: '', held: null, at: 1 };
+  const second = { thread, text: 'second', files: [{ path: 'second.txt', bytes: new Uint8Array([2]) }], held: null, at: 2 };
+  records.set(`threads:${thread}`, { id: thread, runner: 'none', state: 'interrupted' });
+  engine.setClient({ async history() { return { messages: [] }; }, async closeSession() {} });
+  const originalTogether = context.writeTogether;
+  const originalDurable = context.writeDurably;
+  const originalRemove = context.removeDurably;
+  let transactions = 0;
+  let fail = true;
+  context.writeTogether = async (changes, durability) => {
+    assert.equal(durability, 'strict');
+    assert.equal(changes.length, 2);
+    assert.equal(changes[0][2].text, 'first\n\nsecond');
+    assert.equal(changes[1][2], undefined);
+    transactions += 1;
+    if (fail) throw new Error('merge transaction aborted');
+    return originalTogether(changes);
+  };
+  context.writeDurably = async (store, key, value) => {
+    assert.notEqual(value?.text, 'first\n\nsecond', 'the merge is never a separate put followed by a delete');
+    return originalDurable(store, key, value);
+  };
+  context.removeDurably = async (store, key) => {
+    assert.notEqual(key, firstKey, 'the old record is not deleted outside the merge transaction');
+    assert.notEqual(key, secondKey);
+    return originalRemove(store, key);
+  };
+  records.set(`kv:${firstKey}`, structuredClone(first));
+  records.set(`kv:${secondKey}`, structuredClone(second));
+  await engine.restoreQueued();
+  assert.equal(transactions, 1);
+  assert.equal(engine.queued.get(thread).text, 'first', 'an aborted merge leaves memory unchanged');
+  assert.equal(records.get(`kv:${firstKey}`).text, 'first');
+  assert.equal(records.get(`kv:${secondKey}`).text, 'second', 'an aborted merge leaves both disk records intact');
+  engine.queued.delete(thread);
+  fail = false;
+  await engine.restoreQueued();
+  assert.equal(transactions, 2);
+  const merged = engine.queued.get(thread);
+  assert.equal(merged.text, 'first\n\nsecond', 'startup appends later records, never reversing messages');
+  assert.deepEqual(Array.from(merged.files, (file) => file.path), ['first.txt', 'second.txt']);
+  assert.equal(merged.attachmentNote, undefined);
+  assert.equal(records.has(`kv:${secondKey}`), false);
+  assert.equal(records.get(`kv:${firstKey}`).text, 'first\n\nsecond');
+  await engine.restoreQueued();
+  assert.equal(engine.queued.get(thread).text, 'first\n\nsecond', 'replaying a retained key is idempotent');
+  assert.equal(transactions, 2);
+  engine.queued.delete(thread);
+  await engine.restoreQueued();
+  assert.equal(engine.queued.get(thread).text, 'first\n\nsecond', 'a crash after the atomic merge restores exactly one copy');
+  context.writeTogether = originalTogether;
+  context.writeDurably = originalDurable;
+  context.removeDurably = originalRemove;
+  await engine.operate('unqueue', { id: thread });
+  records.delete(`threads:${thread}`);
 }
 
 // Retry after a step the user stopped: asked again from before that step's request,
@@ -3125,6 +3256,42 @@ assert.match(moveKey('ab:cd/ef', 12), /^abcdef-12-[0-9a-f]{12}$/);
   vaultRead.resolve({ mode: 'device', locked: false, kinds: {}, accounts: {}, ended: {}, sites: [] });
   const taken = (await taking).threads.find((thread) => thread.id === moved);
   assert.deepEqual([taken.moving, taken.home?.session], [null, 's1'], 'the snapshot holds the thread as it was when the snapshot answered');
+  const originalRead = context.read;
+  const originalWrite = context.write;
+  const originalDurable = context.writeDurably;
+  for (const invalid of ['false', null]) {
+    records.set('kv:resend', invalid);
+    const snapshot = await engine.snapshot();
+    assert.equal(snapshot.resend, null, 'unknown consent is not shown as enabled');
+    assert.match(snapshot.resendError, /saved automatic resend choice is invalid/);
+    assert.ok(snapshot.threads.some((thread) => thread.id === moved), 'Settings and threads remain reachable to repair the choice');
+  }
+  context.read = async (store, key) => {
+    if (store === 'kv' && key === 'resend') throw new Error('preference unavailable');
+    return originalRead(store, key);
+  };
+  assert.equal((await engine.snapshot()).resendError, 'preference unavailable');
+  context.read = originalRead;
+  let durable = false;
+  context.write = async (store, key, value) => {
+    assert.notEqual(`${store}:${key}`, 'kv:resend', 'consent is not saved with relaxed durability');
+    return originalWrite(store, key, value);
+  };
+  context.writeDurably = async (store, key, value) => {
+    if (store === 'kv' && key === 'resend') durable = true;
+    return originalDurable(store, key, value);
+  };
+  for (const on of ['false', null, 0, undefined]) {
+    await assert.rejects(engine.operate('resend', { on }), /automatic resend needs an on\/off choice/);
+    assert.equal(durable, false, 'invalid arguments never write consent');
+  }
+  const repaired = await engine.operate('resend', { on: false });
+  assert.equal(repaired.resend, false);
+  assert.equal(repaired.resendError, undefined);
+  assert.equal(durable, true);
+  context.write = originalWrite;
+  context.writeDurably = originalDurable;
+  records.delete('kv:resend');
   records.delete(`threads:${moved}`);
   delete context.vault;
 }
@@ -3217,7 +3384,7 @@ assert.equal(sentence(Object.assign(new Error('busy: a command is running'), { k
       async status() { return { provider: 'p', model: 'm', settings: { runner: 'none' } }; },
       async settings(dir, changes) {
         if (changes) { order.push(`settings ${changes.instructions ?? ''}`); return {}; }
-        return { provider: 'p', model: 'm', effort: 'default', network: false, max_usd: null, instructions: made.instructions, tools: [] };
+        return { provider: 'p', model: 'm', effort: 'default', network: false, max_usd: null, instructions: made.instructions, resend_unknown: made.resend_unknown, tools: [] };
       },
       async prompt() { order.push('prompt'); return { unsent: [] }; },
       tools: { definitions: () => [] },
@@ -3233,6 +3400,162 @@ assert.equal(sentence(Object.assign(new Error('busy: a command is running'), { k
   records.delete(`threads:${me}`);
   records.delete('kv:pages');
   records.delete('kv:sites');
+}
+
+// Unknown consent stays visibly unavailable, but the panel can replace the bad choice.
+{
+  const source = readFileSync(new URL('../panel.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('function renderInstructionsSummary()');
+  const code = source.slice(start, source.indexOf('/** Providers, one row each:', start));
+  const nodes = new Map();
+  const choices = [];
+  const panel = vm.createContext({
+    engine: { resend: null, resendError: 'preference unavailable' },
+    $: (name) => {
+      if (!nodes.has(name)) nodes.set(name, { classList: { toggle() {} }, setAttribute(key, value) { this[key] = value; } });
+      return nodes.get(name);
+    },
+    ask: async (_op, args) => { choices.push(args.on); return { resend: args.on }; },
+    toast() {},
+  });
+  panel.apply = (snapshot) => { panel.engine = snapshot; };
+  vm.runInContext(code, panel);
+  panel.renderInstructionsSummary();
+  assert.equal(nodes.get('resend')['aria-checked'], 'false');
+  assert.equal(nodes.get('resend-error').hidden, false);
+  assert.match(nodes.get('resend-error').textContent, /preference unavailable/);
+  await nodes.get('resend').onclick();
+  assert.deepEqual(choices, [true], 'a deliberate click replaces unknown consent with an explicit choice');
+  assert.equal(nodes.get('resend')['aria-checked'], 'true');
+  assert.equal(nodes.get('resend-error').hidden, true);
+  await nodes.get('resend').onclick();
+  assert.deepEqual(choices, [true, false]);
+  assert.equal(nodes.get('resend')['aria-checked'], 'false');
+}
+
+// A new thread's first message and files survive preparation failures and Stop.
+{
+  const originalRead = context.read;
+  records.set('kv:resend', false);
+  for (const mode of ['read-error', 'update-error', 'stop', 'success', 'queued-failure']) {
+    const entered = deferred();
+    const release = deferred();
+    const history = [];
+    let made = null;
+    let prompts = 0;
+    let recovery = null;
+    records.set(`threads:${id}`, { id, title: 'Source workspace', runner: 'none' });
+    const copied = mode === 'success';
+    const expectedText = 'first message' + (copied ? '\n\n[Started with the files of “Source workspace”: 1 in the workspace]' : '');
+    engine.setClient({
+      tools: { definitions: () => [] },
+      async files() { return { files: [{ path: 'copied.sh', size: 2, executable: true }] }; },
+      async read() { return new Uint8Array([4, 5]); },
+      async create(_dir, _provider, options) {
+        made = { provider: 'p', model: 'm', tools: [], ...options, resend_unknown: ['update-error', 'queued-failure'].includes(mode) };
+      },
+      async status() { return { provider: 'p', model: 'm', settings: { runner: 'none' } }; },
+      async settings(_dir, changes) {
+        if (!changes && mode === 'stop') { entered.resolve(); await release.promise; }
+        if (changes && Object.hasOwn(changes, 'resend_unknown')) {
+          if (mode === 'queued-failure') { entered.resolve(); await release.promise; }
+          if (['update-error', 'queued-failure'].includes(mode)) throw new Error('consent update failed');
+        }
+        if (changes) made = { ...made, ...changes };
+        return made;
+      },
+      async prompt(dir, text, options) {
+        prompts += 1;
+        const fresh = dir.split('/').pop();
+        const saved = [...records.entries()].find(([key]) => key.startsWith(`kv:queued:${fresh}:`));
+        assert.ok(saved, 'the first message is durable before the package receives it');
+        recovery = saved;
+        assert.equal(saved[1].text, expectedText);
+        assert.equal(saved[1].attachmentNote, '\n\n[Attached, in the workspace: kept.bin (3 bytes)]');
+        assert.deepEqual(Array.from(options.files.at(-1).bytes), [1, 2, 3]);
+        if (copied) {
+          assert.equal(options.files[0].executable, true);
+          assert.deepEqual(Array.from(options.files[0].bytes), [4, 5]);
+          assert.doesNotMatch(text, /copied.sh/, 'copied workspace files do not inflate the attachment note');
+        }
+        history.push({ role: 'user', content: [{ type: 'text', text }] });
+        return { unsent: [] };
+      },
+      async history() { return { messages: history }; },
+      async tasks() { return { tasks: [] }; },
+      async stop() {},
+      async closeSession() {},
+    });
+    context.read = async (store, key) => {
+      if (mode === 'read-error' && made && store === 'kv' && key === 'resend') throw new Error('preference unavailable after create');
+      return originalRead(store, key);
+    };
+    const { id: fresh } = await engine.operate('create', {
+      provider: 'p', text: 'first message', runner: 'none', ...(copied && { from: id }), files: [{ path: 'kept.bin', bytes: new Uint8Array([1, 2, 3]) }],
+    });
+    const done = engine.running.get(fresh)?.done;
+    if (mode === 'stop' || mode === 'queued-failure') {
+      await entered.promise;
+      if (mode === 'stop') await engine.operate('stop', { id: fresh });
+      else await engine.operate('send', { id: fresh, text: 'followup', files: [{ path: 'next.bin', bytes: new Uint8Array([9]) }] });
+      release.resolve();
+    }
+    await done;
+    context.read = originalRead;
+    assert.equal(prompts, mode === 'success' ? 1 : 0, mode);
+    if (mode === 'success') {
+      assert.equal(engine.queued.has(fresh), false);
+      assert.equal([...records.keys()].some((key) => key.startsWith(`kv:queued:${fresh}:`)), false, 'taken message leaves no recovery record');
+      records.set(...recovery);
+      await engine.restoreQueued();
+      assert.equal(engine.queued.has(fresh), false, 'a crash after taking copied workspace files does not resend the first message');
+      assert.equal(records.has(recovery[0]), false);
+    } else {
+      const waiting = engine.queued.get(fresh);
+      const expected = mode === 'queued-failure' ? 'first message\n\nfollowup' : 'first message';
+      assert.equal(waiting?.text, expected, mode);
+      assert.equal(engine.running.has(fresh), false, 'failed preparation never auto-retries a queued followup');
+      assert.deepEqual(Array.from(waiting.files[0].bytes), [1, 2, 3]);
+      assert.match(waiting.held, mode === 'stop' ? /you stopped/ : /turn failed/, 'preparation failure is not blamed on the user');
+      assert.ok(records.has(`kv:${waiting.key}`));
+      engine.queued.delete(fresh);
+      await engine.restoreQueued();
+      assert.equal(engine.queued.get(fresh)?.text, expected, 'the unsent first message survives engine restart');
+      const returned = await engine.operate('unqueue', { id: fresh });
+      assert.equal(returned.text, expected);
+      if (mode === 'queued-failure') assert.deepEqual(Array.from(returned.files[1].bytes), [9]);
+      assert.deepEqual(Array.from(returned.files[0].bytes), [1, 2, 3]);
+    }
+    records.delete(`threads:${fresh}`);
+    records.delete(`threads:${id}`);
+  }
+  records.delete('kv:resend');
+}
+
+// A failed index/message transaction leaves no hidden empty session behind.
+{
+  const originalTogether = context.writeTogether;
+  let created = null;
+  let closed = null;
+  let removed = null;
+  engine.setClient({
+    async create(dir) { created = dir; },
+    async status() { return { provider: 'p', model: 'm', settings: { runner: 'none' } }; },
+    async tasks() { return { tasks: [] }; },
+    async closeSession(dir) { closed = dir; },
+    async prompt() { assert.fail('a refused recovery transaction must not send'); },
+  });
+  vm.runInContext('poolOpening = Promise.resolve({ free: 1e12, rmSync: (dir) => globalThis.removedSession(dir) });', Object.assign(context, { removedSession: (dir) => { removed = dir; } }));
+  context.writeTogether = async () => { throw new Error('quota exceeded saving the first message'); };
+  await assert.rejects(engine.operate('create', { provider: 'p', runner: 'none', text: 'keep my draft' }), /quota exceeded/);
+  context.writeTogether = originalTogether;
+  assert.ok(created);
+  assert.equal(closed, created);
+  assert.equal(removed, created);
+  const fresh = created.split('/').pop();
+  assert.equal(records.has(`threads:${fresh}`), false);
+  assert.equal([...records.keys()].some((key) => key.startsWith(`kv:queued:${fresh}:`)), false);
+  assert.equal(engine.running.has(fresh), false);
 }
 
 console.log('review-regressions passed: waiting messages kept on disk (until their turn has taken them; restored at start, held, unless taken), a message stopped before its turn began coming back held, a message to a thread that takes none refused at once, the tab a question is about named and pinned, an allowed action held to the page, part or dialog the question showed (refused before acting once the tab reloaded, moved on or shows another dialog; Auto looks nothing up for one that sends nothing), a message coming back (Take back, rewind, a failed send) only into its own thread\'s box, an unreadable Before acting asking, a script\'s question withdrawn when its command ends, icon buttons named Send asked about, moves rolled back after a lost first request and a refusal only a new key gets (never after a lost answer), a move back waiting on its own export, a snapshot holding threads as they are when it answers, the host /v1 client (event stream parsing and resuming, commands sent again with their request ID, bundles in and out), connect PKCE and its state, moves to the host and back cut at every step (one live copy each time), operation races, Before acting (Full, Auto, Ask; allowed, refused, ended), the Dim theme (the old Dark shows Dim), site secret headers checked (names, values, HTTPS only) and named to the package without their values, reset safety, early Stop, a message with files waiting for the turn to end, a turn stopped part way taking a reply (text alone) and Retry after a stopped step, gateway bounds/redirects (the extension store told as closed), IPv6, CDP body IDs, the debugging-bar veto kept (for tabs vetoed at once too, and for actions without the debugger), Before acting kept when site access is taken back, Return asked about as Enter, one action per tab, uncertain actions unknown (engine, its document and the background), the point before a message found by halving in a long thread (the same words sent before, a compaction after it; Rewind reading on past a rewind) with the engine answering meanwhile');

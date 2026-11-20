@@ -790,6 +790,90 @@ fn live_receipt_and_intent_reads_enforce_payload_limits() {
     }
 }
 
+/// An open checks the history written since the last open, its bounds included, above
+/// the watermark that open moved (not only a fresh store's), and the receipts since it.
+#[test]
+fn an_open_checks_the_bounds_of_the_history_since_the_last_open() {
+    use spindle_store::completion::Attempt;
+    let oversized = spindle_store::MAX_PAYLOAD as i64 + 2;
+    let continuation =
+        format!("UPDATE revisions SET continuation=zeroblob({oversized}) WHERE revision=2");
+    let result = format!("UPDATE receipts SET result=zeroblob({oversized})");
+    for mutation in [
+        continuation.as_str(),
+        result.as_str(),
+        "UPDATE intents SET position=-1 WHERE revision=2",
+        "UPDATE revisions SET engine='' WHERE revision=2",
+    ] {
+        let realm = Realm::new();
+        let mut store = Store::open(&realm.0).unwrap();
+        let first = prepare(&mut store, "one");
+        store.commit_proposal(&first).unwrap();
+        drop(store);
+        // This open checks the first revision and moves the watermark past it.
+        let mut store = Store::open(&realm.0).unwrap();
+        let second = prepare(&mut store, "two");
+        store.commit_proposal(&second).unwrap();
+        store
+            .reserve_attempt(&Attempt {
+                id: "attempt".into(),
+                effect: "effect-two".into(),
+                owner_epoch: store.epoch(),
+                implementation: "test-v1".into(),
+                grant_reference: "grant".into(),
+            })
+            .unwrap();
+        store.ingest_receipt("attempt", b"result").unwrap();
+        drop(store);
+        let db = rusqlite::Connection::open(realm.0.join("authority.sqlite")).unwrap();
+        db.execute(mutation, []).unwrap();
+        drop(db);
+        assert!(
+            Store::open(&realm.0).is_err(),
+            "accepted damaged records: {mutation}"
+        );
+    }
+}
+
+/// A damaged chunk is refused wherever it is read and by a full check (`spindle doctor`),
+/// not by an open that reads nothing it is in (an open does not scan the chunks, which
+/// hold most of a store's bytes): every value is checked against its chunks' types, sizes
+/// and digests as it is read.
+#[test]
+fn a_damaged_chunk_is_refused_where_it_is_read_and_by_a_full_check() {
+    let first = "(SELECT min(rowid) FROM chunks)";
+    for damage in [
+        format!("UPDATE chunks SET bytes='text' WHERE rowid={first}"),
+        format!("UPDATE chunks SET bytes=X'00' WHERE rowid={first}"),
+        format!("UPDATE chunks SET bytes=zeroblob(200000) WHERE rowid={first}"),
+        format!("UPDATE chunks SET digest=zeroblob(32) WHERE rowid={first}"),
+        format!("UPDATE chunks SET digest='text' WHERE rowid={first}"),
+    ] {
+        let realm = Realm::new();
+        let mut store = Store::open(&realm.0).unwrap();
+        let mut proposed = prepare(&mut store, "one");
+        // Past the inline bound and hardly compressible: kept in chunks.
+        proposed.continuation = (0..64 * 1024u32)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        store.commit_proposal(&proposed).unwrap();
+        drop(store);
+        // This open checks the revision, reading its chunks, and moves the watermark.
+        drop(Store::open(&realm.0).unwrap());
+        let db = rusqlite::Connection::open(realm.0.join("authority.sqlite")).unwrap();
+        db.execute(&damage, []).unwrap();
+        drop(db);
+        let mut store = Store::open(&realm.0).unwrap();
+        assert!(store.snapshot().is_err(), "read a damaged chunk: {damage}");
+        drop(store);
+        let mut store = Store::open(&realm.0).unwrap();
+        assert!(
+            matches!(store.check_integrity(), Err(Error::Incompatible)),
+            "a full check passed a damaged chunk: {damage}"
+        );
+    }
+}
+
 #[test]
 fn contradictory_and_malformed_committed_records_block_recovery() {
     let mutations = [

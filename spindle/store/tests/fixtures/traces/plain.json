@@ -48,7 +48,7 @@
       {
         "command_id": "start",
         "kind": "dext-turn-v1",
-        "payload": "213ced25dce6c1b56bcba97f",
+        "payload": "7850630bbdc0c456b5c7568f",
         "scope": "operator",
         "sequence": 1
       },
@@ -92,17 +92,17 @@
     ],
     "proposals": [
       {
-        "canonical": "aebd77345d87469de41bb9d3",
+        "canonical": "dcdf620b3f6163ab58e047ad",
         "id": "commit-start",
         "revision": 1
       },
       {
-        "canonical": "d64139e5fa7270855b9e5394",
+        "canonical": "457ef27f3fd94918da2875d1",
         "id": "adopt-r1",
         "revision": 2
       },
       {
-        "canonical": "f49798032abb07b8fce6e25c",
+        "canonical": "6857cf9ab4311d5edcee8ff1",
         "id": "commit-finish-r2",
         "revision": 3
       }
@@ -123,21 +123,21 @@
         "workspace": null
       },
       {
-        "continuation": "377b93a9aeb14667f8339205",
+        "continuation": "a1057c2b14eb4cad37015664",
         "engine": "dext-turn-v1",
         "revision": 1,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "0177bb09ce50eeb6c25e685d",
+        "continuation": "a305978deb2b43298493984d",
         "engine": "dext-turn-v1",
         "revision": 2,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "887623941b9a7ae199c6d46c",
+        "continuation": "854c3b9bcd42fed7f7bbb2ea",
         "engine": "dext-turn-v1",
         "revision": 3,
         "scope": "operator",

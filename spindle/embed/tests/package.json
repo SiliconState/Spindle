@@ -1,0 +1,11 @@
+{
+  "name": "spindle-embedded-type-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "tsc --noEmit --strict --module NodeNext --moduleResolution NodeNext --target ES2022 --lib ES2022,DOM types.mts"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

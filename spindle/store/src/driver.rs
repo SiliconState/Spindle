@@ -1801,6 +1801,22 @@ impl Step<'_> {
                 let Some((cut, prompt)) = compaction_cut(&transcript.messages, keep) else {
                     return Ok(None);
                 };
+                // First, without asking the model anything: the large tool results of the
+                // part a summary would fold (pages read, files, outputs) cleared, the
+                // conversation itself kept. Taken when that alone shrinks history as a
+                // compaction must (by a quarter); a history cleared before shrinks no
+                // more, and is summarized as before.
+                if !crowded
+                    && let Some(cleared) = cleared(&transcript, cut)
+                    && transcript_len(&cleared)? <= size / 4 * 3
+                {
+                    return Ok(Some(CompactCall {
+                        command,
+                        size,
+                        crowded,
+                        replacement: CompactReplacement::Ready(cleared),
+                    }));
+                }
                 // Each compaction must shrink history by a quarter (below); when the part
                 // it can drop is too small for that even with the largest summary,
                 // nothing is asked of the model.
@@ -1949,6 +1965,7 @@ impl Step<'_> {
         if bytes.len() > size / 4 * 3 && (!by_count || crowded(&replacement.messages)) {
             return Ok(false);
         }
+        let cleared = only_cleared(&*state.transcript_ref().map_err(turn_error)?, &replacement);
         let after = state.compact(replacement).map_err(turn_error)?;
         let compacted_size = bytes.len();
         self.commit_action(
@@ -1960,6 +1977,7 @@ impl Step<'_> {
         self.emit(Event::Compacted {
             before: size,
             after: compacted_size,
+            cleared,
         });
         Ok(true)
     }
@@ -2112,7 +2130,7 @@ impl Step<'_> {
                     SCOPE.into(),
                     execution_id(SCOPE, &command).map_err(store_error)?,
                     live.contract,
-                    None,
+                    Some(TURN_STEPS),
                     transcript,
                 )
                 .map_err(turn_error)?;
@@ -2562,6 +2580,65 @@ fn clip(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{} [...]", &text[..end])
+}
+
+/// Tool results at least this long are what clearing (`cleared`) takes out.
+const CLEARED_FROM: usize = 2048;
+/// What a cleared tool result begins with (the rest says what it was).
+pub(crate) const CLEARED: &str = "[Cleared to make room in the history:";
+
+/// The history with the long tool results of `messages[..cut]` (the part a compaction
+/// would fold into its summary) each cleared to a line saying what it was and how long:
+/// what the model read there it has acted on, and what it needs again it reads again (a
+/// page, a file, a command's output kept in the workspace). None when none is long.
+fn cleared(transcript: &TranscriptCheckpoint, cut: usize) -> Option<TranscriptCheckpoint> {
+    let mut replacement = transcript.clone();
+    let mut any = false;
+    for message in &mut replacement.messages[..cut.min(transcript.messages.len())] {
+        for block in &mut message.content {
+            let Block::ToolResult { content, .. } = block else {
+                continue;
+            };
+            if content.len() < CLEARED_FROM || content.starts_with(CLEARED) {
+                continue;
+            }
+            let first: String = content
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or_default()
+                .chars()
+                .take(160)
+                .collect();
+            *content = format!(
+                "{CLEARED} {} characters, beginning \"{}\". Read it again if it is needed.]",
+                content.chars().count(),
+                first.trim()
+            );
+            any = true;
+        }
+    }
+    any.then_some(replacement)
+}
+
+/// Whether `after` is `before` with tool results cleared (`cleared`) and nothing else
+/// changed: the same messages, but for results whose text became a cleared line.
+fn only_cleared(before: &TranscriptCheckpoint, after: &TranscriptCheckpoint) -> bool {
+    before.messages.len() == after.messages.len()
+        && before
+            .messages
+            .iter()
+            .zip(&after.messages)
+            .all(|(was, now)| {
+                was.role == now.role
+                    && was.content.len() == now.content.len()
+                    && was.content.iter().zip(&now.content).all(|(was, now)| {
+                        was == now
+                            || matches!((was, now), (
+                            Block::ToolResult { tool_use_id: id, is_error: failed, .. },
+                            Block::ToolResult { tool_use_id: same, content, is_error: still, .. },
+                        ) if id == same && failed == still && content.starts_with(CLEARED))
+                    })
+            })
 }
 
 fn message_size(message: &Message) -> usize {
@@ -3028,6 +3105,56 @@ pub(crate) fn unreadable(why: Option<&str>) -> String {
     match said {
         Some(said) => format!("the provider ended its reply with an error ({said})"),
         None => format!("{failed} ({why})"),
+    }
+}
+
+/// What a reply that could not be read comes to (`unreadable` says why): an error the
+/// provider streamed after its reply began that says it is passing (overloaded, rate
+/// limited, a server error, try again) is a dropped reply, its outcome unknown, which a
+/// session that chose `resend_unknown` sends again (bounded, counted as possibly billed);
+/// anything else fails the step as before.
+#[cfg(any(feature = "agent", feature = "embedded"))]
+pub(crate) fn protocol_failure(why: Option<&str>) -> ModelFailure {
+    let said = unreadable(why);
+    let passing = why.is_some_and(|why| {
+        let why = why.to_ascii_lowercase();
+        why.starts_with("provider stream error [")
+            && [
+                "overload",
+                "rate limit",
+                "rate_limit",
+                "too many requests",
+                "server_error",
+                "server error",
+                "internal error",
+                "internal_error",
+                "api_error",
+                "try again",
+                "timeout",
+                "timed out",
+                "temporarily",
+                "unavailable",
+                "capacity",
+            ]
+            .iter()
+            .any(|word| why.contains(word))
+            // A request the model cannot take (too long for it, say) fails the same
+            // way however often it is sent, whatever else its words say.
+            && ![
+                "invalid_request",
+                "context length",
+                "context window",
+                "context_length",
+                "maximum context",
+                "too long",
+                "too large",
+            ]
+            .iter()
+            .any(|word| why.contains(word))
+    });
+    match passing {
+        true => ModelFailure::Dropped(said),
+        false => ModelFailure::Failed(said),
     }
 }
 
@@ -3606,10 +3733,19 @@ fn text_of(blocks: &[Block]) -> String {
         .join("\n")
 }
 
+/// The model requests (steps; each may call several tools) a turn makes before it stops,
+/// to be continued (`continue` gives it as many again): a turn looping on the same few
+/// steps, or running on far past what was asked, stops there rather than spending
+/// without end. Turns that began without one (before this limit) keep none. `stop_text`
+/// names the number.
+pub const TURN_STEPS: u32 = 500;
+
 pub fn stop_text(stop: Stop) -> &'static str {
     match stop {
         Stop::Complete => "done",
-        Stop::Iterations => "stopped: step limit reached",
+        Stop::Iterations => {
+            "stopped: step limit reached (500 model requests in this turn; continuing it gives 500 more)"
+        }
         Stop::Budget => "stopped: budget reached",
         Stop::ToolPolicy => "stopped by tool policy",
         Stop::ContentFilter => "stopped by the provider's content filter",
@@ -3808,5 +3944,119 @@ mod plan_tests {
             dext_core::recovery::chatgpt_plan_refusal(limit).is_some(),
             "and backoff gives up on it at once"
         );
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn the_step_limit_says_how_many_model_requests() {
+        let said = stop_text(Stop::Iterations);
+        assert!(
+            said.contains(&format!("{TURN_STEPS} model requests"))
+                && said.contains(&format!("{TURN_STEPS} more")),
+            "{said}"
+        );
+        // Read on every host (a browser has no command line to name).
+        assert!(!said.contains("spindle "), "{said}");
+    }
+
+    fn result(id: &str, content: &str) -> Message {
+        Message {
+            role: "user".into(),
+            content: vec![Block::ToolResult {
+                tool_use_id: id.into(),
+                content: content.into(),
+                is_error: None,
+                metadata: Default::default(),
+            }],
+        }
+    }
+
+    fn content(message: &Message) -> &str {
+        match &message.content[0] {
+            Block::ToolResult { content, .. } => content,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Clearing takes the long tool results of the part before the cut, each to a line
+    /// saying what it was; short ones, and all after the cut, stay; a history cleared
+    /// already gives nothing more.
+    #[test]
+    fn clearing_takes_long_results_before_the_cut_only() {
+        let long = format!("first line\n{}", "x".repeat(4000));
+        let transcript = TranscriptCheckpoint {
+            route_binding: "r".into(),
+            messages: vec![result("a", &long), result("b", "short"), result("c", &long)],
+        };
+        let cleared_once = cleared(&transcript, 2).expect("a long result before the cut");
+        let said = content(&cleared_once.messages[0]);
+        assert!(
+            said.starts_with(CLEARED)
+                && said.contains("\"first line\"")
+                && said.contains("4011 characters"),
+            "{said}"
+        );
+        assert_eq!(content(&cleared_once.messages[1]), "short");
+        assert_eq!(
+            content(&cleared_once.messages[2]),
+            long,
+            "after the cut, kept"
+        );
+        assert_eq!(cleared_once.messages.len(), transcript.messages.len());
+        assert!(cleared(&cleared_once, 2).is_none(), "nothing more to clear");
+        assert!(only_cleared(&transcript, &cleared_once));
+        assert!(!only_cleared(
+            &transcript,
+            &TranscriptCheckpoint {
+                route_binding: "r".into(),
+                messages: transcript.messages[1..].to_vec()
+            }
+        ));
+        assert!(cleared(&transcript, 0).is_none(), "nothing before the cut");
+    }
+
+    /// A passing error streamed mid-reply is a drop (sent again where the session
+    /// resends); any other unreadable reply fails the step.
+    #[cfg(any(feature = "agent", feature = "embedded"))]
+    #[test]
+    fn a_passing_stream_error_is_a_drop_and_a_lasting_one_a_failure() {
+        let streamed = |said: &str| format!("provider stream error [anthropic-messages]: {said}");
+        for passing in [
+            "overloaded_error: Overloaded",
+            "{\"code\":\"server_error\"}",
+            "rate_limit_error: slow down",
+            "api_error: Internal server error",
+        ] {
+            assert!(
+                matches!(
+                    protocol_failure(Some(&streamed(passing))),
+                    ModelFailure::Dropped(_)
+                ),
+                "{passing}"
+            );
+        }
+        for lasting in [
+            "invalid_request_error: bad field",
+            "permission_error: no",
+            "api_error: the prompt exceeds the model's context window capacity",
+        ] {
+            assert!(
+                matches!(
+                    protocol_failure(Some(&streamed(lasting))),
+                    ModelFailure::Failed(_)
+                ),
+                "{lasting}"
+            );
+        }
+        // An unreadable stream (not the provider's own error) is not a drop.
+        assert!(matches!(
+            protocol_failure(Some("tool call 0 has no name; server overloaded")),
+            ModelFailure::Failed(_)
+        ));
+        assert!(matches!(protocol_failure(None), ModelFailure::Failed(_)));
     }
 }

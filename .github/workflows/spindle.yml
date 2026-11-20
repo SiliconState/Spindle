@@ -112,6 +112,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Tested Node runtime for wasm and v86
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.22.1'
       - name: Portable targets and private WASI sysroot
         run: |
           rustup target add wasm32-unknown-unknown wasm32-wasip1 i686-unknown-linux-musl
@@ -168,7 +172,8 @@ jobs:
           (cd chrome/linux/command && cargo fmt -- --check \
             && cargo clippy --locked --release --target i686-unknown-linux-musl -- -D warnings)
           chrome/linux/build.sh
-          node chrome/tests/linux_node.mjs chrome/linux/dist
+          # Bound compiler concurrency and leave room for v86's 512 MiB guest and JIT.
+          node --max-old-space-size=4096 --wasm-num-compilation-tasks=2 chrome/tests/linux_node.mjs chrome/linux/dist
           # Spindle for Browser, built and driven through its panel in the runner's
           # Chrome against a scripted provider (no account).
           chrome/build.sh "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen"

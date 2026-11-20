@@ -50,6 +50,7 @@ struct AnthropicState {
     blocks: BTreeMap<usize, AnthropicBlock>,
     stop_reason: Option<String>,
     usage: Usage,
+    cache_create_5m: u64,
     message_started: bool,
     message_stopped: bool,
     unknown_events: usize,
@@ -80,6 +81,7 @@ struct OpenAiState {
     unknown_events: usize,
     preserve_timing_cache: bool,
     done: bool,
+    request: Option<u64>,
 }
 
 #[derive(Default)]
@@ -125,6 +127,26 @@ impl ProviderStreamParser {
             | RequestContract::ChatGptPlan => ProviderState::ChatGpt(ChatGptState::default()),
         };
         Self { contract, state }
+    }
+
+    pub fn request_identity(mut self, identity: &dext_core::model::Identity) -> Self {
+        if let ProviderState::OpenAi(state) = &mut self.state {
+            let mut digest = Fnv::default();
+            for field in [
+                "dext-call-v1",
+                &identity.effect,
+                &identity.provider,
+                &identity.contract,
+                &identity.endpoint,
+                &identity.model,
+                &identity.credential_scope,
+                &identity.configuration,
+            ] {
+                digest.write(field.as_bytes());
+            }
+            state.request = Some(digest.finish());
+        }
+        self
     }
 
     pub fn capture_openai_reasoning(mut self, enabled: bool) -> Self {
@@ -364,6 +386,65 @@ fn tool_arguments_json_is_incomplete(raw: &str) -> bool {
     raw.trim().is_empty() || serde_json::from_str::<Value>(raw).is_err_and(|error| error.is_eof())
 }
 
+/// How much of arguments that are not a JSON object a call keeps (`admitted_arguments`).
+const UNPARSED_KEPT: usize = 4096;
+
+/// The input of a whole call (not one a reply's end cut short) whose arguments
+/// `parse_tool_arguments` refused: none at all are an empty object (some servers send
+/// `""` for a tool without parameters); any other (malformed JSON, or JSON that is not
+/// an object) an object holding them, bounded, and why, under
+/// `dext_transcript::UNPARSED_ARGUMENTS`, so the call is answered as refused and the
+/// model sends it again, rather than the whole reply, already paid for, failing.
+/// Arguments over the buffer cap stay `error`.
+fn admitted_arguments(raw: &str, error: anyhow::Error) -> Result<Value> {
+    if raw.len() > TOOL_ARGUMENT_BUFFER_CAP {
+        return Err(error);
+    }
+    if raw.trim().is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+    let why = match serde_json::from_str::<Value>(raw) {
+        Err(parse) => format!("not valid JSON ({parse})"),
+        Ok(_) => "JSON, but not an object of arguments".to_string(),
+    };
+    let mut text: String = raw.chars().take(UNPARSED_KEPT).collect();
+    if text.len() < raw.len() {
+        text.push('…');
+    }
+    let mut unparsed = serde_json::Map::new();
+    unparsed.insert("text".into(), Value::String(text));
+    unparsed.insert("error".into(), Value::String(why));
+    let mut input = serde_json::Map::new();
+    input.insert(
+        dext_transcript::UNPARSED_ARGUMENTS.into(),
+        Value::Object(unparsed),
+    );
+    Ok(Value::Object(input))
+}
+
+/// FNV-1a, 64 bits: a stable digest without a hashing crate (names made for calls a
+/// server sent without one).
+struct Fnv(u64);
+impl Default for Fnv {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+impl Fnv {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // Each part ends: "ab"+"c" is not "a"+"bc".
+        self.0 ^= 0xff;
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 fn parse_tool_arguments(
     contract: RequestContract,
     event: &str,
@@ -445,6 +526,9 @@ fn parse_anthropic_frame(
             if let Some(usage) = message.get("usage") {
                 object(contract, event, usage, "message.usage")?;
                 state.usage = Usage::parse(usage);
+                state.cache_create_5m = usage["cache_creation"]["ephemeral_5m_input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
             }
             state.message_started = true;
         }
@@ -723,12 +807,30 @@ fn parse_anthropic_frame(
             if let Some(usage) = data_object.get("usage") {
                 object(contract, event, usage, "usage")?;
                 let parsed = Usage::parse(usage);
-                if parsed.output > 0 {
+                if usage.get("output_tokens").and_then(Value::as_u64).is_some() {
                     state.usage.output = parsed.output;
                 }
-                if parsed.input > 0 || parsed.cache_create > 0 || parsed.cache_read > 0 {
+                if usage.get("input_tokens").and_then(Value::as_u64).is_some() {
                     state.usage.input = parsed.input;
-                    state.usage.cache_create = parsed.cache_create;
+                }
+                // Usage is cumulative, but either TTL bucket may be omitted in a delta.
+                state.cache_create_5m = state.cache_create_5m.max(
+                    usage["cache_creation"]["ephemeral_5m_input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0),
+                );
+                state.usage.cache_create_1h =
+                    state.usage.cache_create_1h.max(parsed.cache_create_1h);
+                state.usage.cache_create = state.usage.cache_create.max(parsed.cache_create).max(
+                    state
+                        .cache_create_5m
+                        .saturating_add(state.usage.cache_create_1h),
+                );
+                if usage
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .is_some()
+                {
                     state.usage.cache_read = parsed.cache_read;
                 }
                 if parsed.cost_usd.is_some() {
@@ -872,7 +974,14 @@ fn finish_anthropic(contract: RequestContract, state: AnthropicState) -> Result<
                     {
                         unfinished_tool_calls += 1;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => blocks.push(Block::ToolUse {
+                        id: block.id,
+                        name: block.name,
+                        input: admitted_arguments(
+                            block.input_json.as_deref().unwrap_or(""),
+                            error,
+                        )?,
+                    }),
                 }
             }
             _ => {}
@@ -1034,13 +1143,16 @@ fn finish_openai(contract: RequestContract, state: OpenAiState) -> Result<Parsed
     }
     let output_truncated = state.stop_reason.as_deref() == Some("length");
     let mut unfinished_tool_calls = 0usize;
-    for (idx, call) in state.tool_calls {
+    for (idx, mut call) in state.tool_calls {
         if call.id.trim().is_empty() {
-            return Err(protocol_error(
-                contract,
-                "finalize",
-                &format!("tool call {idx} has no id"),
-            ));
+            let request = state.request.ok_or_else(|| {
+                protocol_error(
+                    contract,
+                    "finalize",
+                    "an id-less tool call needs its request identity",
+                )
+            })?;
+            call.id = format!("call_dext_{request:016x}_{idx}");
         }
         if call.name.trim().is_empty() {
             return Err(protocol_error(
@@ -1061,7 +1173,11 @@ fn finish_openai(contract: RequestContract, state: OpenAiState) -> Result<Parsed
             Err(_) if output_truncated && tool_arguments_json_is_incomplete(&call.arguments) => {
                 unfinished_tool_calls += 1;
             }
-            Err(error) => return Err(error),
+            Err(error) => blocks.push(Block::ToolUse {
+                input: admitted_arguments(&call.arguments, error)?,
+                id: call.id,
+                name: call.name,
+            }),
         }
     }
     Ok(ParsedStream {
@@ -1755,12 +1871,15 @@ fn finish_chatgpt(contract: RequestContract, mut state: ChatGptState) -> Result<
                 &format!("function item {idx} has incomplete identity"),
             ));
         }
-        let input = parse_tool_arguments(
+        let input = match parse_tool_arguments(
             contract,
             "finalize",
             &format!("function item {idx}"),
             &call.arguments,
-        )?;
+        ) {
+            Ok(input) => input,
+            Err(error) => admitted_arguments(&call.arguments, error)?,
+        };
         blocks.push(Block::ToolUse {
             id: call.id,
             name: call.name,
@@ -1940,6 +2059,38 @@ fn reasoning_summary_stream_delta(raw: &str, emitted: &mut String) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity(effect: &str) -> dext_core::model::Identity {
+        dext_core::model::Identity {
+            effect: effect.into(),
+            provider: "fixture".into(),
+            contract: "openai-chat-completions".into(),
+            endpoint: "https://example.invalid".into(),
+            model: "fixture".into(),
+            credential_scope: "operator".into(),
+            configuration: "policy".into(),
+        }
+    }
+
+    /// A reply whose one call's arguments were kept aside (`admitted_arguments`), the
+    /// reason saying `why`.
+    fn assert_unparsed(parsed: &ParsedStream, why: &str) {
+        let Some(Block::ToolUse { name, input, .. }) = parsed
+            .blocks
+            .iter()
+            .find(|block| matches!(block, Block::ToolUse { .. }))
+        else {
+            panic!("no call kept: {:?}", parsed.blocks);
+        };
+        let refusal = dext_transcript::unparsed_arguments_refusal(name, input)
+            .expect("its arguments kept aside");
+        assert!(refusal.contains(why), "{refusal}");
+        assert_eq!(
+            input.as_object().map(|object| object.len()),
+            Some(1),
+            "{input}"
+        );
+    }
 
     #[test]
     fn shared_response_proposal_rejects_duplicate_native_call_ids() {
@@ -2273,8 +2424,105 @@ mod tests {
                 })
                 .unwrap();
         }
-        let error = parser.finish().unwrap_err().to_string();
-        assert!(error.contains("arguments must be a JSON object"), "{error}");
+        assert_unparsed(&parser.finish().unwrap(), "not an object");
+    }
+
+    #[test]
+    fn anthropic_cache_ttls_survive_cumulative_usage_updates() {
+        for final_usage in [
+            serde_json::json!({"output_tokens": 5}),
+            serde_json::json!({"output_tokens":5,"cache_creation":null}),
+            serde_json::json!({"output_tokens":5,"cache_creation":{}}),
+            serde_json::json!({"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":40}}),
+            serde_json::json!({"output_tokens":5,"cache_creation":{"ephemeral_1h_input_tokens":60}}),
+            serde_json::json!({"input_tokens": 10,"output_tokens": 5}),
+            serde_json::json!({"input_tokens": 10,"output_tokens": 5,"cache_creation_input_tokens":100}),
+            serde_json::json!({"input_tokens": 10,"output_tokens": 5,"cache_creation_input_tokens":100,
+                "cache_creation":{"ephemeral_5m_input_tokens":40,"ephemeral_1h_input_tokens":60}}),
+        ] {
+            let mut parser = ProviderStreamParser::new(RequestContract::AnthropicMessages, false);
+            for value in [
+                serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":10,
+                    "cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":40,"ephemeral_1h_input_tokens":60}}}}),
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":final_usage}),
+                serde_json::json!({"type":"message_stop"}),
+            ] {
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(value.to_string()),
+                    })
+                    .unwrap();
+            }
+            let usage = parser.finish().unwrap().usage;
+            assert_eq!(
+                (
+                    usage.input,
+                    usage.output,
+                    usage.cache_create,
+                    usage.cache_create_1h
+                ),
+                (10, 5, 100, 60)
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_cache_ttls_merge_independently_without_inventing_tokens() {
+        let mut parser = ProviderStreamParser::new(RequestContract::AnthropicMessages, false);
+        parser
+            .push_frame(SseFrame {
+                event: None,
+                data: Some(serde_json::json!({"type":"message_start","message":{"usage":{"cache_creation_input_tokens":100}}}).to_string()),
+            })
+            .unwrap();
+        for (delta, total, hour) in [
+            (
+                serde_json::json!({"cache_creation":{"ephemeral_1h_input_tokens":60}}),
+                100,
+                60,
+            ),
+            (
+                serde_json::json!({"cache_creation":{"ephemeral_5m_input_tokens":50}}),
+                110,
+                60,
+            ),
+            (
+                serde_json::json!({"cache_creation":{"ephemeral_1h_input_tokens":70}}),
+                120,
+                70,
+            ),
+            (
+                serde_json::json!({"cache_creation_input_tokens":200}),
+                200,
+                70,
+            ),
+            (
+                serde_json::json!({"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}),
+                200,
+                70,
+            ),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(
+                        serde_json::json!({"type":"message_delta","delta":{},"usage":delta})
+                            .to_string(),
+                    ),
+                })
+                .unwrap();
+            let usage = parser.known_usage();
+            assert_eq!((usage.cache_create, usage.cache_create_1h), (total, hour));
+            assert!(usage.is_valid());
+        }
+        parser
+            .push_frame(SseFrame {
+                event: None,
+                data: Some(r#"{"type":"message_stop"}"#.into()),
+            })
+            .unwrap();
+        assert_eq!(parser.finish().unwrap().usage.cache_create, 200);
     }
 
     #[test]
@@ -2509,7 +2757,8 @@ mod tests {
         assert_eq!(parsed.unfinished_tool_calls, 1);
         assert_eq!(parsed.stop_reason, None);
 
-        // Case 3: malformed non-EOF JSON remains fatal even at max_tokens.
+        // Case 3: malformed non-EOF JSON at max_tokens was not cut off: the call is kept,
+        // refused for its arguments (the model sends it again), the reply not lost.
         let mut parser = ProviderStreamParser::new(contract, false);
         for (event, data) in [
             (
@@ -2541,11 +2790,10 @@ mod tests {
                 })
                 .unwrap();
         }
-        let error = parser.finish().unwrap_err().to_string();
-        assert!(error.contains("has malformed arguments"), "{error}");
+        assert_unparsed(&parser.finish().unwrap(), "not valid JSON");
 
-        // Case 4: a syntactically complete non-object remains a protocol error
-        // even when max_tokens coincides with the terminal event; it was not cut off.
+        // Case 4: a syntactically complete non-object was not cut off either, even when
+        // max_tokens coincides with the terminal event: kept, to be refused.
         let mut parser = ProviderStreamParser::new(contract, false);
         for (event, data) in [
             (
@@ -2577,8 +2825,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let error = parser.finish().unwrap_err().to_string();
-        assert!(error.contains("arguments must be a JSON object"), "{error}");
+        assert_unparsed(&parser.finish().unwrap(), "not an object");
     }
 
     #[test]
@@ -2823,7 +3070,8 @@ mod tests {
         assert!(error.contains("not valid JSON"), "{error}");
         assert!(!error.contains("not-json"), "{error}");
 
-        let mut parser = ProviderStreamParser::new(contract, false);
+        let mut parser =
+            ProviderStreamParser::new(contract, false).request_identity(&identity("turn/m/1"));
         for data in [
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"{\"path\":"}}]},"finish_reason":null}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#,
@@ -2835,8 +3083,13 @@ mod tests {
                 })
                 .unwrap();
         }
-        let error = parser.finish().unwrap_err().to_string();
-        assert!(error.contains("has no id"), "{error}");
+        // A call without an id is named by its request, not the provider's metadata.
+        let parsed = parser.finish().unwrap();
+        let [Block::ToolUse { id, input, .. }] = parsed.blocks.as_slice() else {
+            panic!("{:?}", parsed.blocks)
+        };
+        assert!(id.starts_with("call_dext_"), "{id}");
+        assert_eq!(input["path"], "README.md");
 
         let mut parser = ProviderStreamParser::new(contract, false);
         parser
@@ -2848,8 +3101,47 @@ mod tests {
                 ),
             })
             .unwrap();
-        let error = parser.finish().unwrap_err().to_string();
-        assert!(error.contains("arguments must be a JSON object"), "{error}");
+        assert_unparsed(&parser.finish().unwrap(), "not an object");
+    }
+
+    /// A call some servers send with no arguments at all (`""`, for a tool without
+    /// parameters) and no id: an empty object of arguments, named the same each time
+    /// the reply is read.
+    #[test]
+    fn openai_call_without_arguments_or_id_is_kept() {
+        let contract = RequestContract::OpenAiChatCompletions;
+        let name = |effect: &str, created: u64| {
+            let mut parser =
+                ProviderStreamParser::new(contract, false).request_identity(&identity(effect));
+            let chunk = format!(
+                r#"{{"id":"chatcmpl-1","created":{created},"choices":[{{"delta":{{"tool_calls":[{{"index":0,"function":{{"name":"list_tabs","arguments":""}}}}]}},"finish_reason":"tool_calls"}}]}}"#
+            );
+            for data in [chunk.as_str(), "[DONE]"] {
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(data.to_string()),
+                    })
+                    .unwrap();
+            }
+            let parsed = parser.finish().unwrap();
+            let [Block::ToolUse { id, input, .. }] = parsed.blocks.as_slice() else {
+                panic!("{:?}", parsed.blocks)
+            };
+            assert_eq!(input, &serde_json::json!({}));
+            id.clone()
+        };
+        assert_eq!(
+            name("turn/m/1", 1_700_000_000),
+            name("turn/m/1", 1_700_000_000),
+            "read again, the same"
+        );
+        assert_eq!(
+            name("turn/m/1", 1),
+            name("turn/m/1", 2),
+            "metadata does not rename a request"
+        );
+        assert_ne!(name("turn/m/1", 1), name("turn/m/2", 1));
     }
 
     #[test]
@@ -2886,7 +3178,8 @@ mod tests {
         assert_eq!(parsed.unfinished_tool_calls, 1);
         assert_eq!(parsed.stop_reason.as_deref(), Some("length"));
 
-        // Case 2: the same cut JSON under any other finish_reason stays fatal.
+        // Case 2: the same cut JSON under any other finish_reason was not cut by the
+        // reply's end: kept, refused for its arguments.
         let mut parser = ProviderStreamParser::new(contract, false);
         push_all(
             &mut parser,
@@ -2895,10 +3188,9 @@ mod tests {
                 r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
             ],
         );
-        let error = parser.finish().unwrap_err().to_string();
-        assert!(error.contains("has malformed arguments"), "{error}");
+        assert_unparsed(&parser.finish().unwrap(), "not valid JSON");
 
-        // Case 3: malformed non-EOF JSON remains fatal even at length.
+        // Case 3: malformed non-EOF JSON at length was not cut off: kept, to be refused.
         let mut parser = ProviderStreamParser::new(contract, false);
         push_all(
             &mut parser,
@@ -2906,10 +3198,9 @@ mod tests {
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":]"}}]},"finish_reason":"length"}]}"#,
             ],
         );
-        let error = parser.finish().unwrap_err().to_string();
-        assert!(error.contains("has malformed arguments"), "{error}");
+        assert_unparsed(&parser.finish().unwrap(), "not valid JSON");
 
-        // Case 4: a complete non-object was not cut off; it stays a protocol error.
+        // Case 4: a complete non-object was not cut off: kept, to be refused.
         let mut parser = ProviderStreamParser::new(contract, false);
         push_all(
             &mut parser,
@@ -2917,8 +3208,7 @@ mod tests {
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"[]"}}]},"finish_reason":"length"}]}"#,
             ],
         );
-        let error = parser.finish().unwrap_err().to_string();
-        assert!(error.contains("arguments must be a JSON object"), "{error}");
+        assert_unparsed(&parser.finish().unwrap(), "not an object");
 
         // Case 5: length after a complete call still executes that call; only
         // the call that was actually cut is dropped.

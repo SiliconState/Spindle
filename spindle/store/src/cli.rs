@@ -1416,8 +1416,9 @@ impl Observer for Terminal {
     fn event(&self, event: Event<'_>) {
         match event {
             Event::Prompt { text: prompt } => self.line(format!("> {}", shown(&prompt_shown(prompt)))),
-            Event::Compacted { before, after } => self.line(format!(
-                "(compacted earlier history: {} KiB -> {} KiB)",
+            Event::Compacted { before, after, cleared } => self.line(format!(
+                "({} earlier history: {} KiB -> {} KiB)",
+                if cleared { "cleared long tool results from" } else { "compacted" },
                 before / 1024,
                 after / 1024
             )),

@@ -217,7 +217,7 @@ overlap, and each returns a Promise of its result. `prompt`, `resume`, `retry`,
 | `grantHeaders` | none | `async ({ grant, url, method, names }) => ({ [name]: value })`: the values of the headers an HTTP grant adds, asked before each script request under it (see [Script calls](#script-calls-code-mode-bridge)). Throwing refuses the request, and nothing is sent |
 | `fetch` | `globalThis.fetch` | Sends model requests and script HTTP requests |
 | `runner` | none | Runs `bash`: `{ app, remote }` (each optional), or a single runner. A `remoteRunner(...)` serves `runner: 'remote'` sessions, and any other runner serves `runner: 'app'` sessions |
-| `deadlines` | `{ firstByte: 180000, idle: 180000, total: 600000 }` | Milliseconds for model requests: until the response starts, between body chunks, and overall |
+| `deadlines` | `{ firstByte: 180000, idle: 180000, total: 1800000 }` | Milliseconds for model requests: until the response starts, between body chunks, and overall. A loopback endpoint (a model on this machine) has at least 600000 for its first byte, within `total`. |
 | `resolveDir` | identity | Maps a caller's `dir` to the name sessions are stored under (`nodeClient` uses `path.resolve`) |
 
 ### Methods
@@ -226,14 +226,15 @@ overlap, and each returns a Promise of its result. `prompt`, `resume`, `retry`,
 | --- | --- |
 | `info()`, `providers()` | `info` (reports `transport: 'embedded'` and the feature list), `providers` |
 | `create(dir, provider, settings)` | `create`; registered app tools are offered unless `settings.tools` is given |
-| `open(dir)`, `status(dir)`, `closeSession(dir)` | `open`, `status`, `close`. `closeSession` also waits for an OPFS session's Web Lock to be released |
+| `open(dir)`, `status(dir, { history })`, `closeSession(dir)` | `open`, `status`, `close`. `closeSession` also waits for an OPFS session's Web Lock to be released. `status` with `history: {from}` adds `history` (as the `history` method reads the head's, from message `from` on), both from one read of the head |
+| `restSession(dir)` | `rest` (embedded only): the session's store rests (`closed=1` written while it stays open), so an app stopped before closing it (a browser quit) leaves it as a clean close does; nothing for a session that runs or is not open here. The next method that may write ends the rest. `{session, rested}` |
 | `prompt(dir, text, { files, state, expectedHead })` | `prompt` |
 | `resume(dir, { expectedHead, until })` | `continue` |
 | `retry(dir, { expectedHead })`, `rewind(dir, revision, { expectedHead })` | `retry`, `rewind` |
 | `stop(dir)`, `steer(dir, text, { now })` | `stop`, `steer` (`now` asks for queued messages to be read now, cutting a streaming reply) |
 | `history(dir, revision, { from })`, `targets(dir, { limit, until })` | `history`, `targets` (default limit 48, clamped to 1-8192; `until: 'settled'` searches back to a completed turn) |
 | `files(dir, revision)`, `read(dir, path, revision)` | `files`; `read` returns a `Uint8Array` |
-| `settings(dir, changes)` | `settings` |
+| `settings(dir, changes)` | `settings`; while a stopped turn waits, `max_usd` and `resend_unknown` may change without changing its frozen request; request-shaping changes still require a settable boundary |
 | `state(dir, revision)`, `setState(dir, patch, { expectedHead })` | `state`, `state_set` |
 | `recover(dir)` | `recover` |
 | `usage(dir)` | `usage`: the session's own spend, not its tasks' |
@@ -255,7 +256,7 @@ overlap, and each returns a Promise of its result. `prompt`, `resume`, `retry`,
 | `ready` | A Promise that settles once the runners given at construction are connected |
 
 The embedded backend ([`backend.rs`](../spindle/store/src/embedded/backend.rs))
-answers `info`, `providers`, `list`, `create`, `open`, `status`, `close`, `prompt`,
+answers `info`, `providers`, `list`, `create`, `open`, `status`, `close`, `rest`, `prompt`,
 `continue`, `retry`, `rewind`, `task_start`, `stop`, `steer`, `state`, `state_set`,
 `app_tool_result`, `history`, `files`, `read`, `targets`, `settings`, `recover`,
 `usage`, `capabilities`, `fit`, `tasks`, `task_wait`, `task_stop`, `compact`,
@@ -264,6 +265,10 @@ answers `info`, `providers`, `list`, `create`, `open`, `status`, `close`, `promp
 includes `usage`, `capabilities` and `tasks` for these additions. Status has stable
 `activity` codes shared with the native host, plus `waiting_tasks` and `background`,
 and a `background` count; `list` entries instead carry boolean `background`. See [API.md](API.md).
+
+The shipped `embedded.d.mts` declares the client methods and events, including
+`restSession`, `status(dir, {history: {from}})` and the `compacted.cleared` flag.
+The package test checks this contract with pinned TypeScript (see [testing.md](testing.md)).
 
 ### App tools
 
@@ -383,8 +388,10 @@ A model request is reserved in the store before the `fetch` work item is handed 
 Credentials are asked for before that reservation, so a missing key never leaves a
 request with an unknown outcome. If the app is killed before a response is recorded,
 the store keeps the request as unresolved, and `recover` reports
-`wake.work: 'blocked'`. In that case, and after a `stop` that cut a request off,
-`resume` sends nothing and fails with kind `failed`. `retry` sends the request again,
+`wake.work: 'blocked'`. By default, in that case and after a `stop` that cut a request
+off, `resume` sends nothing and fails with kind `failed`. A session whose
+`resend_unknown` setting is true permits bounded automatic resends, as the native driver
+does; that setting may be disabled before resuming a stopped request. `retry` sends the request again,
 once, from the point before it. When the unresolved request is the session's first,
 `retry` moves the old store aside (`store.abandoned-<n>` in a Node session directory,
 where its unknown request stays on record), opens a fresh store, and restarts the same

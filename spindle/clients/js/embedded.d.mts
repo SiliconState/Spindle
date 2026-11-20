@@ -13,7 +13,7 @@ export declare class SpindleError extends Error {
 /** An event's stable form; `type` names it (docs/API.md lists every field). */
 export type SpindleEvent =
   | { type: 'prompt'; text: string }
-  | { type: 'compacted'; before: number; after: number }
+  | { type: 'compacted'; before: number; after: number; cleared: boolean }
   | { type: 'model_step'; provider: string; model: string; step: number }
   | { type: 'model_delta'; text: string }
   | { type: 'model_text_withdrawn' }
@@ -247,6 +247,8 @@ export declare class EmbeddedClient {
   create(dir: string, provider: string, settings?: SessionSettings): Promise<any>;
   open(dir: string): Promise<any>;
   closeSession(dir: string): Promise<{ session: string; closed: boolean }>;
+  /** Marks an idle store cleanly resting without closing its session. */
+  restSession(dir: string): Promise<{ session: string; rested: boolean }>;
   /** Gives back the free pages of the session's stores (its tasks' too); sizes in bytes.
    * An open session closes first; one with a turn or a background task running is refused. */
   compactSession(dir: string): Promise<{ session: string; before: number; after: number; stores: number }>;
@@ -256,7 +258,7 @@ export declare class EmbeddedClient {
   rewind(dir: string, revision: number, options?: { expectedHead?: number }): Promise<TurnResult>;
   stop(dir: string): Promise<{ session: string; stopping: true }>;
   steer(dir: string, text?: string, options?: { now?: boolean }): Promise<{ session: string; queued: number }>;
-  status(dir: string): Promise<any>;
+  status(dir: string, options?: { history?: { from?: number } }): Promise<any>;
   /** `from`: only the messages from that index on (`total` counts them all). */
   history(dir: string, revision?: number, options?: { from?: number }): Promise<{ head: number; revision: number; messages: unknown[]; total: number; app_details: unknown[] }>;
   /** Rewind targets among the newest `limit` steps (48 unless said; at most 8192), newest first. */

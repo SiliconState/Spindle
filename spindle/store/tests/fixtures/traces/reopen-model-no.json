@@ -67,7 +67,7 @@
       {
         "command_id": "start",
         "kind": "dext-turn-v1",
-        "payload": "71c2a48ef37da1a9411eb9f6",
+        "payload": "0739ce1f6a281f92756d2708",
         "scope": "operator",
         "sequence": 1
       },
@@ -139,22 +139,22 @@
     ],
     "proposals": [
       {
-        "canonical": "dee3215ceddc98c694f82804",
+        "canonical": "83dd220c2d016b986ee6dd8d",
         "id": "commit-start",
         "revision": 1
       },
       {
-        "canonical": "c36907f7781235ab6cf475ec",
+        "canonical": "884f16ef92dce942f26a81a1",
         "id": "adopt-r1",
         "revision": 2
       },
       {
-        "canonical": "22db906e89c40bb32a521333",
+        "canonical": "92d87ce3cd2e17705202eb89",
         "id": "adopt-r2",
         "revision": 3
       },
       {
-        "canonical": "93ad690d88563d08e3969139",
+        "canonical": "0dd6e87e05d1ab62577e3564",
         "id": "commit-prepare-r3",
         "revision": 4
       }
@@ -180,28 +180,28 @@
         "workspace": null
       },
       {
-        "continuation": "e2913885a7f2c18d09851b34",
+        "continuation": "2ec8364b80874bf9142bc5de",
         "engine": "dext-turn-v1",
         "revision": 1,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "639c5df4ac1049964038b24f",
+        "continuation": "3997538d734684775175ec0a",
         "engine": "dext-turn-v1",
         "revision": 2,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "888a3f4973dd5c1cf8481e9f",
+        "continuation": "fcf0f4e33df2e9ba1490904e",
         "engine": "dext-turn-v1",
         "revision": 3,
         "scope": "operator",
         "workspace": "168c635084dfd00454c55a2fb8671c30c11c6270f54146c1b9b566f7707cf2fd"
       },
       {
-        "continuation": "fe4192af0ed783cf512e1fca",
+        "continuation": "6b64dec7d2406aa51e7c697a",
         "engine": "dext-turn-v1",
         "revision": 4,
         "scope": "operator",

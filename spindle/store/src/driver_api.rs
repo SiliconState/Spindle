@@ -265,7 +265,9 @@ impl Driver {
                     &state,
                     after,
                 )?;
-                step.emit(Event::Extended { steps: 24 });
+                step.emit(Event::Extended {
+                    steps: super::TURN_STEPS,
+                });
                 Ok(Need::Continue)
             }
             Phase::Stopped(stop) => {

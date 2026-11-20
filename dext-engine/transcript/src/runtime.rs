@@ -2976,6 +2976,7 @@ mod tests {
             input: 195_000,
             output: 8_000,
             cache_create: 0,
+            cache_create_1h: 0,
             cache_read: 0,
             cost_usd: None,
         };
@@ -3526,6 +3527,7 @@ mod tests {
             input: 185_000,
             output: 8_000,
             cache_create: 0,
+            cache_create_1h: 0,
             cache_read: 0,
             cost_usd: None,
         };

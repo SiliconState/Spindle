@@ -479,23 +479,32 @@ fn end_task(tx: &Connection, task: &str, input: &[u8], end: TaskEnd<'_>) -> Resu
 /// by row, each dropped once checked, so a check holds one task's answer at a time
 /// however many tasks a store keeps (`tasks_on` would hold all of them). Rows are read
 /// in the table's own order (no sort to hold them either); the rows accepted are the
-/// same in any order.
-pub(crate) fn validate_tasks(db: &Connection) -> Result<()> {
+/// same in any order. `since`: the revision watermark the last open validated (0 in a
+/// full check: none).
+pub(crate) fn validate_tasks(db: &Connection, since: i64) -> Result<()> {
     let mut query = db.prepare(&format!("SELECT {TASK_COLUMNS} FROM task_runs LIMIT 4097"))?;
     let mut rows = query.query([])?;
     let mut count = 0;
+    // The files the bases checked so far proved: the next base sharing them (as a
+    // thread's tasks' bases share most of theirs) checks only its own.
+    let mut proven = std::collections::HashSet::new();
     while let Some(row) = rows.next()? {
         count += 1;
         if count > 4096 {
             return Err(Error::Exhausted);
         }
-        validate_task(db, &task_run(row)?)?;
+        validate_task(db, &task_run(row)?, since, &mut proven)?;
     }
     Ok(())
 }
 
 /// One `task_runs` row as `validate_tasks` checks it.
-fn validate_task(db: &Connection, run: &TaskRun) -> Result<()> {
+fn validate_task(
+    db: &Connection,
+    run: &TaskRun,
+    since: i64,
+    proven: &mut std::collections::HashSet<String>,
+) -> Result<()> {
     if !crate::valid_label(&run.task)
         || !crate::artifact::valid_digest(&run.base)
         || !matches!(
@@ -510,7 +519,12 @@ fn validate_task(db: &Connection, run: &TaskRun) -> Result<()> {
     {
         return Err(Error::Incompatible);
     }
-    crate::workspace::validate_root(db, "operator", &run.base)?;
+    // A base a validated revision names (as almost every task's is: the workspace it
+    // started from) had its files hashed by the open that validated that revision: they
+    // count as matching their digests, and its manifest and every file's pin are still
+    // checked. Hashed again at each open, a thread's tasks' files made it slow to open.
+    let hashed = crate::workspace::validated_root(db, &run.base, since)?;
+    crate::workspace::validate_root_among(db, "operator", &run.base, hashed, proven)?;
     #[cfg(feature = "dext-turn")]
     {
         let input: serde_json::Value =

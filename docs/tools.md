@@ -600,7 +600,11 @@ answered through the app-tool path, and a child session gives the answer.
 enforced with slot files under the session's `cache/task-slots`. Several foreground
 `task` calls in one model step all start from the step's original tree and run
 concurrently, in chunks of `max_running`. Their results are recorded in call order
-([`run_task_batch`](../spindle/store/src/agent.rs)).
+([`run_task_batch`](../spindle/store/src/agent.rs)). The embedded host counts its
+background tasks and the batch's running ones the same way: a foreground call beyond the
+limit waits and starts when one of them ends; a background one is answered at once that
+it did not start (the model starts it again later), rather than waiting behind tasks that
+may run for hours.
 
 When a task's turn ends, its answer is the child's last reply. If the child stopped on
 its own before finishing, for example on its budget, the answer starts with "The task

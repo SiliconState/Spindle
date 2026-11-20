@@ -183,12 +183,16 @@
         <div class="card"><span class="tag">Terminal</span><h3>A CLI that survives you.</h3><p><code>spindle new</code>,
           <code>say</code>, <code>continue</code>, <code>retry</code>, <code>rewind</code>. Steer or stop a running turn
           from another shell, read it while it works, and take its changes as a patch with <code>spindle diff</code>.
-          Sessions are directories you can inspect, export and move.</p></div>
+          Sessions are directories you can inspect, export and move. Inbox tests wait for actual
+          delivery, not just the listener claiming a message. Task-panic tests separate startup
+          from cleanup deadlines, and the v86 Node gate pins its tested Node runtime and bounds
+          compiler concurrency.</p></div>
         <div class="card"><span class="tag">Server</span><h3>Your agent, on your phone.</h3><p><code>spindle serve</code>
           runs a mobile web UI and an HTTP API on loopback, paired per device, behind your own HTTPS proxy.</p></div>
         <div class="card"><span class="tag">App</span><h3>Durability as a library.</h3><p>Drive sessions over
           JSON-RPC or HTTP, or run the WebAssembly package in Node or a browser worker, with app tools whose calls
-          keep stable ids across crashes.</p></div>
+          keep stable ids across crashes. Its TypeScript declarations cover resting sessions, status with history,
+          and compaction events, checked by the package tests.</p></div>
       </div>
     </div>
   </section>
@@ -207,7 +211,13 @@
         <h3>An agent that lives in your browser.</h3>
         <p>Spindle keeps your conversation and workspace together, helps recover saved progress after
           interruptions, and lets you export the session when you want to move. In the browser, threads keep going
-          with the panel closed and read your tabs once you switch that on.</p>
+          with the panel closed and read your tabs once you switch that on.
+          The browser's automatic resend setting is checked before a message, Retry or Continue; an unreadable
+          or malformed preference stops before sending, with Settings still available to repair it.
+          A new thread's unsent first message and files survive preparation failures or Stop;
+          recovery merges stay atomic, ordered and idempotent.
+          One-hour Anthropic cache writes are counted at their higher rate, including partial usage updates.
+          The package's OPFS browser tests wait for their own page before attaching to Chrome.</p>
         <span class="more">See Spindle for Browser &rarr;</span>
       </a>
     </div>

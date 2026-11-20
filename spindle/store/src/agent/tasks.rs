@@ -912,15 +912,17 @@ mod tests {
     fn panicking_task_releases_its_cancellation_watcher_and_retains_a_stop_saying_why() {
         let root = std::env::temp_dir().join(format!("spindle-task-panic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        struct Panics;
+        struct Panics(std::sync::mpsc::SyncSender<()>);
         impl Observer for Panics {
             fn event(&self, event: Event<'_>) {
                 if matches!(event, Event::Task { event, .. } if event["type"] == "prompt") {
+                    self.0.try_send(()).unwrap();
                     panic!("injected task observer panic");
                 }
             }
         }
-        let observer: Arc<dyn Observer> = Arc::new(Panics);
+        let (started, panicking) = std::sync::mpsc::sync_channel(1);
+        let observer: Arc<dyn Observer> = Arc::new(Panics(started));
         let mut parent = Session::create(&root, Settings::from_json(&json!({"provider":"local", "model":"fixture", "builtin_tools":"none", "compaction":"digest"})).unwrap(), vec![], observer).unwrap();
         parent
             .start_turn(
@@ -930,7 +932,10 @@ mod tests {
             .unwrap();
         let input = json!({"prompt":"child"});
         parent.start_task("panic", &input, "queue").unwrap();
-        let result = parent.wait_task("panic", Duration::from_secs(5)).unwrap();
+        panicking
+            .recv_timeout(Duration::from_secs(60))
+            .expect("task did not reach its injected panic");
+        let result = parent.wait_task("panic", Duration::from_secs(10)).unwrap();
         assert_eq!(result["state"], "stopped", "{result}");
         assert_eq!(result["pending"], false, "{result}");
         assert!(

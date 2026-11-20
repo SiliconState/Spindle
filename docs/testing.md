@@ -57,13 +57,18 @@ use `--workspace --all-features` to include `spindle-store` and `spindle-embed`.
 | `bundle.rs` | Store images and session bundles, including damaged and hostile input. Every case is read both in memory and unpacked from a file into a staging directory, with the same answer word for word (or the same files, byte for byte); a bundle's manifest is checked before any file is read; a store's settings too large for a sidecar are refused before they are kept; a previous-schema store is checked where it lies and left byte for byte as it came |
 | `import.rs` | Native imports (`agent::import_session`): a bundle refused at any step (its checksum, a file's digest after others were staged, a store, a sidecar) leaves nothing staged or in place; each import stages in a new, private directory, and one a stopped import left is swept while a live import's is kept; a relative path beginning `file:` is checked as a path. On Linux, child-process probes of peak memory: an import of a store over 64 MiB grows the peak by less than half the store (a read in memory grows past it), a store of 64 tasks' 1 MiB answers is checked one task at a time, and stores with settings far over 4 MiB are refused before their settings are kept |
 | `api.rs` | `spindle api` end to end over JSON-RPC (Unix), plus the Node and Python client smoke tests when those interpreters are installed. The golden frames in `fixtures/protocol/` are checked by a unit test in `src/api/stdio.rs` |
-| `embedded.rs` | Native/embedded parity, shared usage and budgets (nested calls, summaries and task trees), queued tasks, stopped reports, resume and settings fit |
+| `embedded.rs` | Native/embedded parity, shared usage and budgets (nested calls, summaries and task trees), mixed-TTL cache costs across reopen, request-scoped IDs for repeated id-less calls, resend-consent changes while a request is unknown, queued tasks, stopped reports, resume and settings fit |
 | `bench.rs` | Ignored local benchmark of the embedded host built natively: small sessions, long history reads/reopens/exports, compaction, timings and peak resident memory |
 | `host_tools.rs`, `self_edit.rs` | Host tools and self-edit threads end to end through `spindle serve` |
 | `cli.rs` | The `spindle` command line end to end (Linux): a turn driven and read back from a second process (`status`, `log`, `files`, `diff`, `--json`), an unreachable provider counted refused and never uncertain, refused command lines that change nothing, and a prompt from standard input |
 
 `power_loss.rs` runs a sample of crash points by default; `SPINDLE_POWER_LOSS=all` sweeps
-every point and takes much longer.
+every point and takes much longer. The CLI inbox unit test waits up to five seconds
+for claimed messages to reach the steering, read-now and interrupt handles. Claiming
+removes the inbox file before delivering it, so `send` returning `Taken` alone is not
+a delivery barrier. The task-panic recovery regression separately waits up to 60 seconds
+for its injected panic to be reached, then allows ten seconds for cleanup and durable
+stop recording; slow Windows startup does not consume the cleanup deadline.
 
 Some cases need Linux namespaces and `bubblewrap`, delegated cgroup v2, or interpreters
 (Python, Node). Where a requirement is missing, the test reports a skip; a skip is not
@@ -92,14 +97,26 @@ failure's output and rerun the affected suites separately when diagnosing it.
 | `SPINDLE_BROWSER=/path/to/chromium node --test store/tests/ui_browser.mjs` | The web UI in a real headless browser |
 | `SPINDLE_BIN=target/release/spindle node clients/js/smoke_test.mjs` | The Node client against a real `spindle api` |
 | `SPINDLE_BIN=target/release/spindle python3 clients/python/smoke_test.py` | The Python client |
-| `embed/tests/package.sh WASM_BINDGEN` | Builds the wasm package and runs Node and optional OPFS browser tests. Includes `node_compact.mjs`: shrink session/task stores, preserve history/files/head, remove interrupted copies and refuse busy sessions (needs `node:sqlite`, Node 22.5+) |
+| `embed/tests/package.sh WASM_BINDGEN` | Checks the TypeScript client contract, builds the wasm package and runs Node and optional OPFS browser tests. Includes `node_compact.mjs`: shrink session/task stores, preserve history/files/head, remove interrupted copies and refuse busy sessions (needs `node:sqlite`, Node 22.5+) |
 | `SPINDLE_KEY=... SPINDLE_REAL_BROWSER=/path/to/chrome SPINDLE_BIN=target/release/spindle node embed/tests/browser_real.mjs KIT_DIR --provider ID [--model M] [--catalog FILE]` | The package in a real browser against a real provider (`KIT_DIR` from `embed/kit.sh`): stop and resume, steering, a killed browser's unknown request, `retry`, and a bundle out to a native host and back. Real, billed requests |
 | `store/tests/wasi_probe.sh WASI_LIBC_ROOT` | The store compiled for WASI (against an extracted wasi-libc package), run under Node |
+
+The package test needs Node and npm. It installs the test-only TypeScript 5.9.3 compiler
+from `embed/tests/package-lock.json` with lifecycle scripts disabled, then checks
+`types.mts` against the shipped `embedded.d.mts`: resting sessions, status plus history,
+and the compaction event's `cleared` flag, including rejected argument types. Run it alone:
+
+```sh
+npm --prefix embed/tests ci --ignore-scripts --no-audit --no-fund
+npm --prefix embed/tests test
+```
 
 The embedded [`browser_opfs.mjs`](../spindle/embed/tests/browser_opfs.mjs) checks
 worker/session exclusion, reopen after Chrome restarts, and OPFS compaction with
 history and files intact when sibling Node glue and `node:sqlite` can create the
-fragmented fixture. [`node_opfs_replace.mjs`](../spindle/embed/tests/node_opfs_replace.mjs)
+fragmented fixture. The harness waits up to 15 seconds for its exact test-page target
+before attaching; Chrome can answer DevTools before that page exists.
+[`node_opfs_replace.mjs`](../spindle/embed/tests/node_opfs_replace.mjs)
 also checks short header I/O, same-path rename, and interrupted replacements: a rename
 whose record cannot be written changes nothing and the pool goes on; one that fails
 after its record stops the pool (every later call fails) until the next open finishes
@@ -153,6 +170,14 @@ pull request, except those that change only the website or the release workflow:
 | `wasm` | Provider/wire wasm32 builds, store/WASI, Node/OPFS, browser Linux and both browser editions; scripted extension and sign-in/vault suites, focused Node checks, renewal and real-Chrome review |
 | `windows` | Native store, CLI and engine tests on Windows |
 
+Within the wasm job, Node is pinned to the locally verified 22.22.1 rather than the
+runner image's moving default (24.22.2 produced intermittent V8 Zone allocation failures
+in v86). The setup-node action is pinned by commit. The v86 Node suite runs with a
+4096 MiB old-space limit and two WebAssembly compiler tasks. The 512 MiB guest, saved
+state and generated code need room outside the JavaScript heap; limiting compiler
+concurrency bounds simultaneous compilation work. The assertions and guest memory
+size are unchanged.
+
 Two more workflows publish. [`pages.yml`](../.github/workflows/pages.yml) deploys `site/` to
 GitHub Pages when it changes. [`browser-release.yml`](../.github/workflows/browser-release.yml),
 on a `browser-v*` tag, builds both source/GitHub and store editions, tests the exact
@@ -171,9 +196,11 @@ and navigation through large trees; `linux_warm.mjs` checks lazy v86 starts;
 `engine_renew.mjs` checks old wasm memory is released and fresh sessions work.
 `review_browser.mjs` covers contained/static previews and version choices,
 template/reparse sanitizing, WebRTC and DNS leakage checks with a positive netlog
-control, background task cards/reports, queued file messages, reset backup cleanup,
+control, background task cards/reports, queued file messages (merged atomically in
+send order, replayed once), reset backup cleanup,
 one copy per moved thread, move and index updates sharing one strict transaction, and
-Storage > Free. Its document previews (since 0.1.7) use
+Storage > Free, plus a malformed resend preference refusing sends without blocking
+Settings and an explicit replacement choice restoring operation. Its document previews (since 0.1.7) use
 [`office_fixtures.mjs`](../spindle/chrome/tests/office_fixtures.mjs): a Word, an Excel
 and a PowerPoint file written as those programs write them (stored and deflated parts),
 a PDF, an SVG without its namespace, one whose markup is not XML, a short WAV, and

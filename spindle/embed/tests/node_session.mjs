@@ -52,6 +52,11 @@ async function aTurnWithFileTools() {
   assert.equal(events.filter((e) => e.type === 'tool_result').length, 2);
   const history = await c.history(dir);
   assert.equal(history.messages.at(-1).content[0].text, 'done');
+  const both = await c.status(dir, { history: { from: 1 } });
+  assert.deepEqual(both.history, await c.history(dir, undefined, { from: 1 }));
+  const rested = await c.restSession(dir);
+  assert.deepEqual(rested, { session: dir, rested: true });
+  assert.equal((await c.status(dir)).head, both.head);
   await c.close();
   for (const file of filesUnder(dir)) {
     assert.ok(!fs.readFileSync(file).includes(Buffer.from(KEY)), `the key is in ${file}`);

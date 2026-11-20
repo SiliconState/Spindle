@@ -409,8 +409,12 @@ impl Event<'_> {
         // Exhaustive on purpose: a new variant must be given its JSON form here.
         match self {
             Event::Prompt { text } => json!({"type": "prompt", "text": text}),
-            Event::Compacted { before, after } => {
-                json!({"type": "compacted", "before": before, "after": after})
+            Event::Compacted {
+                before,
+                after,
+                cleared,
+            } => {
+                json!({"type": "compacted", "before": before, "after": after, "cleared": cleared})
             }
             Event::ModelStep {
                 provider,

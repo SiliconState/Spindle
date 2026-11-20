@@ -398,16 +398,32 @@ async function setupOf(id, settings) {
   ].filter(Boolean).join('\n');
 }
 
-/** Before a turn, a thread gets what is current, if it differs (if it cannot, the turn
- * goes on as it was): the guide's wording (for a thread made by an earlier build), the
- * user's standing instructions, the page tools as they are now (a thread offered some
- * has all), and, once, summaries its model writes when its history is compacted (a
- * thread made here by an earlier build compacted by digest: Chrome could do no better
- * then; threads made or imported since are marked `summaries` and keep their own). */
+/** Whether a thread sends a request whose reply was cut off (a dropped connection, a
+ * stream that broke, a provider that broke off saying it is overloaded) again by itself,
+ * up to three times, rather than stopping its turn until Retry: on unless the user
+ * turned it off (Settings, Your instructions). Such a request may have been billed
+ * already. */
+async function resendOn() {
+  const choice = await read('kv', 'resend');
+  if (choice === undefined) return true;
+  if (typeof choice !== 'boolean') throw failure('invalid', 'the saved automatic resend choice is invalid; set it again in Settings');
+  return choice;
+}
+
+/** Resend consent is known and applied before anything may send, even Retry/Continue.
+ * An unreadable preference or failed update stops there, never restoring a default. */
+async function syncResend(dir) {
+  const resend = await resendOn();
+  const settings = await client.settings(dir);
+  if (Boolean(settings.resend_unknown) !== resend) await client.settings(dir, { resend_unknown: resend });
+  return settings;
+}
+
+/** Resend consent must be current; other instruction/tool refreshes are best effort. */
 async function freshen(dir) {
+  const settings = await syncResend(dir);
   try {
     const id = dir.slice(dirOf('').length);
-    const settings = await client.settings(dir);
     const instructions = settings.instructions ?? '';
     const tools = settings.tools ?? [];
     const changes = {};
@@ -565,6 +581,9 @@ function makeClient(saved) {
     if (!id) return;
     if (event?.type === 'task') noteTask(id, event);
     send({ type: 'event', thread: id, event });
+    // A background task that ended by itself, its thread otherwise idle: the thread's
+    // store rests, and its session closes, as after any use.
+    if (event?.type === 'task' && event.event?.type === 'stopped' && !running.has(id) && !using.has(id)) rest(id);
   });
   for (const name of ['work_error', 'app_tool_error']) made.on(name, (error) => console.error(`Spindle ${name}:`, error));
   return made;
@@ -1316,24 +1335,58 @@ async function within(id, work) {
   }
 }
 
-/** How long an idle thread's session stays open: reads one after another (a page's
- * preview reading what it refers to, say) share one opening, not one each. */
-const REST_AFTER_MS = 2_000;
+/** How long an idle thread's session stays open: going back to a thread (or reads one
+ * after another, a page's preview reading what it refers to) finds it open, its store
+ * not opened and checked again. A moment after its last use its store rests
+ * (`SETTLE_MS`, `restSession`): Chrome stopping (quit, say) while it is open then leaves
+ * it as a clean close does, so the next open does not check every page of it. Before
+ * stores rested, an open session at a quit cost the next open seconds, which held this
+ * to 2 seconds and made nearly every open of a thread a store's open. */
+const REST_AFTER_MS = 30_000;
+const SETTLE_MS = 250;
+/** Idle sessions kept open at once: going through threads in turn, the one idle longest
+ * closes as another comes to rest (each holds its store's cache in the engine's memory,
+ * which the engine gives back only once no session is open). */
+const IDLE_OPEN = 4;
+/** Idle threads' close timers, the one idle longest first. */
 const resting = new Map();
+const settling = new Map();
 
-/** Closes an idle thread's session once it has rested a moment; the package refuses to
- * close a running one. */
+/** Rests an idle thread's store in a moment, then closes its session once it has been
+ * idle a while (or once IDLE_OPEN others came to rest after it); the package refuses to
+ * rest or close a running one. */
 function rest(id) {
   clearTimeout(resting.get(id));
-  const timer = setTimeout(() => {
-    resting.delete(id);
+  // Set again below: the thread that came to rest last, last.
+  resting.delete(id);
+  clearTimeout(settling.get(id));
+  const settle = setTimeout(() => {
+    settling.delete(id);
     if (running.has(id) || using.has(id)) return;
-    client.closeSession(dirOf(id)).then(() => {
-      if (!running.size && !using.size) renewEngineSoon();
-    }, () => {});
-  }, REST_AFTER_MS);
+    Promise.resolve().then(() => client.restSession(dirOf(id))).catch(() => {});
+  }, SETTLE_MS);
+  settle?.unref?.();
+  settling.set(id, settle);
+  const timer = setTimeout(() => closeIdle(id), REST_AFTER_MS);
   timer?.unref?.();
   resting.set(id, timer);
+  for (const [oldest] of resting) {
+    if (resting.size <= IDLE_OPEN) break;
+    closeIdle(oldest);
+  }
+}
+
+/** Closes an idle thread's session now, its timers cleared (one in use or running stays
+ * open: its end rests it again). */
+function closeIdle(id) {
+  clearTimeout(resting.get(id));
+  resting.delete(id);
+  clearTimeout(settling.get(id));
+  settling.delete(id);
+  if (running.has(id) || using.has(id)) return;
+  client.closeSession(dirOf(id)).then(() => {
+    if (!running.size && !using.size) renewEngineSoon();
+  }, () => {});
 }
 
 /** Once the engine has rested a while, a grown instance is renewed (`renewEngine`). */
@@ -1462,7 +1515,7 @@ async function afterTurn(id, unsent, took, { sending, failed, completed = false 
     // commits the message first). Handed over to one that failed: its history tells.
     const taken = sending && (!failed || (await tookMessage(id, took).catch(() => false)));
     if (taken) await dropQueued(took).catch(() => {});
-    else await requeue(id, took, sending ? 'its turn failed before taking it' : 'you stopped its turn before it began');
+    else await requeue(id, took, failed ? 'its turn failed before taking it' : 'you stopped its turn before it began');
   }
   await holdUnsent(id, unsent);
   send({ type: 'turn_end', thread: id, unsent: [] });
@@ -1482,6 +1535,7 @@ async function holdUnsent(id, unsent) {
   const waiting = queued.get(id);
   if (waiting && !waiting.held) {
     waiting.text = [...unsent, waiting.text].join('\n\n');
+    delete waiting.attachmentNote;
     await keepQueued(waiting).catch(() => {});
     announceQueued(id);
     return;
@@ -1505,9 +1559,12 @@ const QUEUED = 'queued:';
 function waitingMessage(id, text, files) {
   return { key: `${QUEUED}${id}:${crypto.randomUUID()}`, thread: id, text: String(text), files: files ?? [], held: null, at: Date.now() };
 }
+function queuedRecord(waiting) {
+  return { thread: waiting.thread, text: waiting.text, files: waiting.files, ...(waiting.attachmentNote !== undefined && { attachmentNote: waiting.attachmentNote }), held: waiting.held ?? null, at: waiting.at };
+}
 /** Writes a waiting message's record as it is now. */
 function keepQueued(waiting) {
-  return writeDurably('kv', waiting.key, { thread: waiting.thread, text: waiting.text, files: waiting.files, held: waiting.held ?? null, at: waiting.at });
+  return writeDurably('kv', waiting.key, queuedRecord(waiting));
 }
 /** Removes a waiting message's record. */
 function dropQueued(waiting) {
@@ -1529,13 +1586,19 @@ async function enqueue(waiting) {
 }
 /** Puts `took` (a waiting message no turn took) back for thread `id`, held for `why`: in
  * front of one that waits now, if one does. */
-async function requeue(id, took, why) {
+async function requeue(id, took, why, { after = false } = {}) {
   const there = queued.get(id);
   if (there) {
-    there.text = `${took.text}\n\n${there.text}`;
-    there.files = [...took.files, ...there.files];
-    await keepQueued(there);
-    await dropQueued(took).catch(() => {});
+    if (there.key === took.key) return;
+    const ordered = after ? [there, took] : [took, there];
+    const combined = { ...there, text: ordered.map((one) => one.text).join('\n\n'), files: ordered.flatMap((one) => one.files), held: there.held ?? why };
+    delete combined.attachmentNote;
+    await writeTogether([
+      ['kv', there.key, queuedRecord(combined)],
+      ['kv', took.key, undefined],
+    ], 'strict');
+    Object.assign(there, combined);
+    delete there.attachmentNote;
   } else {
     took.held = why;
     queued.set(id, took);
@@ -1546,7 +1609,7 @@ async function requeue(id, took, why) {
 /** Whether thread `id` (here) holds `waiting` as one of its latest user messages: the
  * turn that took it committed it. */
 function tookMessage(id, waiting) {
-  const said = waiting.text + attachedNote(waiting.files);
+  const said = waiting.text + (waiting.attachmentNote ?? attachedNote(waiting.files));
   return within(id, async () => {
     const messages = (await client.history(dirOf(id))).messages ?? [];
     return messages.slice(-64).some((message) => message.role === 'user'
@@ -1574,12 +1637,12 @@ async function restoreQueued() {
       await removeDurably('kv', record.key).catch(() => {});
       continue;
     }
-    const waiting = { key: record.key, thread: id, text: String(record.text ?? ''), files: record.files ?? [], held: null, at: record.at ?? 0 };
+    const waiting = { key: record.key, thread: id, text: String(record.text ?? ''), files: record.files ?? [], ...(typeof record.attachmentNote === 'string' && { attachmentNote: record.attachmentNote }), held: null, at: record.at ?? 0 };
     if (!thread.home && await tookMessage(id, waiting).catch(() => false)) {
       await removeDurably('kv', record.key).catch(() => {});
       continue;
     }
-    await requeue(id, waiting, record.held ?? `${BROWSER} stopped before the turn it waited for ended`).catch((error) => {
+    await requeue(id, waiting, record.held ?? `${BROWSER} stopped before the turn it waited for ended`, { after: true }).catch((error) => {
       console.warn('Spindle: a waiting message could not be restored:', error);
     });
   }
@@ -1611,7 +1674,7 @@ async function sendQueued(id) {
     turn(id, async (check) => {
       await freshen(dirOf(id));
       check();
-      return client.prompt(dirOf(id), waiting.text + note, files ? { files } : {});
+      return client.prompt(dirOf(id), waiting.text + (waiting.attachmentNote ?? note), files ? { files } : {});
     });
     // Out of the queue once its turn has started (until then a failure holds it); its
     // record stays until that turn has ended (`afterTurn`).
@@ -1755,6 +1818,10 @@ async function snapshot() {
   const catalogSaved = Boolean(await read('kv', 'catalog'));
   const sites = await sitesKept();
   const standing = (await read('kv', 'standing')) ?? '';
+  const resendChoice = await resendOn().then(
+    (resend) => ({ resend }),
+    (error) => ({ resend: null, resendError: String(error?.message ?? error) }),
+  );
   const relay = (await read('kv', 'relay')) ?? null;
   const vault = await vaultState();
   // Sign in with ChatGPT registrations kept (outliving a sign-out), by provider: the
@@ -1779,6 +1846,7 @@ async function snapshot() {
     sites,
     approvals: approvalsShown(),
     standing,
+    ...resendChoice,
     relay,
     vault,
     registrations,
@@ -1797,8 +1865,11 @@ function announceVault() {
   vaultState().then((state) => send({ type: 'vault', vault: state }));
 }
 
-/** The last turnFiles answer, by thread and revision (asked again at every turn's end). */
-let turnFilesKept = { key: null, value: null };
+/** The last turnFiles answer of each of the threads asked about last, by thread (each
+ * for one revision; asked again at every turn's end): going back to a thread does not
+ * look for its last turn's start again (seconds of reads in a long thread). */
+const turnFilesKept = new Map();
+const TURN_FILES_KEPT = 8;
 
 /** Said when the messages before a summary are asked for while the thread works: a
  * store lists no points to go back to meanwhile. */
@@ -1828,12 +1899,23 @@ async function letOthersGo() {
  * thread, the engine answering nothing meanwhile. A rewind past the message and on
  * again breaks that order and can hide the point: `thorough` then reads every target,
  * newest first (its length first, the whole only for one of that length), as Rewind
- * needs; without it (marking what a turn changed) the point is then not found. */
+ * needs; without it (marking what a turn changed) the point is then not found.
+ * Without `thorough`, the newest targets are listed first (128, then 1024, then all):
+ * the point before the thread's last message is nearly always among them, and listing
+ * 8192 steps at once was one call of seconds in a long thread, every other thread's
+ * work waiting behind it. More are listed only while the oldest listed still holds the
+ * message (the point is older than the list). */
 async function pointBefore(dir, shown, at, { thorough = false } = {}) {
   const before = JSON.stringify(shown.slice(0, at));
   const through = JSON.stringify(shown.slice(0, at + 1));
-  const targets = await client.targets(dir, { limit: 8192 });
   const begun = (messages) => messages.length > at && JSON.stringify(messages.slice(0, at + 1)) === through;
+  let targets = [];
+  for (const limit of thorough ? [8192] : [128, 1024, 8192]) {
+    targets = await client.targets(dir, { limit });
+    if (limit === 8192 || targets.length === 0) break;
+    await letOthersGo();
+    if (!begun((await client.history(dir, targets.at(-1).revision)).messages ?? [])) break;
+  }
   // The histories of targets before `low` begin so, those from `high` on do not;
   // `without` is the one at targets[high], once one is read.
   let low = 0;
@@ -1891,7 +1973,7 @@ async function checkCreation(provider, settings) {
 /** A first turn's old record survives a reset, even if the engine stops during it. */
 async function replaceFirst(id, provider, settings) {
   await checkCreation(provider, settings);
-  turnFilesKept = { key: null, value: null };
+  turnFilesKept.delete(id);
   // A name of its own (its time and a random part): no reset writes over another's.
   const backup = `prior:${id}:${String(Date.now()).padStart(15, '0')}:${crypto.randomUUID()}`;
   // Checked whole: if the reset fails, this is what the thread comes back from. On disk
@@ -2046,6 +2128,8 @@ const ops = {
       await client.create(dir, provider, {
         ...(model && { model }), ...(effort && { effort }), runner: where, network: Boolean(network) && where !== 'none',
         ...(instructions && { instructions }), ...(tasks && { tasks: true }),
+        // A request cut off mid-reply goes again by itself unless the user said not to.
+        ...((await resendOn()) && { resend_unknown: true }),
         // A spending limit set for new threads (dollars, tasks included).
         ...(Number.isFinite(limit) && limit >= 0 && { max_usd: limit }),
         // Where history compacts, when the user set one for new threads (else the
@@ -2063,21 +2147,30 @@ const ops = {
       runner: status.settings?.runner ?? 'app', network: Boolean(status.settings?.network), tasks: Boolean(status.settings?.tasks),
       created: now, updated: now, state: 'idle', note: null, summaries: true,
     };
-    // On disk before anything else is told of it: an index entry lost to a power cut
-    // would leave the thread's files unlisted (found again at the next start).
-    await writeDurably('threads', id, thread);
-    send({ type: 'thread', thread });
     const { files, note } = attachments(given);
     const sent = [...(carried?.files ?? []), ...(files ?? [])];
     // Before the attachments' line, which ends a message.
     const started = carried ? `\n\n[Started with the files of “${carried.title}”: ${carried.files.length} in the workspace]` : '';
-    // Its setup in its instructions from its first turn on (`setupOf`), inside the turn
-    // as `send` does, so nothing else starts one meanwhile. Unlike a later message, the
-    // first has no box to go back to, so a Stop does not hold it back here (as before).
-    turn(id, async () => {
+    const waiting = waitingMessage(id, text + started, sent);
+    waiting.attachmentNote = note;
+    // The index and first message survive together, even if preparation fails or the
+    // engine stops before the package takes it.
+    try {
+      await writeTogether([
+        ['threads', id, thread],
+        ['kv', waiting.key, queuedRecord(waiting)],
+      ], 'strict');
+    } catch (error) {
+      await discard(id).catch(() => {});
+      throw error;
+    }
+    send({ type: 'thread', thread });
+    turn(id, async (check) => {
       await freshen(dir);
-      return client.prompt(dir, text + started + note, sent.length ? { files: sent } : {});
+      check();
+      return client.prompt(dir, waiting.text + note, sent.length ? { files: sent } : {});
     });
+    carrying.set(id, waiting);
     warmFor(thread);
     return { id };
   },
@@ -2141,13 +2234,21 @@ const ops = {
     // A step stopped in the thread's first request has nothing before it to ask again
     // from: the turn starts over instead (taken back, its message sent again).
     if (await firstStepStopped(id)) return ops.restart({ id });
-    turn(id, () => client.retry(dirOf(id)));
+    turn(id, async (check) => {
+      await syncResend(dirOf(id));
+      check();
+      return client.retry(dirOf(id));
+    });
     return { started: true };
   },
 
   async resume({ id }) {
     await workable(id);
-    turn(id, () => client.resume(dirOf(id)));
+    turn(id, async (check) => {
+      await syncResend(dirOf(id));
+      check();
+      return client.resume(dirOf(id));
+    });
     return { started: true };
   },
 
@@ -2164,7 +2265,9 @@ const ops = {
     // and writes, not when the first command waits for it.
     warmFor(thread);
     return within(id, async () => {
-      const status = await client.status(dir);
+      // Its history with its status, from one read of the head (a long thread's is
+      // megabytes, read once).
+      const { history, ...status } = await client.status(dir, { history: { from: from ?? 0 } });
       // Its index entry follows the session's own settings (one made or imported before
       // the entry said whether tasks are on, say).
       // Kept in place (not as a change of the thread: its place in the list stays).
@@ -2174,7 +2277,7 @@ const ops = {
         entry = (await update('threads', id, (kept) => ({ ...kept, tasks }))) ?? thread;
         send({ type: 'thread', thread: entry });
       }
-      return { thread: entry, status, history: await client.history(dir, undefined, { from }), running: running.has(id), queued: queuedOf(id) };
+      return { thread: entry, status, history, running: running.has(id), queued: queuedOf(id) };
     });
   },
 
@@ -2228,14 +2331,20 @@ const ops = {
     return within(id, async () => {
       const shown = (await client.history(dir, revision ?? undefined)).messages ?? [];
       const summary = JSON.stringify(shown[0] ?? null);
-      const targets = await client.targets(dir, { limit: 8192 }).catch((error) => {
-        throw error?.kind === 'busy' ? failure('busy', NOT_WHILE_WORKING) : error;
-      });
-      for (const target of targets) {
-        if (revision != null && target.revision >= revision) continue;
-        await letOthersGo();
-        const history = await client.history(dir, target.revision);
-        if (JSON.stringify(history.messages?.[0] ?? null) !== summary) return { revision: target.revision, history };
+      // Newest first, a few at a time (as `pointBefore`): one listing of 8192 steps held
+      // the engine for seconds.
+      let read = 0;
+      for (const limit of [128, 1024, 8192]) {
+        const targets = await client.targets(dir, { limit }).catch((error) => {
+          throw error?.kind === 'busy' ? failure('busy', NOT_WHILE_WORKING) : error;
+        });
+        for (const target of targets.slice(read)) {
+          if (revision != null && target.revision >= revision) continue;
+          await letOthersGo();
+          const history = await client.history(dir, target.revision);
+          if (JSON.stringify(history.messages?.[0] ?? null) !== summary) return { revision: target.revision, history };
+        }
+        read = targets.length;
       }
       throw failure('not_found', 'Spindle no longer holds the messages before that summary');
     });
@@ -2715,7 +2824,8 @@ const ops = {
     const dir = dirOf(id);
     const now = await client.files(dir);
     const key = `${id}@${now.revision}`;
-    if (turnFilesKept.key === key) return turnFilesKept.value;
+    const kept = turnFilesKept.get(id);
+    if (kept?.key === key) return kept.value;
     const shown = (await client.history(dir)).messages ?? [];
     // The last message the user wrote (not steering, not a compaction's summary).
     const at = shown.findLastIndex((message) => message.role === 'user' && (message.content ?? []).some((block) =>
@@ -2736,7 +2846,12 @@ const ops = {
       }
     }
     const value = { ...now, before };
-    if (lasting) turnFilesKept = { key, value };
+    if (lasting) {
+      // Asked about last: the last to go.
+      turnFilesKept.delete(id);
+      turnFilesKept.set(id, { key, value });
+      if (turnFilesKept.size > TURN_FILES_KEPT) turnFilesKept.delete(turnFilesKept.keys().next().value);
+    }
     return value;
   }),
 
@@ -2809,6 +2924,13 @@ const ops = {
     const kept = String(text ?? '').trim().slice(0, 8000);
     if (kept) await write('kv', 'standing', kept);
     else await remove('kv', 'standing');
+    return snapshot();
+  },
+
+  /** The user's resend choice, durable before a successful answer. */
+  async resend({ on }) {
+    if (typeof on !== 'boolean') throw failure('invalid', 'automatic resend needs an on/off choice');
+    await writeDurably('kv', 'resend', on);
     return snapshot();
   },
 

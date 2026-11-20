@@ -117,7 +117,11 @@ See [docs/tools.md](docs/tools.md) for the full execution model.
 - `continue` never resends an unknown outcome unless the session's `resend_unknown`
   setting consents to it; `retry` sends it once more, explicitly. With consent, a dropped
   or unknown send is retried automatically up to three times, waiting 1, 2 and 4 seconds,
-  and only when a rewind target exists. Each resend may be billed.
+  and only when a rewind target exists. Each resend may be billed. Spindle for Browser
+  enables this setting by default after 0.1.8, with an opt-out in Settings; it must read
+  and apply that choice before a message, Retry or Continue. An unreadable or malformed
+  choice or failed update stops before sending, rather than reverting to default consent.
+  The choice is saved with strict durability; Settings stays available to repair it.
 - A provider refusal (an HTTP error) is a known outcome; its retries are bounded and
   honor `Retry-After`.
 - Effect ids are stable for a call across crashes and fresh after a rewind, but they are
@@ -127,6 +131,8 @@ See [docs/tools.md](docs/tools.md) for the full execution model.
 - Dollar budgets on both hosts use the same [ledger](spindle/store/src/spend.rs)
   and refuse a request before it is sent when its worst case would not fit. They
   depend on catalog prices and conservative estimates, not exact provider billing.
+  Anthropic one-hour cache writes are counted separately within cache creation and
+  reserved at their higher rate when a request asks for that TTL.
   Before a budgeted send, the embedded host also recounts retained child stores after
   reopen; unreadable task spend fails closed
   ([embedded.md](docs/embedded.md#settings-and-limits)).

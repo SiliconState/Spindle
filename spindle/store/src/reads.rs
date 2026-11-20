@@ -73,33 +73,97 @@ fn root_at(
 pub fn head_on(view: &mut ReadView<'_>) -> Result<Value> {
     let read = view.read(|view| {
         let (head, continuation, root) = view.head()?;
-        // A count needs the manifest alone, not each file's size.
-        let files = match &root {
-            Some(root) => view.file_count(root)?,
-            None => 0,
-        };
-        let mut recorded = false;
-        let mut rejection = None;
-        if head == 0 {
-            return Ok((head, None, files, recorded, rejection));
-        }
-        let Ok(state) = crate::turn::restored(&continuation) else {
-            return Err(crate::Error::Incompatible);
-        };
-        if state.control().phase() == Phase::ModelWait {
-            for effect in state
-                .pending_effects()
-                .map_err(|_| crate::Error::Incompatible)?
-            {
-                if let Effect::Model { id, .. } = effect {
-                    recorded = view.recorded(&id)?;
-                    rejection = view.rejection(&id)?;
-                }
-            }
-        }
-        Ok((head, Some(state), files, recorded, rejection))
+        head_facts(view, head, &continuation, root.as_deref())
     });
     let (head, state, files, recorded, rejection) = read.map_err(view_error)?;
+    head_json(head, state.as_ref(), files, recorded, rejection)
+}
+
+/// `head_on` and `messages_from` of the head (from message `from` on) out of one read
+/// of the head's continuation: a long thread's is megabytes, read and decoded once for
+/// both rather than once each.
+pub fn head_and_messages(view: &mut ReadView<'_>, from: usize) -> Result<(Value, Value)> {
+    let read = view.read(|view| {
+        let (head, continuation, root) = view.head()?;
+        let facts = head_facts(view, head, &continuation, root.as_deref())?;
+        let details = view.app_details_at(head)?;
+        // Only to mark reports: a store that cannot list them shows none marked.
+        let tasks = view.task_keys().unwrap_or_default();
+        Ok((facts, details, tasks))
+    });
+    let ((head, state, files, recorded, rejection), details, tasks) = read.map_err(view_error)?;
+    let status = head_json(head, state.as_ref(), files, recorded, rejection)?;
+    let transcript = match state {
+        None => None,
+        Some(state) => Some(
+            state
+                .into_transcript()
+                .map_err(|_| "unreadable transcript".to_string())?,
+        ),
+    };
+    let history = messages_json(
+        view,
+        head,
+        head,
+        transcript.as_ref().map(|t| t.messages.as_slice()),
+        details,
+        &tasks,
+        from,
+    )?;
+    Ok((status, history))
+}
+
+/// What `head_on` reads of the head beside its continuation: the head, its restored
+/// state (None before the first turn), its file count, and for a waiting model step
+/// whether its reply is recorded and the provider's rejection of it.
+#[allow(clippy::type_complexity)]
+fn head_facts(
+    view: &mut ReadView<'_>,
+    head: u64,
+    continuation: &[u8],
+    root: Option<&str>,
+) -> crate::Result<(
+    u64,
+    Option<TurnContinuation>,
+    usize,
+    bool,
+    Option<(u16, String)>,
+)> {
+    // A count needs the manifest alone, not each file's size.
+    let files = match root {
+        Some(root) => view.file_count(root)?,
+        None => 0,
+    };
+    let mut recorded = false;
+    let mut rejection = None;
+    if head == 0 {
+        return Ok((head, None, files, recorded, rejection));
+    }
+    let Ok(state) = crate::turn::restored(continuation) else {
+        return Err(crate::Error::Incompatible);
+    };
+    if state.control().phase() == Phase::ModelWait {
+        for effect in state
+            .pending_effects()
+            .map_err(|_| crate::Error::Incompatible)?
+        {
+            if let Effect::Model { id, .. } = effect {
+                recorded = view.recorded(&id)?;
+                rejection = view.rejection(&id)?;
+            }
+        }
+    }
+    Ok((head, Some(state), files, recorded, rejection))
+}
+
+/// The head's JSON (`head_on`) from what `head_facts` read.
+fn head_json(
+    head: u64,
+    state: Option<&TurnContinuation>,
+    files: usize,
+    recorded: bool,
+    rejection: Option<(u16, String)>,
+) -> Result<Value> {
     let rejection = rejection.map(|(status, detail)| json!({"status": status, "detail": detail}));
     let Some(state) = state else {
         return Ok(json!({
@@ -113,8 +177,10 @@ pub fn head_on(view: &mut ReadView<'_>) -> Result<Value> {
         Phase::Stopped(stop) => Some(stop),
         _ => None,
     };
+    // Borrowed: a copy of a long thread's whole transcript only to count its prompts
+    // was much of a status's time.
     let prompts = state
-        .transcript()
+        .transcript_ref()
         .map_err(|_| "unreadable transcript".to_string())?
         .messages
         .iter()
@@ -179,16 +245,44 @@ pub fn messages_from(view: &mut ReadView<'_>, revision: Option<u64>, from: usize
             Ok((head, revision, continuation, root, details, tasks))
         })
         .map_err(|_| no_revision(revision))?;
-    let (messages, total): (Vec<Value>, usize) = if revision == 0 {
-        (vec![], 0)
+    let transcript = if revision == 0 {
+        None
     } else {
-        let transcript = restore(&continuation)?
-            .into_transcript()
-            .map_err(|_| "unreadable transcript".to_string())?;
-        let total = transcript.messages.len();
-        let mut messages = window(&transcript.messages, from);
-        annotate_reports(&mut messages, &tasks);
-        (messages, total)
+        Some(
+            restore(&continuation)?
+                .into_transcript()
+                .map_err(|_| "unreadable transcript".to_string())?,
+        )
+    };
+    messages_json(
+        view,
+        head,
+        revision,
+        transcript.as_ref().map(|t| t.messages.as_slice()),
+        raw_details,
+        &tasks,
+        from,
+    )
+}
+
+/// `messages_from`'s JSON: the messages (None before the first turn) from `from` on,
+/// with the app details on their line.
+fn messages_json(
+    view: &ReadView<'_>,
+    head: u64,
+    revision: u64,
+    messages: Option<&[Message]>,
+    raw_details: Vec<(String, Vec<u8>)>,
+    tasks: &[String],
+    from: usize,
+) -> Result<Value> {
+    let (messages, total): (Vec<Value>, usize) = match messages {
+        None => (vec![], 0),
+        Some(all) => {
+            let mut messages = window(all, from);
+            annotate_reports(&mut messages, tasks);
+            (messages, all.len())
+        }
     };
     let details = raw_details.into_iter().map(|(effect, bytes)| {
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| "unreadable private app details".to_string())?;

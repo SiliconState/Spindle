@@ -506,7 +506,8 @@ impl Drop for Store {
     /// Best effort: a store that cannot be written now is counted as one, and so is an
     /// owner unwinding from a panic (a step that panics every time is a crash loop).
     fn drop(&mut self) {
-        if !self.paused && !std::thread::panicking() {
+        // Resting with nothing written since, it says so already.
+        if !self.paused && !std::thread::panicking() && !self.resting() {
             let _ = self.db.execute(
                 "UPDATE opens SET closed=1 WHERE id=1 AND epoch=?1",
                 [self.opened as i64],
@@ -540,6 +541,9 @@ pub struct Store {
     /// `epoch` on, not this).
     opened: u64,
     paused: bool,
+    /// Set while the `opens` row says this owner closed cleanly though it is still open
+    /// (`rest`): the connection's change count then, so a write made since is seen.
+    resting: Option<u64>,
     /// Owners that stopped without closing the store since its head last moved
     /// (counted at open; see `crashes`).
     crashes: u64,
@@ -856,6 +860,8 @@ fn validate_schema(db: &Connection, from: i64) -> Result<()> {
 /// Every row's column types and label shapes. `since`: the (revision, receipt row)
 /// watermark the last open validated (`validated`); rows of the append-only tables at
 /// or below it were checked then and never change, so only newer ones are (None: all).
+/// Given it (an open), chunks are left to their reads (each is checked whole as it is
+/// read) and objects to `artifact::validate_storage`, which checks the same in its pass.
 fn validate_row_types(db: &Connection, since: Option<(i64, i64)>) -> Result<()> {
     // Fixed schema identifiers only; never interpolate caller-controlled SQL.
     let tables = [
@@ -950,6 +956,10 @@ fn validate_row_types(db: &Connection, since: Option<(i64, i64)>) -> Result<()> 
         ),
     ];
     for (table, integers, labels, blobs, optional_labels) in tables {
+        // On open: chunks to their reads and full checks, objects to their one pass.
+        if since.is_some() && matches!(table, "chunks" | "objects") {
+            continue;
+        }
         // Each table's newer rows, by the key the watermark bounds.
         let newer = match (since, table) {
             (
@@ -957,6 +967,15 @@ fn validate_row_types(db: &Connection, since: Option<(i64, i64)>) -> Result<()> 
                 "revisions" | "proposals" | "consumed" | "intents" | "applied_receipts",
             ) => Some(("revision", revision)),
             (Some((_, receipt)), "receipts") => Some(("rowid", receipt)),
+            _ => None,
+        };
+        // Rows written before or with their attempt's receipt (an attempt; its strict
+        // receipt and app details, in the receipt's transaction) and never changed: those
+        // whose receipt the watermark covers were checked by the open that set it. A
+        // long thread's thousands of attempts were each checked again at every open.
+        let receipted = match (since, table) {
+            (Some((_, receipt)), "attempts") => Some(("id", receipt)),
+            (Some((_, receipt)), "strict_receipts" | "app_details") => Some(("attempt", receipt)),
             _ => None,
         };
         let mut checks = Vec::new();
@@ -993,14 +1012,20 @@ fn validate_row_types(db: &Connection, since: Option<(i64, i64)>) -> Result<()> 
         }
         // Unbounded: `0>-1`, true for every row.
         let (key, after) = newer.unwrap_or(("0", -1));
-        let invalid: bool = db.query_row(
-            &format!(
+        let sql = match receipted {
+            // The receipt looked up first (CASE keeps that order), the checks only for
+            // the rows it does not cover.
+            Some((column, _)) => format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE CASE WHEN EXISTS(SELECT 1 FROM receipts q WHERE q.attempt={table}.{column} AND q.rowid<=?1) THEN 0 ELSE ({}) END)",
+                checks.join(" OR ")
+            ),
+            None => format!(
                 "SELECT EXISTS(SELECT 1 FROM {table} WHERE {key}>?1 AND ({}))",
                 checks.join(" OR ")
             ),
-            [after],
-            |row| row.get(0),
-        )?;
+        };
+        let bound = receipted.map_or(after, |(_, receipt)| receipt);
+        let invalid: bool = db.query_row(&sql, [bound], |row| row.get(0))?;
         if invalid {
             return Err(Error::Incompatible);
         }
@@ -1162,10 +1187,11 @@ fn check_pages(db: &Connection) -> Result<()> {
 }
 
 /// Validates the stored records: in full (every chunk, receipt and admission value
-/// too), or (on open) only revisions and receipts newer than those recorded in
-/// `validated` by the last open; older ones were checked then, and every chunk is
-/// checked against its digest whenever it is read. Returns the head revision and newest
-/// receipt row the store now covers.
+/// too), or (on open) only the history newer than what `validated` records the last
+/// open checked (revisions, their proposals and intents, receipts: never changed once
+/// written, older ones were checked then), the rest whole but for chunks, each of which
+/// is checked (its types, size and digest) whenever it is read. Returns the head
+/// revision and newest receipt row the store now covers.
 fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
     let (since, receipts_since): (i64, i64) = if full {
         (0, 0)
@@ -1177,27 +1203,35 @@ fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
         )?
     };
     let invalid: i64 = db.query_row(
-        "SELECT (SELECT count(*) FROM chunks WHERE length(digest)!=32 OR length(bytes)>?1 OR length(bytes)<2)
-              + (SELECT count(*) FROM attempt_failures f LEFT JOIN receipts q ON q.attempt=f.attempt WHERE q.attempt IS NOT NULL OR f.status NOT BETWEEN 100 AND 599 OR typeof(f.detail)!='text' OR length(CAST(f.detail AS BLOB))>4096)
+        "SELECT (SELECT count(*) FROM attempt_failures f LEFT JOIN receipts q ON q.attempt=f.attempt WHERE q.attempt IS NOT NULL OR f.status NOT BETWEEN 100 AND 599 OR typeof(f.detail)!='text' OR length(CAST(f.detail AS BLOB))>4096)
               + (SELECT count(*) FROM validated WHERE id!=1 OR revision<0 OR receipt<0 OR revision>(SELECT revision FROM head WHERE id=1))
-              + (SELECT count(*) FROM app_state s WHERE s.revision<=0 OR length(s.value)>?2 OR NOT EXISTS(SELECT 1 FROM revisions r WHERE r.revision=s.revision))
+              + (SELECT count(*) FROM app_state s WHERE s.revision<=0 OR length(s.value)>?1 OR NOT EXISTS(SELECT 1 FROM revisions r WHERE r.revision=s.revision))
               + (SELECT count(*) FROM opens WHERE epoch>(SELECT epoch FROM realm WHERE id=1))
               + (1-(SELECT count(*) FROM opens))
               + (1-(SELECT count(*) FROM instance WHERE id=1 AND length(identity)=16 AND identity!=zeroblob(16)))
               + (SELECT count(*) FROM retry_delays WHERE millis<0)
-              + (SELECT count(*) FROM app_details d LEFT JOIN attempts a ON a.id=d.attempt WHERE a.id IS NULL OR substr(a.implementation,1,20)!='spindle-app-tool-v1-' OR length(d.value)>?2)
-              + (SELECT count(*) FROM app_patches p LEFT JOIN attempts a ON a.id=p.attempt WHERE a.id IS NULL OR substr(a.implementation,1,20)!='spindle-app-tool-v1-' OR length(p.patch)>?2)",
-        params![
-            codec::stored_bound(codec::CHUNK_MAX) as i64,
-            codec::stored_bound(transition::MAX_STATE) as i64
-        ],
+              + (SELECT count(*) FROM app_details d LEFT JOIN attempts a ON a.id=d.attempt WHERE a.id IS NULL OR substr(a.implementation,1,20)!='spindle-app-tool-v1-' OR length(d.value)>?1)
+              + (SELECT count(*) FROM app_patches p LEFT JOIN attempts a ON a.id=p.attempt WHERE a.id IS NULL OR substr(a.implementation,1,20)!='spindle-app-tool-v1-' OR length(p.patch)>?1)",
+        [codec::stored_bound(transition::MAX_STATE) as i64],
         |r| r.get(0),
     )?;
     if invalid != 0 {
         return Err(Error::Incompatible);
     }
     if full {
-        // Every chunk against its digest, and the stored values no other check decodes.
+        // Every chunk's types and bounds, then each against its digest. An open does not
+        // scan them: a chunk is checked so (`bounded_blob`, its digest) whenever it is
+        // read, the table holds most of a store's bytes, and scanning it made opening a
+        // long thread take seconds; a chunk whose digest is malformed no read ever finds.
+        let chunks: i64 = db.query_row(
+            "SELECT count(*) FROM chunks WHERE typeof(digest)!='blob' OR typeof(bytes)!='blob' OR length(digest)!=32 OR length(bytes)>?1 OR length(bytes)<2",
+            [codec::stored_bound(codec::CHUNK_MAX) as i64],
+            |r| r.get(0),
+        )?;
+        if chunks != 0 {
+            return Err(Error::Incompatible);
+        }
+        // The stored values no other check decodes.
         let mut chunks = db.prepare("SELECT digest,bytes FROM chunks")?;
         let mut rows = chunks.query([])?;
         while let Some(row) = rows.next()? {
@@ -1218,8 +1252,12 @@ fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
             }
         }
     }
+    // Objects before the checks that read some of them (tasks' bases, new workspace
+    // roots): an open checks their row types in this pass (`validate_row_types` leaves
+    // them to it), so a malformed one is refused as such before any is read.
+    artifact::validate_storage(db, full)?;
     meta::validate(db)?;
-    meta::validate_tasks(db)?;
+    meta::validate_tasks(db, since)?;
     transition::validate_storage(db, since, receipts_since, full)?;
     // App details are written with their receipt: on open, those recorded since the
     // last one.
@@ -1238,7 +1276,6 @@ fn validate_all(db: &Connection, full: bool) -> Result<(i64, i64)> {
     }
     drop(rows);
     drop(details);
-    artifact::validate_storage(db, full)?;
     ownership::validate_storage(db)?;
     rewind::validate_storage(db, since)?;
     Ok(db.query_row(
@@ -1885,6 +1922,7 @@ impl Store {
             epoch,
             opened: epoch,
             paused: false,
+            resting: None,
             crashes,
             #[cfg(feature = "dext-image")]
             image_disclosure: image::DisclosureState::default(),
@@ -1899,6 +1937,54 @@ impl Store {
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Records that this owner, still open, has stopped writing for now: an owner that
+    /// stops while resting (its browser quit, say) left the store as whole as a clean
+    /// close does, so the next open neither checks every page nor counts a crash. Only
+    /// between transactions; `wake` undoes it before the next write. A host that keeps
+    /// stores open while idle (the embedded package) calls it once nothing runs.
+    /// Returns whether the store rests now.
+    pub fn rest(&mut self) -> Result<bool> {
+        if self.paused || !self.db.is_autocommit() {
+            return Ok(false);
+        }
+        // Resting already (`closed=1` on disk; only `wake` writes it again): from now on.
+        if self.resting.is_some() {
+            self.resting = Some(self.db.total_changes());
+            return Ok(true);
+        }
+        execute_one(
+            &self.db,
+            "UPDATE opens SET closed=1 WHERE id=1 AND epoch=?1",
+            [self.opened as i64],
+        )?;
+        self.resting = Some(self.db.total_changes());
+        Ok(true)
+    }
+
+    /// Ends a rest (`rest`), on disk before anything else is written: an owner stopped
+    /// from here on was in the middle of its work, as before the rest. Nothing to do
+    /// when the store is not resting.
+    pub fn wake(&mut self) -> Result<()> {
+        if self.resting.is_none() {
+            return Ok(());
+        }
+        if !self.db.is_autocommit() {
+            return Err(Error::Invalid);
+        }
+        execute_one(
+            &self.db,
+            "UPDATE opens SET closed=0 WHERE id=1 AND epoch=?1",
+            [self.opened as i64],
+        )?;
+        self.resting = None;
+        Ok(())
+    }
+
+    /// Whether the store rests (`rest`) and nothing was written since it began to.
+    pub fn resting(&self) -> bool {
+        self.resting == Some(self.db.total_changes())
     }
 
     /// Moves this owner to a new epoch on its open connection, as reopening would:
@@ -2147,6 +2233,89 @@ mod tests {
 
     struct Owned;
     impl OwnerExclusion for Owned {}
+
+    /// A store whose owner rests (`rest`) is on disk as a cleanly closed one: a copy taken
+    /// then (as an owner killed then leaves it) opens counting no crash, and so is not
+    /// checked page by page. Woken, or written to while resting, the owner is at work
+    /// again: a copy taken then counts one.
+    #[test]
+    fn a_resting_store_reads_as_closed_cleanly() {
+        let dir = std::env::temp_dir().join(format!("spindle-rest-{}", process_id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.sqlite");
+        let open = |path: &Path, initialization| {
+            Store::from_connection(
+                Connection::open(path).unwrap(),
+                ConnectionProfile::Persistent {
+                    journal: JournalMode::Delete,
+                    initialization,
+                },
+                Owned,
+            )
+            .unwrap()
+        };
+        let closed = |store: &Store| -> i64 {
+            store
+                .db
+                .query_row("SELECT closed FROM opens WHERE id=1", [], |row| row.get(0))
+                .unwrap()
+        };
+        // What an owner killed now leaves: the file as it is.
+        let killed = |name: &str| {
+            let copy = dir.join(name);
+            std::fs::copy(&path, &copy).unwrap();
+            open(&copy, Initialization::Open).crashes()
+        };
+        drop(open(&path, Initialization::Create));
+        let mut store = open(&path, Initialization::Open);
+        assert_eq!(closed(&store), 0);
+        assert_eq!(
+            killed("at-work.sqlite"),
+            1,
+            "an owner stopped at work counts"
+        );
+        assert!(store.rest().unwrap());
+        assert!(store.resting());
+        assert_eq!(closed(&store), 1);
+        assert_eq!(
+            killed("resting.sqlite"),
+            0,
+            "an owner stopped while resting does not"
+        );
+        // Resting again writes nothing.
+        let changes = store.db.total_changes();
+        assert!(store.rest().unwrap());
+        assert_eq!(store.db.total_changes(), changes);
+        store.wake().unwrap();
+        assert!(!store.resting());
+        assert_eq!(closed(&store), 0);
+        assert_eq!(killed("woken.sqlite"), 1, "woken, it is at work");
+        // A write while resting is seen (and a close then says so on its own).
+        assert!(store.rest().unwrap());
+        store
+            .db
+            .execute("UPDATE opens SET crashes=crashes WHERE id=1", [])
+            .unwrap();
+        assert!(!store.resting());
+        // Not inside a transaction.
+        store.wake().unwrap();
+        store.db.execute_batch("BEGIN").unwrap();
+        assert!(!store.rest().unwrap());
+        store.db.execute_batch("COMMIT").unwrap();
+        drop(store);
+        assert_eq!(
+            open(&path, Initialization::Open).crashes(),
+            0,
+            "closed cleanly"
+        );
+        // A store dropped while resting is closed cleanly without writing again.
+        let mut store = open(&path, Initialization::Open);
+        assert!(store.rest().unwrap());
+        drop(store);
+        assert_eq!(open(&path, Initialization::Open).crashes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A migration from a connection commits its records, then packs objects in many
     /// transactions: cut off between them, the store reads as one whose owner stopped

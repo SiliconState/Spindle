@@ -804,8 +804,8 @@ pub(crate) fn execute_code_model_with_credentials(
             credentials.live_headers(&route, session)?,
         )
         .map_err(|e| e.to_string())?;
-        // The transport bounds one model call at 600 s, whatever the script's timeout.
-        let total = remaining.min(Duration::from_secs(600));
+        // The transport bounds one model call at 1800 s, whatever the script's timeout.
+        let total = remaining.min(Duration::from_secs(1800));
         let transport = ModelTransport::new(Deadlines {
             connect: total.min(Duration::from_secs(15)),
             first_byte: total,
@@ -1937,11 +1937,13 @@ impl Session {
             other => store_open_error(&dir.join("store"), other),
         })?;
         crate::meta::seed(&mut store, dir).map_err(store_error)?;
+        // A stall is what the idle deadline catches; the total only bounds a reply that
+        // never ends (a long one at a slow model's pace takes well over ten minutes).
         let transport = ModelTransport::new(Deadlines {
             connect: Duration::from_secs(15),
             first_byte: Duration::from_secs(180),
             idle: Duration::from_secs(180),
-            total: Duration::from_secs(600),
+            total: Duration::from_secs(1800),
         })
         .map_err(|error| error.to_string())?;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2710,7 +2712,7 @@ impl Session {
                 ) => driver::ModelFailure::Dropped(model_error(error)),
                 // What was wrong with the stream, so the failure says.
                 Error::Model(crate::ModelError::Protocol) => {
-                    driver::ModelFailure::Failed(driver::unreadable(unparsed.as_deref()))
+                    driver::protocol_failure(unparsed.as_deref())
                 }
                 other => driver::ModelFailure::Failed(store_error(other)),
             }),
@@ -3979,7 +3981,7 @@ fn is_model_effect(id: &str) -> bool {
 pub fn stop_text(stop: Stop) -> &'static str {
     match stop {
         Stop::Complete => "done",
-        Stop::Iterations => "stopped: step limit reached",
+        Stop::Iterations => crate::driver::stop_text(Stop::Iterations),
         Stop::Budget => "stopped: budget reached",
         Stop::ToolPolicy => "stopped by tool policy",
         Stop::ContentFilter => "stopped by the provider's content filter",
@@ -4678,9 +4680,11 @@ mod tests {
             &transcript,
         )
         .unwrap();
-        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        // The tools and the system prompt are kept an hour.
+        let hour = json!({"type": "ephemeral", "ttl": "1h"});
+        assert_eq!(body["system"][0]["cache_control"], hour);
         let tools = body["tools"].as_array().unwrap();
-        assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert_eq!(tools.last().unwrap()["cache_control"], hour);
         assert!(tools[0].get("cache_control").is_none());
         // The newest block that can carry a marker: signed thinking cannot.
         let messages = body["messages"].as_array().unwrap();
@@ -4689,12 +4693,83 @@ mod tests {
             last.iter()
                 .all(|block| block["type"] != "thinking" || block.get("cache_control").is_none())
         );
-        let marked = messages
-            .iter()
-            .flat_map(|message| message["content"].as_array().unwrap())
-            .filter(|block| block.get("cache_control").is_some())
-            .count();
-        assert_eq!(marked, 1);
+        let markers = |body: &Value| -> Vec<Value> {
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["content"].as_array().unwrap())
+                .filter_map(|block| block.get("cache_control").cloned())
+                .collect()
+        };
+        assert_eq!(markers(&body), [json!({"type": "ephemeral"})]);
+        // A step later: the newest block, and where the step before had its marker (a
+        // step of many calls leaves that one past the newest's reach), kept five
+        // minutes; after a long step, an hour.
+        let step = |ms: u64| {
+            let mut transcript = transcript.clone();
+            transcript.messages[1].content.push(Block::ToolUse {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: json!({"command": "make"}),
+            });
+            transcript.messages.push(Message {
+                role: "user".into(),
+                content: vec![Block::ToolResult {
+                    tool_use_id: "c1".into(),
+                    content: "built".into(),
+                    is_error: None,
+                    metadata: dext_transcript::ToolResultMetadata {
+                        duration_ms: Some(ms),
+                        ..Default::default()
+                    },
+                }],
+            });
+            request_body(
+                &claude,
+                &claude.model,
+                "s",
+                false,
+                false,
+                Effort::Default,
+                &transcript,
+            )
+            .unwrap()
+        };
+        let body = step(1_000);
+        assert_eq!(
+            markers(&body),
+            [json!({"type": "ephemeral"}), json!({"type": "ephemeral"})]
+        );
+        assert!(
+            body["messages"][0]["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .get("cache_control")
+                .is_some()
+        );
+        assert_eq!(markers(&step(600_000)), [hour.clone(), hour.clone()]);
+        // A server of Anthropic's format elsewhere keeps the default lifetime throughout
+        // (it may not know `ttl`).
+        let mut proxy = claude.clone();
+        proxy.profile.base_url = "https://proxy.example/anthropic".into();
+        let body = request_body(
+            &proxy,
+            &proxy.model,
+            "s",
+            false,
+            false,
+            Effort::Default,
+            &transcript,
+        )
+        .unwrap();
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert!(!body.to_string().contains("\"ttl\""), "{body}");
         // Routes whose models do not cache keep the plain shape.
         let mut plain = builtin("anthropic", "claude-opus-5-5");
         plain.profile.model_specs.clear();

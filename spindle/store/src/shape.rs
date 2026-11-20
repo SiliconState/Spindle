@@ -164,6 +164,21 @@ pub(crate) fn subscription_session(session: &str) -> String {
     )
 }
 
+/// The key OpenAI's prompt cache routes a thread's requests by: the same for all of them
+/// while its history begins the same (its first message; a compaction begins another),
+/// so a new turn or a retry finds what the turns before cached. Keyed by the execution,
+/// as it was, each turn's first request went where nothing of the thread was cached.
+fn prompt_cache_key(transcript: &TranscriptCheckpoint, session: &str) -> String {
+    let Some(first) = transcript.messages.first() else {
+        return session.to_string();
+    };
+    let digest: String = Sha256::digest(serde_json::to_vec(first).unwrap_or_default())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    subscription_session(&format!("prompt-cache:{digest}"))
+}
+
 pub(crate) fn subscription_body_with_identity(
     mut body: Value,
     first_prompt: &str,
@@ -1008,6 +1023,11 @@ pub(crate) fn offered_refusal(
     name: &str,
     input: &Value,
 ) -> Option<String> {
+    // A call whose arguments were not a JSON object (the parser kept them aside): said
+    // so, and the model sends it again, whatever tool it names.
+    if let Some(why) = dext_transcript::unparsed_arguments_refusal(name, input) {
+        return Some(why);
+    }
     if tasks && name == tasks::NAME {
         if let Some(why) = tasks::refusal(input) {
             return Some(why);
@@ -1223,7 +1243,7 @@ pub(crate) fn request_body_for(
                 "stream": true,
                 "instructions": system,
                 "text": {"verbosity": "medium"},
-                "prompt_cache_key": session,
+                "prompt_cache_key": prompt_cache_key(transcript, session),
                 "tools": tools.iter().map(|(name, description, schema)| json!(
                     {"type": "function", "name": name, "description": description,
                         "parameters": schema, "strict": false})).collect::<Vec<_>>(),
@@ -1247,7 +1267,10 @@ pub(crate) fn request_body_for(
     if route.contract == RequestContract::AnthropicMessages
         && provider::resolve_model_spec(&route.profile, &route.model).prompt_cache
     {
-        mark_prompt_cache(&mut body);
+        // An hour's cache is asked of Anthropic's own API only: a server that speaks its
+        // format elsewhere may refuse the `ttl` it does not know.
+        let hour = provider::is_official_anthropic_profile(&route.profile, &route.profile.base_url);
+        mark_prompt_cache(&mut body, hour, waited_long(transcript));
     }
     Ok(body)
 }
@@ -1310,21 +1333,57 @@ fn name_output_cap(route: &Route, model: &str, body: &mut Value) {
     }
 }
 
-/// Anthropic prompt caching, as Dext places it: the system prompt, the tool list and a
-/// sliding breakpoint on the newest message block that can carry one (markers cache
-/// everything before them; signed thinking and images cannot carry one, and nothing at
-/// or after the first image is marked). Each step then pays full price only for what
-/// changed since the last one.
-pub(crate) fn mark_prompt_cache(body: &mut Value) {
-    let marker = json!({"type": "ephemeral"});
+/// A step whose tools ran this long (or longer) was most likely more than five minutes
+/// from the request before it, and the next is likely as far (a long build, tasks, the
+/// user's answer to a question before acting): the history it marks is kept an hour.
+const LONG_STEP_MS: u64 = 240_000;
+
+/// Whether the newest tool results took `LONG_STEP_MS` or longer (`mark_prompt_cache`).
+/// From the transcript alone, so the request is the same however often it is made.
+pub(crate) fn waited_long(transcript: &TranscriptCheckpoint) -> bool {
+    let Some(last) = transcript
+        .messages
+        .last()
+        .filter(|message| message.role == "user")
+    else {
+        return false;
+    };
+    last.content.iter().any(|block| {
+        matches!(block, Block::ToolResult { metadata, .. }
+            if metadata.duration_ms.is_some_and(|ms| ms >= LONG_STEP_MS))
+    })
+}
+
+/// Anthropic prompt caching, as Dext places it: the tool list and the system prompt,
+/// kept an hour (they open every request, and a pause between turns is often longer
+/// than five minutes); and in the history a sliding breakpoint on the newest block that
+/// can carry one, with another where the previous step's was (markers cache everything
+/// before them, and a step of many calls puts the last marker too far back to be found
+/// from the newest alone; signed thinking and images cannot carry one, and nothing at or
+/// after the first image is marked). The history's markers keep it five minutes, or an
+/// hour after a long step (`waited_long`): a long one's next request is often more than
+/// five minutes away, and the history would then be written again in full. Each step
+/// pays full price only for what changed since the last one. Longer-kept markers come
+/// before shorter ones, as the API requires; four at most. Without `hour_ok` (a server
+/// other than Anthropic's own), every marker keeps the default five minutes.
+pub(crate) fn mark_prompt_cache(body: &mut Value, hour_ok: bool, long_step: bool) {
+    let five = json!({"type": "ephemeral"});
+    let hour = match hour_ok {
+        true => json!({"type": "ephemeral", "ttl": "1h"}),
+        false => five.clone(),
+    };
+    let history = match long_step {
+        true => hour.clone(),
+        false => five,
+    };
     if let Some(system) = body["system"].as_str() {
-        body["system"] = json!([{"type": "text", "text": system, "cache_control": marker}]);
+        body["system"] = json!([{"type": "text", "text": system, "cache_control": hour}]);
     }
     if let Some(last) = body["tools"]
         .as_array_mut()
         .and_then(|tools| tools.last_mut())
     {
-        last["cache_control"] = marker.clone();
+        last["cache_control"] = hour.clone();
     }
     let Some(messages) = body["messages"].as_array_mut() else {
         return;
@@ -1336,21 +1395,37 @@ pub(crate) fn mark_prompt_cache(body: &mut Value) {
             .position(|block| block["type"] == "image")
             .map(|block| (index, block))
     });
-    for (index, message) in messages.iter_mut().enumerate().rev() {
-        let Some(blocks) = message["content"].as_array_mut() else {
-            continue;
-        };
-        for (position, block) in blocks.iter_mut().enumerate().rev() {
-            let kind = block["type"].as_str().unwrap_or("");
-            if first_image.is_some_and(|first| (index, position) >= first)
-                || matches!(kind, "thinking" | "redacted_thinking" | "image")
-                || !block.is_object()
-            {
-                continue;
-            }
-            block["cache_control"] = marker;
-            return;
-        }
+    // The newest block that can carry a marker in `messages[..end]`.
+    let markable = |messages: &[Value], end: usize| {
+        messages[..end]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                let blocks = message["content"].as_array()?;
+                blocks
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(position, block)| {
+                        let kind = block["type"].as_str().unwrap_or("");
+                        (!(first_image.is_some_and(|first| (index, position) >= first)
+                            || matches!(kind, "thinking" | "redacted_thinking" | "image")
+                            || !block.is_object()))
+                        .then_some((index, position))
+                    })
+            })
+    };
+    let Some(newest) = markable(messages, messages.len()) else {
+        return;
+    };
+    // Where the previous step's request had its own: before the newest assistant reply.
+    let previous = messages[..newest.0]
+        .iter()
+        .rposition(|message| message["role"] == "assistant")
+        .and_then(|reply| markable(messages, reply));
+    for (index, position) in previous.into_iter().chain([newest]) {
+        messages[index]["content"][position]["cache_control"] = history.clone();
     }
 }
 

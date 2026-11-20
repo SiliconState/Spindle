@@ -130,6 +130,7 @@ impl Call {
             "provider": self.provider, "model": self.model, "billing": self.billing.as_str(),
             "input": self.usage.input, "output": self.usage.output,
             "cache_read": self.usage.cache_read, "cache_create": self.usage.cache_create,
+            "cache_create_1h": self.usage.cache_create_1h,
             "usd": self.usd, "at": self.at, "count": self.count, "worst": self.worst})
     }
     /// None for an entry that cannot be read back (the ledger then counts again).
@@ -155,6 +156,7 @@ impl Call {
                 output: number("output"),
                 cache_read: number("cache_read"),
                 cache_create: number("cache_create"),
+                cache_create_1h: number("cache_create_1h"),
                 cost_usd: None,
             },
             usd: value["usd"].as_f64().filter(|usd| valid_usd(*usd))?,
@@ -253,6 +255,7 @@ impl Ledger {
                             output: number("output"),
                             cache_read: number("cache_read"),
                             cache_create: number("cache_create"),
+                            cache_create_1h: 0,
                             cost_usd: None,
                         }
                     } else {
@@ -1105,9 +1108,13 @@ pub(crate) fn priced_at(rates: &ModelPricing, usage: &Usage) -> (Billing, f64) {
         (usage.input, rates.input_usd_per_mtok),
         (usage.output, rates.output_usd_per_mtok),
         (usage.cache_read, rates.cache_read_usd_per_mtok),
-        (usage.cache_create, rates.cache_create_usd_per_mtok),
+        (
+            usage.cache_create.saturating_sub(usage.cache_create_1h),
+            rates.cache_create_usd_per_mtok,
+        ),
+        (usage.cache_create_1h, rates.cache_create_usd_per_mtok * 1.6),
     ];
-    if !rates.iter().all(|(_, rate)| valid_usd(*rate)) {
+    if !usage.is_valid() || !rates.iter().all(|(_, rate)| valid_usd(*rate)) {
         return (Billing::Unpriced, 0.0);
     }
     let usd = rates
@@ -1137,17 +1144,35 @@ pub(crate) fn worst_case(
     if subscription {
         return Some(0.0);
     }
-    let (input, output) = match serde_json::from_slice::<Value>(body) {
-        Ok(body) => (worst_input(&body), allowed_output(&body)),
+    let (input, output, hour) = match serde_json::from_slice::<Value>(body) {
+        Ok(body) => (
+            worst_input(&body),
+            allowed_output(&body),
+            has_hour_cache(&body),
+        ),
         Err(_) => {
             let ascii = body.iter().filter(|byte| byte.is_ascii()).count() as u64;
             (
                 ascii.div_ceil(WORST_BYTES_PER_TOKEN) + (body.len() as u64 - ascii),
                 allowed_output(&Value::Null),
+                true,
             )
         }
     };
-    worst_tokens(catalog, provider, model, contract, input, output)
+    worst_tokens(catalog, provider, model, contract, input, output, hour)
+}
+
+fn has_hour_cache(body: &Value) -> bool {
+    match body {
+        Value::Object(object) => {
+            object
+                .get("cache_control")
+                .is_some_and(|marker| marker["ttl"] == "1h")
+                || object.values().any(has_hour_cache)
+        }
+        Value::Array(items) => items.iter().any(has_hour_cache),
+        _ => false,
+    }
 }
 
 /// Every output token a request body allows (Spindle's largest when it states none).
@@ -1248,6 +1273,7 @@ pub(crate) fn journal_worst(catalog: Option<&ProviderCatalog>, prepared: &Value)
         contract,
         worst_input(body),
         allowed_output(body),
+        has_hour_cache(body),
     )
     .unwrap_or(0.0)
 }
@@ -1286,6 +1312,7 @@ pub(crate) fn summary_worst(catalog: Option<&ProviderCatalog>, reserved: &Value)
         &contract,
         input,
         allowed_output(&Value::Null),
+        contract == RequestContract::AnthropicMessages.as_str(),
     )
     .unwrap_or(0.0)
 }
@@ -1326,6 +1353,7 @@ pub(crate) fn worst_tokens(
     contract: &str,
     input: u64,
     output: u64,
+    hour: bool,
 ) -> Option<f64> {
     let fresh = Usage {
         input,
@@ -1334,6 +1362,11 @@ pub(crate) fn worst_tokens(
     };
     let written = Usage {
         cache_create: input,
+        cache_create_1h: if hour && contract == RequestContract::AnthropicMessages.as_str() {
+            input
+        } else {
+            0
+        },
         output,
         ..Usage::default()
     };
@@ -1788,6 +1821,7 @@ pub(crate) fn journal_request_worst(
         contract,
         worst_input(body),
         allowed_output(body),
+        has_hour_cache(body),
     )
 }
 
@@ -1896,6 +1930,180 @@ pub(crate) fn unpriced_text(provider: &str, model: &str, max: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn priced_catalog() -> ProviderCatalog {
+        let mut catalog = provider::default_provider_catalog();
+        let profile = catalog
+            .providers
+            .iter_mut()
+            .find(|profile| profile.id == "anthropic")
+            .unwrap();
+        profile
+            .model_specs
+            .get_mut("claude-opus-5-5")
+            .unwrap()
+            .pricing = Some(ModelPricing {
+            input_usd_per_mtok: 1.0,
+            output_usd_per_mtok: 5.0,
+            cache_read_usd_per_mtok: 0.1,
+            cache_create_usd_per_mtok: 1.25,
+        });
+        catalog
+    }
+
+    #[test]
+    fn one_hour_cache_writes_are_priced_and_retained_separately() {
+        let catalog = priced_catalog();
+        for (five, hour, expected) in [
+            (1_000_000, 0, 1.25),
+            (0, 1_000_000, 2.0),
+            (400_000, 600_000, 1.7),
+        ] {
+            let usage = Usage::parse(&json!({
+                "cache_creation_input_tokens": five + hour,
+                "cache_creation": {"ephemeral_5m_input_tokens": five, "ephemeral_1h_input_tokens": hour}
+            }));
+            let (billing, usd) = price(
+                Some(&catalog),
+                "anthropic",
+                "claude-opus-5-5",
+                "anthropic-messages",
+                false,
+                &usage,
+            );
+            assert_eq!(billing, Billing::Priced);
+            assert!((usd - expected).abs() < 1e-12, "{usd} != {expected}");
+            let call = Call {
+                key: "turn/m/1".into(),
+                kind: CallKind::Parent,
+                turn: Some("turn".into()),
+                after: None,
+                provider: "anthropic".into(),
+                model: "claude-opus-5-5".into(),
+                billing,
+                usage: tokens(&usage),
+                usd,
+                at: Some(1),
+                count: 1,
+                worst: 0.0,
+            };
+            let mut ledger = Ledger::default();
+            ledger.push(call);
+            let rebuilt = Ledger::from_value(Some(
+                serde_json::from_slice(&ledger.encoded().unwrap()).unwrap(),
+            ));
+            assert_eq!(rebuilt.calls[0].usage, usage);
+            assert_eq!(rebuilt.calls[0].usd, usd);
+            let nested = outcome(Some(&catalog), &json!({"provider":"anthropic", "model":"claude-opus-5-5", "contract":"anthropic-messages"}),
+                &json!({"ok":true,"data":{"usage":usage,"subscription":false}})).unwrap();
+            assert_eq!(nested.usage, usage);
+            assert_eq!(nested.usd, usd);
+        }
+    }
+
+    #[test]
+    fn one_hour_cache_reservations_cover_parent_nested_and_unknown_requests() {
+        use dext_core::model::{Encoding, Identity, PreparedRequest};
+        let catalog = priced_catalog();
+        let body = json!({"max_tokens":1000,"system":[{"type":"text","text":"x".repeat(3000),"cache_control":{"type":"ephemeral","ttl":"1h"}}]});
+        let prepared = json!({"provider":"anthropic","model":"claude-opus-5-5","contract":"anthropic-messages","body":body});
+        let expected = (worst_input(&body) as f64 * 2.0 + 5000.0) / 1e6;
+        let bytes = serde_json::to_vec(&body).unwrap();
+        assert_eq!(
+            worst_case(
+                Some(&catalog),
+                "anthropic",
+                "claude-opus-5-5",
+                "anthropic-messages",
+                false,
+                &bytes
+            ),
+            Some(expected)
+        );
+        assert_eq!(journal_worst(Some(&catalog), &prepared), expected);
+        assert_eq!(
+            journal_request_worst(Some(&catalog), &prepared),
+            Some(expected)
+        );
+        let request = PreparedRequest::new(
+            Identity {
+                effect: "turn/m/1".into(),
+                provider: "anthropic".into(),
+                model: "claude-opus-5-5".into(),
+                contract: "anthropic-messages".into(),
+                endpoint: "https://api.anthropic.com/v1/messages".into(),
+                credential_scope: "operator".into(),
+                configuration: "policy".into(),
+            },
+            Encoding::Json,
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(prepared_worst(Some(&catalog), &request), Some(expected));
+        assert!(
+            refusal(
+                Some(&catalog),
+                expected - 0.000001,
+                &request,
+                &UsageReport::default(),
+                0.0
+            )
+            .is_some()
+        );
+        assert!(
+            refusal(
+                Some(&catalog),
+                expected,
+                &request,
+                &UsageReport::default(),
+                0.0
+            )
+            .is_none()
+        );
+        let report = UsageReport {
+            uncertain_usd: expected,
+            ..UsageReport::default()
+        };
+        assert!(
+            refusal(
+                Some(&catalog),
+                expected * 2.0 - 0.000001,
+                &request,
+                &report,
+                0.0
+            )
+            .is_some()
+        );
+        let mut five = body.clone();
+        five["system"][0]["cache_control"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ttl");
+        let five_expected = (worst_input(&five) as f64 * 1.25 + 5000.0) / 1e6;
+        assert_eq!(
+            worst_case(
+                Some(&catalog),
+                "anthropic",
+                "claude-opus-5-5",
+                "anthropic-messages",
+                false,
+                &serde_json::to_vec(&five).unwrap()
+            ),
+            Some(five_expected)
+        );
+        assert!(expected > five_expected);
+        assert_eq!(
+            worst_case(
+                Some(&catalog),
+                "anthropic",
+                "claude-opus-5-5",
+                "anthropic-messages",
+                true,
+                &serde_json::to_vec(&body).unwrap()
+            ),
+            Some(0.0)
+        );
+    }
 
     /// A model call a bash command's script made through the runner's bridge (the
     /// guest `spindle` command, `import spindle`) is counted as run_code's are.

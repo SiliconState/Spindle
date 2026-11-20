@@ -13,7 +13,12 @@ import { lockSession } from './opfs.mjs';
 export { SpindleError } from './common.mjs';
 export const API_VERSION = 1;
 
-const DEADLINES = { firstByte: 180_000, idle: 180_000, total: 600_000 };
+/** A model request's deadlines (ms): a stall is what `idle` catches; `total` only bounds
+ * a reply that never ends (a long one at a slow model's pace runs past ten minutes). A
+ * model on this machine (a loopback endpoint) has at least LOCAL_FIRST_BYTE for its first
+ * byte: it reads a long prompt for minutes before it writes anything. */
+const DEADLINES = { firstByte: 180_000, idle: 180_000, total: 1_800_000 };
+const LOCAL_FIRST_BYTE = 600_000;
 /** Longest refusal body read (as the native transport keeps it). */
 const MAX_REFUSAL = 4096;
 /** Longest reply a script's nested model request reads (the most code mode lets a
@@ -33,6 +38,16 @@ const REMOTE_STOP_MS = 10_000;
  * one, and the header changes nothing elsewhere. */
 const ANTHROPIC_MESSAGES = 'anthropic-messages';
 const BROWSER_ACCESS = { 'anthropic-dangerous-direct-browser-access': 'true' };
+
+/** Whether `url` is on this machine (localhost or a loopback address). */
+function loopback(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, '');
+    return host === 'localhost' || host.endsWith('.localhost') || host === '::1' || /^127(\.\d{1,3}){3}$/.test(host);
+  } catch {
+    return false;
+  }
+}
 
 function base64ToBytes(text) {
   const binary = atob(text);
@@ -841,7 +856,7 @@ export class EmbeddedClient extends Emitter {
     let timedOut = false;
     const deadline = (ms) => setTimeout(() => { timedOut = true; entry.controller.abort(); }, ms);
     const total = deadline(this.deadlines.total);
-    let idle = deadline(this.deadlines.firstByte);
+    let idle = deadline(loopback(work.endpoint) ? Math.min(Math.max(this.deadlines.firstByte, LOCAL_FIRST_BYTE), this.deadlines.total) : this.deadlines.firstByte);
     const dropped = (reason) => this.#deliver(session, id, { kind: 'dropped', reason });
     try {
       const headers = {
@@ -1000,6 +1015,15 @@ export class EmbeddedClient extends Emitter {
     await this.#opfs?.releasing.get(dir);
     return result;
   }
+  /** The app stopped using an open session for now: its store rests (`rest`), so if the
+   * app then stops without closing it (a browser quit, say), its next open is a clean
+   * one's, with no check of every page. Nothing for a session that runs (or is not open
+   * here); the session's next call that may write ends the rest. `{session, rested}`. */
+  async restSession(dir) {
+    dir = this.#dir(dir);
+    if (this.#opfs && !this.#opfs.owned.has(dir)) return { session: dir, rested: false };
+    return this.call('rest', { dir });
+  }
   /** Gives back the free pages of the session's stores (its tasks' too): `{before,
    * after, stores}`, sizes in bytes. An open session closes first (as `closeSession`);
    * one with a turn or a background task running is refused. */
@@ -1018,7 +1042,9 @@ export class EmbeddedClient extends Emitter {
   }
   stop(dir) { return this.call('stop', { dir: this.#dir(dir) }); }
   steer(dir, text, { now } = {}) { return this.call('steer', { dir: this.#dir(dir), ...(text != null && { text }), ...(now && { now }) }); }
-  status(dir) { return this.call('status', { dir: this.#dir(dir) }); }
+  /** Where the session stands; `history: {from}` adds its conversation (`history` of
+   * the head, from message `from` on) from the same read of the head. */
+  status(dir, { history } = {}) { return this.call('status', { dir: this.#dir(dir), ...(history && { history }) }); }
   /** The transcript (at `revision`, or now); `from`: only the messages from that index on
    * (`total` counts them all). */
   history(dir, revision, { from } = {}) { return this.call('history', { dir: this.#dir(dir), revision, ...(from && { from }) }); }

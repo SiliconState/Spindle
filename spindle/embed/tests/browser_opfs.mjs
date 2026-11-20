@@ -93,8 +93,15 @@ async function run(phase) {
     write.write(`${JSON.stringify({ id, method, params, ...(sessionId && { sessionId }) })}\0`);
   });
   try {
-    const { result: { targetInfos } } = await send('Target.getTargets');
-    const page = targetInfos.find((target) => target.type === 'page');
+    const ready = Date.now() + 15_000;
+    let page;
+    while (!page && Date.now() < ready) {
+      const reply = await send('Target.getTargets');
+      if (reply.error) throw new Error(`Chrome targets (${phase}): ${reply.error.message}`);
+      page = reply.result.targetInfos.find((target) => target.type === 'page' && target.url === url);
+      if (!page) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (!page) throw new Error(`Chrome did not open the test page (${phase})`);
     const { result: { sessionId } } = await send('Target.attachToTarget', { targetId: page.targetId, flatten: true });
     const until = Date.now() + 90_000;
     while (Date.now() < until) {

@@ -78,11 +78,18 @@ impl Default for Deadlines {
         }
     }
 }
+/// The longest any deadline may be: a reply of tens of thousands of tokens at a slow
+/// model's pace runs past ten minutes, which the cap was once.
+pub const MAX_DEADLINE: Duration = Duration::from_secs(3600);
+/// The least time a model on this machine (a loopback endpoint) has for its first byte:
+/// a local model reads a long prompt for minutes before it writes anything.
+pub const LOCAL_FIRST_BYTE: Duration = Duration::from_secs(600);
+
 impl Deadlines {
     fn validate(self) -> anyhow::Result<()> {
         if [self.connect, self.first_byte, self.idle, self.total]
             .iter()
-            .any(|value| value.is_zero() || *value > Duration::from_secs(600))
+            .any(|value| value.is_zero() || *value > MAX_DEADLINE)
             || self.connect > self.total
             || self.first_byte > self.total
             || self.idle > self.total
@@ -206,9 +213,17 @@ impl ModelTransport {
         if interrupt.load(Ordering::SeqCst) {
             return Err(AttemptError::Interrupted);
         }
+        let first_byte = match loopback {
+            true => self
+                .deadlines
+                .first_byte
+                .max(LOCAL_FIRST_BYTE)
+                .min(self.deadlines.total),
+            false => self.deadlines.first_byte,
+        };
         let execution = async {
             use futures_util::StreamExt;
-            let response = tokio::time::timeout(self.deadlines.first_byte, request.send())
+            let response = tokio::time::timeout(first_byte, request.send())
                 .await
                 .map_err(|_| AttemptError::Deadline)?
                 .map_err(|error| {

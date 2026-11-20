@@ -11,10 +11,12 @@ pub enum Event<'a> {
     Prompt {
         text: &'a str,
     },
-    /// Older history was compacted; sizes are checkpoint bytes.
+    /// Older history was compacted; sizes are checkpoint bytes. `cleared`: only the long
+    /// tool results of its older part were cleared (no summary), the conversation kept.
     Compacted {
         before: usize,
         after: usize,
+        cleared: bool,
     },
     /// A model request is about to be sent.
     ModelStep {

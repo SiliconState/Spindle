@@ -381,8 +381,12 @@ impl Observer for Sink {
         self.0.push_api(api);
         let mut data = match event {
             Event::Prompt { text } => json!({"type":"prompt","text":text}),
-            Event::Compacted { before, after } => {
-                json!({"type":"compacted","before":before,"after":after})
+            Event::Compacted {
+                before,
+                after,
+                cleared,
+            } => {
+                json!({"type":"compacted","before":before,"after":after,"cleared":cleared})
             }
             Event::ModelStep {
                 provider,

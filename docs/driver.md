@@ -90,7 +90,7 @@ The driver may read the store, commit steps, and call three host traits:
 | `start(store, prompt, start, state)` | Starts a turn: may compact the prior history first (returning `Need::Summarize`), then admits and commits the prompt with its first model request. |
 | `next(store)` | Decides and commits the next local transition, or returns an owned need. |
 | `deliver(store, answer)` | Takes the host's answer to a need. The host calls it only after emitting the need's preview events and retaining its receipt. Returns the next need. |
-| `resume(store)` | Continues the committed head. A turn stopped at the legacy step limit gets a fresh step count (`Extend`); a turn already stopped, with no task report or pack follow-up waiting, emits `NothingToContinue`. |
+| `resume(store)` | Continues the committed head. A turn stopped at the step limit gets a fresh step count (`Extend`); a turn already stopped, with no task report or pack follow-up waiting, emits `NothingToContinue`. |
 | `resume_until_unknown(store)` | As `resume`, but stops with an error at the first unknown outcome instead of acting on it (see [Unknown outcomes](#unknown-outcomes)). |
 | `retry(store)` | Re-runs an unresolved model request, or the last step of a turn the user stopped between its steps (back to the point before the request whose reply made it). Returns `Retry::InPlace(need)`, or `Retry::FreshStore { prompt }` when it was the session's first request and the host must replace the store. |
 | `say(store, text)` | A message for a turn stopped part way: it is committed as the turn's next user message and the turn goes on. A turn that rests between steps reads it after the stopped result; one stopped in a model request whose reply was not saved goes back to the point before that request and makes it again with the message read first. |
@@ -194,16 +194,18 @@ Stop codes (`protocol::stop_code`) and their sentences (`stop_text`):
 | Code | Sentence |
 | --- | --- |
 | `complete` | done |
-| `step_limit` | stopped: step limit reached |
+| `step_limit` | stopped: step limit reached (500 model requests in this turn; continuing it gives 500 more) |
 | `budget` | stopped: budget reached (not committed by Spindle: a budget refusal leaves the request prepared and fails the operation with the API error `budget`) |
 | `tool_policy` | stopped by tool policy |
 | `content_filter` | stopped by the provider's content filter |
 | `recovery_budget` | stopped: too many incomplete responses |
 | `cancelled` | cancelled |
 
-New turns are created without a step limit. A turn stopped at `step_limit` (an older
-session's) is continued by `resume`, which commits `Extend`. A new prompt is accepted
-only after a `complete` stop; any other stop needs a rewind first.
+New turns stop after 500 model requests (`TURN_STEPS`; a request may call several tools) at
+`step_limit`, so a turn looping on the same few steps, or running on far past what was asked,
+stops rather than spending without end; `resume` continues it with as many again, committing
+`Extend`. Turns that began before the limit keep none. A new prompt is accepted only after a
+`complete` stop; any other stop needs a rewind first.
 
 ## Steps and their names
 
@@ -427,8 +429,8 @@ When a send does not produce a reply, `deliver` classifies it:
 | HTTP 400 or 422 that states a lower output-token limit | Output limit (recorded) | The limit is remembered per provider and model in the `output_limits` metadata and the request is sent again at once asking for less. |
 | No connection could be made (refused, unknown host, a TLS or proxy refusal before any of it was sent: `ModelError::Unsent`) | Refusal with status 599 (`UNREACHED`, recorded) | Known never to have been sent, so neither billed nor uncertain. Sent again after 1, 2 and 4 seconds, up to 3 automatic retries; then the turn stops saying nothing was sent and that `spindle continue` sends it once the provider is reachable (for the session's first request, which is never retried automatically: `spindle retry`). A nested `model()` call no connection reached did not run. |
 | Any other HTTP status | Refusal (recorded) | The turn stops; `spindle retry` sends it again. |
-| Connection lost or deadline passed (`ModelFailure::Dropped`) | Unknown outcome | Only with `resend_unknown`, and not in until-unknown mode: sent again after 1, 2 and 4 seconds, up to 3 automatic retries. Otherwise the turn stops. |
-| Anything else (`ModelFailure::Failed`: an unparsable stream, an oversized response, a store error) | Not recorded | The turn stops and points at `spindle retry`; a request that was reserved is an unknown outcome on `continue`. An unparsable stream's message says why in parentheses (the parser's words); an error the provider streamed after its reply began reads `the provider ended its reply with an error (...)`. |
+| Connection lost or deadline passed, or an error the provider streamed after its reply began that says it passes (overloaded, rate limited, a server error, try again: `driver::protocol_failure`) (`ModelFailure::Dropped`) | Unknown outcome | Only with `resend_unknown`, and not in until-unknown mode: sent again after 1, 2 and 4 seconds, up to 3 automatic retries. Otherwise the turn stops. A streamed error's message reads `the provider ended its reply with an error (...)`. |
+| Anything else (`ModelFailure::Failed`: an unparsable stream, another streamed error, an oversized response, a store error) | Not recorded | The turn stops and points at `spindle retry`; a request that was reserved is an unknown outcome on `continue`. An unparsable stream's message says why in parentheses (the parser's words); an error the provider streamed after its reply began reads `the provider ended its reply with an error (...)`. |
 
 No automatic retry applies to the session's first request. Each automatic retry emits
 `ProviderRetry { status, seconds, attempt, compacting }` (status `0` for a drop); the
@@ -517,6 +519,12 @@ history. The ledger is the store's `usage` metadata; the native host mirrors it 
 embedded host does no accounting work during a turn and emits no `cost`; `usage`
 counts from the records when asked. With a budget it counts each call as it goes.
 
+Anthropic cache writes retain the one-hour subset of the total cache-write tokens.
+`cache_create_usd_per_mtok` is the five-minute rate; one-hour writes use 1.6 times
+that rate (2 times base input rather than 1.25). Mixed TTLs are priced separately,
+without counting those tokens twice. The split survives recorded replies, nested
+journals and ledger reopen; subscription requests still cost nothing per call.
+
 | Billing | Meaning |
 | --- | --- |
 | `priced` | Priced from the provider catalog (or a provider-stated cost where one is used). |
@@ -536,7 +544,10 @@ case plus what the thread has spent would exceed the budget. What counts as spen
 total plus the worst case of every request whose outcome is unknown. The worst case of a
 request is its body's text at three ASCII bytes per token (any other byte one token),
 each inline image at 10,000 tokens, billed as fresh input or cache write (whichever is
-dearer), plus every output token it allows. With a budget set, a model without a catalog
+dearer), plus every output token it allows. When an Anthropic request contains a one-hour
+cache marker, its conservative reservation uses the one-hour write rate for all input;
+this also covers nested requests and requests whose outcomes remain unknown.
+With a budget set, a model without a catalog
 price is refused; a subscription request costs nothing. The refusal is an error
 (`spending limit: ...`), which `spindle api` reports as the `budget` error (`-32007`) and
 `/v1` as a `command_done` with `code: "budget"`; the embedded backend returns
@@ -578,6 +589,13 @@ start of top-level NOTES.md/notes.md alongside what the model wrote.
 | The prepared step would not fit in one stored value (forced) | As forced. |
 | Before a new prompt, the prior turn's history exceeds the budget | As the first row; the compaction commits before the prompt. |
 | Before a new prompt, the provider said the input did not fit, or twice the history plus the reply reserve exceeds the stored-value limit (forced) | As forced; the compaction commits before the prompt. |
+
+Before a summary is asked for, the long tool results (2 KiB or more) of the part it would
+fold are cleared, each to a line saying how long it was and how it began (`[Cleared to make
+room in the history: ...]`), the conversation itself kept. When that alone shrinks the
+history by a quarter, it is the compaction, committed as such with no summary request; a
+history cleared before shrinks no more and is summarized. A compaction forced by the
+message count is always summarized.
 
 The kept part starts at an assistant message, so tool results always follow their calls.
 If the current prompt falls in the dropped part, it is kept verbatim after the summary.
@@ -637,8 +655,8 @@ and settings in the store's metadata (mirrored to `session.json`). It owns the s
 `Driver` wired to its own `Env`, `Inbox` and `Observer` implementations, the model
 transport, the command runners, and the shared handles below. It is driven on the
 caller's thread; a model send blocks on a single-threaded Tokio runtime. The transport's
-deadlines are 15 seconds to connect, 180 seconds to the first byte, 180 seconds idle and
-600 seconds in total.
+deadlines are 15 seconds to connect, 180 seconds to the first byte (at least 600 for a
+model on this machine, a loopback endpoint), 180 seconds idle and 1800 seconds in total.
 
 | Method | Purpose |
 | --- | --- |
