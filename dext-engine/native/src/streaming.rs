@@ -50,6 +50,7 @@ struct AnthropicState {
     blocks: BTreeMap<usize, AnthropicBlock>,
     stop_reason: Option<String>,
     usage: Usage,
+    cache_create_5m: u64,
     message_started: bool,
     message_stopped: bool,
     unknown_events: usize,
@@ -80,10 +81,7 @@ struct OpenAiState {
     unknown_events: usize,
     preserve_timing_cache: bool,
     done: bool,
-    /// The completion's own `id` and `created` as its first chunk gave them (bounded):
-    /// part of the name made for a call a server sent without one, so two replies alike
-    /// in every word (a repeated call, from a server that counts no usage) differ.
-    completion: Option<String>,
+    request: Option<u64>,
 }
 
 #[derive(Default)]
@@ -129,6 +127,26 @@ impl ProviderStreamParser {
             | RequestContract::ChatGptPlan => ProviderState::ChatGpt(ChatGptState::default()),
         };
         Self { contract, state }
+    }
+
+    pub fn request_identity(mut self, identity: &dext_core::model::Identity) -> Self {
+        if let ProviderState::OpenAi(state) = &mut self.state {
+            let mut digest = Fnv::default();
+            for field in [
+                "dext-call-v1",
+                &identity.effect,
+                &identity.provider,
+                &identity.contract,
+                &identity.endpoint,
+                &identity.model,
+                &identity.credential_scope,
+                &identity.configuration,
+            ] {
+                digest.write(field.as_bytes());
+            }
+            state.request = Some(digest.finish());
+        }
+        self
     }
 
     pub fn capture_openai_reasoning(mut self, enabled: bool) -> Self {
@@ -508,6 +526,9 @@ fn parse_anthropic_frame(
             if let Some(usage) = message.get("usage") {
                 object(contract, event, usage, "message.usage")?;
                 state.usage = Usage::parse(usage);
+                state.cache_create_5m = usage["cache_creation"]["ephemeral_5m_input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
             }
             state.message_started = true;
         }
@@ -786,12 +807,30 @@ fn parse_anthropic_frame(
             if let Some(usage) = data_object.get("usage") {
                 object(contract, event, usage, "usage")?;
                 let parsed = Usage::parse(usage);
-                if parsed.output > 0 {
+                if usage.get("output_tokens").and_then(Value::as_u64).is_some() {
                     state.usage.output = parsed.output;
                 }
-                if parsed.input > 0 || parsed.cache_create > 0 || parsed.cache_read > 0 {
+                if usage.get("input_tokens").and_then(Value::as_u64).is_some() {
                     state.usage.input = parsed.input;
-                    state.usage.cache_create = parsed.cache_create;
+                }
+                // Usage is cumulative, but either TTL bucket may be omitted in a delta.
+                state.cache_create_5m = state.cache_create_5m.max(
+                    usage["cache_creation"]["ephemeral_5m_input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0),
+                );
+                state.usage.cache_create_1h =
+                    state.usage.cache_create_1h.max(parsed.cache_create_1h);
+                state.usage.cache_create = state.usage.cache_create.max(parsed.cache_create).max(
+                    state
+                        .cache_create_5m
+                        .saturating_add(state.usage.cache_create_1h),
+                );
+                if usage
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .is_some()
+                {
                     state.usage.cache_read = parsed.cache_read;
                 }
                 if parsed.cost_usd.is_some() {
@@ -982,16 +1021,6 @@ fn parse_openai_frame(
         let error = object(contract, "error", error, "error")?;
         return Err(provider_stream_error(contract, error));
     }
-    if state.completion.is_none() {
-        let part = |key: &str, most: usize| -> String {
-            match data_object.get(key) {
-                Some(Value::String(text)) => text.chars().take(most).collect(),
-                Some(Value::Number(number)) => number.to_string(),
-                _ => String::new(),
-            }
-        };
-        state.completion = Some(format!("{}\n{}", part("id", 256), part("created", 64)));
-    }
     let mut recognized = false;
     let mut updates = Vec::new();
     if let Some(choices) = data_object.get("choices") {
@@ -1102,22 +1131,6 @@ fn finish_openai(contract: RequestContract, state: OpenAiState) -> Result<Parsed
             "unexpected EOF before finish_reason or [DONE]; function calls were not accepted",
         ));
     }
-    // A call some servers send without an id gets one made from the reply (its words
-    // and calls, what it was counted at, the completion's id and time): the same reply
-    // parsed again names it the same, and another reply, nearly always another name.
-    let reply_digest = {
-        let mut digest = Fnv::default();
-        digest.write(state.completion.as_deref().unwrap_or_default().as_bytes());
-        digest.write(state.reasoning.as_bytes());
-        digest.write(state.text.as_bytes());
-        digest.write(format!("{:?}", state.usage).as_bytes());
-        for (idx, call) in &state.tool_calls {
-            digest.write(&idx.to_le_bytes());
-            digest.write(call.name.as_bytes());
-            digest.write(call.arguments.as_bytes());
-        }
-        digest.finish()
-    };
     let mut blocks = Vec::new();
     if !state.reasoning.is_empty() {
         blocks.push(Block::Thinking {
@@ -1132,7 +1145,14 @@ fn finish_openai(contract: RequestContract, state: OpenAiState) -> Result<Parsed
     let mut unfinished_tool_calls = 0usize;
     for (idx, mut call) in state.tool_calls {
         if call.id.trim().is_empty() {
-            call.id = format!("call_dext_{reply_digest:016x}_{idx}");
+            let request = state.request.ok_or_else(|| {
+                protocol_error(
+                    contract,
+                    "finalize",
+                    "an id-less tool call needs its request identity",
+                )
+            })?;
+            call.id = format!("call_dext_{request:016x}_{idx}");
         }
         if call.name.trim().is_empty() {
             return Err(protocol_error(
@@ -2040,6 +2060,18 @@ fn reasoning_summary_stream_delta(raw: &str, emitted: &mut String) -> Option<Str
 mod tests {
     use super::*;
 
+    fn identity(effect: &str) -> dext_core::model::Identity {
+        dext_core::model::Identity {
+            effect: effect.into(),
+            provider: "fixture".into(),
+            contract: "openai-chat-completions".into(),
+            endpoint: "https://example.invalid".into(),
+            model: "fixture".into(),
+            credential_scope: "operator".into(),
+            configuration: "policy".into(),
+        }
+    }
+
     /// A reply whose one call's arguments were kept aside (`admitted_arguments`), the
     /// reason saying `why`.
     fn assert_unparsed(parsed: &ParsedStream, why: &str) {
@@ -2393,6 +2425,104 @@ mod tests {
                 .unwrap();
         }
         assert_unparsed(&parser.finish().unwrap(), "not an object");
+    }
+
+    #[test]
+    fn anthropic_cache_ttls_survive_cumulative_usage_updates() {
+        for final_usage in [
+            serde_json::json!({"output_tokens": 5}),
+            serde_json::json!({"output_tokens":5,"cache_creation":null}),
+            serde_json::json!({"output_tokens":5,"cache_creation":{}}),
+            serde_json::json!({"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":40}}),
+            serde_json::json!({"output_tokens":5,"cache_creation":{"ephemeral_1h_input_tokens":60}}),
+            serde_json::json!({"input_tokens": 10,"output_tokens": 5}),
+            serde_json::json!({"input_tokens": 10,"output_tokens": 5,"cache_creation_input_tokens":100}),
+            serde_json::json!({"input_tokens": 10,"output_tokens": 5,"cache_creation_input_tokens":100,
+                "cache_creation":{"ephemeral_5m_input_tokens":40,"ephemeral_1h_input_tokens":60}}),
+        ] {
+            let mut parser = ProviderStreamParser::new(RequestContract::AnthropicMessages, false);
+            for value in [
+                serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":10,
+                    "cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":40,"ephemeral_1h_input_tokens":60}}}}),
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":final_usage}),
+                serde_json::json!({"type":"message_stop"}),
+            ] {
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(value.to_string()),
+                    })
+                    .unwrap();
+            }
+            let usage = parser.finish().unwrap().usage;
+            assert_eq!(
+                (
+                    usage.input,
+                    usage.output,
+                    usage.cache_create,
+                    usage.cache_create_1h
+                ),
+                (10, 5, 100, 60)
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_cache_ttls_merge_independently_without_inventing_tokens() {
+        let mut parser = ProviderStreamParser::new(RequestContract::AnthropicMessages, false);
+        parser
+            .push_frame(SseFrame {
+                event: None,
+                data: Some(serde_json::json!({"type":"message_start","message":{"usage":{"cache_creation_input_tokens":100}}}).to_string()),
+            })
+            .unwrap();
+        for (delta, total, hour) in [
+            (
+                serde_json::json!({"cache_creation":{"ephemeral_1h_input_tokens":60}}),
+                100,
+                60,
+            ),
+            (
+                serde_json::json!({"cache_creation":{"ephemeral_5m_input_tokens":50}}),
+                110,
+                60,
+            ),
+            (
+                serde_json::json!({"cache_creation":{"ephemeral_1h_input_tokens":70}}),
+                120,
+                70,
+            ),
+            (
+                serde_json::json!({"cache_creation_input_tokens":200}),
+                200,
+                70,
+            ),
+            (
+                serde_json::json!({"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}),
+                200,
+                70,
+            ),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(
+                        serde_json::json!({"type":"message_delta","delta":{},"usage":delta})
+                            .to_string(),
+                    ),
+                })
+                .unwrap();
+            let usage = parser.known_usage();
+            assert_eq!((usage.cache_create, usage.cache_create_1h), (total, hour));
+            assert!(usage.is_valid());
+        }
+        parser
+            .push_frame(SseFrame {
+                event: None,
+                data: Some(r#"{"type":"message_stop"}"#.into()),
+            })
+            .unwrap();
+        assert_eq!(parser.finish().unwrap().usage.cache_create, 200);
     }
 
     #[test]
@@ -2940,7 +3070,8 @@ mod tests {
         assert!(error.contains("not valid JSON"), "{error}");
         assert!(!error.contains("not-json"), "{error}");
 
-        let mut parser = ProviderStreamParser::new(contract, false);
+        let mut parser =
+            ProviderStreamParser::new(contract, false).request_identity(&identity("turn/m/1"));
         for data in [
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"{\"path\":"}}]},"finish_reason":null}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#,
@@ -2952,7 +3083,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        // A call without an id gets one made from the reply, the same each time.
+        // A call without an id is named by its request, not the provider's metadata.
         let parsed = parser.finish().unwrap();
         let [Block::ToolUse { id, input, .. }] = parsed.blocks.as_slice() else {
             panic!("{:?}", parsed.blocks)
@@ -2979,10 +3110,9 @@ mod tests {
     #[test]
     fn openai_call_without_arguments_or_id_is_kept() {
         let contract = RequestContract::OpenAiChatCompletions;
-        // The call's made name, read from a reply with the same words each time, its
-        // completion made at `created`.
-        let name = |created: u64| {
-            let mut parser = ProviderStreamParser::new(contract, false);
+        let name = |effect: &str, created: u64| {
+            let mut parser =
+                ProviderStreamParser::new(contract, false).request_identity(&identity(effect));
             let chunk = format!(
                 r#"{{"id":"chatcmpl-1","created":{created},"choices":[{{"delta":{{"tool_calls":[{{"index":0,"function":{{"name":"list_tabs","arguments":""}}}}]}},"finish_reason":"tool_calls"}}]}}"#
             );
@@ -3002,12 +3132,16 @@ mod tests {
             id.clone()
         };
         assert_eq!(
-            name(1_700_000_000),
-            name(1_700_000_000),
+            name("turn/m/1", 1_700_000_000),
+            name("turn/m/1", 1_700_000_000),
             "read again, the same"
         );
-        // The same call made again later (no usage counted to tell them apart).
-        assert_ne!(name(1_700_000_000), name(1_700_000_060));
+        assert_eq!(
+            name("turn/m/1", 1),
+            name("turn/m/1", 2),
+            "metadata does not rename a request"
+        );
+        assert_ne!(name("turn/m/1", 1), name("turn/m/2", 1));
     }
 
     #[test]

@@ -244,6 +244,7 @@ impl WireAttempt {
         Ok(Self {
             decoder: SseDecoder::new(sse_event_cap(contract)),
             parser: ProviderStreamParser::new(contract, preserve_timing_cache)
+                .request_identity(waiting.request().identity())
                 .capture_openai_reasoning(capture_reasoning),
             total: 0,
             generating: false,
@@ -374,6 +375,52 @@ mod tests {
         "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
+
+    #[test]
+    fn idless_calls_are_scoped_to_the_request_and_replay_deterministically() {
+        let body = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}},{\"index\":1,\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+        let parsed = |effect: &str| {
+            let original = waiting("openai-chat-completions");
+            let mut identity = original.request().identity().clone();
+            identity.effect = effect.into();
+            let request = ModelWait::new(
+                PreparedRequest::new(identity, Encoding::Json, b"{}".to_vec()).unwrap(),
+            )
+            .start()
+            .unwrap();
+            let mut attempt = WireAttempt::new(&request, false, false).unwrap();
+            for part in body.chunks(7) {
+                attempt.push(part).unwrap();
+            }
+            let recorded = attempt.finish(&request, &|_| {}).unwrap();
+            dext_transcript::checkpoint::NativeResponse::restore(recorded.response().unwrap())
+                .unwrap()
+        };
+        let first = parsed("turn/m/1");
+        assert_eq!(
+            first.checkpoint().unwrap(),
+            parsed("turn/m/1").checkpoint().unwrap()
+        );
+        let ids = |response: &dext_transcript::checkpoint::NativeResponse| {
+            response
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    dext_transcript::Block::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = ids(&first);
+        assert_ne!(first[0], first[1]);
+        assert_ne!(first, ids(&parsed("turn/m/2")));
+        assert!(
+            first
+                .iter()
+                .all(|id| id.len() <= 64
+                    && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+        );
+    }
 
     #[test]
     fn endpoints_need_https_or_literal_loopback_http() {

@@ -404,20 +404,26 @@ async function setupOf(id, settings) {
  * turned it off (Settings, Your instructions). Such a request may have been billed
  * already. */
 async function resendOn() {
-  return (await read('kv', 'resend').catch(() => null)) !== false;
+  const choice = await read('kv', 'resend');
+  if (choice === undefined) return true;
+  if (typeof choice !== 'boolean') throw failure('invalid', 'the saved automatic resend choice is invalid; set it again in Settings');
+  return choice;
 }
 
-/** Before a turn, a thread gets what is current, if it differs (if it cannot, the turn
- * goes on as it was): the guide's wording (for a thread made by an earlier build), the
- * user's standing instructions, the page tools as they are now (a thread offered some
- * has all), whether it sends a cut-off request again (`resendOn`), and, once, summaries
- * its model writes when its history is compacted (a thread made here by an earlier
- * build compacted by digest: Chrome could do no better then; threads made or imported
- * since are marked `summaries` and keep their own). */
+/** Resend consent is known and applied before anything may send, even Retry/Continue.
+ * An unreadable preference or failed update stops there, never restoring a default. */
+async function syncResend(dir) {
+  const resend = await resendOn();
+  const settings = await client.settings(dir);
+  if (Boolean(settings.resend_unknown) !== resend) await client.settings(dir, { resend_unknown: resend });
+  return settings;
+}
+
+/** Resend consent must be current; other instruction/tool refreshes are best effort. */
 async function freshen(dir) {
+  const settings = await syncResend(dir);
   try {
     const id = dir.slice(dirOf('').length);
-    const settings = await client.settings(dir);
     const instructions = settings.instructions ?? '';
     const tools = settings.tools ?? [];
     const changes = {};
@@ -432,8 +438,6 @@ async function freshen(dir) {
     if (offered.length && !current) changes.tools = [...tools.filter((tool) => !PAGE_NAMES.has(tool.name)), ...now];
     const summarized = (await read('threads', id))?.summaries;
     if (settings.compaction === 'digest' && !summarized) changes.compaction = 'model';
-    const resend = await resendOn();
-    if (Boolean(settings.resend_unknown) !== resend) changes.resend_unknown = resend;
     if (Object.keys(changes).length) await client.settings(dir, changes);
     if (!summarized) await touch(id, { summaries: true });
   } catch (error) {
@@ -1511,7 +1515,7 @@ async function afterTurn(id, unsent, took, { sending, failed, completed = false 
     // commits the message first). Handed over to one that failed: its history tells.
     const taken = sending && (!failed || (await tookMessage(id, took).catch(() => false)));
     if (taken) await dropQueued(took).catch(() => {});
-    else await requeue(id, took, sending ? 'its turn failed before taking it' : 'you stopped its turn before it began');
+    else await requeue(id, took, failed ? 'its turn failed before taking it' : 'you stopped its turn before it began');
   }
   await holdUnsent(id, unsent);
   send({ type: 'turn_end', thread: id, unsent: [] });
@@ -1531,6 +1535,7 @@ async function holdUnsent(id, unsent) {
   const waiting = queued.get(id);
   if (waiting && !waiting.held) {
     waiting.text = [...unsent, waiting.text].join('\n\n');
+    delete waiting.attachmentNote;
     await keepQueued(waiting).catch(() => {});
     announceQueued(id);
     return;
@@ -1554,9 +1559,12 @@ const QUEUED = 'queued:';
 function waitingMessage(id, text, files) {
   return { key: `${QUEUED}${id}:${crypto.randomUUID()}`, thread: id, text: String(text), files: files ?? [], held: null, at: Date.now() };
 }
+function queuedRecord(waiting) {
+  return { thread: waiting.thread, text: waiting.text, files: waiting.files, ...(waiting.attachmentNote !== undefined && { attachmentNote: waiting.attachmentNote }), held: waiting.held ?? null, at: waiting.at };
+}
 /** Writes a waiting message's record as it is now. */
 function keepQueued(waiting) {
-  return writeDurably('kv', waiting.key, { thread: waiting.thread, text: waiting.text, files: waiting.files, held: waiting.held ?? null, at: waiting.at });
+  return writeDurably('kv', waiting.key, queuedRecord(waiting));
 }
 /** Removes a waiting message's record. */
 function dropQueued(waiting) {
@@ -1578,13 +1586,19 @@ async function enqueue(waiting) {
 }
 /** Puts `took` (a waiting message no turn took) back for thread `id`, held for `why`: in
  * front of one that waits now, if one does. */
-async function requeue(id, took, why) {
+async function requeue(id, took, why, { after = false } = {}) {
   const there = queued.get(id);
   if (there) {
-    there.text = `${took.text}\n\n${there.text}`;
-    there.files = [...took.files, ...there.files];
-    await keepQueued(there);
-    await dropQueued(took).catch(() => {});
+    if (there.key === took.key) return;
+    const ordered = after ? [there, took] : [took, there];
+    const combined = { ...there, text: ordered.map((one) => one.text).join('\n\n'), files: ordered.flatMap((one) => one.files), held: there.held ?? why };
+    delete combined.attachmentNote;
+    await writeTogether([
+      ['kv', there.key, queuedRecord(combined)],
+      ['kv', took.key, undefined],
+    ], 'strict');
+    Object.assign(there, combined);
+    delete there.attachmentNote;
   } else {
     took.held = why;
     queued.set(id, took);
@@ -1595,7 +1609,7 @@ async function requeue(id, took, why) {
 /** Whether thread `id` (here) holds `waiting` as one of its latest user messages: the
  * turn that took it committed it. */
 function tookMessage(id, waiting) {
-  const said = waiting.text + attachedNote(waiting.files);
+  const said = waiting.text + (waiting.attachmentNote ?? attachedNote(waiting.files));
   return within(id, async () => {
     const messages = (await client.history(dirOf(id))).messages ?? [];
     return messages.slice(-64).some((message) => message.role === 'user'
@@ -1623,12 +1637,12 @@ async function restoreQueued() {
       await removeDurably('kv', record.key).catch(() => {});
       continue;
     }
-    const waiting = { key: record.key, thread: id, text: String(record.text ?? ''), files: record.files ?? [], held: null, at: record.at ?? 0 };
+    const waiting = { key: record.key, thread: id, text: String(record.text ?? ''), files: record.files ?? [], ...(typeof record.attachmentNote === 'string' && { attachmentNote: record.attachmentNote }), held: null, at: record.at ?? 0 };
     if (!thread.home && await tookMessage(id, waiting).catch(() => false)) {
       await removeDurably('kv', record.key).catch(() => {});
       continue;
     }
-    await requeue(id, waiting, record.held ?? `${BROWSER} stopped before the turn it waited for ended`).catch((error) => {
+    await requeue(id, waiting, record.held ?? `${BROWSER} stopped before the turn it waited for ended`, { after: true }).catch((error) => {
       console.warn('Spindle: a waiting message could not be restored:', error);
     });
   }
@@ -1660,7 +1674,7 @@ async function sendQueued(id) {
     turn(id, async (check) => {
       await freshen(dirOf(id));
       check();
-      return client.prompt(dirOf(id), waiting.text + note, files ? { files } : {});
+      return client.prompt(dirOf(id), waiting.text + (waiting.attachmentNote ?? note), files ? { files } : {});
     });
     // Out of the queue once its turn has started (until then a failure holds it); its
     // record stays until that turn has ended (`afterTurn`).
@@ -1804,7 +1818,10 @@ async function snapshot() {
   const catalogSaved = Boolean(await read('kv', 'catalog'));
   const sites = await sitesKept();
   const standing = (await read('kv', 'standing')) ?? '';
-  const resend = await resendOn();
+  const resendChoice = await resendOn().then(
+    (resend) => ({ resend }),
+    (error) => ({ resend: null, resendError: String(error?.message ?? error) }),
+  );
   const relay = (await read('kv', 'relay')) ?? null;
   const vault = await vaultState();
   // Sign in with ChatGPT registrations kept (outliving a sign-out), by provider: the
@@ -1829,7 +1846,7 @@ async function snapshot() {
     sites,
     approvals: approvalsShown(),
     standing,
-    resend,
+    ...resendChoice,
     relay,
     vault,
     registrations,
@@ -2130,21 +2147,30 @@ const ops = {
       runner: status.settings?.runner ?? 'app', network: Boolean(status.settings?.network), tasks: Boolean(status.settings?.tasks),
       created: now, updated: now, state: 'idle', note: null, summaries: true,
     };
-    // On disk before anything else is told of it: an index entry lost to a power cut
-    // would leave the thread's files unlisted (found again at the next start).
-    await writeDurably('threads', id, thread);
-    send({ type: 'thread', thread });
     const { files, note } = attachments(given);
     const sent = [...(carried?.files ?? []), ...(files ?? [])];
     // Before the attachments' line, which ends a message.
     const started = carried ? `\n\n[Started with the files of “${carried.title}”: ${carried.files.length} in the workspace]` : '';
-    // Its setup in its instructions from its first turn on (`setupOf`), inside the turn
-    // as `send` does, so nothing else starts one meanwhile. Unlike a later message, the
-    // first has no box to go back to, so a Stop does not hold it back here (as before).
-    turn(id, async () => {
+    const waiting = waitingMessage(id, text + started, sent);
+    waiting.attachmentNote = note;
+    // The index and first message survive together, even if preparation fails or the
+    // engine stops before the package takes it.
+    try {
+      await writeTogether([
+        ['threads', id, thread],
+        ['kv', waiting.key, queuedRecord(waiting)],
+      ], 'strict');
+    } catch (error) {
+      await discard(id).catch(() => {});
+      throw error;
+    }
+    send({ type: 'thread', thread });
+    turn(id, async (check) => {
       await freshen(dir);
-      return client.prompt(dir, text + started + note, sent.length ? { files: sent } : {});
+      check();
+      return client.prompt(dir, waiting.text + note, sent.length ? { files: sent } : {});
     });
+    carrying.set(id, waiting);
     warmFor(thread);
     return { id };
   },
@@ -2208,13 +2234,21 @@ const ops = {
     // A step stopped in the thread's first request has nothing before it to ask again
     // from: the turn starts over instead (taken back, its message sent again).
     if (await firstStepStopped(id)) return ops.restart({ id });
-    turn(id, () => client.retry(dirOf(id)));
+    turn(id, async (check) => {
+      await syncResend(dirOf(id));
+      check();
+      return client.retry(dirOf(id));
+    });
     return { started: true };
   },
 
   async resume({ id }) {
     await workable(id);
-    turn(id, () => client.resume(dirOf(id)));
+    turn(id, async (check) => {
+      await syncResend(dirOf(id));
+      check();
+      return client.resume(dirOf(id));
+    });
     return { started: true };
   },
 
@@ -2893,10 +2927,10 @@ const ops = {
     return snapshot();
   },
 
-  /** Whether threads send a model request cut off mid-reply again by themselves
-   * (`resend_unknown`): new ones from now, the rest from their next turn. */
+  /** The user's resend choice, durable before a successful answer. */
   async resend({ on }) {
-    await write('kv', 'resend', Boolean(on));
+    if (typeof on !== 'boolean') throw failure('invalid', 'automatic resend needs an on/off choice');
+    await writeDurably('kv', 'resend', on);
     return snapshot();
   },
 

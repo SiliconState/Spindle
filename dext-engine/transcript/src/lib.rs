@@ -187,9 +187,16 @@ pub struct Usage {
     pub input: u64,
     pub output: u64,
     pub cache_create: u64,
+    /// One-hour writes included in `cache_create`, not additional input tokens.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_create_1h: u64,
     pub cache_read: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl Usage {
@@ -201,6 +208,7 @@ impl Usage {
         self.input = self.input.saturating_add(o.input);
         self.output = self.output.saturating_add(o.output);
         self.cache_create = self.cache_create.saturating_add(o.cache_create);
+        self.cache_create_1h = self.cache_create_1h.saturating_add(o.cache_create_1h);
         self.cache_read = self.cache_read.saturating_add(o.cache_read);
         self.cost_usd = match (lhs_cost, rhs_cost) {
             (Some(a), Some(b)) => Some(a + b).filter(|cost| cost.is_finite()),
@@ -236,8 +244,10 @@ impl Usage {
     }
 
     pub fn is_valid(&self) -> bool {
-        self.cost_usd
-            .is_none_or(|cost| cost.is_finite() && cost >= 0.0)
+        self.cache_create_1h <= self.cache_create
+            && self
+                .cost_usd
+                .is_none_or(|cost| cost.is_finite() && cost >= 0.0)
     }
 
     pub fn estimated_cost_usd(&self) -> f64 {
@@ -248,11 +258,23 @@ impl Usage {
         (self.input as f64 / per_mtok) * DEFAULT_INPUT_USD_PER_MTOK
             + (self.output as f64 / per_mtok) * DEFAULT_OUTPUT_USD_PER_MTOK
             + (self.cache_read as f64 / per_mtok) * DEFAULT_CACHE_READ_USD_PER_MTOK
-            + (self.cache_create as f64 / per_mtok) * DEFAULT_CACHE_CREATE_USD_PER_MTOK
+            + (self.cache_create.saturating_sub(self.cache_create_1h) as f64 / per_mtok)
+                * DEFAULT_CACHE_CREATE_USD_PER_MTOK
+            + (self.cache_create_1h as f64 / per_mtok) * DEFAULT_INPUT_USD_PER_MTOK * 2.0
     }
 
     pub fn parse(v: &Value) -> Self {
-        let cache_create = v["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        let cache_create_1h = v["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_u64()
+            .unwrap_or(0);
+        let split = v["cache_creation"]["ephemeral_5m_input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_add(cache_create_1h);
+        let cache_create = v["cache_creation_input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .max(split);
         let cache_read = v["cache_read_input_tokens"].as_u64().unwrap_or(0);
         let input = if let Some(input) = v["input_tokens"].as_u64() {
             input
@@ -271,6 +293,7 @@ impl Usage {
             input,
             output,
             cache_create,
+            cache_create_1h,
             cache_read,
             cost_usd: parse_usage_cost(v),
         }
@@ -310,6 +333,7 @@ impl Usage {
                 .saturating_sub(cache_create),
             output,
             cache_create,
+            cache_create_1h: 0,
             cache_read,
             cost_usd,
         }
@@ -323,6 +347,7 @@ impl Usage {
             input,
             output,
             cache_create: 0,
+            cache_create_1h: 0,
             cache_read,
             cost_usd: None,
         })

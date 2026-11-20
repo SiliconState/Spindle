@@ -121,11 +121,12 @@ try {
     if (method === 'Runtime.exceptionThrown') logs.push(params.exceptionDetails.exception?.description ?? params.exceptionDetails.text);
   });
   await page.until('spindlePanel?.engine');
-  await page.eval(`globalThis.rpc = (() => {
+  const installRpc = () => page.eval(`globalThis.rpc = (() => {
     const channel = new BroadcastChannel('spindle-engine'); const pending = new Map(); let next = 0;
     channel.onmessage = ({ data }) => { if (data?.to !== 'review') return; const wait = pending.get(data.id); if (!wait) return; pending.delete(data.id); clearTimeout(wait.timer); data.ok ? wait.resolve(data.result) : wait.reject(new Error(data.error.message)); };
     return (op, args = {}, wait = 15000) => new Promise((resolve, reject) => { const id = ++next; const timer = setTimeout(() => { pending.delete(id); reject(new Error(op + ' did not answer in ' + wait / 1000 + ' s')); }, wait); pending.set(id, { resolve, reject, timer }); channel.postMessage({ to: 'engine', from: 'review', id, op, args }); });
   })()`);
+  await installRpc();
   const catalog = { version: 4, active_provider: 'review', providers: [{ id: 'review', display_name: 'Review', api_provider: 'openai', request_contract: 'openai-chat-completions', base_url: `http://127.0.0.1:${port}/v1`, default_model: 'review-model', requires_api_key: false, models: ['review-model'] }] };
   const catalogPath = join(work, 'providers.json');
   fs.writeFileSync(catalogPath, JSON.stringify(catalog));
@@ -146,6 +147,28 @@ try {
   replies.push({ tool: 'write_file', input: { path: 'notes.md', content: '# Notes\n' } }, { content: 'done' });
   const { id } = await rpc('create', { provider: 'review', runner: 'none', text: 'first' });
   await settled(id);
+  await page.eval(`import('./shared.mjs').then((shared) => shared.writeDurably('kv', 'resend', 'false'))`);
+  await browser.send('Page.reload', {}, page.sessionId);
+  await page.until(`spindlePanel?.engine?.resendError`, { what: 'invalid resend choice shown without blocking the panel' });
+  await installRpc();
+  assert.equal(await page.eval('spindlePanel.engine.resend'), null);
+  assert.equal(await page.eval(`spindlePanel.threads.has(${JSON.stringify(id)})`), true);
+  await page.eval(`document.querySelector('#settings').click()`);
+  await page.until(`document.querySelector('#settings-dialog').open && !document.querySelector('#resend-error').hidden`);
+  assert.match(await page.eval(`document.querySelector('#resend-error').textContent`), /saved automatic resend choice is invalid/);
+  assert.equal(await page.eval(`document.querySelector('#resend').getAttribute('aria-checked')`), 'false');
+  const beforeInvalid = requests;
+  await rpc('send', { id, text: 'not sent under invalid consent' });
+  await page.until(`spindlePanel.threads.get(${JSON.stringify(id)})?.state === 'failed'`);
+  assert.equal(requests, beforeInvalid, 'invalid stored consent sends no request');
+  const held = await rpc('unqueue', { id });
+  assert.equal(held.text, 'not sent under invalid consent');
+  await page.eval(`document.querySelector('#resend').click()`);
+  await page.until(`spindlePanel.engine.resend === true && document.querySelector('#resend-error').hidden`);
+  await page.eval(`document.querySelector('#resend').click()`);
+  await page.until(`spindlePanel.engine.resend === false`);
+  await page.eval(`document.querySelector('#settings-dialog').close()`);
+  console.log('ok invalid resend consent blocks sending but leaves Settings available to repair it');
   for (let n = 0; n < 3; n++) {
     await rpc('send', { id, text: `message ${n}` });
     await settled(id);
@@ -187,6 +210,34 @@ try {
   assert.deepEqual(atomic.sibling, { done: true });
   assert.ok(atomic.refused && atomic.absent && atomic.missing);
   console.log('ok strict move/index transactions merge with concurrent updates and abort atomically');
+
+  const recoveredId = 'c0c0c0c0c0c0c0c0';
+  const recoveryKeys = [`queued:${recoveredId}:first`, `queued:${recoveredId}:second`];
+  await page.eval(`(async () => {
+    const shared = await import('./shared.mjs');
+    const thread = await shared.read('threads', ${JSON.stringify(id)});
+    await shared.writeTogether([
+      ['threads', ${JSON.stringify(recoveredId)}, { ...thread, id: ${JSON.stringify(recoveredId)}, title: 'Recovery order', state: 'idle' }],
+      ['kv', ${JSON.stringify(recoveryKeys[0])}, { thread: ${JSON.stringify(recoveredId)}, text: 'older', files: [{ path: 'older.txt', bytes: new Uint8Array([1]) }], held: null, at: 1 }],
+      ['kv', ${JSON.stringify(recoveryKeys[1])}, { thread: ${JSON.stringify(recoveredId)}, text: 'newer', files: [{ path: 'newer.txt', bytes: new Uint8Array([2]) }], held: null, at: 2 }],
+    ], 'strict');
+    await chrome.offscreen.closeDocument();
+  })()`);
+  await browser.send('Page.reload', {}, page.sessionId);
+  await page.until('spindlePanel?.engine');
+  await installRpc();
+  const recovery = await page.eval(`(async () => {
+    const shared = await import('./shared.mjs');
+    const keys = await shared.keysWith('kv', ${JSON.stringify(`queued:${recoveredId}:`)});
+    return { keys, records: await Promise.all(keys.map((key) => shared.read('kv', key))) };
+  })()`);
+  assert.deepEqual(recovery.keys, [recoveryKeys[0]]);
+  assert.equal(recovery.records[0].text, 'older\n\nnewer');
+  assert.deepEqual(recovery.records[0].files.map((file) => file.path), ['older.txt', 'newer.txt']);
+  const recoveredMessages = await rpc('unqueue', { id: recoveredId });
+  assert.equal(recoveredMessages.text, 'older\n\nnewer');
+  await page.eval(`import('./shared.mjs').then((shared) => shared.removeDurably('threads', ${JSON.stringify(recoveredId)}))`);
+  console.log('ok engine restart merges two unsent records atomically in send order');
 
   // A delayed permission answer must neither duplicate a send nor eat a newer draft.
   await page.click(`#threads .thread-row[data-id="${id}"]`);

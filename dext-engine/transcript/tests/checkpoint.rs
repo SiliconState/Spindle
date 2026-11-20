@@ -36,6 +36,7 @@ fn response() -> NativeResponse {
             input: 19,
             output: 29,
             cache_create: 3,
+            cache_create_1h: 0,
             cache_read: 4,
             cost_usd: Some(0.125),
         },
@@ -62,6 +63,54 @@ fn native_response_roundtrip_preserves_order_metadata_and_opaque_values() {
         ["z", "a"]
     );
     assert!(!format!("{value:?}").contains("private"));
+}
+
+#[test]
+fn one_hour_cache_usage_roundtrips_without_double_counting_tokens() {
+    let usage = Usage::parse(&json!({
+        "input_tokens": 10, "output_tokens": 20, "cache_read_input_tokens": 30,
+        "cache_creation_input_tokens": 100,
+        "cache_creation": {"ephemeral_5m_input_tokens": 40, "ephemeral_1h_input_tokens": 60}
+    }));
+    assert_eq!(usage.cache_create, 100);
+    assert_eq!(usage.cache_create_1h, 60);
+    assert_eq!(usage.total_input_tokens(), 140);
+    assert_eq!(usage.total_tokens(), 160);
+    let mut value = response();
+    value.usage = usage;
+    assert_eq!(
+        NativeResponse::restore(&value.checkpoint().unwrap())
+            .unwrap()
+            .usage,
+        usage
+    );
+    let mut sum = usage;
+    sum.add(usage);
+    assert_eq!(
+        (sum.cache_create, sum.cache_create_1h, sum.total_tokens()),
+        (200, 120, 320)
+    );
+    assert!((usage.estimated_cost_usd() - (10.0 + 100.0 + 3.0 + 50.0 + 120.0) / 1e6).abs() < 1e-12);
+    let split_only = Usage::parse(&json!({"cache_creation": {"ephemeral_1h_input_tokens": 60}}));
+    assert_eq!(
+        (split_only.cache_create, split_only.cache_create_1h),
+        (60, 60)
+    );
+    let old = Usage::parse(&json!({"cache_creation_input_tokens": 100}));
+    assert_eq!(old.cache_create_1h, 0);
+    assert!(
+        !serde_json::to_string(&old)
+            .unwrap()
+            .contains("cache_create_1h")
+    );
+    assert!(usage.is_valid());
+    assert!(
+        !Usage {
+            cache_create_1h: 101,
+            ..usage
+        }
+        .is_valid()
+    );
 }
 
 #[test]

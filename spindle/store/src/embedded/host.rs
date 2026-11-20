@@ -794,14 +794,15 @@ impl Host {
         if self.running.is_some() {
             return Err("a turn is running; settings change between turns".into());
         }
-        // A budget alone changes at any step (a request it refused is sent once it
-        // fits); it shapes no request. Anything else changes between turns.
-        let budget_only = {
+        // Budget and resend consent do not shape a frozen request, so either may change
+        // while a stopped turn waits for a model reply.
+        let control_only = {
             let mut now = self.settings()?;
             now.max_usd = settings.max_usd;
+            now.resend_unknown = settings.resend_unknown;
             now.to_json()? == settings.to_json()?
         };
-        if !budget_only {
+        if !control_only {
             self.ensure_settable()?;
         }
         let was = *lock(&self.facts.budget);

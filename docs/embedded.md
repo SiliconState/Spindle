@@ -234,7 +234,7 @@ overlap, and each returns a Promise of its result. `prompt`, `resume`, `retry`,
 | `stop(dir)`, `steer(dir, text, { now })` | `stop`, `steer` (`now` asks for queued messages to be read now, cutting a streaming reply) |
 | `history(dir, revision, { from })`, `targets(dir, { limit, until })` | `history`, `targets` (default limit 48, clamped to 1-8192; `until: 'settled'` searches back to a completed turn) |
 | `files(dir, revision)`, `read(dir, path, revision)` | `files`; `read` returns a `Uint8Array` |
-| `settings(dir, changes)` | `settings` |
+| `settings(dir, changes)` | `settings`; while a stopped turn waits, `max_usd` and `resend_unknown` may change without changing its frozen request; request-shaping changes still require a settable boundary |
 | `state(dir, revision)`, `setState(dir, patch, { expectedHead })` | `state`, `state_set` |
 | `recover(dir)` | `recover` |
 | `usage(dir)` | `usage`: the session's own spend, not its tasks' |
@@ -265,6 +265,10 @@ answers `info`, `providers`, `list`, `create`, `open`, `status`, `close`, `rest`
 includes `usage`, `capabilities` and `tasks` for these additions. Status has stable
 `activity` codes shared with the native host, plus `waiting_tasks` and `background`,
 and a `background` count; `list` entries instead carry boolean `background`. See [API.md](API.md).
+
+The shipped `embedded.d.mts` declares the client methods and events, including
+`restSession`, `status(dir, {history: {from}})` and the `compacted.cleared` flag.
+The package test checks this contract with pinned TypeScript (see [testing.md](testing.md)).
 
 ### App tools
 
@@ -384,8 +388,10 @@ A model request is reserved in the store before the `fetch` work item is handed 
 Credentials are asked for before that reservation, so a missing key never leaves a
 request with an unknown outcome. If the app is killed before a response is recorded,
 the store keeps the request as unresolved, and `recover` reports
-`wake.work: 'blocked'`. In that case, and after a `stop` that cut a request off,
-`resume` sends nothing and fails with kind `failed`. `retry` sends the request again,
+`wake.work: 'blocked'`. By default, in that case and after a `stop` that cut a request
+off, `resume` sends nothing and fails with kind `failed`. A session whose
+`resend_unknown` setting is true permits bounded automatic resends, as the native driver
+does; that setting may be disabled before resuming a stopped request. `retry` sends the request again,
 once, from the point before it. When the unresolved request is the session's first,
 `retry` moves the old store aside (`store.abandoned-<n>` in a Node session directory,
 where its unknown request stays on record), opens a fresh store, and restarts the same

@@ -679,6 +679,157 @@ fn parity(
 }
 
 #[test]
+fn repeated_idless_calls_have_distinct_ids_in_saved_history() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host);
+    app.call(
+        "create",
+        json!({"dir":"ids", "provider":"fake", "tools":lookup_tools()}),
+    );
+    app.hook = Some(Box::new(|host, session, id, index| {
+        let delta = if index <= 2 {
+            json!({"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{\"q\":\"again\"}"}}]})
+        } else {
+            json!({"content":"done"})
+        };
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":delta,"finish_reason":if index <= 2 {"tool_calls"} else {"stop"}}]})
+        );
+        let (mut frames, streaming) = host.chunk(session, id, body.as_bytes());
+        if streaming {
+            frames.extend(host.deliver(session, id, answer_of(&json!({"kind":"response", "status":200, "content_type":"text/event-stream"})).unwrap()).unwrap());
+        }
+        Some(frames)
+    }));
+    let result = app.call("prompt", json!({"dir":"ids", "text":"look twice"}));
+    assert!(result.get("result").is_some(), "{result}");
+    let history = app.call("history", json!({"dir":"ids"}));
+    let ids: Vec<&str> = history["result"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().unwrap())
+        .filter(|block| block["type"] == "tool_use")
+        .map(|block| block["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[test]
+fn one_hour_cache_spend_survives_reopen_and_counts_against_the_budget() {
+    let root = temp_root("cache-hour");
+    let mut catalog = catalog_json(&fake().base);
+    catalog["providers"][0]["api_provider"] = json!("anthropic");
+    catalog["providers"][0]["request_contract"] = json!("anthropic-messages");
+    catalog["providers"][0]["model_specs"]["fake-model"]["pricing"] = json!({
+        "input_usd_per_mtok":1, "output_usd_per_mtok":5,
+        "cache_read_usd_per_mtok":0.1, "cache_create_usd_per_mtok":1.25
+    });
+    let make_host = || {
+        Embedded::new(
+            Box::new(DirPlaces(root.clone())),
+            Catalog::from_json(&catalog).unwrap(),
+        )
+    };
+    {
+        let host = make_host();
+        let mut app = App::new(&host);
+        app.call("create", json!({"dir":"cache", "provider":"fake"}));
+        app.hook = Some(Box::new(|host, session, id, _| {
+            let body: String = [
+                json!({"type":"message_start","message":{"usage":{"cache_creation_input_tokens":1_000_000,
+                    "cache_creation":{"ephemeral_5m_input_tokens":400_000,"ephemeral_1h_input_tokens":600_000}}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"done"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{},"usage":{"cache_creation":{"ephemeral_5m_input_tokens":400_000}}}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}),
+                json!({"type":"message_stop"})
+            ].iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap())).collect();
+            let (mut frames, streaming) = host.chunk(session, id, body.as_bytes());
+            if streaming {
+                frames.extend(host.deliver(session, id, answer_of(&json!({"kind":"response","status":200,"content_type":"text/event-stream"})).unwrap()).unwrap());
+            }
+            Some(frames)
+        }));
+        let result = app.call("prompt", json!({"dir":"cache", "text":"hello"}));
+        assert!(result.get("result").is_some(), "{result}");
+        let usage = app.call("usage", json!({"dir":"cache"}));
+        assert!(
+            (usage["result"]["usd"].as_f64().unwrap() - 1.7).abs() < 1e-12,
+            "{usage}"
+        );
+    }
+    let host = make_host();
+    let mut app = App::new(&host);
+    let usage = app.call("usage", json!({"dir":"cache"}));
+    assert!(
+        (usage["result"]["usd"].as_f64().unwrap() - 1.7).abs() < 1e-12,
+        "{usage}"
+    );
+    app.call("settings", json!({"dir":"cache", "max_usd":1.5}));
+    let refused = app.call("prompt", json!({"dir":"cache", "text":"again"}));
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("spending limit:"),
+        "{refused}"
+    );
+    assert!(
+        app.run.requests.is_empty(),
+        "over-budget request was not sent"
+    );
+}
+
+#[test]
+fn resend_consent_can_change_while_a_stopped_model_request_is_unknown() {
+    let host = embedded(Box::new(MemoryPlaces));
+    let mut app = App::new(&host).script("consent", vec![Reply::Text("ready"), Reply::HangUp]);
+    app.call(
+        "create",
+        json!({"dir":"consent", "provider":"fake", "resend_unknown":true}),
+    );
+    app.call("prompt", json!({"dir":"consent", "text":"hello"}));
+    app.hold = 2;
+    let frames = host.handle(json!({"jsonrpc":"2.0", "id":77, "method":"prompt", "params":{"dir":"consent", "text":"again"}}).to_string().as_bytes());
+    app.drive(frames);
+    app.call("stop", json!({"dir":"consent"}));
+    let before = app.run.requests.len();
+    let changed = app.call("settings", json!({"dir":"consent", "resend_unknown":false}));
+    assert_eq!(changed["result"]["resend_unknown"], false, "{changed}");
+    let continued = app.call("continue", json!({"dir":"consent"}));
+    assert!(
+        continued["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown outcome"),
+        "{continued}"
+    );
+    assert_eq!(
+        app.run.requests.len(),
+        before,
+        "opted out: Continue sends nothing"
+    );
+    let changed = app.call("settings", json!({"dir":"consent", "resend_unknown":true}));
+    assert_eq!(changed["result"]["resend_unknown"], true, "{changed}");
+    assert_eq!(
+        app.run.requests.len(),
+        before,
+        "changing consent does not send a request"
+    );
+    let unrelated = app.call(
+        "settings",
+        json!({"dir":"consent", "instructions":"different"}),
+    );
+    assert!(
+        unrelated.get("error").is_some(),
+        "request-shaping settings still refuse: {unrelated}"
+    );
+}
+
+#[test]
 fn a_plain_reply_matches_the_native_host() {
     parity(
         "plain",

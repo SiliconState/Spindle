@@ -284,8 +284,9 @@
         </form>
         <div class="switch-row">
           <div><strong id="resend-label">Send a cut-off request again</strong><small>When a reply is cut off while a model writes (the connection drops, or the provider breaks off, overloaded say), its request goes again by itself (up to three times) rather than the turn stopping; a request sent again may be billed twice</small></div>
-          <button id="resend" type="button" role="switch" class="switch" aria-labelledby="resend-label"></button>
+          <button id="resend" type="button" role="switch" class="switch" aria-labelledby="resend-label" aria-describedby="resend-error"></button>
         </div>
+        <p id="resend-error" class="note" role="status" hidden></p>
       </div>
     </details>
     <details class="fold" data-fold="appearance">

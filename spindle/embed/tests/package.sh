@@ -22,6 +22,8 @@ node -e 'if (+process.versions.node.split(".")[0] < 20) {
   console.error(`Node ${process.versions.node}: the package needs Node 20 or newer`);
   process.exit(1);
 }'
+npm --prefix embed/tests ci --ignore-scripts --no-audit --no-fund
+npm --prefix embed/tests test
 
 cargo build --locked -p spindle-embed --target wasm32-unknown-unknown
 wasm=${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/debug/spindle_embed.wasm

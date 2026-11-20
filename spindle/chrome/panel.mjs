@@ -3689,12 +3689,15 @@ function renderInstructionsSummary() {
   const summary = $('instructions-summary');
   summary.textContent = engine?.standing ? 'Set' : 'Add';
   summary.classList.toggle('add', !engine?.standing);
-  $('resend').setAttribute('aria-checked', String(engine?.resend !== false));
+  $('resend').setAttribute('aria-checked', String(engine?.resend === true));
+  const error = $('resend-error');
+  error.textContent = engine?.resendError ? `Automatic resend is unavailable: ${engine.resendError}. Choose a setting again to replace the saved choice.` : '';
+  error.hidden = !engine?.resendError;
 }
 
 $('resend').onclick = async () => {
   try {
-    apply(await ask('resend', { on: engine?.resend === false }));
+    apply(await ask('resend', { on: engine?.resend !== true }));
     renderInstructionsSummary();
     toast(engine.resend ? 'A cut-off request goes again by itself, from each thread\'s next message.' : 'A cut-off request now stops its turn (Retry sends it again).');
   } catch (error) {

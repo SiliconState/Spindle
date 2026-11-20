@@ -289,12 +289,20 @@ Source: [`transcript/src/`](../dext-engine/transcript/src). Depends on `dext-cor
   `image_reference` (workspace path, media type, width and height, source SHA-256),
   `image_artifact` (a scoped, digest-identified sanitized JPEG) and `partial_stream`.
 - `Usage`: token counts normalized into disjoint buckets `input`, `output`,
-  `cache_create`, `cache_read`, plus an optional provider-reported `cost_usd`. `parse`
+  `cache_create`, `cache_read`, plus an optional provider-reported `cost_usd`.
+  `cache_create_1h` is the one-hour subset of `cache_create`, never extra input tokens;
+  it is omitted from checkpoints when zero. `parse`
   reads Anthropic-style fields, `parse_openai` reads Chat Completions and Responses fields
   (cached tokens are moved out of `input`), and `parse_openai_timings` reads llama.cpp
   `timings` (`prompt_n`, `cache_n`, `predicted_n`). Without a reported cost,
   `estimated_cost_usd` uses default rates of 1 / 5 / 0.1 / 1.25 USD per million input,
-  output, cache-read and cache-write tokens.
+  output, cache-read and five-minute cache-write tokens; one-hour writes use 2 USD per
+  million tokens. Anthropic's `cache_creation` TTL breakdown is retained through streaming,
+  checkpoints and the spend ledger. Cumulative streaming updates merge each TTL bucket
+  independently: omitted, null or empty breakdowns never erase previously reported writes.
+  Older records without the breakdown keep their original
+  aggregate cache-write interpretation. Builds that predate this field may refuse a store or
+  bundle containing nonzero one-hour usage; a binary rollback is not a store downgrade.
 
 ### Checkpoint codecs
 
@@ -448,8 +456,12 @@ or JSON that is not an object, is kept with an input of one key,
 `dext_transcript::UNPARSED_ARGUMENTS` (`{"text": what was sent, at most 4 KiB, "error":
 why}`), which a host refuses (`unparsed_arguments_refusal`) so the model sends the call
 again, rather than the whole reply, already paid for, failing; only arguments over the
-buffer cap still fail it. A Chat Completions call without an id gets one made from the
-reply (`call_dext_<digest>_<index>`), the same each time the reply is read. Unrecognized events are counted in `unknown_events`. `finish` admits
+buffer cap still fail it. A Chat Completions call without an id gets one made from its
+request identity (`call_dext_<digest>_<index>`), the same on replay of that request and
+different for another request even when the replies and provider metadata are identical.
+`WireAttempt` binds that identity; standalone parser callers use `request_identity`, and
+an id-less call without that binding is refused. Unrecognized events are counted in
+`unknown_events`. `finish` admits
 the blocks through `dext_core::response::ResponseProposal` and returns a
 `NativeResponse`. While parsing, `push_frame` returns `StreamUpdate` previews (text and
 thinking deltas); previews are never adopted, only the finished response is.

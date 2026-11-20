@@ -519,6 +519,12 @@ history. The ledger is the store's `usage` metadata; the native host mirrors it 
 embedded host does no accounting work during a turn and emits no `cost`; `usage`
 counts from the records when asked. With a budget it counts each call as it goes.
 
+Anthropic cache writes retain the one-hour subset of the total cache-write tokens.
+`cache_create_usd_per_mtok` is the five-minute rate; one-hour writes use 1.6 times
+that rate (2 times base input rather than 1.25). Mixed TTLs are priced separately,
+without counting those tokens twice. The split survives recorded replies, nested
+journals and ledger reopen; subscription requests still cost nothing per call.
+
 | Billing | Meaning |
 | --- | --- |
 | `priced` | Priced from the provider catalog (or a provider-stated cost where one is used). |
@@ -538,7 +544,10 @@ case plus what the thread has spent would exceed the budget. What counts as spen
 total plus the worst case of every request whose outcome is unknown. The worst case of a
 request is its body's text at three ASCII bytes per token (any other byte one token),
 each inline image at 10,000 tokens, billed as fresh input or cache write (whichever is
-dearer), plus every output token it allows. With a budget set, a model without a catalog
+dearer), plus every output token it allows. When an Anthropic request contains a one-hour
+cache marker, its conservative reservation uses the one-hour write rate for all input;
+this also covers nested requests and requests whose outcomes remain unknown.
+With a budget set, a model without a catalog
 price is refused; a subscription request costs nothing. The refusal is an error
 (`spending limit: ...`), which `spindle api` reports as the `budget` error (`-32007`) and
 `/v1` as a `command_done` with `code: "budget"`; the embedded backend returns
