@@ -168,7 +168,8 @@ jobs:
           (cd chrome/linux/command && cargo fmt -- --check \
             && cargo clippy --locked --release --target i686-unknown-linux-musl -- -D warnings)
           chrome/linux/build.sh
-          node chrome/tests/linux_node.mjs chrome/linux/dist
+          # Bound compiler concurrency and leave room for v86's 512 MiB guest and JIT.
+          node --max-old-space-size=4096 --wasm-num-compilation-tasks=2 chrome/tests/linux_node.mjs chrome/linux/dist
           # Spindle for Browser, built and driven through its panel in the runner's
           # Chrome against a scripted provider (no account).
           chrome/build.sh "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen"

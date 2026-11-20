@@ -66,7 +66,9 @@ use `--workspace --all-features` to include `spindle-store` and `spindle-embed`.
 every point and takes much longer. The CLI inbox unit test waits up to five seconds
 for claimed messages to reach the steering, read-now and interrupt handles. Claiming
 removes the inbox file before delivering it, so `send` returning `Taken` alone is not
-a delivery barrier.
+a delivery barrier. The task-panic recovery regression separately waits up to 60 seconds
+for its injected panic to be reached, then allows ten seconds for cleanup and durable
+stop recording; slow Windows startup does not consume the cleanup deadline.
 
 Some cases need Linux namespaces and `bubblewrap`, delegated cgroup v2, or interpreters
 (Python, Node). Where a requirement is missing, the test reports a skip; a skip is not
@@ -167,6 +169,11 @@ pull request, except those that change only the website or the release workflow:
 | `portable` | Clippy and tests of `spindle-store` for each portable feature set, plus the native-free dependency checks |
 | `wasm` | Provider/wire wasm32 builds, store/WASI, Node/OPFS, browser Linux and both browser editions; scripted extension and sign-in/vault suites, focused Node checks, renewal and real-Chrome review |
 | `windows` | Native store, CLI and engine tests on Windows |
+
+Within the wasm job, the v86 Node suite runs with a 4096 MiB old-space limit and two
+WebAssembly compiler tasks. The 512 MiB guest, saved state and generated code need room
+outside the JavaScript heap; limiting compiler concurrency avoids a runner memory spike.
+The assertions and the guest memory size are unchanged.
 
 Two more workflows publish. [`pages.yml`](../.github/workflows/pages.yml) deploys `site/` to
 GitHub Pages when it changes. [`browser-release.yml`](../.github/workflows/browser-release.yml),

@@ -184,7 +184,8 @@
           <code>say</code>, <code>continue</code>, <code>retry</code>, <code>rewind</code>. Steer or stop a running turn
           from another shell, read it while it works, and take its changes as a patch with <code>spindle diff</code>.
           Sessions are directories you can inspect, export and move. Inbox tests wait for actual
-          delivery, not just the listener claiming a message.</p></div>
+          delivery, not just the listener claiming a message. Task-panic tests separate startup
+          from cleanup deadlines, and the v86 Node gate bounds compiler concurrency.</p></div>
         <div class="card"><span class="tag">Server</span><h3>Your agent, on your phone.</h3><p><code>spindle serve</code>
           runs a mobile web UI and an HTTP API on loopback, paired per device, behind your own HTTPS proxy.</p></div>
         <div class="card"><span class="tag">App</span><h3>Durability as a library.</h3><p>Drive sessions over
