@@ -292,7 +292,9 @@ exit 1: nothing runs the session, or `spindle serve` or `spindle api` holds it (
 take messages their own way). A message the running process does not take within 5 s
 (its turn ending, or 32 messages already waiting) is withdrawn, and the sender says
 nothing was sent. A message it took but its turn ended without reading is named in that
-process's output (and its `--json` result's `unsent`).
+process's output (and its `--json` result's `unsent`). “Taken” acknowledges that the
+listener claimed the inbox file; it is not a synchronous acknowledgment that the
+model read the steer or the running command has already stopped.
 
 ## Inspecting a session
 

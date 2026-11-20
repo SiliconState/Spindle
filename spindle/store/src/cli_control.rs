@@ -195,7 +195,7 @@ fn waiting(inbox: &Path) -> Vec<(PathBuf, Message)> {
 
 /// What happened to a message `send` left.
 pub(crate) enum Sent {
-    /// The running process took it.
+    /// The running process claimed it; delivery into its handles may still be finishing.
     Taken,
     /// No process runs a turn of the session here.
     NotRunning,
@@ -315,6 +315,17 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn wait_for_delivery(delivered: impl Fn() -> bool) {
+        let deadline = Instant::now() + TAKEN_WITHIN;
+        while !delivered() {
+            assert!(
+                Instant::now() < deadline,
+                "claimed message was not delivered"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// A steer and a stop left by another process reach the turn's handles once each;
     /// with no process listening, a message is never left behind.
     #[test]
@@ -343,10 +354,12 @@ mod tests {
         let listener = Listener::start(&dir, handles, |_| {});
         assert!(matches!(send(&dir, Some("first"), false), Ok(Sent::Taken)));
         assert!(matches!(send(&dir, Some("now"), true), Ok(Sent::Taken)));
+        wait_for_delivery(|| steering.lock().unwrap().len() == 2 && hurry.load(Ordering::SeqCst));
         assert_eq!(*steering.lock().unwrap(), ["first", "now"]);
         assert!(hurry.load(Ordering::SeqCst));
         assert!(!interrupt.load(Ordering::SeqCst));
         assert!(matches!(send(&dir, None, false), Ok(Sent::Taken)));
+        wait_for_delivery(|| interrupt.load(Ordering::SeqCst));
         assert!(interrupt.load(Ordering::SeqCst));
         drop(listener);
         // Held but not listening: a host that takes messages its own way.

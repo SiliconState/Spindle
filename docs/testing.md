@@ -63,7 +63,10 @@ use `--workspace --all-features` to include `spindle-store` and `spindle-embed`.
 | `cli.rs` | The `spindle` command line end to end (Linux): a turn driven and read back from a second process (`status`, `log`, `files`, `diff`, `--json`), an unreachable provider counted refused and never uncertain, refused command lines that change nothing, and a prompt from standard input |
 
 `power_loss.rs` runs a sample of crash points by default; `SPINDLE_POWER_LOSS=all` sweeps
-every point and takes much longer.
+every point and takes much longer. The CLI inbox unit test waits up to five seconds
+for claimed messages to reach the steering, read-now and interrupt handles. Claiming
+removes the inbox file before delivering it, so `send` returning `Taken` alone is not
+a delivery barrier.
 
 Some cases need Linux namespaces and `bubblewrap`, delegated cgroup v2, or interpreters
 (Python, Node). Where a requirement is missing, the test reports a skip; a skip is not
