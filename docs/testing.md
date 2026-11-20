@@ -170,10 +170,13 @@ pull request, except those that change only the website or the release workflow:
 | `wasm` | Provider/wire wasm32 builds, store/WASI, Node/OPFS, browser Linux and both browser editions; scripted extension and sign-in/vault suites, focused Node checks, renewal and real-Chrome review |
 | `windows` | Native store, CLI and engine tests on Windows |
 
-Within the wasm job, the v86 Node suite runs with a 4096 MiB old-space limit and two
-WebAssembly compiler tasks. The 512 MiB guest, saved state and generated code need room
-outside the JavaScript heap; limiting compiler concurrency avoids a runner memory spike.
-The assertions and the guest memory size are unchanged.
+Within the wasm job, Node is pinned to the locally verified 22.22.1 rather than the
+runner image's moving default (24.22.2 produced intermittent V8 Zone allocation failures
+in v86). The setup-node action is pinned by commit. The v86 Node suite runs with a
+4096 MiB old-space limit and two WebAssembly compiler tasks. The 512 MiB guest, saved
+state and generated code need room outside the JavaScript heap; limiting compiler
+concurrency bounds simultaneous compilation work. The assertions and guest memory
+size are unchanged.
 
 Two more workflows publish. [`pages.yml`](../.github/workflows/pages.yml) deploys `site/` to
 GitHub Pages when it changes. [`browser-release.yml`](../.github/workflows/browser-release.yml),
