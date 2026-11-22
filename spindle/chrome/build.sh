@@ -5,14 +5,19 @@
 # (store/ui, copied so there is one source), and the Linux threads run bash in
 # (chrome/linux/build.sh's output; SPINDLE_LINUX names another). With SPINDLE_WASM_LINUX
 # naming a wasm Linux (chrome/wasm-linux/build-image.sh's output) it carries that too, and
-# plain sh commands run there (linux-route.mjs); without it every command runs on v86. Run
+# plain sh commands run there (linux-route.mjs); without it every command runs on v86. The
+# two Linuxes' files are kept in one store, linux/flat/ (each named by its digest), so
+# what they have in common (Python's standard library, byte for byte) is carried once. Run
 # from the spindle directory. The icons are the native UI's icon.svg drawn at the
 # browser's sizes; THIRD-PARTY.md names the other software a build carries and where its
 # source is. SPINDLE_STORE=1 makes the Chrome Web Store's build: ChatGPT signs in only with
 # OpenAI's Sign in with ChatGPT (`chatgpt-plan`); the sign-in through the Codex CLI client
 # (`chatgpt`, feature `codex-signin`) is left out, and the build checks none of it is there.
+# The engine wasm is built with the `browser` profile (the whole program optimized as one)
+# and then optimized by Binaryen's wasm-opt (SPINDLE_WASM_OPT, else wasm-opt on PATH; a
+# build without one says so, and releases use one): smaller, as fast or faster.
 #
-# usage: [SPINDLE_STORE=1] chrome/build.sh [WASM_BINDGEN_CLI] [OUT_DIR]   (OUT_DIR defaults to chrome/dist)
+# usage: [SPINDLE_STORE=1] [SPINDLE_WASM_OPT=...] chrome/build.sh [WASM_BINDGEN_CLI] [OUT_DIR]   (OUT_DIR defaults to chrome/dist)
 set -euo pipefail
 
 bindgen=${1:-wasm-bindgen}
@@ -26,8 +31,17 @@ if [ ! -f "$linux/identity" ]; then
     echo "no browser Linux in $linux: build it first (chrome/linux/build.sh)" >&2
     exit 1
 fi
-if [ -n "$wasm_linux" ] && [ ! -f "$wasm_linux/identity" ]; then
-    echo "no wasm Linux in $wasm_linux: build it first (chrome/wasm-linux/build-image.sh)" >&2
+# Images from before the Linux's own kernel and compressed files would not boot here.
+if [ ! -f "$linux/bzImage" ]; then
+    echo "the browser Linux in $linux is an older build (no bzImage): build it again (chrome/linux/build.sh)" >&2
+    exit 1
+fi
+if [ -n "$wasm_linux" ] && [ ! -f "$wasm_linux/fs.json" ]; then
+    echo "no wasm Linux in $wasm_linux: build it first (chrome/wasm-linux/build-image.sh, or fetch-image.sh)" >&2
+    exit 1
+fi
+if [ -n "$wasm_linux" ] && [ ! -f "$wasm_linux/vmlinux.wasm.zst" ]; then
+    echo "the wasm Linux in $wasm_linux is an older build (no vmlinux.wasm.zst): build it again (chrome/wasm-linux/build-image.sh) or fetch it (fetch-image.sh)" >&2
     exit 1
 fi
 # What the Chrome Web Store takes of the manifest's names for the extension: it refuses a
@@ -56,10 +70,19 @@ fi
 # The wasm names source files in its panic messages: under /src (this checkout's parent,
 # holding spindle/ and dext-engine/) and /cargo, not this machine's directories.
 RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$(cd .. && pwd)=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo" \
-    cargo build --locked --release -p spindle-embed --target wasm32-unknown-unknown ${features[@]+"${features[@]}"}
+    cargo build --locked --profile browser -p spindle-embed --target wasm32-unknown-unknown ${features[@]+"${features[@]}"}
 rm -rf "$out"
 mkdir -p "$out/clients" "$out/icons"
-"$bindgen" --target web --out-dir "$out/web" target/wasm32-unknown-unknown/release/spindle_embed.wasm
+"$bindgen" --target web --out-dir "$out/web" target/wasm32-unknown-unknown/browser/spindle_embed.wasm
+wasm_opt=${SPINDLE_WASM_OPT:-$(command -v wasm-opt || true)}
+if [ -n "$wasm_opt" ]; then
+    # Features as the wasm's own target_features section names them.
+    "$wasm_opt" -O3 "$out/web/spindle_embed_bg.wasm" -o "$out/web/spindle_embed_bg.wasm"
+    built_wasm_opt="\"$("$wasm_opt" --version | awk '{print $NF}' | tr -d '()')\""
+else
+    echo "no wasm-opt (SPINDLE_WASM_OPT, or on PATH): the engine wasm is left as Rust made it" >&2
+    built_wasm_opt=null
+fi
 # The engine gives a grown wasm instance's memory back by loading a fresh copy of the
 # glue (engine-worker.mjs `renewEngine`): a module is never unloaded, so this one lets go of
 # its instance and of the views of its memory. Nothing in it is used after.
@@ -84,12 +107,29 @@ cp chrome/manifest.json chrome/background.js chrome/engine.html chrome/engine.mj
     chrome/preview.js "$out/"
 cp -r "$linux" "$out/linux"
 if [ -n "$wasm_linux" ]; then
-    # Its runtime (what boots the kernel and serves its devices; v86's 9p server, vendored)
-    # and its image.
+    # Its runtime (what boots the kernel and serves its devices; v86's 9p server, vendored;
+    # zstd from v86.wasm) and its image, its files in the store v86's are in.
     mkdir -p "$out/wasm-linux"
-    cp chrome/wasm-linux/{console,devicetree,entropy,imports,machine,ninep,runner,task,user,virtio}.mjs "$out/wasm-linux/"
+    cp chrome/wasm-linux/{console,devicetree,entropy,imports,machine,ninep,runner,task,user,virtio,zstd}.mjs "$out/wasm-linux/"
     cp -r chrome/wasm-linux/v86 "$out/wasm-linux/v86"
-    cp -r "$wasm_linux/fs.json" "$wasm_linux/flat" "$wasm_linux/vmlinux.wasm" "$wasm_linux/identity" "$out/wasm-linux/"
+    cp "$wasm_linux/fs.json" "$wasm_linux/vmlinux.wasm.zst" "$out/wasm-linux/"
+    # Its identity from the image and this runtime (identity.sh), whatever the image's
+    # own file says.
+    chrome/wasm-linux/identity.sh "$wasm_linux" > "$out/wasm-linux/identity"
+    shared=0
+    for file in "$wasm_linux"/flat/*; do
+        if [ -e "$out/linux/flat/${file##*/}" ]; then shared=$((shared + 1)); else cp "$file" "$out/linux/flat/"; fi
+    done
+    echo "wasm Linux: $(find "$wasm_linux/flat" -type f | wc -l) files, $shared of them carried for v86 already"
+    # One Python in both (build-image.sh takes Alpine's library for the wasm Linux's): a
+    # browser Linux built since with another python3 still works, but shares fewer files.
+    v86_python=$(sed -n 's/^python3-\([0-9][0-9.]*\)-r[0-9]*$/\1/p' "$linux/manifest.txt")
+    wasm_python=$(cat "$wasm_linux/python-version" 2>/dev/null || echo unknown)
+    if [ "$v86_python" != "$wasm_python" ]; then
+        drift="the browser Linux has Python $v86_python and the wasm Linux $wasm_python: rebuild the wasm Linux with $v86_python (chrome/wasm-linux/build-python.sh)"
+        echo "warning: $drift" >&2
+        [ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::$drift"
+    fi
 fi
 cp chrome/icons/*.png "$out/icons/"
 cp clients/js/common.mjs clients/js/embedded.mjs clients/js/opfs.mjs clients/js/remote.mjs "$out/clients/"
@@ -118,7 +158,7 @@ built_rustc=$(rustc -V | cut -d' ' -f2)
 built_wasm=$(sha256sum "$out/web/spindle_embed_bg.wasm" | cut -c1-64)
 built_linux=$(tr -d '\n' < "$linux/identity")
 built_wasm_linux=null
-if [ -n "$wasm_linux" ]; then built_wasm_linux="\"$(tr -d '\n' < "$wasm_linux/identity")\""; fi
+if [ -n "$wasm_linux" ]; then built_wasm_linux="\"$(tr -d '\n' < "$out/wasm-linux/identity")\""; fi
 for value in "$built_version" "$built_rustc" "$built_wasm" "$built_linux"; do
     [ -n "$value" ] || { echo "build.json: a value could not be worked out" >&2; exit 1; }
 done
@@ -128,6 +168,7 @@ cat > "$out/build.json" <<BUILD
   "spindle": "$built_spindle",
   "engine": "$built_engine",
   "wasm_bindgen": "$have",
+  "wasm_opt": $built_wasm_opt,
   "rustc": "$built_rustc",
   "wasm": "$built_wasm",
   "linux": "$built_linux",

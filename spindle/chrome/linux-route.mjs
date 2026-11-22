@@ -384,8 +384,8 @@ function substitutions(inner) {
 }
 
 /** Whether a wasm Linux result says the command needs what it lacks (a program it does
- * not have, syntax its sh does not take, an option only GNU's tools take, a Python module
- * or a program Python asked for):
+ * not have, syntax its sh does not take, an option only GNU's tools take, ripgrep's
+ * PCRE2, a Python module, pip, a program Python asked for, or more memory):
  * run again on v86, unless it made a Spindle call (journaled, maybe billed) or was
  * stopped or timed out (its result stands). */
 export function wantsV86(result) {
@@ -404,11 +404,23 @@ export function wantsV86(result) {
   // A busybox program refusing an option GNU's takes (grep -P, find -printf, date -d):
   // v86 has GNU coreutils, grep, sed and findutils.
   if (/(^|\n)[\w.-]+: (unrecognized|invalid) option\b/.test(output) || /(^|\n)BusyBox v[\d.]+[^\n]* multi-call binary/.test(output)) return true;
+  // ripgrep's PCRE2 (`rg -P`): the wasm Linux's ripgrep is built without it, v86's with.
+  if (/(^|\n)(rg: )?PCRE2 is not available in this build of ripgrep/.test(output)) return true;
   // GNU date reads dates busybox's does not (`yesterday`, `next friday`).
   if (/(^|\n)date: invalid date /.test(output)) return true;
   // Python: a module the wasm Linux's Python lacks (v86's may have it: pip installs
   // there), or a program its subprocess found nowhere or may not run (a saved one).
   if (/(^|\n)ModuleNotFoundError: No module named /.test(output)) return true;
+  // `python3 -m MODULE` naming one it lacks (pip, pytest: what pip installs is v86's),
+  // which Python says without a traceback.
+  if (/(^|\n)\S*python[\d.]*: No module named /.test(output)) return true;
+  // A venv made here could never get its pip (pip and what it installs are v86's): venv's
+  // ensurepip fails, and v86 makes the venv afresh.
+  if (/(^|\n)Error: Command '\[[^\n]*'-m', 'ensurepip'/.test(output)) return true;
+  // Out of memory: each wasm Linux program has at most 256 MiB, v86's machine 512 MiB
+  // (Python's MemoryError, a Rust program's failed allocation, busybox's).
+  if (/(^|\n)MemoryError\b/.test(output) || /(^|\n)memory allocation of \d+ bytes failed/.test(output)
+    || /(^|\n)[\w.-]+: out of memory\s*(\n|$)/.test(output)) return true;
   return /subprocess\.py", line \d+/.test(output)
     && /(^|\n)(FileNotFoundError: \[Errno 2\] No such file or directory|PermissionError: \[Errno 13\] Permission denied): /.test(output);
 }

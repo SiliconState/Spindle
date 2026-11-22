@@ -11,19 +11,19 @@
 //                   { type: 'files', id, files: [{object, bytes}] | error } (the bytes it asked for)
 //                   { type: 'stop', id } | { type: 'code_reply', id, seq, reply } | { type: 'relay', url }
 //                   { type: 'forget', session } (a thread gone: what the share keeps of it goes)
+//                   { type: 'start' } | { type: 'prepare' } (the saved state made now, if there is none)
 // worker -> engine  { type: 'ran', id, result } | { type: 'status', state, detail }
+//                   | { type: 'prepared', did } (whether the machine booted to make its state)
 //                   | { type: 'need', id, objects } (files of its workspace the share lacks)
 //                   | { type: 'code', id, seq, request }   (a script's Spindle call)
 import { V86 } from './linux/libv86.mjs';
 import { wireNetwork } from './linux-net.mjs';
 import { readFrames as listen, sendFrame as frame } from './linux-frames.mjs';
 import { Workspaces } from './linux-workspace.mjs';
+import { linuxStateName } from './shared.mjs';
 
 const base = new URL('./linux/', import.meta.url).href;
 const MEMORY = 512 * 1024 * 1024;
-/** The machine's devices, as its saved state holds them: a state saved with others is
- * not resumed. */
-const MACHINE = 'net1';
 /** The network card's frames: large, so a TCP stream moves in few round trips. */
 const MTU = 65520;
 /** Most output a command returns (the package keeps far less in the transcript). */
@@ -75,8 +75,10 @@ function options(saved, wired) {
     ...(saved
       ? { initial_state: { buffer: saved } }
       : {
-          bzimage_initrd_from_filesystem: true,
-          cmdline: 'rw root=host9p rootfstype=9p rootflags=trans=virtio,cache=loose,msize=262144 modules=virtio_pci,virtio_net tsc=reliable quiet',
+          // The kernel (beside the image: build.sh builds 9p and virtio in, so it boots straight
+          // onto the 9p root with no boot image).
+          bzimage: { url: `${base}bzImage` },
+          cmdline: 'rw root=host9p rootfstype=9p rootflags=trans=virtio,cache=loose,msize=262144 tsc=reliable quiet',
         }),
   };
 }
@@ -99,9 +101,9 @@ async function stateFile(identity, create) {
   const dir = await root.getDirectoryHandle('linux', { create: true });
   if (create) {
     // States of other images are dead weight.
-    for await (const name of dir.keys()) if (name !== `state-${identity}-${MACHINE}`) await dir.removeEntry(name).catch(() => {});
+    for await (const name of dir.keys()) if (name !== linuxStateName(identity)) await dir.removeEntry(name).catch(() => {});
   }
-  return dir.getFileHandle(`state-${identity}-${MACHINE}`, { create });
+  return dir.getFileHandle(linuxStateName(identity), { create });
 }
 
 /** The machine: resumed from its saved state, or booted (and saved) the first time; a
@@ -182,8 +184,21 @@ async function resumed(vm, listeners) {
 /** Removes the saved state (one that did not resume, or was not saved whole). */
 async function forgetState(identity) {
   try {
-    await (await (await navigator.storage.getDirectory()).getDirectoryHandle('linux')).removeEntry(`state-${identity}-${MACHINE}`);
+    await (await (await navigator.storage.getDirectory()).getDirectoryHandle('linux')).removeEntry(linuxStateName(identity));
   } catch {}
+}
+
+/** Makes the saved state now if there is none for this image (a first start's boot and
+ * save, ahead of the first command that needs this Linux, which then resumes it). False
+ * when there was one, or a machine is running or starting already: nothing started. */
+async function prepare() {
+  if (machine || starting) return false;
+  const identity = (await (await fetch(`${base}identity`)).text()).trim();
+  try {
+    if ((await (await stateFile(identity, false)).getFile()).size) return false;
+  } catch {}
+  await start();
+  return true;
 }
 
 /** Saves a freshly booted machine's state, for later starts to resume. */
@@ -461,5 +476,10 @@ self.onmessage = ({ data }) => {
     machine?.workspaces.forget(data.session, under).catch(() => {});
   } else if (data.type === 'start') {
     start().catch((error) => status('failed', error.message));
+  } else if (data.type === 'prepare') {
+    prepare().then((did) => postMessage({ type: 'prepared', did }), (error) => {
+      status('failed', error.message);
+      postMessage({ type: 'prepared', did: false });
+    });
   }
 };

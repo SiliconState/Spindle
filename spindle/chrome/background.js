@@ -5,7 +5,7 @@
 // keys and typing reach the page as the user's would, and a tab's network can be
 // watched).
 import { ACTING_NAMES, BROWSER, PAGE_ACCESS, PICTURE_ACCESS, pageSwitches, pagesRecord, uncertain } from './page-tools.mjs';
-import { REQUESTS, answersFor, read, startEngine, write } from './shared.mjs';
+import { REQUESTS, answersFor, linuxStateName, read, startEngine, write } from './shared.mjs';
 
 // (A browser without the side panel API still runs the rest.)
 chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
@@ -17,7 +17,26 @@ chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true }).catch(() =>
 // Full as it updates (its switches never named a mode), so nothing it did unasked starts
 // asking. A new install asks before what sends or submits.
 const UNREAD = Symbol('unread');
+/** Whether the browser Linux has its saved state for the image this build carries (an
+ * update that kept the image needs no new boot, nor the engine started for one). */
+async function linuxSaved() {
+  try {
+    const identity = (await (await fetch(chrome.runtime.getURL('linux/identity'))).text()).trim();
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('linux');
+    return (await (await dir.getFileHandle(linuxStateName(identity))).getFile()).size > 0;
+  } catch {
+    // None there (or OPFS unreadable here): the engine looks, and boots only if it must.
+    return false;
+  }
+}
 chrome.runtime.onInstalled.addListener(async ({ reason }) => {
+  // The browser Linux's one boot (v86 boots and saves its state the first time; a new
+  // image, once after the update that brought it) is done now, in the background, rather
+  // than on the first command that needs it. Nothing starts when its state is there.
+  if (reason === 'install' || reason === 'update') {
+    linuxSaved().then((saved) => saved || fromEngine('prepareLinux', {}))
+      .catch((error) => console.warn('Spindle: the browser Linux was not prepared:', error.message));
+  }
   // A read that fails changes nothing (a missing record reads as undefined).
   const kept = await read('kv', 'pages').catch(() => UNREAD);
   if (kept === UNREAD) return;

@@ -1,21 +1,28 @@
 // Which Linux starts ahead of a command (a Node test of linux-runner.mjs with stand-in
 // workers): `warm()` starts both, `warm({ v86: false })` the wasm Linux alone, and
 // without a wasm Linux in the build it starts nothing; v86 then starts with the first
-// command that goes to it, and `onRan` says which Linux ran each command.
+// command that goes to it, and `onRan` says which Linux ran each command. `prepare()`
+// (after an install or update) has v86 make its saved state and then lets the machine
+// go, unless a command came for it meanwhile.
 import assert from 'node:assert/strict';
 
 const started = [];
 class StandIn {
   constructor(url) {
     this.kind = String(url).includes('wasm-linux') ? 'wasm' : 'v86';
+    this.got = [];
+    this.terminated = false;
     started.push(this);
   }
   postMessage(message) {
+    this.got.push(message.type);
     if (message.type !== 'run') return;
     // Answer the command as the Linux would.
     queueMicrotask(() => this.onmessage({ data: { type: 'ran', id: message.id, result: { output: 'ok', success: true } } }));
   }
-  terminate() {}
+  terminate() {
+    this.terminated = true;
+  }
 }
 globalThis.Worker = StandIn;
 let carriesWasm = true;
@@ -66,5 +73,44 @@ runner.warm();
 await settle();
 assert.deepEqual(kinds(), ['v86']);
 
-console.log('linux-warm passed: v86 starts only when asked or with a command that needs it; the wasm Linux on open; which ran each command told');
+// prepare(): v86 alone makes its state, then goes (its memory with it), said stopped.
+started.length = 0;
+carriesWasm = true;
+const states = [];
+runner = linuxRunner({ onStatus: (state, detail, kind) => states.push(`${kind}:${state}`) });
+runner.prepare();
+await settle();
+assert.deepEqual(kinds(), ['v86']);
+let [v86] = started;
+assert.ok(v86.got.includes('prepare'));
+v86.onmessage({ data: { type: 'status', state: 'booting' } });
+v86.onmessage({ data: { type: 'status', state: 'ready' } });
+v86.onmessage({ data: { type: 'prepared', did: true } });
+assert.equal(v86.terminated, true, 'the machine goes once its state is made');
+assert.deepEqual(states.filter((state) => state.startsWith('v86')), ['v86:booting', 'v86:ready', 'v86:stopped']);
+// A state already there: nothing booted, the worker goes, no status.
+started.length = 0;
+states.length = 0;
+runner.prepare();
+await settle();
+[v86] = started;
+v86.onmessage({ data: { type: 'prepared', did: false } });
+assert.equal(v86.terminated, true);
+assert.deepEqual(states.filter((state) => state.startsWith('v86')), []);
+// A command for v86 while it prepares: the machine stays.
+started.length = 0;
+runner.prepare();
+await settle();
+[v86] = started;
+assert.equal((await runner.run({ ...job, command: 'curl example.com', network: true })).success, true);
+v86.onmessage({ data: { type: 'prepared', did: true } });
+assert.equal(v86.terminated, false, 'a command came: the machine stays');
+// And while v86 runs already, prepare() asks nothing of it.
+const asked = v86.got.length;
+runner.prepare();
+await settle();
+assert.equal(v86.got.length, asked);
+assert.equal(started.length, 1);
+
+console.log('linux-warm passed: v86 starts only when asked or with a command that needs it; the wasm Linux on open; which ran each command told; prepare() makes v86\'s state and lets it go');
 process.exit(0);

@@ -1,9 +1,12 @@
 // The wasm Linux (chrome/wasm-linux: Linux compiled to WebAssembly, run with no
 // emulator; its runner wasm-linux/runner.mjs), in a worker of its own beside v86's
 // (linux-worker.mjs), speaking the same messages, so linux-runner.mjs sends a command to
-// either. Its root filesystem is wasm-linux/fs.json and flat/ (fetched as the guest opens
-// files), its kernel wasm-linux/vmlinux.wasm; it boots in under a second, so it is not
-// saved. Several commands run at once (one per thread at a time, each on CPUs of its
+// either. Its root filesystem is wasm-linux/fs.json, its files fetched as the guest opens
+// them from linux/flat/ (the one store of files both Linuxes' indexes name: chrome/build.sh
+// puts the wasm Linux's there beside v86's, so what they have in common is carried once),
+// its kernel wasm-linux/vmlinux.wasm.zst. Files and kernel are compressed with zstd and
+// decompressed with v86's own decoder (wasm-linux/zstd.mjs). It boots in under a second,
+// so it is not saved. Several commands run at once (one per thread at a time, each on CPUs of its
 // own); none has network (linux-runner.mjs sends those to v86). It checks first that this
 // browser lets a worker share memory with the workers it starts, and says `unavailable`
 // when it does not (or the image is missing): commands then go to v86. A boot that fails
@@ -20,8 +23,11 @@ import { browserPlatform } from './wasm-linux/machine.mjs';
 import { WasmLinux } from './wasm-linux/runner.mjs';
 import { FS } from './wasm-linux/v86/lib/filesystem.js';
 import { MemoryFileStorage, ServerFileStorageWrapper } from './wasm-linux/v86/src/browser/filestorage.js';
+import { contentSize, zstdDecoder } from './wasm-linux/zstd.mjs';
 
 const base = new URL('./wasm-linux/', import.meta.url).href;
+/** Where both Linuxes' files are, by digest. */
+const files = new URL('./linux/flat/', import.meta.url).href;
 /** Commands running at once (the machine gives each two CPUs of its own). */
 const MOST_RUNNING = 4;
 
@@ -65,8 +71,8 @@ function lasting(message) {
 function start() {
   starting ??= (async () => {
     if (!(await sharesMemory())) throw lasting('this browser does not share memory with workers');
-    const [kernel, index] = await Promise.all([
-      fetch(`${base}vmlinux.wasm`).then((response) => {
+    const [packed, index, decode] = await Promise.all([
+      fetch(`${base}vmlinux.wasm.zst`).then((response) => {
         if (!response.ok) throw lasting(`no wasm Linux kernel (HTTP ${response.status})`);
         return response.arrayBuffer();
       }),
@@ -74,8 +80,15 @@ function start() {
         if (!response.ok) throw lasting(`no wasm Linux image (HTTP ${response.status})`);
         return response.json();
       }),
+      fetch(new URL('./linux/v86.wasm', import.meta.url)).then((response) => {
+        if (!response.ok) throw lasting(`no zstd decoder (v86.wasm: HTTP ${response.status})`);
+        return response.arrayBuffer().then(zstdDecoder);
+      }),
     ]);
-    const root = new FS(new ServerFileStorageWrapper(new MemoryFileStorage(), `${base}flat/`));
+    const size = contentSize(new Uint8Array(packed));
+    if (size === null) throw lasting('the wasm Linux kernel does not say its size');
+    const kernel = decode(size, new Uint8Array(packed));
+    const root = new FS(new ServerFileStorageWrapper(new MemoryFileStorage(), files, decode));
     root.load_from_json(index);
     const platform = browserPlatform();
     platform.warm();

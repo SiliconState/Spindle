@@ -37,8 +37,8 @@ function boot(initial, relay = null) {
     ...(initial
       ? { initial_state: { buffer: initial } }
       : {
-          bzimage_initrd_from_filesystem: true,
-          cmdline: 'rw root=host9p rootfstype=9p rootflags=trans=virtio,cache=loose,msize=262144 modules=virtio_pci,virtio_net tsc=reliable quiet',
+          bzimage: { url: `${dist}/bzImage` },
+          cmdline: 'rw root=host9p rootfstype=9p rootflags=trans=virtio,cache=loose,msize=262144 tsc=reliable quiet',
         }),
   });
 }

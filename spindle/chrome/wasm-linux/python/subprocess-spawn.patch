@@ -1,6 +1,6 @@
 --- a/Modules/_posixsubprocess.c
 +++ b/Modules/_posixsubprocess.c
-@@ -50,6 +50,13 @@
+@@ -52,6 +52,13 @@
  # define VFORK_USABLE 1
  #endif
  
@@ -14,7 +14,7 @@
  #if defined(__sun) && defined(__SVR4)
  /* readdir64 is used to work around Solaris 9 bug 6395699. */
  # define readdir readdir64
-@@ -870,6 +877,7 @@
+@@ -872,6 +879,7 @@
   * child_exec() should not be inlined to avoid spurious -Wclobber warnings from
   * GCC (see bpo-35823).
   */
@@ -22,7 +22,7 @@
  Py_NO_INLINE static pid_t
  do_fork_exec(char *const exec_array[],
               char *const argv[],
-@@ -958,6 +966,181 @@
+@@ -960,6 +968,181 @@
      _exit(255);
      return 0;  /* Dead code to avoid a potential compiler warning. */
  }
@@ -204,7 +204,7 @@
  
  /*[clinic input]
  _posixsubprocess.fork_exec as subprocess_fork_exec
-@@ -1214,6 +1397,12 @@
+@@ -1228,6 +1411,12 @@
          goto cleanup;
      }
  
@@ -217,7 +217,7 @@
      /* This must be the last thing done before fork() because we do not
       * want to call PyOS_BeforeFork() if there is any chance of another
       * error leading to the cleanup: code without calling fork(). */
-@@ -1285,6 +1474,7 @@
+@@ -1299,6 +1488,7 @@
  
      if (need_after_fork)
          PyOS_AfterFork_Parent();

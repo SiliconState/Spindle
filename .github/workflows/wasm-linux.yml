@@ -1,0 +1,126 @@
+name: wasm Linux image
+
+# Builds the wasm Linux's image (spindle/chrome/wasm-linux: its toolchain, kernel,
+# busybox, Rust, Python 3.14 with Alpine's standard library, and the image) from source at
+# the pinned commits and checksums its scripts name, checks Python on it, and publishes it
+# as a release asset (tag wasm-linux-SHA12, a prerelease, never Latest) with its sha256
+# and an attestation of where it was built. The browser release fetches the image that
+# spindle/chrome/wasm-linux/image.json pins (fetch-image.sh): this run's summary prints that
+# file. Run it when the wasm Linux's sources change, or when Alpine's python3 moves to a
+# new version (build-image.sh refuses an image whose Python differs from Alpine's).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-linux
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    # LLVM is built from source the first time (the toolchain is cached after).
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Tested Node runtime for wasm and v86 (with zstd, for the path check)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.22.1'
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld cmake ninja-build wabt flex bison m4 bc
+          rustup target add i686-unknown-linux-musl
+          # Alpine's packages (the image's Python library, zstd) and the browser Linux's
+          # build run in user namespaces, which this runner's AppArmor blocks by default.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # The toolchain (what later stages use of it: its compilers, their wrappers and the
+      # sysroot), cached by its script, and saved as soon as it is built.
+      - name: The toolchain, as cached
+        id: toolchain
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/w/toolchain/bin
+            ${{ runner.temp }}/w/toolchain/llvm
+            ${{ runner.temp }}/w/toolchain/sysroot
+          key: wasm-linux-toolchain-${{ hashFiles('spindle/chrome/wasm-linux/build-toolchain.sh') }}
+      - name: The toolchain, built (LLVM from source)
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        working-directory: spindle
+        run: |
+          chrome/wasm-linux/build-toolchain.sh "$RUNNER_TEMP/w/toolchain"
+          # Its sources and build (gigabytes) are not needed after.
+          rm -rf "$RUNNER_TEMP/w/toolchain/src" "$RUNNER_TEMP/w/toolchain/build"
+      - name: The toolchain, saved
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/w/toolchain/bin
+            ${{ runner.temp }}/w/toolchain/llvm
+            ${{ runner.temp }}/w/toolchain/sysroot
+          key: wasm-linux-toolchain-${{ hashFiles('spindle/chrome/wasm-linux/build-toolchain.sh') }}
+      - name: Build
+        working-directory: spindle
+        run: |
+          W="$RUNNER_TEMP/w"
+          # The kernel by the toolchain's own LLVM (the runner's clang is older than the one
+          # it was first built with); host programs by the runner's clang.
+          KERNEL_LLVM="$W/toolchain/llvm/bin" chrome/wasm-linux/build-kernel.sh "$W/kernel"
+          chrome/wasm-linux/build-userland.sh "$W/toolchain" "$W/userland"
+          chrome/wasm-linux/build-rust.sh "$W/toolchain" "$W/rust"
+          chrome/wasm-linux/build-python.sh "$W/toolchain" "$W/python"
+          chrome/wasm-linux/build-image.sh "$W/kernel/vmlinux.wasm" "$W/userland" "$W/rust" "$W/python" "$W/image"
+          # The image names no directory of the machine that made it (its files read as
+          # they decompress).
+          node chrome/tests/find_paths.mjs "$W/image" "$HOME" "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+      - name: Check it
+        working-directory: spindle
+        run: |
+          # The browser Linux carries the zstd decoder the wasm Linux uses (v86.wasm).
+          chrome/linux/build.sh
+          node chrome/tests/wasm_linux_python.mjs "$RUNNER_TEMP/w/image" chrome/linux/dist/v86.wasm
+          node chrome/tests/linux_route.mjs
+      - name: Pack
+        working-directory: spindle
+        run: |
+          sha=$(chrome/wasm-linux/pack-image.sh "$RUNNER_TEMP/w/image" "$RUNNER_TEMP/wasm-linux.tar")
+          tag="wasm-linux-${sha:0:12}"
+          mv "$RUNNER_TEMP/wasm-linux.tar" "$RUNNER_TEMP/$tag.tar"
+          (cd "$RUNNER_TEMP" && sha256sum "$tag.tar" > "$tag.tar.sha256")
+          {
+            echo "SHA=$sha"
+            echo "TAG=$tag"
+            echo "PYTHON=$(cat "$RUNNER_TEMP/w/image/python-version")"
+          } >> "$GITHUB_ENV"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/${{ env.TAG }}.tar
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$TAG.tar" "$TAG.tar.sha256" -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$TAG.tar" "$TAG.tar.sha256" -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --prerelease --latest=false --title "wasm Linux image ${SHA:0:12}" \
+              --notes "The wasm Linux's image (Python $PYTHON), built from ${GITHUB_SHA:0:12} by the wasm Linux workflow. Spindle for Browser's releases carry it when spindle/chrome/wasm-linux/image.json pins it."
+          fi
+          {
+            echo "### spindle/chrome/wasm-linux/image.json"
+            echo '```json'
+            printf '{\n  "url": "https://github.com/%s/releases/download/%s/%s.tar",\n  "sha256": "%s",\n  "python": "%s"\n}\n' "$GITHUB_REPOSITORY" "$TAG" "$TAG" "$SHA" "$PYTHON"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

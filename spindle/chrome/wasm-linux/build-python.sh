@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # Builds CPython for Spindle's wasm Linux with its toolchain (build-toolchain.sh): Python
-# 3.13 (PSF license) cross-compiled for wasm32-unknown-linux-musl, every C module linked
+# 3.14 (PSF license; the version of the browser Linux's, Alpine's python3, so a command
+# runs on one Python wherever it runs: build-image.sh checks they match and takes the
+# standard library from Alpine's package) cross-compiled for wasm32-unknown-linux-musl,
+# every C module linked
 # into the one program (there is no dlopen here), with zlib, bzip2 and SQLite (built here
 # too); subprocess starts children with posix_spawn (python/subprocess-spawn.patch: there
 # is no fork); no ctypes, ssl, readline or curses, and pymalloc rather than mimalloc
-# (which needs mprotect; with no mmap here pymalloc takes its arenas from malloc). A
+# (which needs mprotect; with no mmap here pymalloc takes its arenas from malloc), and no
+# remote debugging (3.14's sys.remote_exec: it maps other processes' memory). A
 # native Python of the same version is
 # built first (a cross build needs one; it also compiles the library). From release
 # tarballs pinned by digest; nothing needs root.
 #
 # usage: chrome/wasm-linux/build-python.sh TOOLCHAIN_DIR OUT_DIR
-#   OUT_DIR gets root/ (usr/bin/python3, usr/lib/python3.13: the standard library compiled
-#   ahead, without its tests, IDLE, Tk and the like); sources and builds go in OUT_DIR/src
-#   and OUT_DIR/build.
+#   OUT_DIR gets root/ (usr/bin/python3, usr/lib/python3.14: the standard library compiled
+#   ahead, without its tests, IDLE, Tk and the like) and VERSION; sources and builds go in
+#   OUT_DIR/src and OUT_DIR/build.
 set -euo pipefail
 umask 022
 
@@ -21,8 +25,8 @@ toolchain=$(cd "$1" && pwd)
 out=$(mkdir -p "$2" && cd "$2" && pwd)
 
 TARGET=wasm32-unknown-linux-musl
-PYTHON=3.13.18
-PYTHON_SHA256=abb0102e6d4ae027509bcb82327d9dd85515b44a3ba8ad538cfc5e9847029f68
+PYTHON=3.14.10
+PYTHON_SHA256=de414a57119abef52784d8993e341d53aed635fc2b05c2607d9f98a2c5b72032
 ZLIB=1.3.2
 ZLIB_SHA256=bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
 BZIP2=1.0.8
@@ -98,12 +102,13 @@ ac_cv_func_dlopen=no
 ac_cv_lib_dl_dlopen=no
 ac_cv_header_sys_mman_h=no
 py_cv_module__posixshmem=n/a
+py_cv_module__remote_debugging=n/a
 SITE
 # pkg-config sees the target's libraries alone (the build machine's would pass for them).
 mkdir -p "$deps/lib/pkgconfig"
 (cd "$build/python-target" && CONFIG_SITE=config.site PKG_CONFIG_LIBDIR="$deps/lib/pkgconfig" PKG_CONFIG_PATH= ../python/configure \
     --host="$TARGET" --build="$(../python/config.guess)" --with-build-python="$native" \
-    --prefix=/usr --disable-shared --disable-test-modules --without-ensurepip --disable-ipv6 --without-mimalloc \
+    --prefix=/usr --disable-shared --disable-test-modules --without-ensurepip --disable-ipv6 --without-mimalloc --without-remote-debug \
     CC="$cc" AR="$TARGET-ar" RANLIB="$TARGET-ranlib" READELF="$TARGET-readelf" CFLAGS=-O2 \
     ZLIB_CFLAGS="-I$deps/include" ZLIB_LIBS="-L$deps/lib -lz" \
     BZIP2_CFLAGS="-I$deps/include" BZIP2_LIBS="-L$deps/lib -lbz2" \
@@ -115,22 +120,27 @@ echo "its install"
 rm -rf "$root"
 make -C "$build/python-target" DESTDIR="$root" install >"$build/python-install.log" 2>&1 \
     || { tail -n 20 "$build/python-install.log" >&2; exit 1; }
-lib=$root/usr/lib/python3.13
+minor=${PYTHON%.*}
+lib=$root/usr/lib/python$minor
 # What a command has no use for here: tests, IDLE, Tk, the static library and build
-# files, what installs pip (no network), what is gone already in 3.13's own sense.
+# files, what installs pip (no network).
 rm -rf "$lib"/test "$lib"/idlelib "$lib"/tkinter "$lib"/turtledemo "$lib"/turtle.py "$lib"/ensurepip \
-    "$lib"/lib2to3 "$lib"/pydoc_data "$lib"/config-3.13* "$root"/usr/lib/pkgconfig "$root"/usr/include \
-    "$root"/usr/lib/libpython3.13.a "$root"/usr/share "$root"/usr/bin/idle3* "$root"/usr/bin/pydoc3* "$root"/usr/bin/python3*-config
+    "$lib"/pydoc_data "$lib"/config-$minor* "$root"/usr/lib/pkgconfig "$root"/usr/include \
+    "$root"/usr/lib/libpython$minor.a "$root"/usr/share "$root"/usr/bin/idle3* "$root"/usr/bin/pydoc3* "$root"/usr/bin/python3*-config
 find "$lib" -name __pycache__ -prune -exec rm -rf {} +
 # Python keeps its configure-time settings (compiler, flags, directories) in
-# _sysconfigdata; this machine's directories are named there as /toolchain and /python.
-sed -i -e "s|$toolchain|/toolchain|g" -e "s|$out|/python|g" "$lib"/_sysconfigdata_*.py
+# _sysconfigdata and (since 3.14) _sysconfig_vars; this machine's directories are named
+# there as /toolchain and /python, and its user's home (3.14's `userbase`) as the home of
+# the user commands run as.
+sed -i -e "s|$toolchain|/toolchain|g" -e "s|$out|/python|g" -e "s|$HOME|/home/spindle|g" \
+    "$lib"/_sysconfigdata_*.py "$lib"/_sysconfig_vars_*.json
 # Compiled ahead and never checked against the sources' times (the image gives every
 # file one fixed time, and the library is read-only to commands), named by their paths in
 # the guest, not this machine's (the same sources give the same files).
 "$native" -m compileall -q -j0 --invalidation-mode unchecked-hash -s "$root" -p / "$lib" >/dev/null
 # Its debug information goes (most of its size).
-"$TARGET-strip" "$root/usr/bin/python3.13"
-ln -sf python3.13 "$root/usr/bin/python3"
+"$TARGET-strip" "$root/usr/bin/python$minor"
+ln -sf "python$minor" "$root/usr/bin/python3"
 ln -sf python3 "$root/usr/bin/python"
-echo "Python in $root ($(du -sh "$root" | cut -f1); the program $(du -h "$root/usr/bin/python3.13" | cut -f1))"
+echo "$PYTHON" > "$out/VERSION"
+echo "Python in $root ($(du -sh "$root" | cut -f1); the program $(du -h "$root/usr/bin/python$minor" | cut -f1))"

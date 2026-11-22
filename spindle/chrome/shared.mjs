@@ -9,6 +9,11 @@ export const CHANNEL = 'spindle-engine';
 export const REQUESTS = `${CHANNEL}:requests`;
 export const answersFor = (page) => `${CHANNEL}:answers:${page}`;
 
+/** The browser Linux's saved state for an image, in OPFS `linux/` (linux-worker.mjs saves
+ * it and resumes from it; the background looks for it after an install or update). The
+ * machine's devices are in its name: a state saved with others is not resumed. */
+export const linuxStateName = (identity) => `state-${identity}-net1`;
+
 const STORES = ['kv', 'keys', 'threads', 'bundles'];
 let opening = null;
 

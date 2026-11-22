@@ -5,8 +5,10 @@
 # wasm32-spindle-linux-musl (vendor `spindle`, which is how the patches tell it from
 # WALI; it links with build-toolchain.sh's compiler wrapper), a pinned nightly (from
 # rustup) copied with its library source patched (rust/patches: core and std take this
-# target's paths rather than WALI's, std spawns by posix_spawn only and has no
-# stack-overflow handler; the libc crate gains musl's 32-bit wasm32 definitions, 64-bit
+# target's paths rather than WALI's, std spawns by posix_spawn only, has no
+# stack-overflow handler and duplicates file descriptors as on Linux (std takes no wasm32
+# to have fcntl's F_DUPFD_CLOEXEC or dup2: ripgrep's check for piped input needs them);
+# the libc crate gains musl's 32-bit wasm32 definitions, 64-bit
 # time, asm-generic syscall numbers), a libunwind with nothing to unwind (rust/unwind.c:
 # programs abort on panic) and `bin/cargo-wasm-linux`, cargo building a crate and std
 # (-Zbuild-std) for the target. Nothing needs root.

@@ -12,6 +12,39 @@ diff -ruN a/core/src/ffi/primitives.rs b/core/src/ffi/primitives.rs
          ) => {
              pub(super) type c_long = i64;
              pub(super) type c_ulong = u64;
+diff -ruN a/std/src/os/fd/owned.rs b/std/src/os/fd/owned.rs
+--- a/std/src/os/fd/owned.rs
++++ b/std/src/os/fd/owned.rs
+@@ -12,7 +12,8 @@
+ use crate::marker::PhantomData;
+ use crate::mem::ManuallyDrop;
+ #[cfg(not(any(
+-    all(target_arch = "wasm32", not(target_os = "emscripten")),
++    // Spindle's wasm32 Linux (arch/wasm) has fcntl and dup2, as Linux does
++    all(target_arch = "wasm32", not(any(target_os = "emscripten", target_vendor = "spindle"))),
+     target_env = "sgx",
+     target_os = "hermit",
+     target_os = "trusty",
+@@ -104,7 +105,8 @@
+     /// Creates a new `OwnedFd` instance that shares the same underlying file
+     /// description as the existing `BorrowedFd` instance.
+     #[cfg(not(any(
+-        all(target_arch = "wasm32", not(target_os = "emscripten")),
++        // Spindle's wasm32 Linux (arch/wasm) has fcntl and dup2, as Linux does
++        all(target_arch = "wasm32", not(any(target_os = "emscripten", target_vendor = "spindle"))),
+         target_os = "hermit",
+         target_os = "trusty",
+         target_os = "motor"
+@@ -132,7 +134,8 @@
+     /// Creates a new `OwnedFd` instance that shares the same underlying file
+     /// description as the existing `BorrowedFd` instance.
+     #[cfg(any(
+-        all(target_arch = "wasm32", not(target_os = "emscripten")),
++        // Spindle's wasm32 Linux (arch/wasm) has fcntl and dup2, as Linux does
++        all(target_arch = "wasm32", not(any(target_os = "emscripten", target_vendor = "spindle"))),
+         target_os = "hermit",
+         target_os = "trusty"
+     ))]
 diff -ruN a/std/src/os/linux/raw.rs b/std/src/os/linux/raw.rs
 --- a/std/src/os/linux/raw.rs
 +++ b/std/src/os/linux/raw.rs
@@ -35,6 +68,19 @@ diff -ruN a/std/src/os/linux/raw.rs b/std/src/os/linux/raw.rs
  mod arch {
      use crate::os::raw::{c_int, c_long};
  
+diff -ruN a/std/src/os/unix/io/mod.rs b/std/src/os/unix/io/mod.rs
+--- a/std/src/os/unix/io/mod.rs
++++ b/std/src/os/unix/io/mod.rs
+@@ -215,7 +215,8 @@
+             cvt(unsafe { libc::__wasilibc_fd_renumber(other.as_raw_fd(), this.as_raw_fd()) }).map(|_| ())
+         }
+         not(any(
+-            all(target_arch = "wasm32", not(target_os = "emscripten")),
++            // Spindle's wasm32 Linux (arch/wasm) has fcntl and dup2, as Linux does
++            all(target_arch = "wasm32", not(any(target_os = "emscripten", target_vendor = "spindle"))),
+             target_os = "hermit",
+             target_os = "trusty",
+             target_os = "motor"
 diff -ruN a/std/src/sys/args/mod.rs b/std/src/sys/args/mod.rs
 --- a/std/src/sys/args/mod.rs
 +++ b/std/src/sys/args/mod.rs

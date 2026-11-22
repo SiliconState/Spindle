@@ -108,14 +108,23 @@ assert.equal(wantsV86({ success: false, code: 127, output: 'my script failed on 
 assert.equal(wantsV86({ success: false, failure: 'the command did not finish within 5 s', output: '' }), false);
 assert.equal(wantsV86({ success: true, code: 0, output: 'sh: x: not found\n' }), false);
 assert.equal(wantsV86({ success: false, code: 1, output: 'Traceback (most recent call last):\n  File "a.py", line 1, in <module>\nModuleNotFoundError: No module named \'numpy\'\n' }), true);
-const missingProgram = 'Traceback (most recent call last):\n  File "/usr/lib/python3.13/subprocess.py", line 1955, in _execute_child\nFileNotFoundError: [Errno 2] No such file or directory: \'git\'\n';
+assert.equal(wantsV86({ success: false, code: 1, output: '/usr/bin/python3: No module named pip\n' }), true, 'python3 -m pip: pip is v86\'s');
+assert.equal(wantsV86({ success: false, code: 2, output: 'rg: PCRE2 is not available in this build of ripgrep\n' }), true, 'rg -P: v86\'s ripgrep has PCRE2');
+assert.equal(wantsV86({ success: false, code: 1, output: '' }), false, 'rg finding nothing is its answer');
+assert.equal(wantsV86({ success: false, code: 1, output: "Error: Command '['/workspace/.venv/bin/python3', '-m', 'ensurepip', '--upgrade', '--default-pip']' returned non-zero exit status 1.\n" }), true, 'a venv gets its pip on v86');
+assert.equal(wantsV86({ success: false, code: 1, output: "Error: no file named 'pip' here\n" }), false);
+assert.equal(wantsV86({ success: false, code: 1, output: 'Traceback (most recent call last):\n  File "<string>", line 1, in <module>\nMemoryError\n' }), true, 'v86 has more memory');
+assert.equal(wantsV86({ success: false, code: 134, output: 'memory allocation of 536870912 bytes failed\n' }), true);
+assert.equal(wantsV86({ success: false, code: 1, output: 'sort: out of memory\n' }), true);
+assert.equal(wantsV86({ success: false, code: 1, output: 'ran out of memory budget: 3 items left\n' }), false, 'a script\'s own words');
+const missingProgram = 'Traceback (most recent call last):\n  File "/usr/lib/python3.14/subprocess.py", line 1955, in _execute_child\nFileNotFoundError: [Errno 2] No such file or directory: \'git\'\n';
 assert.equal(wantsV86({ success: false, code: 1, output: missingProgram }), true);
 assert.equal(wantsV86({ success: false, code: 1, output: 'Traceback (most recent call last):\n  File "a.py", line 1, in <module>\nFileNotFoundError: [Errno 2] No such file or directory: \'data.csv\'\n' }), false, 'a missing data file is the script\'s');
 // A program a command saved does not run in the wasm Linux (its workspace and scratch
 // are data only): v86 runs the command again.
 assert.equal(wantsV86({ success: false, code: 126, output: 'sh: ./tool: Permission denied\n' }), true);
 assert.equal(wantsV86({ success: false, code: 126, output: "env: can't execute './tool': Permission denied\n" }), true);
-const savedProgram = 'Traceback (most recent call last):\n  File "/usr/lib/python3.13/subprocess.py", line 1955, in _execute_child\nPermissionError: [Errno 13] Permission denied: \'./tool\'\n';
+const savedProgram = 'Traceback (most recent call last):\n  File "/usr/lib/python3.14/subprocess.py", line 1955, in _execute_child\nPermissionError: [Errno 13] Permission denied: \'./tool\'\n';
 assert.equal(wantsV86({ success: false, code: 1, output: savedProgram }), true);
 assert.equal(wantsV86({ success: false, code: 1, output: 'Traceback (most recent call last):\n  File "a.py", line 1, in <module>\nPermissionError: [Errno 13] Permission denied: \'/etc/shadow\'\n' }), false, 'a file the script may not read is the script\'s');
 console.log(`linux-route passed: ${wasm.length} commands to the wasm Linux, ${v86.length} to v86, fallbacks told (GNU options, saved programs too)`);

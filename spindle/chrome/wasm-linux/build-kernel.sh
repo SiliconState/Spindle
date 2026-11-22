@@ -7,7 +7,7 @@
 # go on the pinned commit, and its options (spindle.config: 9p shares, namespaces,
 # System V IPC) on top of the defconfig.
 #
-# usage: chrome/wasm-linux/build-kernel.sh OUT_DIR [TOOLS_DIR]
+# usage: [KERNEL_LLVM=DIR] chrome/wasm-linux/build-kernel.sh OUT_DIR [TOOLS_DIR]
 #   OUT_DIR gets vmlinux.wasm; TOOLS_DIR (default: OUT_DIR/tools) keeps the build tools.
 set -euo pipefail
 umask 022
@@ -50,9 +50,14 @@ command -v m4 >/dev/null || build_tool m4 "$M4" "$M4_SHA256" "https://ftp.gnu.or
 command -v bison >/dev/null || build_tool bison "$BISON" "$BISON_SHA256" "https://ftp.gnu.org/gnu/bison/$BISON"
 command -v flex >/dev/null || build_tool flex "$FLEX" "$FLEX_SHA256" "https://github.com/westes/flex/releases/download/v2.6.4/$FLEX"
 
-# clang and the LLVM tools under their plain names, and a wasm-ld (LLVM's, else rustup's).
+# clang and the LLVM tools under their plain names, and a wasm-ld (LLVM's, else rustup's):
+# KERNEL_LLVM's (a directory of them, such as build-toolchain.sh's llvm/bin, where the
+# machine's clang is too old), else the machine's clang 21, else its clang. Host programs
+# are built with the machine's clang either way.
 mkdir -p "$tools/llvm"
-llvm=$(dirname "$(readlink -f "$(command -v clang-21 || command -v clang)")")
+# (The machine's own, looked for past the links an earlier run left in $tools/llvm.)
+machine_clang=$(PATH=/usr/local/bin:/usr/bin:/bin; readlink -f "$(command -v clang-21 || command -v clang)")
+llvm=${KERNEL_LLVM:-$(dirname "$machine_clang")}
 for tool in clang llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-ranlib; do
     [ -x "$llvm/$tool" ] && ln -sf "$llvm/$tool" "$tools/llvm/$tool"
 done
@@ -83,15 +88,15 @@ build="$out/build"
 mkdir -p "$build/arch/wasm"
 # The arch Makefile names its script by a path relative to the tree.
 ln -sfn "$src/arch/wasm/scripts" "$build/arch/wasm/scripts"
-make -C "$src" O="$build" LLVM=1 HOSTCC=clang HOSTLD=/usr/bin/ld defconfig >/dev/null
+make -C "$src" O="$build" LLVM=1 HOSTCC="$machine_clang" HOSTLD=/usr/bin/ld defconfig >/dev/null
 # Spindle's options on top (spindle.config): the runner depends on every one (full
 # dynticks above all), so one the kernel does not take stops the build.
 fragment="$here/spindle.config"
 cat "$fragment" >>"$build/.config"
-make -C "$src" O="$build" LLVM=1 HOSTCC=clang HOSTLD=/usr/bin/ld olddefconfig >/dev/null
+make -C "$src" O="$build" LLVM=1 HOSTCC="$machine_clang" HOSTLD=/usr/bin/ld olddefconfig >/dev/null
 dropped=$(grep '^CONFIG_' "$fragment" | while read -r wanted; do grep -qx "$wanted" "$build/.config" || echo "$wanted"; done)
 [ -z "$dropped" ] || { echo "the kernel did not take: $dropped" >&2; exit 1; }
-make -C "$src" O="$build" LLVM=1 HOSTCC=clang HOSTLD=/usr/bin/ld -j"$(nproc)" vmlinux.wasm >"$out/build.log" 2>&1 \
+make -C "$src" O="$build" LLVM=1 HOSTCC="$machine_clang" HOSTLD=/usr/bin/ld -j"$(nproc)" vmlinux.wasm >"$out/build.log" 2>&1 \
     || { tail -n 20 "$out/build.log" >&2; exit 1; }
 cp "$build/vmlinux.wasm" "$out/vmlinux.wasm"
 echo "Linux for wasm (${LINUX_COMMIT:0:7}) in $out/vmlinux.wasm ($(du -h "$out/vmlinux.wasm" | cut -f1))"

@@ -48,7 +48,7 @@ const linuxDir = {
       opfs.set(name, new ArrayBuffer(0));
     }
     return {
-      getFile: async () => ({ arrayBuffer: async () => opfs.get(name) }),
+      getFile: async () => ({ size: opfs.get(name).byteLength, arrayBuffer: async () => opfs.get(name) }),
       createWritable: async () => {
         let written = null;
         return {
@@ -210,7 +210,22 @@ agent.silent = false;
 agent.onRun = (vm, id) => setTimeout(() => answer(vm, id, 'again'), 5);
 const again = await ran(run('a'));
 assert.deepEqual([again.success, again.output, machines.length], [true, 'again', 2], again.failure);
-console.log('ok the worker: an unsaved boot is kept, a state that never loads boots afresh, one stuck command ends alone, a silent machine restarts');
+
+// Prepared ahead (after an install or update): with no saved state the machine boots and
+// saves it, and says it did; with one, nothing boots; a command after resumes it.
+const prepared = () => until(() => messages.find((message) => message.type === 'prepared'), 'prepared');
+opfs.clear();
+await freshWorker();
+send({ type: 'prepare' });
+assert.equal((await prepared()).did, true);
+assert.deepEqual([machines.length, opfs.get(STATE)?.byteLength], [1, 64], 'one boot, its state saved');
+await freshWorker({ onRun: (vm, id) => setTimeout(() => answer(vm, id, 'resumed'), 5) });
+send({ type: 'prepare' });
+assert.equal((await prepared()).did, false);
+assert.equal(machines.length, 0, 'nothing booted: the state was there');
+const afterPrepare = await ran(run('a'));
+assert.deepEqual([afterPrepare.output, machines.map((vm) => Boolean(vm.options.initial_state))], ['resumed', [true]], afterPrepare.failure);
+console.log('ok the worker: an unsaved boot is kept, a state that never loads boots afresh, one stuck command ends alone, a silent machine restarts, a state made ahead');
 
 // ---- the share: a file's bytes taken as they came, and read back as one copy ----
 const fs9p = new FS();

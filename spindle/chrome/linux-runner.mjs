@@ -34,8 +34,9 @@ const WASM_FAILURES = 3;
  * to send every command to that one, with no fallback (tests and benchmarks). */
 export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: false, error: 'no Spindle calls here' }), onRan = () => {}, route = 'auto' } = {}) {
   const machines = {
-    v86: { url: 'linux-worker.mjs', worker: null, idle: 0 },
-    wasm: { url: 'wasm-linux-worker.mjs', worker: null, idle: 0 },
+    // preparing: a prepare() is making v86's saved state, and the machine goes when done.
+    v86: { url: 'linux-worker.mjs', worker: null, idle: 0, preparing: false },
+    wasm: { url: 'wasm-linux-worker.mjs', worker: null, idle: 0, preparing: false },
   };
   let next = 0;
   let identity = null;
@@ -89,6 +90,15 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
       } else if (data.type === 'ran') {
         waiting.get(data.id)?.done(data.result);
         waiting.delete(data.id);
+      } else if (data.type === 'prepared') {
+        // Its state made (or there already): the machine goes, with its memory, unless a
+        // command or a warm-up came for it meanwhile.
+        if (!machine.preparing) return;
+        machine.preparing = false;
+        if (machine.worker !== worker || [...waiting.values()].some((entry) => entry.kind === kind)) return;
+        worker.terminate();
+        machine.worker = null;
+        if (data.did) onStatus('stopped', null, kind);
       } else if (data.type === 'need') {
         const run = sessions.get(data.id);
         try {
@@ -116,7 +126,10 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
         waiting.delete(id);
       }
       worker.terminate();
-      if (machine.worker === worker) machine.worker = null;
+      if (machine.worker === worker) {
+        machine.worker = null;
+        machine.preparing = false;
+      }
       if (kind === 'wasm') wasmFailed();
       if (wasm !== false || kind === 'v86') onStatus('failed', event.message, kind);
     };
@@ -137,6 +150,7 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
   /** Runs one command on `kind`'s Linux. */
   async function runOn(kind, id, job, signal) {
     clearTimeout(machines[kind].idle);
+    machines[kind].preparing = false;
     const worker = ensure(kind);
     // Stop: the command, and its scripts' calls with it.
     const stop = () => {
@@ -216,6 +230,7 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
      * that needs it: a thread that only talks or reads pages never starts it). */
     warm({ v86 = true } = {}) {
       if (v86) {
+        machines.v86.preparing = false;
         ensure('v86').postMessage({ type: 'start' });
         rest('v86');
       }
@@ -224,6 +239,17 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
         ensure('wasm').postMessage({ type: 'start' });
         rest('wasm');
       });
+    },
+
+    /** Makes v86's saved state ahead of the first command that needs it (after an install,
+     * or an update that brought a new image): its first start boots and saves (some
+     * seconds, once), and every later start resumes in under one. The machine goes when
+     * done, unless a command came for it meanwhile; nothing starts when the state is
+     * there already. (The wasm Linux boots in under a second and saves nothing.) */
+    prepare() {
+      if (machines.v86.worker) return;
+      machines.v86.preparing = true;
+      ensure('v86').postMessage({ type: 'prepare' });
     },
   };
 }

@@ -1162,17 +1162,24 @@ chrome/build.sh /path/to/wasm-bindgen OUT     # or into another folder
 ```
 
 `chrome/build.sh [WASM_BINDGEN_CLI] [OUT_DIR]` builds `spindle-embed` for `wasm32-unknown-unknown`
-(`cargo build --locked --release`), generates its web glue into `OUT/web`, and copies the
-extension files, the JS clients (into `OUT/clients`), the native UI's `text.js` and
-`theme.js`, the icons, `THIRD-PARTY.md`, the browser Linux (`OUT/linux`) and, with
-`SPINDLE_WASM_LINUX`, the wasm Linux (`OUT/wasm-linux`). It writes `build.json`: the version,
-the sources' commits (marked when they had changes), the tool versions, the wasm's digest and
-each Linux image's identity, which Settings, About shows. Environment variables:
+(after 0.1.8 with the workspace's `browser` profile, `cargo build --locked --profile browser`:
+the release profile with fat link-time optimization and one codegen unit; 0.1.8 used
+`--release`), generates its web glue into `OUT/web`, optimizes the wasm with Binaryen's
+`wasm-opt -O3` when one is found (after 0.1.8), and copies the extension files, the JS
+clients (into `OUT/clients`), the native UI's `text.js` and `theme.js`, the icons,
+`THIRD-PARTY.md`, the browser Linux (`OUT/linux`) and, with `SPINDLE_WASM_LINUX`, the wasm
+Linux (`OUT/wasm-linux`; after 0.1.8 its files go into `OUT/linux/flat/` beside the v86
+Linux's, where the files the two share are carried once, and its identity is worked out
+again by `chrome/wasm-linux/identity.sh`). It writes `build.json`: the version, the sources'
+commits (marked when they had changes), the tool versions (after 0.1.8 also `wasm_opt`,
+null when none ran), the wasm's digest and each Linux image's identity, which Settings, About
+shows. Environment variables:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SPINDLE_LINUX` | `chrome/linux/dist` | The v86 Linux to carry (must contain `identity`). |
-| `SPINDLE_WASM_LINUX` | unset | The wasm Linux to carry (`build-image.sh` output). Without it, every command runs on v86. |
+| `SPINDLE_WASM_LINUX` | unset | The wasm Linux to carry (`build-image.sh` output, or `chrome/wasm-linux/fetch-image.sh`'s: the image `image.json` pins, which releases after 0.1.8 carry). Without it, every command runs on v86. A wasm Linux whose Python differs from the v86 Linux's python3 is carried with a warning (they then share fewer files). |
+| `SPINDLE_WASM_OPT` | `wasm-opt` on `PATH` | Binaryen's `wasm-opt` for the engine wasm (after 0.1.8; releases pin version 133). Without one the build says so and leaves the wasm unoptimized. |
 | `SPINDLE_STORE` | unset | A nonempty value builds without `codex-signin`, checks the output contains no legacy Codex client/options, and sets `build.json.edition` to `store`; otherwise `source`. |
 
 To load it:

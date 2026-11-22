@@ -3074,6 +3074,13 @@ const ops = {
     return linuxState;
   },
 
+  /** Makes v86's saved state now if there is none (after an install or update: the
+   * background asks), so the first command that needs it does not wait for its boot. */
+  async prepareLinux() {
+    linux.prepare();
+    return linuxState;
+  },
+
   /** Uses `catalog` (Dext's providers.json format; null: the built-ins) from now on. */
   async catalog({ catalog: next }) {
     if (running.size) throw failure('busy', 'wait for running threads to finish before changing providers');

@@ -51,6 +51,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { StdioClient } from '../../clients/js/spindle.mjs';
 import { attach, launch, open } from './cdp.mjs';
@@ -207,7 +208,8 @@ if (options.scripted) {
   }));
 }
 const providerId = options.scripted ? 'scripted' : options.provider;
-const glue = await import(resolve(distArg, 'web', 'spindle_embed.js'));
+// (By its file URL: a plain path is no URL on Windows.)
+const glue = await import(pathToFileURL(resolve(distArg, 'web', 'spindle_embed.js')).href);
 await glue.default({ module_or_path: fs.readFileSync(resolve(distArg, 'web', 'spindle_embed_bg.wasm')) });
 const probe = new glue.Embedded('memory', '{}', catalogFile ? fs.readFileSync(catalogFile, 'utf8') : undefined);
 const profileOf = JSON.parse(probe.catalog()).providers.find((p) => p.id === providerId);

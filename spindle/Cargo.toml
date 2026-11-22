@@ -18,3 +18,11 @@ debug = "line-tables-only"
 
 [profile.dev.package.spindle-store]
 debug = "line-tables-only"
+
+# The extension's engine wasm (chrome/build.sh builds it with this profile): the whole
+# program optimized as one, for a smaller and faster engine in the browser. Native builds
+# keep the release profile.
+[profile.browser]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

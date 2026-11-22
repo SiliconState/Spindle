@@ -54,9 +54,13 @@ your key.
   the Linux between commands too, but are no part of the workspace: never versioned,
   exported or shown as files, and gone for good when a command removes them or the
   Linux lets the thread's copy go. The Linux keeps the browser's
-  clock. The first command ever boots it (about 20 seconds in our measurements, once for
-  each Linux image: an update that changes the image boots it again); after that it
-  resumes in under a second, and rests (giving its memory back) after ten idle minutes.
+  clock. It boots once for each Linux image (about 17 seconds in headless Chrome in our
+  measurements, its state saved included: its own kernel, booted straight onto its files
+  with no boot image) and saves its state;
+  Spindle does that in the background right after an install, or an update that brings
+  a new image, then lets it go, so the first command that needs it resumes it. After
+  that it resumes in under a second, and rests (giving its memory back) after ten idle
+  minutes.
   Opening a thread that ran commands there in the last day starts it, so its next
   command rarely waits; a thread that only talks or reads pages leaves it, and its 512
   MiB, unstarted until a command needs it. Saving Browser under Commands run in, in a
@@ -66,11 +70,13 @@ your key.
   minute, an engine that grew past 64 MiB starts a fresh copy of itself (sessions stay
   on disk; keys, the Linuxes and a connected host carry over) and the old copy's memory
   goes back to the browser.
-- **A second, faster Linux for plain commands** (in builds made with
-  `SPINDLE_WASM_LINUX`, see Build and install; the release zip does not carry it, and a
-  browser that will not let its workers share memory, or three failed starts in a row,
-  sends every command to the emulated Linux): Spindle's wasm Linux is Linux itself
-  compiled to WebAssembly, with busybox `sh` and Python 3.13, run at the machine's own
+- **A second, faster Linux for plain commands** (in every release, and in builds made
+  with `SPINDLE_WASM_LINUX`, see Build and install; a browser that will not let its
+  workers share memory, or three failed starts in a row, sends every command to the
+  emulated Linux): Spindle's wasm Linux is Linux itself compiled to WebAssembly, with
+  busybox `sh`, Python 3.14 (the emulated Linux's version, with the same standard
+  library files, carried once for both) and ripgrep (the emulated Linux's version, without
+  PCRE2: `rg -P` runs in the emulated Linux), run at the machine's own
   speed with no emulator: in our measurements it boots in about half a second and runs
   plain shell commands 2 to 9 times faster than the emulated Linux, Python 3 to 25
   times. No switch: a command that is plain POSIX sh with programs it has runs there
@@ -549,12 +555,15 @@ your key.
 ## Build and install
 
 From the `spindle` directory, with the pinned wasm-bindgen CLI (see `embed/`) and Rust's
-`wasm32-unknown-unknown` target. The Linux is built first (curl, npm, python3, Rust with
-its `i686-unknown-linux-musl` target (`rustup target add i686-unknown-linux-musl`) and
-user namespaces; no root, no Docker; where AppArmor restricts unprivileged user
+`wasm32-unknown-unknown` target. The Linux is built first (curl, npm, xz, Rust
+with its `i686-unknown-linux-musl` target (`rustup target add i686-unknown-linux-musl`)
+and user namespaces; no root, no Docker; where AppArmor restricts unprivileged user
 namespaces, as on recent Ubuntu, allow them first; downloads are pinned by version and
 checksum, and Alpine packages are the branch's current ones, checked against its
-signing keys):
+signing keys). It builds its own kernel (Alpine's virt configuration with
+`chrome/linux/kernel.config`, about a minute and a half on 24 cores) and compresses the
+image's files with zstd, both in an Alpine root of their own, so the same compilers are
+used wherever it is built:
 
 ```sh
 chrome/linux/build.sh                                 # into chrome/linux/dist
@@ -565,14 +574,23 @@ chrome/build.sh /path/to/wasm-bindgen /mnt/c/Users/YOU/spindle-chrome   # a Wind
 `chrome/build.sh [WASM_BINDGEN] [OUT_DIR]`: the first defaults to `wasm-bindgen` on your
 PATH; OUT_DIR (default `chrome/dist`) is emptied first, so give it a folder of its own.
 `SPINDLE_LINUX=DIR` builds with a browser Linux other than `chrome/linux/dist`
-(`chrome/linux/build.sh` takes that DIR as its own argument).
+(`chrome/linux/build.sh` takes that DIR as its own argument). The engine wasm is built
+with the `browser` profile (link-time optimization of the whole program) and then
+optimized by Binaryen's `wasm-opt` (`SPINDLE_WASM_OPT=/path/to/wasm-opt`, else one on
+PATH; releases pin version 133): about a quarter smaller and as fast or faster. Without
+one the build says so and leaves the wasm as Rust made it.
 
 The build stops when the manifest's name is over 75 characters, its short name over 12
 or its description over 132: the Chrome Web Store refuses those.
 
 The wasm Linux is built separately (its kernel, then a toolchain from source: about half
 an hour, once; it needs clang, cmake, git, make, wabt's `wasm2wat` and rustup; see each
-script's header in `chrome/wasm-linux/`) and carried with `SPINDLE_WASM_LINUX`:
+script's header in `chrome/wasm-linux/`) and carried with `SPINDLE_WASM_LINUX`. Its
+Python must be the version of Alpine's python3 in the browser Linux (`build-image.sh`
+checks, and takes the standard library from Alpine's package). Releases use the image
+the wasm Linux workflow built and `chrome/wasm-linux/image.json` pins:
+`chrome/wasm-linux/fetch-image.sh DIR` fetches it, checks its sha256 and unpacks it for
+`SPINDLE_WASM_LINUX=DIR`. To build it yourself:
 
 ```sh
 W=/path/to/wasm-linux-build     # any directory outside the repository
@@ -708,7 +726,8 @@ checks that a renewed engine gives a grown instance's memory back; `vault_host.m
 host's token in the vault (sealed, locked with the keys, gone with a reset).
 `linux_worker.mjs` runs the v86 Linux's worker with a stand-in machine (no image): a
 boot that cannot be saved, a saved state that never loads, a command that never ends
-let go of alone, a silent machine restarted, files shared with the guest, and the local
+let go of alone, a silent machine restarted, a state made ahead (after an install or
+update) and resumed, files shared with the guest, and the local
 addresses its gateway refuses. `zip.mjs` checks the .zip of a thread's files (read back
 whole by Python's zipfile; refused past 65,534 files or 4 GiB).
 `panel_long_run.mjs DIST [SHOTS]` drives one long turn (34 steps, failures, a retry, a
@@ -791,9 +810,11 @@ always removed; `SPINDLE_SHOTS=DIR` keeps only screenshots, in DIR.
   neither sends nor shows them), downloads run at about 2 MB/s, a request body is at
   most 64 MiB. Every redirect is refused (Chrome hides where it leads); use the final
   public address or your relay. Your host's sandbox has none of these gateway limits.
-- The wasm Linux has no bash, Node, git or network, Python without ssl, ctypes or C
-  extensions, and no `fork` (programs start others with posix_spawn); routing keeps
-  what needs those on the emulated Linux. It runs only the programs it was built with:
+- The wasm Linux has no bash, Node, git or network, Python without ssl, ctypes, lzma,
+  pip or C extensions, ripgrep without PCRE2, at most 256 MiB of memory for each program,
+  and no `fork` (programs start others with posix_spawn); routing keeps what needs those
+  on the emulated Linux, and runs a command again there when the wasm Linux's result says
+  it lacked one (`python3 -m pip`, a venv, `rg -P` and running out of memory included). It runs only the programs it was built with:
   what a command writes (its workspace, `/tmp`, its home) is data there, never a
   program, so a command that runs a saved program runs again on the emulated Linux. A
   program that computes without ever calling the kernel cannot be interrupted there:

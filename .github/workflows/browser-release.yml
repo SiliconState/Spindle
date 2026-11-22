@@ -2,7 +2,9 @@ name: browser release
 
 # Publishes Spindle for Browser as a zip on a GitHub release. Push a tag browser-vVERSION,
 # where VERSION is spindle/chrome/manifest.json's version; the job builds the extension
-# from that commit (the browser Linux included), checks the unpacked zip in Chrome
+# from that commit (the browser Linux included, and the wasm Linux image that
+# spindle/chrome/wasm-linux/image.json pins, made by the wasm Linux workflow; the engine
+# wasm optimized by a pinned Binaryen), checks the unpacked zip in Chrome
 # against a scripted provider, attests where it was built, and attaches it to the
 # tag's release, beside the Chrome Web Store's build of the same commit (ChatGPT signs in
 # there only with OpenAI's Sign in with ChatGPT). Running it by hand on an existing tag
@@ -38,6 +40,10 @@ jobs:
         with:
           ref: refs/tags/${{ env.TAG }}
           persist-credentials: false
+      - name: Tested Node runtime for wasm and v86 (with zstd, for the path checks)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.22.1'
       - name: Version from the manifest
         run: |
           version=$(node -p "require('./spindle/chrome/manifest.json').version")
@@ -60,17 +66,25 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           version=$(sed -n 's/^wasm-bindgen = "=\(.*\)"$/\1/p' spindle/embed/Cargo.toml)
           cargo install wasm-bindgen-cli --version "$version" --locked --root "$RUNNER_TEMP/wasm-bindgen"
+          # Binaryen's wasm-opt for the engine wasm (chrome/build.sh), pinned.
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/binaryen.tar.gz" https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz
+          echo "2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489  $RUNNER_TEMP/binaryen.tar.gz" | sha256sum -c --quiet -
+          tar xzf "$RUNNER_TEMP/binaryen.tar.gz" -C "$RUNNER_TEMP"
+          echo "SPINDLE_WASM_OPT=$RUNNER_TEMP/binaryen-version_133/bin/wasm-opt" >> "$GITHUB_ENV"
+          # The wasm Linux image image.json pins, checked by its sha256; both zips carry it.
+          spindle/chrome/wasm-linux/fetch-image.sh "$RUNNER_TEMP/wasm-linux"
+          echo "SPINDLE_WASM_LINUX=$RUNNER_TEMP/wasm-linux" >> "$GITHUB_ENV"
       - name: Build
         working-directory: spindle
         run: |
           chrome/linux/build.sh
+          # Python on the wasm Linux image, its files decompressed with this v86's decoder.
+          node chrome/tests/wasm_linux_python.mjs "$SPINDLE_WASM_LINUX" chrome/linux/dist/v86.wasm
           chrome/build.sh "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen"
           cp ../LICENSE chrome/dist/LICENSE
-          # The build names no directory of the machine that made it.
-          if grep -r -a -l -F -e "$HOME" -e "$GITHUB_WORKSPACE" chrome/dist; then
-            echo "build paths in the files above" >&2
-            exit 1
-          fi
+          # The build names no directory of the machine that made it (the Linux images'
+          # files read as they decompress).
+          node chrome/tests/find_paths.mjs chrome/dist "$HOME" "$GITHUB_WORKSPACE"
           (cd chrome/dist && zip -q -r -X "$RUNNER_TEMP/$ASSET" .)
           (cd "$RUNNER_TEMP" && sha256sum "$ASSET" > "$ASSET.sha256")
       - name: Check the zip, unpacked, in Chrome
@@ -92,6 +106,8 @@ jobs:
             const build = require(process.argv[1]);
             if (build.version !== process.env.VERSION) throw new Error(`build.json says ${build.version}`);
             for (const part of ["spindle", "engine"]) if (!/^[0-9a-f]{12}$/.test(build[part])) throw new Error(`build.json ${part}: ${build[part]}`);
+            if (!/^[0-9a-f]{64}$/.test(build.wasm_linux ?? "")) throw new Error(`build.json wasm_linux: ${build.wasm_linux}`);
+            if (!build.wasm_opt) throw new Error("build.json: the engine wasm was not optimized (wasm_opt)");
             console.log(JSON.stringify(build));
           ' "$RUNNER_TEMP/spindle-browser/build.json"
       - name: The Chrome Web Store's build, checked in Chrome
@@ -101,10 +117,7 @@ jobs:
           # none of it is in the files); everything else as the zip above.
           SPINDLE_STORE=1 chrome/build.sh "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen" "$RUNNER_TEMP/store-dist"
           cp ../LICENSE "$RUNNER_TEMP/store-dist/LICENSE"
-          if grep -r -a -l -F -e "$HOME" -e "$GITHUB_WORKSPACE" "$RUNNER_TEMP/store-dist"; then
-            echo "build paths in the files above" >&2
-            exit 1
-          fi
+          node chrome/tests/find_paths.mjs "$RUNNER_TEMP/store-dist" "$HOME" "$GITHUB_WORKSPACE"
           (cd "$RUNNER_TEMP/store-dist" && zip -q -r -X "$RUNNER_TEMP/$STORE_ASSET" .)
           (cd "$RUNNER_TEMP" && sha256sum "$STORE_ASSET" > "$STORE_ASSET.sha256")
           unzip -q "$RUNNER_TEMP/$STORE_ASSET" -d "$RUNNER_TEMP/spindle-browser-store"
@@ -115,6 +128,7 @@ jobs:
           node -e '
             const build = require(process.argv[1]);
             if (build.version !== process.env.VERSION || build.edition !== "store") throw new Error(`build.json says ${build.version} ${build.edition}`);
+            if (!/^[0-9a-f]{64}$/.test(build.wasm_linux ?? "") || !build.wasm_opt) throw new Error(`build.json: wasm_linux ${build.wasm_linux}, wasm_opt ${build.wasm_opt}`);
           ' "$RUNNER_TEMP/spindle-browser-store/build.json"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -142,7 +156,7 @@ jobs:
 
           **Update:** unzip the new version over the same folder, replacing its files (Windows' Extract All suggests a new folder named after the zip: change it to the one you loaded; on macOS or Linux, \`unzip -o $ASSET -d FOLDER\`), then click **Reload** on Spindle's card in the extensions page. Reload stops the turns running in the browser; they show as interrupted, and Continue goes on. The browser derives an unpacked extension's id from its folder's path, so another folder, or this one moved or renamed, is a separate install with its own threads and keys.
 
-          This build runs commands in the browser Linux on v86. The faster wasm Linux is in builds made from source with \`SPINDLE_WASM_LINUX\` ([how](https://github.com/$GITHUB_REPOSITORY/blob/main/docs/browser-linux.md#building-the-images)).
+          Commands run in the wasm Linux when it can run them (plain \`sh\`, Python and ripgrep, at the machine's own speed) and in the browser Linux on v86 otherwise (bash, Node, git, pip, the network). Both are built in ([how they are made](https://github.com/$GITHUB_REPOSITORY/blob/main/docs/browser-linux.md#building-the-images)).
 
           \`$STORE_ASSET\` is the Chrome Web Store's build of this tag: the same extension, with ChatGPT signing in only through OpenAI's Sign in with ChatGPT (the other zip and builds from source also offer ChatGPT through the Codex CLI's sign-in).
 
