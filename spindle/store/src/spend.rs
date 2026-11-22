@@ -1097,7 +1097,18 @@ pub(crate) fn price(
         };
     };
     let (pricing, overridden) = priced_by_env(&pricing);
-    let rates = long_context(provider, model, usage, pricing, overridden);
+    let mut rates = long_context(provider, model, usage, pricing, overridden);
+    if contract == RequestContract::AnthropicMessages.as_str()
+        && provider::is_claude_haiku_5_5_model(model)
+        && usage.total_input_tokens() > 100_000
+        && !overridden
+        && builtin_pricing("anthropic", model).as_ref() == Some(&rates)
+    {
+        rates.input_usd_per_mtok *= 5.0;
+        rates.output_usd_per_mtok *= 5.0;
+        rates.cache_read_usd_per_mtok *= 5.0;
+        rates.cache_create_usd_per_mtok *= 5.0;
+    }
     priced_at(&rates, usage)
 }
 

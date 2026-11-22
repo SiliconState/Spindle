@@ -104,12 +104,13 @@ pub fn sanitize_anthropic_messages(
                             metadata: ToolResultMetadata::default(),
                         }),
                         Block::Thinking { text, signature } => {
-                            let signature = signature.as_ref().filter(|signature| {
-                                allow_empty_thinking_signature || !signature.is_empty()
-                            })?;
-                            preserve_thinking.then_some(Block::Thinking {
+                            // Stream decoding represents an empty signature as None.
+                            let signature = signature.as_deref().unwrap_or_default();
+                            (preserve_thinking
+                                && (allow_empty_thinking_signature || !signature.is_empty()))
+                            .then(|| Block::Thinking {
                                 text: text.clone(),
-                                signature: Some(signature.clone()),
+                                signature: Some(signature.to_string()),
                             })
                         }
                         Block::RedactedThinking { data } => (preserve_thinking && !data.is_empty())

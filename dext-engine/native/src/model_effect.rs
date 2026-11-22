@@ -231,6 +231,9 @@ impl ModelTransport {
                     if error.is_connect() {
                         self.set_failure(Some(connect_failure(&error)));
                         AttemptError::Unsent
+                    } else if error.is_timeout() {
+                        // Reqwest's total deadline can win the race with the outer timer.
+                        AttemptError::Deadline
                     } else {
                         AttemptError::Transport
                     }
@@ -280,7 +283,13 @@ impl ModelTransport {
                 .await
                 .map_err(|_| AttemptError::Deadline)?
             {
-                let chunk = chunk.map_err(|_| AttemptError::Transport)?;
+                let chunk = chunk.map_err(|error| {
+                    if error.is_timeout() {
+                        AttemptError::Deadline
+                    } else {
+                        AttemptError::Transport
+                    }
+                })?;
                 // An error the provider streams before any output is a refusal like an
                 // HTTP one (overloaded, rate limited, context too long).
                 match attempt.push(&chunk) {
