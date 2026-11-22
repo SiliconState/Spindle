@@ -851,6 +851,65 @@ mod tests {
     }
 
     #[test]
+    fn haiku_5_5_tier_counts_all_input_buckets_and_reserves_the_higher_cost() {
+        let provider = "anthropic";
+        let model = "claude-haiku-5-5";
+        let contract = RequestContract::AnthropicMessages;
+        let mut usage = Usage {
+            input: 70_000,
+            cache_read: 20_000,
+            cache_create: 10_000,
+            cache_create_1h: 5_000,
+            output: 1_000,
+            ..Usage::default()
+        };
+        let base =
+            (70_000.0 * 0.1 + 20_000.0 * 0.01 + 5_000.0 * (0.125 + 0.2) + 1_000.0 * 0.5) / 1e6;
+        close(priced(provider, model, contract, &usage), base);
+        usage.input += 1;
+        close(
+            priced(provider, model, contract, &usage),
+            5.0 * (base + 0.1 / 1e6),
+        );
+        close(
+            worst_tokens(
+                Some(&catalog()),
+                provider,
+                model,
+                contract.as_str(),
+                100_001,
+                1_000,
+                true,
+            )
+            .unwrap(),
+            (100_001.0 * 1.0 + 1_000.0 * 2.5) / 1e6,
+        );
+        let mut custom = catalog();
+        custom
+            .providers
+            .iter_mut()
+            .find(|profile| profile.id == provider)
+            .unwrap()
+            .model_specs
+            .get_mut(model)
+            .unwrap()
+            .pricing
+            .as_mut()
+            .unwrap()
+            .input_usd_per_mtok = 1.0;
+        let (billing, usd) = price(
+            Some(&custom),
+            provider,
+            model,
+            contract.as_str(),
+            false,
+            &usage,
+        );
+        assert_eq!(billing, Billing::Priced);
+        close(usd, base + (70_001.0 - 7_000.0) / 1e6);
+    }
+
+    #[test]
     fn openai_chat_cached_tokens_are_subtracted_once_and_reasoning_is_output() {
         let usage = parse(
             RequestContract::OpenAiChatCompletions,

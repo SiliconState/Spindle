@@ -125,6 +125,7 @@ pub(crate) fn route_with(profile: ProviderProfile, model: String, base_url: &str
             profile.id
         ));
     }
+    let model = provider::normalize_provider_model_value(&profile, &model);
     let contract = provider::effective_request_contract(&profile, base_url, &model);
     Ok(Route {
         endpoint: provider::provider_request_url(base_url, contract),
@@ -141,7 +142,7 @@ pub(crate) fn route_with(profile: ProviderProfile, model: String, base_url: &str
 pub(crate) fn profile_route(profile: ProviderProfile, model: Option<&str>) -> Result<Route> {
     let model = match model {
         Some(model) => model.to_string(),
-        None => provider::normalize_provider_model_value(&profile, &profile.default_model),
+        None => profile.default_model.clone(),
     };
     let base_url = profile.base_url.trim_end_matches('/').to_string();
     route_with(profile, model, &base_url)
@@ -239,25 +240,24 @@ pub(crate) fn chat_effort(route: &Route, level: Effort) -> String {
         .unwrap_or_else(|| levels[levels.len() - 1].clone())
 }
 
-/// Answer tokens and reasoning tokens a request on this route may spend at `level`:
-/// up to `MAX_OUTPUT_TOKENS` for the answer and the level's allowance on top, within
-/// what the model's own catalog entry declares it can output (Some(limit) when that
-/// lowered them; reasoning then gets what remains beside at least half the limit for
-/// the answer). Profile-wide defaults are not limits: Dext fills them with 8,192.
-pub(crate) fn output_tokens(route: &Route, level: Effort) -> (u32, u32, Option<u32>) {
-    let wanted = level.reasoning_allowance();
-    let model =
-        provider::normalize_provider_model_value(&route.profile, &route.model).to_ascii_lowercase();
+// Profile-wide defaults are not hard limits: Dext fills them with 8,192.
+fn route_output_limit(route: &Route) -> Option<u32> {
+    let model = route.model.to_ascii_lowercase();
     let declared = route
         .profile
         .model_specs
         .get(&model)
         .and_then(|spec| spec.max_output_tokens);
-    let limit = match (declared, route.learned_limit) {
+    match (declared, route.learned_limit) {
         (Some(declared), Some(learned)) => Some(declared.min(learned)),
         (declared, learned) => declared.or(learned),
-    };
-    match limit {
+    }
+}
+
+/// The foreground answer cap and reasoning allowance, plus any model limit that reduced them.
+pub(crate) fn output_tokens(route: &Route, level: Effort) -> (u32, u32, Option<u32>) {
+    let wanted = level.reasoning_allowance();
+    match route_output_limit(route) {
         Some(limit) if limit < MAX_OUTPUT_TOKENS + wanted => {
             let thinking = wanted.min(limit - MAX_OUTPUT_TOKENS.min(limit / 2));
             (
@@ -415,6 +415,26 @@ pub(crate) fn adaptive(route: &Route, effort: Effort) -> Result<Reasoning> {
             "this model always thinks: adaptive thinking at effort low".into(),
             "think low".into(),
         ),
+        (_, Effort::Off) if provider::is_claude_haiku_5_5_model(&route.model) => {
+            let levels = provider::resolve_model_spec(&route.profile, &route.model).effort_levels;
+            let sent = ["low", "medium", "high"]
+                .into_iter()
+                .find(|level| {
+                    levels.is_empty() || levels.iter().any(|candidate| candidate == level)
+                })
+                .ok_or("Haiku 5.5 disabled thinking requires low, medium, or high effort")?;
+            let (answer, _, _) = output_tokens(route, Effort::Default);
+            Ok(Reasoning {
+                fields: vec![
+                    ("thinking", json!({"type":"disabled"})),
+                    ("output_config", json!({"effort":sent})),
+                ],
+                answer,
+                allowance: 0,
+                label: "thinking off".into(),
+                short: "think off".into(),
+            })
+        }
         (_, Effort::Off) => {
             let (answer, _, _) = output_tokens(route, Effort::Default);
             Ok(Reasoning {
@@ -441,6 +461,46 @@ pub(crate) fn adaptive(route: &Route, effort: Effort) -> Result<Reasoning> {
     }
 }
 
+fn official_kimi(route: &Route) -> bool {
+    route
+        .endpoint
+        .strip_suffix("/v1/messages")
+        .is_some_and(|base| provider::is_official_kimi_profile(&route.profile, base))
+}
+
+fn messages_effort_thinking(
+    route: &Route,
+    effort: Effort,
+    kind: &'static str,
+    default: &'static str,
+    xhigh: &'static str,
+) -> Result<Reasoning> {
+    let sent = match effort {
+        Effort::Default => default,
+        Effort::Off | Effort::Low => "low",
+        Effort::Medium | Effort::High => "high",
+        Effort::XHigh => xhigh,
+        Effort::Max => "max",
+    };
+    let level = match sent {
+        "low" => Effort::Low,
+        "high" => Effort::High,
+        _ => Effort::Max,
+    };
+    let (answer, allowance, limit) = output_tokens(route, level);
+    Ok(Reasoning {
+        fields: vec![
+            ("thinking", json!({"type": kind})),
+            ("output_config", json!({"effort": sent})),
+            ("max_tokens", json!(answer + allowance)),
+        ],
+        answer,
+        allowance,
+        label: format!("{kind} thinking, effort {sent}{}", limit_note(limit)),
+        short: format!("think {sent}"),
+    })
+}
+
 pub(crate) fn reasoning(route: &Route, effort: Effort) -> Result<Reasoning> {
     let glm = route.profile.id == "glm" || route.endpoint.contains("z.ai");
     let deepseek = provider::is_deepseek_provider(
@@ -465,6 +525,19 @@ pub(crate) fn reasoning(route: &Route, effort: Effort) -> Result<Reasoning> {
         })
     };
     match (route.contract, effort) {
+        (RequestContract::AnthropicMessages, effort)
+            if route.profile.id == "glm"
+                && route.endpoint == "https://api.z.ai/api/anthropic/v1/messages"
+                && provider::is_glm_5_3_model(&route.model) =>
+        {
+            messages_effort_thinking(route, effort, "enabled", "low", "max")
+        }
+        (RequestContract::AnthropicMessages, effort)
+            if official_kimi(route) && provider::is_kimi_adaptive_model(&route.model) =>
+        {
+            let default = if route.model == "kimi-for-coding" { "max" } else { "high" };
+            messages_effort_thinking(route, effort, "adaptive", default, "high")
+        }
         // GLM's endpoint thinks by default and a long chain can spend the whole answer
         // cap with no text or calls (three of those halt the turn).
         (RequestContract::AnthropicMessages, Effort::Default) if glm => plain(
@@ -567,6 +640,12 @@ pub(crate) fn reasoning(route: &Route, effort: Effort) -> Result<Reasoning> {
         ),
         (RequestContract::OpenAiChatCompletions, Effort::Default) => {
             plain(vec![], "provider default", "default")
+        }
+        (RequestContract::OpenAiChatCompletions, Effort::Off)
+            if provider::is_gpt_6_sol_or_luna_model(&route.model)
+                || route.model.eq_ignore_ascii_case("gpt-6.1-terra") =>
+        {
+            plain(vec![("reasoning_effort", json!("none"))], "thinking off", "think off")
         }
         (RequestContract::OpenAiChatCompletions, Effort::Off) => Err(
             "this route has no reasoning off switch; choose default, low, medium, high, xhigh or max"
@@ -1142,12 +1221,10 @@ pub(crate) fn no_images(_: usize, _: &Block) -> wire::ImagePart {
     wire::ImagePart::Text("[image not available in spindle]".into())
 }
 
-/// Deterministic for a given state and configuration, so a re-admitted step after a
-/// crash is byte-identical to the original.
-#[cfg_attr(not(feature = "agent"), allow(dead_code))]
+/// Shape a test request with Spindle's built-in tools.
+#[cfg(all(test, feature = "agent"))]
 pub(crate) fn request_body(
     route: &Route,
-    model: &str,
     session: &str,
     network: bool,
     toolchain: bool,
@@ -1156,7 +1233,6 @@ pub(crate) fn request_body(
 ) -> Result<Value> {
     request_body_for(
         route,
-        model,
         session,
         network,
         toolchain,
@@ -1171,7 +1247,6 @@ pub(crate) fn request_body(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn request_body_for(
     route: &Route,
-    model: &str,
     session: &str,
     network: bool,
     toolchain: bool,
@@ -1180,6 +1255,7 @@ pub(crate) fn request_body_for(
     transcript: &TranscriptCheckpoint,
     offer: Offer<'_>,
 ) -> Result<Value> {
+    let model = &route.model;
     let tools = offer.tools(network, toolchain);
     let system = offer.system(network, toolchain, guidance);
     let reasoning = reasoning(route, effort)?;
@@ -1188,8 +1264,13 @@ pub(crate) fn request_body_for(
     let mut body = match route.contract {
         RequestContract::AnthropicMessages => {
             let messages = {
-                let sanitized =
-                    wire::sanitize_anthropic_messages(&transcript.messages, true, false);
+                let allow_empty_signature =
+                    official_kimi(route) && provider::is_kimi_adaptive_model(&route.model);
+                let sanitized = wire::sanitize_anthropic_messages(
+                    &transcript.messages,
+                    !(provider::is_claude_haiku_5_5_model(&route.model) && effort == Effort::Off),
+                    allow_empty_signature,
+                );
                 wire::anthropic_messages(&sanitized, &mut no_images)
                     .map_err(|error| error.to_string())?
             };
@@ -1206,6 +1287,12 @@ pub(crate) fn request_body_for(
             body
         }
         RequestContract::OpenAiChatCompletions => {
+            if !tools.is_empty() && provider::is_gpt_6_responses_tools_only_model(&route.model) {
+                return Err(format!(
+                    "{} tool calling requires the Responses API; select an openai-responses route",
+                    route.model
+                ));
+            }
             let messages = serde_json::to_value(wire::chat_messages(
                 &transcript.messages,
                 &system,
@@ -1227,6 +1314,11 @@ pub(crate) fn request_body_for(
                     .collect::<Vec<_>>(),
             });
             body["messages"] = messages;
+            if tools.is_empty() {
+                body.as_object_mut()
+                    .expect("request object")
+                    .remove("tools");
+            }
             body
         }
         RequestContract::OpenAiResponses
@@ -1256,12 +1348,33 @@ pub(crate) fn request_body_for(
             body["input"] = Value::Array(input);
             if route.contract == RequestContract::OpenAiResponses {
                 body["max_output_tokens"] = json!(reasoning.answer);
+                if !tools.is_empty()
+                    && route
+                        .endpoint
+                        .strip_suffix("/responses")
+                        .is_some_and(|base| {
+                            provider::official_openai_responses_model(&route.profile, base, model)
+                        })
+                {
+                    body["include"] = json!(["reasoning.encrypted_content"]);
+                }
             }
             body
         }
     };
     for (key, value) in reasoning.fields {
         body[key] = value;
+    }
+    if route.contract == RequestContract::OpenAiChatCompletions
+        && !tools.is_empty()
+        && provider::is_gpt_6_sol_or_luna_model(&route.model)
+    {
+        body["reasoning_effort"] = json!("none");
+    }
+    if route.contract == RequestContract::OpenAiResponses
+        && provider::is_gpt_6_2_model(&route.model)
+    {
+        place_responses_prefix(&mut body, &system);
     }
     name_output_cap(route, model, &mut body);
     if route.contract == RequestContract::AnthropicMessages
@@ -1273,6 +1386,25 @@ pub(crate) fn request_body_for(
         mark_prompt_cache(&mut body, hour, waited_long(transcript));
     }
     Ok(body)
+}
+
+fn place_responses_prefix(body: &mut Value, system: &str) {
+    // GPT-6.2 appends top-level instructions after input; stable guidance belongs first.
+    body.as_object_mut()
+        .expect("request object")
+        .remove("instructions");
+    if !system.is_empty() {
+        body["input"]
+            .as_array_mut()
+            .expect("Responses input")
+            .insert(
+                0,
+                json!({
+                    "type": "message", "role": "developer",
+                    "content": [{ "type": "input_text", "text": system }],
+                }),
+            );
+    }
 }
 
 /// The namespace a Sign in with ChatGPT request groups its function tools in: the route
@@ -1468,7 +1600,6 @@ pub(crate) fn prepared_request(
     let transcript = state.transcript_ref().map_err(turn_error)?;
     let body = request_body_for(
         route,
-        &config.model,
         state.execution(),
         config.network,
         config.toolchain,
@@ -1731,17 +1862,47 @@ pub(crate) fn code_model_request(
             }],
         }],
     };
-    let mut body = request_body(
+    let mut body = request_body_for(
         route,
-        &route.model,
         session,
         false,
         false,
+        None,
         effort,
         &transcript,
+        Offer {
+            builtin: BuiltinTools::None,
+            ..Offer::BUILTIN
+        },
     )?;
     let thinking = u64::from(reasoning(route, effort)?.allowance);
+    let requested_output = max_tokens + thinking;
+    let server_caps_output = matches!(
+        route.contract,
+        RequestContract::AnthropicMessages
+            | RequestContract::OpenAiChatCompletions
+            | RequestContract::OpenAiResponses
+    );
+    let output = if server_caps_output {
+        requested_output.min(
+            route_output_limit(route)
+                .map_or(CODE_MODEL_MAX_TOKENS, u64::from)
+                .min(CODE_MODEL_MAX_TOKENS),
+        )
+    } else {
+        requested_output
+    };
     let object = body.as_object_mut().ok_or("invalid child body")?;
+    if let Some(budget) = object
+        .get("thinking")
+        .and_then(|thinking| thinking["budget_tokens"].as_u64())
+        && output <= budget
+    {
+        return Err(format!(
+            "{} cannot fit a {budget}-token thinking budget below its {output}-token output cap",
+            route.model
+        ));
+    }
     for key in ["tools", "tool_choice", "parallel_tool_calls"] {
         object.remove(key);
     }
@@ -1757,8 +1918,7 @@ pub(crate) fn code_model_request(
                 json!([{"role":"user","content":content}]),
             );
             object.insert("system".into(), json!(system));
-            // A thinking budget is added on top so it can never starve the answer.
-            object.insert("max_tokens".into(), json!(max_tokens + thinking));
+            object.insert("max_tokens".into(), json!(output));
         }
         RequestContract::OpenAiChatCompletions => {
             let user = if images.is_empty() {
@@ -1776,10 +1936,7 @@ pub(crate) fn code_model_request(
             );
             object.remove("max_tokens");
             object.remove("max_completion_tokens");
-            object.insert(
-                chat_output_cap(route, &route.model).into(),
-                json!(max_tokens + thinking),
-            );
+            object.insert(chat_output_cap(route, &route.model).into(), json!(output));
         }
         RequestContract::OpenAiResponses
         | RequestContract::ChatGptResponses
@@ -1792,17 +1949,22 @@ pub(crate) fn code_model_request(
                 "input".into(),
                 json!([{"type":"message","role":"user","content":content}]),
             );
-            object.insert("instructions".into(), json!(system));
-            // Neither ChatGPT route takes an output cap; the allowance below still counts
-            // max_tokens against the script's model budget.
+            // Neither ChatGPT route takes an output cap; keep the full requested allowance
+            // in the script budget for those routes.
             if route.contract == RequestContract::OpenAiResponses {
-                object.insert("max_output_tokens".into(), json!(max_tokens + thinking));
+                object.insert("max_output_tokens".into(), json!(output));
+            }
+            if route.contract == RequestContract::OpenAiResponses
+                && provider::is_gpt_6_2_model(&route.model)
+            {
+                place_responses_prefix(&mut body, system);
+            } else {
+                object.insert("instructions".into(), json!(system));
             }
         }
     }
     // Thinking tokens are billed output too, so they count against the script's allowance.
-    let budget =
-        (prompt.len() + system.len()) as u64 + max_tokens + thinking + 1024 * images.len() as u64;
+    let budget = (prompt.len() + system.len()) as u64 + output + 1024 * images.len() as u64;
     Ok(
         json!({"kind":"model","provider":route.profile.id,"model":route.model,"endpoint":route.endpoint,"contract":route.contract.as_str(),"body":body,"session":session,"budget":budget}),
     )

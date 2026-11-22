@@ -4253,6 +4253,7 @@ mod tests {
         for (provider, model, subscription) in [
             ("deepseek", "deepseek-flash", false),
             ("openai", "gpt-5", false),
+            ("openai", "gpt62astra", false),
             ("chatgpt", "gpt-5", false),
             ("chatgpt-plan", "gpt-6.1-sol", false),
             ("anthropic", "claude-sonnet-4-6", false),
@@ -4271,7 +4272,10 @@ mod tests {
             )
             .unwrap();
             let shape = RequestShape {
-                config: config(&route),
+                config: Settings {
+                    model: model.into(),
+                    ..config(&route)
+                },
                 route,
                 guidance: Some("Host guidance.".into()),
                 tasks_offered: true,
@@ -4283,9 +4287,10 @@ mod tests {
                 }),
             };
             let found = prepared_request(&state, &shape).unwrap();
+            let wire: Value = serde_json::from_slice(found.body()).unwrap();
+            assert_eq!(wire["model"], found.identity().model);
             let body = request_body_for(
                 &shape.route,
-                model,
                 state.execution(),
                 false,
                 false,
@@ -4340,16 +4345,7 @@ mod tests {
             route_binding: ROUTE.into(),
             messages,
         };
-        let body = request_body(
-            &route,
-            &route.model,
-            "s",
-            false,
-            false,
-            Effort::High,
-            &transcript,
-        )
-        .unwrap();
+        let body = request_body(&route, "s", false, false, Effort::High, &transcript).unwrap();
         assert_eq!(
             (&body["store"], &body["stream"]),
             (&json!(false), &json!(true))
@@ -4418,7 +4414,7 @@ mod tests {
             messages: vec![text("user", "go")],
         };
         let body = |route: &Route, effort| {
-            request_body(route, &route.model, "s", false, false, effort, &prompt).unwrap()
+            request_body(route, "s", false, false, effort, &prompt).unwrap()
         };
         let deepseek = builtin("deepseek", "deepseek-flash");
         assert_eq!(body(&deepseek, Effort::Max)["reasoning_effort"], "max");
@@ -4496,16 +4492,7 @@ mod tests {
         let mut small = builtin("deepseek", "deepseek-flash");
         let spec = small.profile.model_specs.get_mut("deepseek-flash").unwrap();
         spec.max_output_tokens = Some(32_768);
-        let body = request_body(
-            &small,
-            &small.model,
-            "s",
-            false,
-            false,
-            Effort::Max,
-            &prompt,
-        )
-        .unwrap();
+        let body = request_body(&small, "s", false, false, Effort::Max, &prompt).unwrap();
         assert_eq!(body["max_tokens"], 32_768);
         assert!(
             reasoning(&small, Effort::Max)
@@ -4514,19 +4501,10 @@ mod tests {
                 .contains("32768-token output limit")
         );
         // A profile-wide default (Dext writes 8,192 for every model) is not a limit.
-        let mut defaulted = builtin("glm", "glm-5.3");
+        let mut defaulted = builtin("glm", "glm-5.2");
         defaulted.profile.model_specs.clear();
         defaulted.profile.model_defaults.max_output_tokens = Some(8_192);
-        let body = request_body(
-            &defaulted,
-            &defaulted.model,
-            "s",
-            false,
-            false,
-            Effort::Max,
-            &prompt,
-        )
-        .unwrap();
+        let body = request_body(&defaulted, "s", false, false, Effort::Max, &prompt).unwrap();
         assert_eq!(body["thinking"]["budget_tokens"], 65536);
         assert_eq!(body["max_tokens"], MAX_OUTPUT_TOKENS + 65536);
     }
@@ -4558,7 +4536,7 @@ mod tests {
             messages: vec![text("user", "go")],
         };
         let body = |route: &Route, effort| {
-            request_body(route, &route.model, "s", false, false, effort, &prompt).unwrap()
+            request_body(route, "s", false, false, effort, &prompt).unwrap()
         };
         let opus = builtin("anthropic", "claude-opus-5-5");
         assert!(binds_thinking(&opus));
@@ -4604,14 +4582,207 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_models_use_their_documented_wire_shapes() {
+        let prompt = TranscriptCheckpoint {
+            route_binding: ROUTE.into(),
+            messages: vec![text("user", "go")],
+        };
+        for (id, alias, model, kind, effort, sent, vision) in [
+            (
+                "glm",
+                "glm-5.3",
+                "glm-5.3",
+                "enabled",
+                Effort::Off,
+                "low",
+                false,
+            ),
+            (
+                "glm",
+                "glm-5.3-flashx",
+                "glm-5.3-flashx",
+                "enabled",
+                Effort::Max,
+                "max",
+                true,
+            ),
+            (
+                "kimi",
+                "kimi-k3.1-pro",
+                "k3.1-pro",
+                "adaptive",
+                Effort::Off,
+                "low",
+                true,
+            ),
+            (
+                "anthropic",
+                "claude-fable-5-2",
+                "claude-fable-5-2",
+                "adaptive",
+                Effort::XHigh,
+                "xhigh",
+                true,
+            ),
+            (
+                "anthropic",
+                "claude-haiku-5-5",
+                "claude-haiku-5-5",
+                "disabled",
+                Effort::Off,
+                "low",
+                true,
+            ),
+        ] {
+            let route = builtin(id, alias);
+            let body = request_body(&route, "s", false, false, effort, &prompt).unwrap();
+            assert_eq!(body["model"], model);
+            assert_eq!(body["thinking"]["type"], kind);
+            assert!(body["thinking"].get("budget_tokens").is_none());
+            assert_eq!(body["output_config"]["effort"], sent);
+            assert_eq!(
+                provider::resolve_model_spec(&route.profile, &route.model).image_input,
+                vision
+            );
+        }
+        let openai = builtin("openai", "gpt62astra");
+        assert_eq!(openai.endpoint, "https://api.openai.com/v1/responses");
+        assert_eq!(openai.model, "gpt-6.2-astra");
+        let body = request_body(&openai, "s", false, false, Effort::Max, &prompt).unwrap();
+        assert_eq!(body["reasoning"], json!({"effort": "max"}));
+        assert!(body["max_output_tokens"].as_u64().is_some());
+        assert!(body.get("instructions").is_none());
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][1]["role"], "user");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        let nested = code_model_request(
+            &json!({"prompt":"go", "system":"child guidance"}),
+            &openai,
+            "s",
+            &Vec::new,
+        )
+        .unwrap();
+        assert_eq!(
+            nested["body"]["input"][0]["content"][0]["text"],
+            "child guidance"
+        );
+        assert_eq!(nested["body"]["input"][1]["role"], "user");
+        assert!(nested["body"].get("tools").is_none());
+        let custom = route_with(openai.profile, openai.model, "https://example.test").unwrap();
+        assert_eq!(custom.contract, RequestContract::OpenAiChatCompletions);
+        let error = request_body(&custom, "s", false, false, Effort::Max, &prompt).unwrap_err();
+        assert!(error.contains("tool calling requires the Responses API"));
+        let nested = code_model_request(
+            &json!({"prompt":"go", "effort":"max"}),
+            &custom,
+            "s",
+            &Vec::new,
+        )
+        .unwrap();
+        assert_eq!(nested["body"]["model"], "gpt-6.2-astra");
+        assert_eq!(nested["body"]["reasoning_effort"], "max");
+        assert!(nested["body"]["max_completion_tokens"].is_number());
+        assert!(nested["body"].get("tools").is_none());
+        let codex = builtin("chatgpt", "auto");
+        assert_eq!(codex.model, "gpt-6.2-sol");
+        assert_eq!(builtin("chatgpt", "gpt-5.4-mini").model, "gpt-6-luna");
+        let body = request_body(&codex, "s", false, false, Effort::Max, &prompt).unwrap();
+        assert_eq!(body["reasoning"], json!({"effort": "max"}));
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(
+            provider::resolve_model_spec(&codex.profile, &codex.model).context_window,
+            Some(500_000)
+        );
+        let plan = builtin("chatgpt-plan", "gpt-6.1-sol");
+        assert_eq!(plan.profile.default_model, "gpt-6.1-sol");
+        assert!(!plan.profile.model_specs.contains_key("gpt-6.2-sol"));
+        assert!(
+            !catalog::models_of(&plan.profile)
+                .iter()
+                .any(|id| id == "gpt-6.2-sol")
+        );
+    }
+
+    #[test]
+    fn nested_model_respects_catalog_and_learned_output_limits() {
+        let input =
+            json!({"prompt": "go", "system": "guidance", "effort": "max", "max_tokens": 131_072});
+        for (provider, model, field) in [
+            ("openai", "gpt-6.2-astra", "max_output_tokens"),
+            ("anthropic", "claude-fable-5-2", "max_tokens"),
+            ("glm", "glm-5.3-flash", "max_tokens"),
+        ] {
+            let mut route = builtin(provider, model);
+            let request = code_model_request(&input, &route, "s", &Vec::new).unwrap();
+            let cap = if provider == "glm" { 131_072 } else { 128_000 };
+            assert_eq!(request["body"][field], cap);
+            assert_eq!(request["budget"], cap + 10);
+            route.learned_limit = Some(4_096);
+            let request = code_model_request(&input, &route, "s", &Vec::new).unwrap();
+            assert_eq!(request["body"][field], 4_096);
+            assert_eq!(request["budget"], 4_106);
+        }
+    }
+
+    #[test]
+    fn kimi_replays_unsigned_stream_thinking_only_on_the_official_code_route() {
+        let transcript = TranscriptCheckpoint {
+            route_binding: ROUTE.into(),
+            messages: vec![
+                text("user", "go"),
+                Message {
+                    role: "assistant".into(),
+                    content: vec![
+                        Block::Thinking {
+                            text: "plan".into(),
+                            signature: None,
+                        },
+                        Block::ToolUse {
+                            id: "c1".into(),
+                            name: "read_file".into(),
+                            input: json!({}),
+                        },
+                    ],
+                },
+                Message {
+                    role: "user".into(),
+                    content: vec![Block::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: "ok".into(),
+                        is_error: None,
+                        metadata: Default::default(),
+                    }],
+                },
+            ],
+        };
+        let official = builtin("kimi", "k3.1-pro");
+        let proxy = route_with(
+            official.profile.clone(),
+            official.model.clone(),
+            "https://example.test",
+        )
+        .unwrap();
+        let build =
+            |route| request_body(route, "s", false, false, Effort::XHigh, &transcript).unwrap();
+        let body = build(&official);
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            json!({"type":"thinking", "thinking":"plan", "signature":""})
+        );
+        assert_eq!(
+            build(&proxy)["messages"][1]["content"][0]["type"],
+            "tool_use"
+        );
+    }
+
+    #[test]
     fn gpt_efforts_are_only_what_each_openai_model_takes() {
         let prompt = TranscriptCheckpoint {
             route_binding: ROUTE.into(),
             messages: vec![text("user", "go")],
         };
-        let body = |route: &Route, effort| {
-            request_body(route, &route.model, "s", false, false, effort, &prompt)
-        };
+        let body = |route: &Route, effort| request_body(route, "s", false, false, effort, &prompt);
         // GPT-4.1 and GPT-4o do not reason: OpenAI refuses `reasoning_effort` for them,
         // so only the provider default is offered and an effort is refused here.
         for model in ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"] {
@@ -4630,9 +4801,9 @@ mod tests {
             assert!(body(&route, Effort::High).is_err(), "{model}");
         }
         assert!(catalog::valid_efforts("openai", "o3").contains(&"high"));
-        // GPT-6 Sol and Luna list `none`: "off" sends it, on both OpenAI routes.
+        // These models list `none`: "off" sends it, on both OpenAI routes.
         for provider in ["openai", "chatgpt"] {
-            for model in ["gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"] {
+            for model in ["gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"] {
                 let off = body(&builtin(provider, model), Effort::Off).unwrap();
                 assert_eq!(
                     off["reasoning"],
@@ -4641,7 +4812,7 @@ mod tests {
                 );
             }
             // GPT-6.1 Sol and Astra list no `none`: there is no off.
-            for model in ["gpt-6.1-sol", "gpt-6-astra"] {
+            for model in ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra"] {
                 assert!(body(&builtin(provider, model), Effort::Off).is_err());
                 assert!(!catalog::valid_efforts(provider, model).contains(&"off"));
             }
@@ -4670,16 +4841,7 @@ mod tests {
         let model = claude.model.to_ascii_lowercase();
         let spec = claude.profile.model_specs.entry(model).or_default();
         spec.capabilities.prompt_cache = Some(true);
-        let body = request_body(
-            &claude,
-            &claude.model,
-            "s",
-            false,
-            false,
-            Effort::Default,
-            &transcript,
-        )
-        .unwrap();
+        let body = request_body(&claude, "s", false, false, Effort::Default, &transcript).unwrap();
         // The tools and the system prompt are kept an hour.
         let hour = json!({"type": "ephemeral", "ttl": "1h"});
         assert_eq!(body["system"][0]["cache_control"], hour);
@@ -4725,16 +4887,7 @@ mod tests {
                     },
                 }],
             });
-            request_body(
-                &claude,
-                &claude.model,
-                "s",
-                false,
-                false,
-                Effort::Default,
-                &transcript,
-            )
-            .unwrap()
+            request_body(&claude, "s", false, false, Effort::Default, &transcript).unwrap()
         };
         let body = step(1_000);
         assert_eq!(
@@ -4755,16 +4908,7 @@ mod tests {
         // (it may not know `ttl`).
         let mut proxy = claude.clone();
         proxy.profile.base_url = "https://proxy.example/anthropic".into();
-        let body = request_body(
-            &proxy,
-            &proxy.model,
-            "s",
-            false,
-            false,
-            Effort::Default,
-            &transcript,
-        )
-        .unwrap();
+        let body = request_body(&proxy, "s", false, false, Effort::Default, &transcript).unwrap();
         assert_eq!(
             body["system"][0]["cache_control"],
             json!({"type": "ephemeral"})
@@ -4774,16 +4918,7 @@ mod tests {
         let mut plain = builtin("anthropic", "claude-opus-5-5");
         plain.profile.model_specs.clear();
         plain.profile.model_defaults.capabilities.prompt_cache = Some(false);
-        let body = request_body(
-            &plain,
-            &plain.model,
-            "s",
-            false,
-            false,
-            Effort::Default,
-            &transcript,
-        )
-        .unwrap();
+        let body = request_body(&plain, "s", false, false, Effort::Default, &transcript).unwrap();
         assert!(body["system"].is_string());
     }
 
@@ -4942,16 +5077,7 @@ mod tests {
             route_binding: ROUTE.into(),
             messages,
         };
-        let next = request_body(
-            &deepseek,
-            "deepseek-flash",
-            "s",
-            false,
-            false,
-            Effort::Max,
-            &history,
-        )
-        .unwrap();
+        let next = request_body(&deepseek, "s", false, false, Effort::Max, &history).unwrap();
         let held = 2 * transcript_bytes(&history).unwrap().len()
             + 2 * serde_json::to_vec(&next).unwrap().len();
         assert!(
@@ -4997,18 +5123,7 @@ mod tests {
                 },
             ],
         };
-        let body = |effort| {
-            request_body(
-                &route,
-                "deepseek-flash",
-                "s",
-                false,
-                false,
-                effort,
-                &transcript,
-            )
-            .unwrap()
-        };
+        let body = |effort| request_body(&route, "s", false, false, effort, &transcript).unwrap();
         let high = body(Effort::High);
         assert_eq!(high["thinking"]["type"], "enabled");
         assert_eq!(high["reasoning_effort"], "high");

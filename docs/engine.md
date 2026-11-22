@@ -765,7 +765,7 @@ provider is `glm`):
 |---|---|---|---|---|
 | `glm` | ZAI GLM | `anthropic-messages` | `glm-5.2[1m]` | API key, `ZAI_API_KEY` |
 | `chatgpt-plan` | ChatGPT | `chatgpt-plan` | `gpt-6.1-sol` | OpenAI's issued-client Sign in with ChatGPT; browser only, absent from native load/save |
-| `chatgpt` | ChatGPT (Codex) | `chatgpt-responses` | `gpt-6.1-sol` | Legacy OAuth (PKCE), or `CHATGPT_ACCESS_TOKEN`; feature `codex-signin` |
+| `chatgpt` | ChatGPT (Codex) | `chatgpt-responses` | `gpt-6.2-sol` | Legacy OAuth (PKCE), or `CHATGPT_ACCESS_TOKEN`; feature `codex-signin` |
 | `openai` | OpenAI API | `openai-chat-completions`; `openai-responses` for the gpt-5.6 and gpt-6 models on the official API host | `gpt-5` | API key, `OPENAI_API_KEY` |
 | `anthropic` | Anthropic | `anthropic-messages` | `claude-sonnet-4-6` | API key (`ANTHROPIC_API_KEY`) or subscription OAuth |
 | `kimi` | Kimi Code | `anthropic-messages` | `k3` | API key, `KIMI_API_KEY` (stored OAuth entries are ignored) |
@@ -774,12 +774,23 @@ provider is `glm`):
 
 Built-in profiles also carry curated models, context windows, effort levels and pricing
 (`hydrate_builtin_model_specs`, `builtin_model_pricing`, `openai_responses_model_specs`).
-The `chatgpt` profile lists only the models its backend serves a ChatGPT account
-(`gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`,
-`gpt-5.6-luna`); it refuses older ones there with HTTP 400. A model whose spec says it
-does not reason (`capabilities.reasoning` false, as for GPT-4.1 and GPT-4o) takes only
-the default effort in Spindle, which then sends no reasoning field; a Responses model
-whose `effort_levels` list `none` is sent `none` for effort `off`.
+OpenAI Platform and source-build Codex list GPT-6.2 Sol and Astra. Codex uses context
+windows of 500K for Sol and 272K for Astra and omits the output cap on requests. On
+Platform, both have a 1.05M context and a 128K output limit. Tool-bearing calls use
+Responses; tool-free calls can still use a configured Chat Completions endpoint.
+Platform Responses puts stable developer instructions first for caching and requests
+encrypted reasoning on tool turns for replay. Codex migrates `gpt-5.4` to `gpt-6-sol`
+and `gpt-5.4-mini` to `gpt-6-luna`; these mappings do not apply to Platform. The
+separate Sign in with ChatGPT (`chatgpt-plan`) catalog is unchanged. A catalog entry
+does not establish account entitlement.
+
+Claude Fable 5.2 uses adaptive thinking even at Off. Haiku 5.5 has a higher pricing
+tier above 100K total input tokens (including cache reads and writes) unless pricing
+is overridden. GLM 5.3 variants and Kimi Code K3.1 Pro, Highspeed, and K3-256k have
+low/high/max thinking metadata. Unsigned thinking replay is limited to official
+Kimi Code tool turns. A model whose spec says it does not reason
+(`capabilities.reasoning` false, as for GPT-4.1 and GPT-4o) takes only the default
+effort. A Responses model whose effort list contains `none` sends `none` at Off.
 
 **Ids and aliases** (`canonical_provider_id`): `zai`, `bigmodel`, `bigmodel-cn` → `glm`;
 `openai-codex`, `codex-openai`, `codex`, `chatgpt-plus`, `chatgpt-pro` → `chatgpt`;
