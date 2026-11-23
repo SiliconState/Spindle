@@ -317,12 +317,12 @@ async function lookedAt(control = null) {
 }
 
 /** The tab a tool works on (`id`, or the one the user is looking at), which must show a
- * web page Chrome lets extensions into. */
+ * web page Chrome lets extensions into, or a workspace file in Spindle's own tab. */
 async function pageTab(id, control = null) {
   const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt(control);
   if (!tab) throw new Error(id != null ? `there is no tab ${id}` : 'no tab is open');
   if (!tab.url) throw new Error(`${BROWSER} gives Spindle no access to tab ${tab.id} (a new tab, a blank page or a browser page)`);
-  if (!/^https?:/.test(tab.url)) throw new Error(`${BROWSER} does not let extensions into ${new URL(tab.url).protocol} pages`);
+  if (!/^https?:/.test(tab.url) && !viewed(tab)) throw new Error(`${BROWSER} does not let extensions into ${new URL(tab.url).protocol} pages`);
   return tab;
 }
 
@@ -330,7 +330,8 @@ async function pageTab(id, control = null) {
  * (never a browser page, another extension's, or Spindle's own). */
 const webTab = (tab) => /^https?:/.test(tab?.url ?? '') || tab?.url === 'about:blank';
 
-/** Runs one of `inPage`'s operations in the tab (Spindle's own isolated world there).
+/** Runs one of `inPage`'s operations in the tab (Spindle's own isolated world there;
+ * in a workspace page Spindle's tab shows, through the debugger: `inPreview`).
  * A tab showing a dialog answers nothing until the dialog is answered: said at once. */
 async function page(tabId, op, args = {}, control) {
   if (!(await reading())) throw new Error(OFF);
@@ -338,18 +339,29 @@ async function page(tabId, op, args = {}, control) {
   if (['caret', 'select', 'scroll', 'files'].includes(op)) await refuseVetoed(tabId);
   check(control);
   refuseWhileDialog(tabId);
+  const preview = viewed(await chrome.tabs.get(tabId).catch(() => null));
+  // An action let go unasked because it was on a workspace page in Spindle's tab is done
+  // only there (the tab may have moved on since).
+  if (control?.allowed?.preview && !preview) throw new Error(`tab ${tabId} no longer shows the workspace page this was for, so it was not done`);
   // `point` only measures; these change the page, unless it refuses first (then this
   // changed nothing, and the call stands as it did).
   const was = control?.acted;
   if (control && ['caret', 'select', 'scroll', 'files'].includes(op)) control.acted = true;
-  const [answer] = await deadline(
-    chrome.scripting.executeScript({ target: { tabId }, func: inPage, args: [op, { ...args, expires: control?.until }], injectImmediately: true }),
+  const call = [op, { ...args, expires: control?.until }];
+  const result = preview ? await inPreview(tabId, inPage, call, control) : (await deadline(
+    chrome.scripting.executeScript({ target: { tabId }, func: inPage, args: call, injectImmediately: true }),
     DEADLINE_MS, `tab ${tabId}`,
-  );
-  const result = answer?.result;
+  ))[0]?.result;
   if (result?.error) {
     if (control) control.acted = was;
     throw new Error(result.error);
+  }
+  // Where a part of the preview is in the tab, whose page has Spindle's bar above it.
+  if (preview && op === 'point' && result.value?.x != null) {
+    const frame = await previewBox(tabId);
+    if (!frame) throw new Error(`tab ${tabId}'s page went while it was measured: read its parts again`);
+    result.value.x += frame.x;
+    result.value.y += frame.y;
   }
   return result?.value;
 }
@@ -405,11 +417,7 @@ async function readPage({ tab: id, max_chars: max, scroll: screens, find }, cont
   const [{ result }] = await deadline(chrome.scripting.executeScript({
     target: { tabId: tab.id },
     args: [find ? 4 * 1024 * 1024 : limit],
-    func: (limit) => {
-      const text = document.body?.innerText ?? '';
-      const selection = String(getSelection() ?? '');
-      return { url: location.href, title: document.title, selection: selection.slice(0, 10000), text: text.slice(0, limit), total: text.length };
-    },
+    func: shownText,
   }), DEADLINE_MS, `tab ${tab.id}`);
   const lines = [`Address: ${result.url}`, `Title: ${result.title}`];
   if (result.selection.trim()) lines.push(`Selected text: ${result.selection}`);
@@ -430,32 +438,36 @@ function viewed(tab) {
   return /^[0-9a-f]{16}$/.test(thread) && path ? { thread, path } : null;
 }
 
+/** Files a workspace tab shows as a page in its frame (page.mjs `FRAMED`: pages, and
+ * Word, Excel and PowerPoint documents drawn as pages), where the page tools reach. */
+const FRAMED_FILE = /\.(html?|docx|docm|xlsx|xlsm|pptx|pptm)$/i;
+
 /** Files a workspace tab shows that have no text to read. */
 const PICTURED = /\.(png|jpe?g|gif|webp|svg|avif|bmp|ico|apng|pdf|docx|docm|xlsx|xlsm|pptx|pptm|mp4|m4v|webm|ogv|mov|mp3|m4a|aac|wav|ogg|oga|opus|flac)$/i;
 
-/** The text of the workspace file a tab shows: what its preview frame shows (the page
- * drawn, scripts run as the user let them), when Chrome lets a script into Spindle's
- * own page; else the file itself, a page's markup stripped to its text. */
+/** A page's address, title, selected text and visible text (at most `limit` characters
+ * of it), read in the page. Self-contained: Chrome sends the function itself. */
+function shownText(limit) {
+  const text = document.body?.innerText ?? '';
+  const selection = String(getSelection() ?? '');
+  return { url: location.href, title: document.title, selection: selection.slice(0, 10000), text: text.slice(0, limit), total: text.length };
+}
+
+/** The text of the workspace file a tab shows: the page as drawn, its scripts run, when
+ * the debugger may reach it (page actions on: `inPreview`); else the file itself, a
+ * page's markup stripped to its text. */
 async function readView(tab, { thread, path }, limit, find) {
   let text = null;
-  let how = 'as the preview shows it';
-  try {
-    const [{ result }] = await deadline(chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      args: [find ? 4 * 1024 * 1024 : limit],
-      func: (most) => {
-        const body = document.querySelector('iframe')?.contentDocument?.body;
-        const text = body?.innerText;
-        return typeof text === 'string' && text.trim() ? { text: text.slice(0, most), total: text.length } : null;
-      },
-    }), DEADLINE_MS, `tab ${tab.id}`);
-    if (result) text = result;
-  } catch {
-    // Chrome keeps scripts out of extension pages here: the file itself is read.
+  let how = 'as it shows, its scripts run';
+  const live = FRAMED_FILE.test(path) && (await acting());
+  if (live) {
+    const shown = await inPreview(tab.id, shownText, [find ? 4 * 1024 * 1024 : limit]).catch(() => null);
+    if (shown?.text.trim()) text = shown;
   }
   if (!text) {
     if (PICTURED.test(path)) {
-      return { error: `${path} is no text (a picture, a document or media): with bash in the browser Linux, \`spindle model --image ${path} "QUESTION"\` has a model look at a picture` };
+      const drawn = FRAMED_FILE.test(path) && !live ? '; with page actions on, read_page reads a document as it shows' : '';
+      return { error: `${path} is no text (a picture, a document or media)${drawn}: with bash in the browser Linux, \`spindle model --image ${path} "QUESTION"\` has a model look at a picture` };
     }
     const { bytes } = await fromEngine('read', { id: thread, path });
     let whole = new TextDecoder().decode(bytes);
@@ -465,9 +477,12 @@ async function readView(tab, { thread, path }, limit, find) {
         .replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     }
     text = { text: whole.slice(0, find ? 4 * 1024 * 1024 : limit), total: whole.length };
-    how = 'the file itself';
+    how = live || !FRAMED_FILE.test(path) ? 'the file itself' : 'the file itself; with page actions on, as it shows';
   }
   const lines = [`Address: ${tab.url}`, `Title: ${tab.title || path}`, `Workspace file: ${path} (${how})`];
+  // Read as drawn: what its console said, as a page's tester would look.
+  const problems = previews.get(tab.id)?.problems;
+  if (how.startsWith('as it shows') && problems) lines.push(...consoleLines(problems));
   if (find) return { content: `${lines.join('\n')}\n\n${matchingLines(text.text, find, limit)}`, details: { tab: tab.id, url: tab.url, title: tab.title } };
   const more = text.total - text.text.length;
   const body = more > 0 ? `${text.text}\n[${more} more characters: ask again with a larger max_chars, or read the file with read_file]` : text.text;
@@ -587,7 +602,9 @@ async function pageElements({ tab: id, ref, depth, hidden, max_chars: max, find 
     max: Math.min(Math.max(Number(max) || 30000, 2000), 100000),
     ...(find != null && String(find) && { find: String(find).slice(0, 500) }),
   }, control);
-  return { content: `Address: ${parts.url}\nTitle: ${parts.title} (tab ${tab.id})\n\n${parts.text}`, details: { tab: tab.id, url: parts.url } };
+  // Spindle's own tab is named by its address (the page in it has the frame's).
+  const url = viewed(tab) ? tab.url : parts.url;
+  return { content: `Address: ${url}\nTitle: ${parts.title} (tab ${tab.id})\n\n${parts.text}`, details: { tab: tab.id, url } };
 }
 
 async function pageHtml({ tab: id, ref, scripts, max_chars: max }, control) {
@@ -598,18 +615,18 @@ async function pageHtml({ tab: id, ref, scripts, max_chars: max }, control) {
 }
 
 /** A picture of a tab: the one showing in its window as Chrome draws it, once the user
- * let Spindle picture pages (no debugger); any tab through Chrome's debugger (page
- * actions on). */
-async function screenshot({ tab: id }, control) {
-  // Chrome pictures no extension page, its own debugger refused there too: a file of
-  // the workspace shown in Spindle's tab (named, or looked at) is read, not pictured.
-  const own = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt(control).catch(() => null);
-  const view = viewed(own);
-  if (view) return { error: `${BROWSER} does not picture extension pages, so tab ${own.id} (${view.path} from the workspace) cannot be pictured; read_page on it gives the file's text as shown, and read_file the file` };
+ * let Spindle picture pages (no debugger); through Chrome's debugger (page actions on),
+ * any tab, its whole page (`full_page`) or laid out `width` pixels wide, and a workspace
+ * page Spindle's own tab shows (that page alone). */
+async function screenshot({ tab: id, full_page: full, width }, control) {
   const tab = await pageTab(id, control);
   refuseWhileDialog(tab.id);
+  const view = viewed(tab);
+  const wide = width == null ? 0 : Math.round(Number(width));
+  if (width != null && !(wide >= 200 && wide <= 4000)) return { error: 'width is the width to lay the page out at, 200-4000 pixels' };
   let base64;
-  if (tab.active && (await chrome.permissions.contains({ origins: PICTURE_ACCESS }))) {
+  let cut = false;
+  if (!view && full !== true && !wide && tab.active && (await chrome.permissions.contains({ origins: PICTURE_ACCESS }))) {
     check(control);
     const url = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 75 });
     // Chrome pictures whatever its window shows: still this tab's web page, or nothing.
@@ -617,23 +634,63 @@ async function screenshot({ tab: id }, control) {
     if (shown?.id !== tab.id || !/^https?:/.test(shown.url ?? '')) throw new Error(`tab ${tab.id} stopped showing in its window while it was pictured: try again`);
     base64 = url.slice(url.indexOf(',') + 1);
   } else if (await acting()) {
-    ({ data: base64 } = await cdp(tab.id, 'Page.captureScreenshot', { format: 'jpeg', quality: 75 }, control));
+    ({ base64, cut } = await pictured(tab.id, Boolean(view), full === true, wide, control));
   } else {
     return {
-      error: tab.active
-        ? 'Spindle may not picture pages yet: the user lets it with the camera beside the message box (once), or turns page actions on'
-        : `tab ${tab.id} is not the one showing in its window: a picture of it needs page actions on (Settings, Pages), or the user to show it`,
+      error: view || full === true || wide ? `a picture of ${view ? "a workspace page in Spindle's tab" : full === true ? 'a whole page' : 'a page at a set width'} is taken through ${BROWSER}'s debugger: it needs page actions on (Settings, Pages)`
+        : tab.active
+          ? 'Spindle may not picture pages yet: the user lets it with the camera beside the message box (once), or turns page actions on'
+          : `tab ${tab.id} is not the one showing in its window: a picture of it needs page actions on (Settings, Pages), or the user to show it`,
     };
   }
   if (!base64) return { error: `tab ${tab.id} gave no picture. ${await whereNow(tab.id)}` };
   // To the millisecond: two pictures never share a name.
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.(\d+)Z$/, '$1');
   const path = `screenshots/${stamp}-tab${tab.id}.jpg`;
+  const what = view ? `${view.path} from the workspace` : `${tab.title || '(untitled)'} <${tab.url}>`;
+  const shape = `${full === true ? ', the whole page' : ''}${wide ? `, ${wide} pixels wide` : ''}${cut ? ` (cut at ${TALLEST} pixels tall)` : ''}`;
   return {
-    content: `Saved ${path}: tab ${tab.id}, ${tab.title || '(untitled)'} <${tab.url}>. The user sees it in the panel. To have a model look at it, with bash in this browser's Linux: spindle model --image ${path} "QUESTION"`,
+    content: `Saved ${path}: tab ${tab.id}, ${what}${shape}. The user sees it in the panel. To have a model look at it, with bash in this browser's Linux: spindle model --image ${path} "QUESTION"`,
     files: { write_base64: { [path]: base64 } },
     details: { tab: tab.id, screenshot: path },
   };
+}
+
+/** The tallest picture Spindle takes (Chrome draws no taller in one go). */
+const TALLEST = 16_384;
+
+/** A picture through the debugger: what tab `tabId` shows, or its whole page (`full`),
+ * laid out `wide` pixels wide (0: as its window is); of Spindle's own tab (`view`), the
+ * workspace page in it alone, which scrolls inside its frame, so for the whole of it the
+ * tab is made tall enough to show it unscrolled (as a window that tall would). */
+async function pictured(tabId, view, full, wide, control) {
+  let clip = null;
+  let cut = false;
+  const resize = (height) => cdp(tabId, 'Emulation.setDeviceMetricsOverride', { width: wide, height, deviceScaleFactor: 0, mobile: false }, control);
+  try {
+    if (wide) await resize(0);
+    if (view) {
+      await previewWorld(tabId);
+      let box = await previewBox(tabId);
+      if (box && full) {
+        const whole = await inPreview(tabId, () => Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0), [], control);
+        cut = whole > TALLEST;
+        await resize(Math.ceil(box.y + Math.min(whole, TALLEST)));
+        box = await previewBox(tabId);
+      }
+      if (!box) throw new Error(`tab ${tabId}'s page went while it was pictured: try again`);
+      clip = { x: box.x, y: box.y, width: box.width, height: Math.min(box.height, TALLEST), scale: 1 };
+    } else if (full) {
+      const { cssContentSize: size } = await cdp(tabId, 'Page.getLayoutMetrics', {}, control);
+      cut = size.height > TALLEST;
+      clip = { x: 0, y: 0, width: size.width, height: Math.min(size.height, TALLEST), scale: 1 };
+    }
+    const { data } = await cdp(tabId, 'Page.captureScreenshot', { format: 'jpeg', quality: 75, ...(clip && { clip, captureBeyondViewport: true }) }, control);
+    return { base64: data, cut };
+  } finally {
+    // Laid out as before, whatever stopped the picture (a call cut off too).
+    if (wide || (view && full)) await chrome.debugger.sendCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride').catch(() => {});
+  }
 }
 
 // ---- Acting ------------------------------------------------------------------------
@@ -678,7 +735,8 @@ async function navigate({ url, action = 'go', tab: id, new_tab: fresh, keep_open
   } else {
     tab = id != null ? await chrome.tabs.get(id).catch(() => null) : await lookedAt(control);
     if (!tab) return { error: id != null ? `there is no tab ${id}` : 'no tab is open' };
-    if (!webTab(tab)) return { error: `tab ${tab.id} does not show a web page Spindle may move (a new tab, a browser or extension page): open the address with new_tab` };
+    // Spindle's own tab of a workspace file reloads (showing the file as it is now).
+    if (!webTab(tab) && !(viewed(tab) && action === 'reload')) return { error: `tab ${tab.id} does not show a web page Spindle may move (a new tab, a browser or extension page): open the address with new_tab` };
     return onTab(tab.id, async () => {
       refuseWhileDialog(tab.id);
       await refuseVetoed(tab.id);
@@ -734,7 +792,8 @@ const shownOf = (control) => {
 async function target({ ref, tab: id }, control) {
   const tab = await pageTab(id, control);
   const found = await page(tab.id, 'target', { ref }, control);
-  return { content: found.what, details: { ...found, host: new URL(tab.url).host, tab: tab.id } };
+  // `preview`: a workspace page in Spindle's own tab, no site's (the engine asks nothing).
+  return { content: found.what, details: { ...found, host: new URL(tab.url).host, tab: tab.id, ...(viewed(tab) && { preview: true }) } };
 }
 
 /** Which tab an action without a `tab` would land on now (the one the user is looking
@@ -753,7 +812,7 @@ async function tabOf({ tab: id, focus: withFocus }, control) {
   return {
     content: `tab ${tab.id}`,
     details: {
-      tab: tab.id, host: hostOf(tab.url), url: withoutPart(tab.url), title: tab.title ?? '',
+      tab: tab.id, host: hostOf(tab.url), url: withoutPart(tab.url), title: tab.title ?? '', ...(viewed(tab) && { preview: true }),
       ...(document && { document }), ...(open && { dialog: { id: open.id, type: open.type, message: open.message } }),
       ...(focus !== undefined && { focus }),
     },
@@ -801,6 +860,8 @@ async function asAllowed(tabId, control) {
   }
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) throw new Error(`there is no tab ${tabId}`);
+  // Let go unasked on a workspace page in Spindle's tab (Before acting): only there.
+  if (allowed.preview && !viewed(tab)) throw new Error(`tab ${tabId} no longer shows the workspace page this was for, so it was not done`);
   const host = hostOf(tab.url);
   if (allowed.host != null && host !== allowed.host) {
     throw new Error(`tab ${tabId} moved from ${allowed.host || 'the page the user saw'} to ${host || 'another page'} since the user allowed this, ${notDone}`);
@@ -1296,6 +1357,117 @@ async function cdp(tabId, method, params = {}, control) {
   }
 }
 
+/** Spindle's tabs of workspace pages whose page the debugger reached -> {session,
+ * context}: its session with the page's frame (preview.html, a sandboxed page in a
+ * process of its own, which Chrome lets no extension script into) and Spindle's isolated
+ * world there, made on first use. */
+const previews = new Map();
+
+/** `func(...args)` run in the workspace page Spindle's tab `tabId` shows, in Spindle's
+ * world there, as a web page's runs through Chrome's scripting: through the debugger, so
+ * with page actions on. */
+async function inPreview(tabId, func, args, control) {
+  if (!(await acting())) throw new Error(`Spindle reads and acts in a workspace page in its own tab through ${BROWSER}'s debugger: it needs page actions on (Settings, Pages)`);
+  check(control);
+  await attach(tabId);
+  keepAttached(tabId);
+  for (let tries = 0; ; tries += 1) {
+    const held = await previewWorld(tabId);
+    const answer = await deadline(chrome.debugger.sendCommand({ tabId, sessionId: held.session }, 'Runtime.evaluate', {
+      expression: `(${func})(...${JSON.stringify(args)})`, contextId: held.context, returnByValue: true, awaitPromise: true,
+    }), DEADLINE_MS, `tab ${tabId}`).catch((error) => {
+      // Its world went with the page it was made in: made again, once.
+      if (tries || !/context/i.test(error.message)) throw error;
+      held.context = null;
+      return null;
+    });
+    if (!answer) continue;
+    if (answer.exceptionDetails) throw new Error(answer.exceptionDetails.exception?.description?.split('\n')[0] ?? answer.exceptionDetails.text);
+    return answer.result?.value;
+  }
+}
+
+/** The debugger's hold on tab `tabId`'s workspace page (`previews`), once the page is
+ * open (a moment after its tab: the file comes first): its frame's session comes as
+ * Chrome attaches it. */
+async function previewWorld(tabId) {
+  let held = previews.get(tabId);
+  if (!held) {
+    const view = viewed(await chrome.tabs.get(tabId).catch(() => null));
+    if (!view) throw new Error(`tab ${tabId} shows no workspace file`);
+    if (!FRAMED_FILE.test(view.path)) throw new Error(`tab ${tabId} shows ${view.path}, which is no page (a picture, text or media): read_file reads the file, and with bash \`spindle model --image FILE\` has a model look at a picture`);
+    for (const until = Date.now() + 10_000; !(await previewBox(tabId)); await pause(100)) {
+      if (Date.now() > until) throw new Error(`tab ${tabId}'s page did not open within 10 s`);
+    }
+    // Asked anew, off then on: Chrome says again which frames it attaches (a repeated
+    // "on" says nothing, and after this worker rested the debugger may hold them still).
+    await chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false }).catch(() => {});
+    await chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: 'iframe' }] });
+    for (const until = Date.now() + 5_000; !(held = previews.get(tabId)); await pause(50)) {
+      if (Date.now() > until) throw new Error(`${BROWSER} did not let Spindle into tab ${tabId}'s page within 5 s`);
+    }
+  }
+  if (held.context == null) {
+    const at = { tabId, sessionId: held.session };
+    // Its page is written in once the frame says it is ready (preview.js, whose own
+    // script goes with the document it writes over): until then it is an empty one.
+    for (const until = Date.now() + 5_000; ; await pause(100)) {
+      const { result } = await chrome.debugger.sendCommand(at, 'Runtime.evaluate', { expression: `!document.querySelector('script[src="preview.js"]')`, returnByValue: true });
+      if (result?.value) break;
+      if (Date.now() > until) throw new Error(`tab ${tabId}'s page did not show within 5 s`);
+    }
+    // Its console, once for the frame (a second "on" tells nothing again): errors and
+    // warnings since it loaded come first, then each as it comes (`noteProblem`).
+    if (!held.console) {
+      held.console = true;
+      await chrome.debugger.sendCommand(at, 'Runtime.enable');
+    }
+    const { frameTree } = await chrome.debugger.sendCommand(at, 'Page.getFrameTree');
+    ({ executionContextId: held.context } = await chrome.debugger.sendCommand(at, 'Page.createIsolatedWorld', { frameId: frameTree.frame.id, worldName: 'spindle' }));
+  }
+  return held;
+}
+
+/** Notes a workspace page's console error or warning, or an error it did not catch, for
+ * read_page to say (consecutive repeats counted, the last 50 kept). */
+function noteProblem(held, method, params) {
+  let text;
+  if (method === 'Runtime.exceptionThrown') {
+    const details = params.exceptionDetails ?? {};
+    const line = Number.isInteger(details.lineNumber) ? ` (line ${details.lineNumber + 1})` : '';
+    text = `uncaught: ${String(details.exception?.description ?? details.text ?? 'an error').split('\n')[0]}${line}`;
+  } else {
+    if (!['error', 'warning', 'assert'].includes(params.type)) return;
+    text = `${params.type === 'warning' ? 'warning' : 'error'}: ${(params.args ?? []).map((arg) => arg.value ?? arg.unserializableValue ?? arg.description ?? arg.type).join(' ')}`;
+  }
+  text = text.replace(/\s+/g, ' ').slice(0, 300);
+  const last = held.problems.at(-1);
+  if (last?.text === text) last.times += 1;
+  else held.problems.push({ text, times: 1 });
+  if (held.problems.length > 50) held.problems.shift();
+}
+
+/** What a workspace page's console said since it loaded (`noteProblem`), as read_page
+ * gives it: its errors and warnings, the last 20, or that there were none. */
+function consoleLines(problems) {
+  if (!problems.length) return ['Console since it loaded: no errors or warnings'];
+  const shown = problems.slice(-20);
+  return [
+    `Console since it loaded (errors and warnings${problems.length > shown.length ? `, the last ${shown.length}` : ''}):`,
+    ...shown.map(({ text, times }) => `  ${text}${times > 1 ? ` (${times} times)` : ''}`),
+  ];
+}
+
+/** Where the workspace page sits in Spindle's tab `tabId` (below Spindle's bar), or null
+ * while there is none. */
+async function previewBox(tabId) {
+  const { result } = await cdp(tabId, 'Runtime.evaluate', {
+    expression: "(() => { const box = document.querySelector('iframe#view')?.getBoundingClientRect(); return box && { x: box.x, y: box.y, width: box.width, height: box.height }; })()",
+    returnByValue: true,
+  });
+  return result?.value ?? null;
+}
+
 /** The debugger stays on `tabId` for another idle while (none while its network is watched). */
 function keepAttached(tabId) {
   clearTimeout(attached.get(tabId));
@@ -1305,6 +1477,7 @@ function keepAttached(tabId) {
 function forget(tabId) {
   clearTimeout(attached.get(tabId));
   attached.delete(tabId);
+  previews.delete(tabId);
   watched.delete(tabId);
   dialogs.delete(tabId);
   choosers.delete(tabId);
@@ -1336,7 +1509,8 @@ chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
   forget(tabId);
   if (reason === 'canceled_by_user') veto(tabId).catch(() => {});
 });
-chrome.debugger.onEvent.addListener(({ tabId }, method, params) => {
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const { tabId } = source;
   if (method === 'Page.fileChooserOpened') {
     choosers.add(tabId);
   } else if (method === 'Page.javascriptDialogOpening') {
@@ -1345,6 +1519,14 @@ chrome.debugger.onEvent.addListener(({ tabId }, method, params) => {
     dialogWaiters.delete(tabId);
   } else if (method === 'Page.javascriptDialogClosed') {
     dialogs.delete(tabId);
+  } else if (method === 'Runtime.consoleAPICalled' || method === 'Runtime.exceptionThrown') {
+    const held = previews.get(tabId);
+    if (held && source.sessionId === held.session) noteProblem(held, method, params);
+  } else if (method === 'Target.attachedToTarget') {
+    // The frame of a workspace page in Spindle's tab (`previewWorld`), the one asked for.
+    if (params.targetInfo?.url?.startsWith(chrome.runtime.getURL('preview.html'))) previews.set(tabId, { session: params.sessionId, context: null, problems: [] });
+  } else if (method === 'Target.detachedFromTarget') {
+    if (previews.get(tabId)?.session === params.sessionId) previews.delete(tabId);
   } else if (method === 'Page.windowOpen') {
     // A link to a new tab, window.open...: its tab is the thread's if Spindle's action did it.
     opens.push({ source: tabId, url: String(params.url ?? ''), at: Date.now() });
@@ -1433,8 +1615,12 @@ async function network({ action, tab: id, filter, body }, control) {
   const log = watched.get(tab.id);
   if (!log) return { error: `tab ${tab.id}'s network is not watched (start it; ${BROWSER} ends a watch when its debugging bar is closed)` };
   if (body) {
-    const entry = log.get(body);
-    if (!entry) return { error: `there is no request ${body} in tab ${tab.id}'s log` };
+    // `last`: the last finished request `filter` matches (a script reads what the page just
+    // fetched in one call).
+    const entry = body === 'last'
+      ? [...log.values()].filter((one) => !one.redirected && typeof one.status === 'number' && (!filter || one.url.includes(filter))).at(-1)
+      : log.get(body);
+    if (!entry) return { error: body === 'last' ? `no finished request${filter ? ` whose address holds ${JSON.stringify(filter)}` : ''} in tab ${tab.id}'s log` : `there is no request ${body} in tab ${tab.id}'s log` };
     if (entry.redirected) return { error: `${BROWSER} does not keep a redirect hop's body; read the final request instead` };
     const answer = await cdp(tab.id, 'Network.getResponseBody', { requestId: entry.id }, control).catch((error) => ({ error: error.message }));
     if (answer.error || answer.body == null) return { error: `that response's body is not kept (${answer.error ?? 'none was given'})` };

@@ -8248,6 +8248,21 @@ fn output_windows_are_selectable_and_unicode_pages_always_advance() {
             "max_output {cap} is clamped, not refused"
         );
     }
+    // A whole number in quotes is that number (some models quote them, and do again).
+    assert!(
+        strict_tool_refusal(
+            "bash",
+            &serde_json::json!({"command":"ls","max_output":"4096","timeout":"60"})
+        )
+        .is_none()
+    );
+    assert!(
+        strict_tool_refusal(
+            "read_file",
+            &serde_json::json!({"path":"a.txt","offset":"2","limit":"10"})
+        )
+        .is_none()
+    );
     for (name, input, fragment) in [
         (
             "run_code",

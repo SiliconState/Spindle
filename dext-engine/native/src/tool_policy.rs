@@ -337,7 +337,7 @@ pub fn tool_input_issue(name: &str, input: &Value) -> Option<String> {
                 if input[field].is_null() {
                     continue;
                 }
-                let Some(value) = input[field].as_u64() else {
+                let Some(value) = dext_transcript::whole_number(&input[field]) else {
                     return Some(format!("{field} must be a positive integer"));
                 };
                 if value == 0 || usize::try_from(value).is_err() {

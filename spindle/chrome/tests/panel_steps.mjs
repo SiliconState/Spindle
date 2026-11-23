@@ -49,6 +49,12 @@ assert.equal(label('navigate', { url: 'https://www.example.com/x/y' }, 'running'
 assert.equal(label('navigate', { url: 'https://example.com', new_tab: true }), 'Opened example.com');
 assert.equal(label('navigate', { action: 'back', tab: 7 }, 'done', tabs), 'Went back on docs.example.org/guide');
 assert.equal(label('screenshot', { tab: 9 }, 'done', tabs), 'Pictured news.example.com/today');
+// A workspace page in Spindle's own tab is named by its file.
+const viewing = tabsFrom([{ name: 'navigate', input: { url: '/workspace/report.html' }, result: 'Opened report.html from the workspace in a tab for the user (tab 12).' },
+  { name: 'read_page', input: { tab: 13 }, result: 'Address: chrome-extension://abc/view.html?thread=0123456789abcdef&path=site%2Findex.html\nTitle: index.html · Spindle' }]);
+assert.equal(label('screenshot', { tab: 12 }, 'done', viewing), 'Pictured report.html');
+assert.equal(label('read_page', { tab: 13 }, 'done', viewing), 'Read site/index.html');
+assert.equal(label('navigate', { url: 'file:///workspace/report.html', new_tab: true }), 'Opened report.html');
 assert.equal(label('some_new_tool', {}), 'Used some new tool');
 
 // A page step's row says what it did without its page (its site's icon shows that, its

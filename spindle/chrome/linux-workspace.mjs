@@ -330,6 +330,12 @@ export class Workspaces {
       this.watched.add(file.id);
     }
     const kept = { dir, files, bytes, used: Date.now() };
+    // Packages a dropped command left meanwhile (`drop`) are older than this copy.
+    const older = this.kept.get(session);
+    if (older && older.dir !== dir) {
+      this.kept.delete(session);
+      this.abandon({ kept: older }).catch(() => {});
+    }
     if (this.forgotten.delete(session) || bytes > KEPT_BYTES) {
       this.abandon({ kept }).catch(() => {});
       return;
@@ -353,13 +359,42 @@ export class Workspaces {
     await this.abandon({ kept });
   }
 
-  /** Drops a command's copy (it ran over its limits, stopped, or never ran). */
-  async drop(run) {
+  /** Drops a command's copy (it ran over its limits, stopped, or never ran): nothing it
+   * changed is kept, but its package and cache directories (`ignored`: the thread's last
+   * copy carried them in) stay for the thread's next command, as after any command (an
+   * `npm install` cut off by its time goes on from what it fetched); all of it with
+   * `whole` (a command that may still be writing there). */
+  async drop(run, { whole = false } = {}) {
     for (const { id } of run.placed.values()) {
       this.watched.delete(id);
       this.written.delete(id);
     }
-    await this.remove(run.dir);
+    // Never over a copy a later command of the thread kept meanwhile (the wasm Linux drops
+    // a copy once its machine is gone, when the thread may have gone on): that one is newer.
+    const newer = () => run.session == null || this.kept.has(run.session);
+    const packages = whole || newer() ? null : await this.prune(run);
+    if (packages?.size && !newer()) this.keep(run.session, run.dir, packages);
+    else await this.remove(run.dir);
+  }
+
+  /** Removes from a command's copy all but what lies under package and cache
+   * directories, and gives those files and links (path -> as `keep` takes them). */
+  async prune(run) {
+    const fs = this.fs;
+    const left = new Map();
+    const stack = [[run.top, '']];
+    while (stack.length) {
+      const [id, prefix] = stack.pop();
+      for (const name of fs.GetChildren(id)) {
+        const child = fs.Search(id, name);
+        const inode = fs.inodes[child];
+        const path = prefix ? `${prefix}/${name}` : name;
+        if ((inode.mode & S_IFMT) === S_IFDIR) stack.push([child, path]);
+        else if (ignored(path)) left.set(path, { id: child, digest: null, executable: Boolean(inode.mode & 0o111), size: inode.size });
+        else await this.remove(`${run.dir}/${path}`);
+      }
+    }
+    return left;
   }
 
   /** Removes a copy from the share, its bytes too. */

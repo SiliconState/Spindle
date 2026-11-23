@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Builds the Linux that Spindle for Browser runs bash in: Alpine (32-bit x86) with bash,
-# coreutils, Python and pip, Node and npm, git and curl, booted by v86 (an x86 emulator
-# in wasm) over its 9p filesystem, with Spindle's runner agent and web proxy as its only
-# services (guest/), its `spindle` command and `spindle-sandbox` (which puts each command
-# in namespaces of its own), static Rust programs (command/) built for the image with
-# Rust's i686-unknown-linux-musl target. The kernel is built here: Alpine's virt
+# coreutils, Python and pip, Node and npm, git and curl, the time zones, booted by v86 (an
+# x86 emulator in wasm) over its 9p filesystem, with Spindle's runner agent and web proxy
+# as its only services (guest/), its `spindle` command and `spindle-sandbox` (which puts
+# each command in namespaces of its own), static Rust programs (command/) built for the
+# image with Rust's i686-unknown-linux-musl target. The kernel is built here: Alpine's virt
 # configuration with kernel.config's changes (no modules, no boot image: v86 boots it
 # straight onto the 9p root), compressed with xz. The image's files are compressed with
 # zstd (v86 reads them so). Nothing needs root: Alpine's static apk installs as a normal
@@ -37,7 +37,7 @@ V86_FILES="bios/seabios.bin:73e3f359102e3a9982c35fce98eb7cd08f18303ac7f1ba6ebfbe
 bios/vgabios.bin:a4bc0d80cc3ca028c73dafa8fee396b8d054ce87ebd8abfbd31b06b437607880
 tools/fs2json.py:546b0ce7d0b172fa855587209318a8d473bce6de23fa327ceeb5b6c115fda23f
 tools/copy-to-sha256.py:7bfb94736afbb9753b6deea922184eec2f9b205be0214bc5f9866cf990bfa77c"
-PACKAGES="bash coreutils findutils grep sed gawk diffutils patch tar gzip xz python3 py3-pip nodejs npm git curl openssl jq ripgrep file less"
+PACKAGES="bash coreutils findutils grep sed gawk diffutils patch tar gzip xz python3 py3-pip nodejs npm git curl openssl jq ripgrep file less tzdata"
 KERNEL=6.18.64
 KERNEL_SHA256=020d45510c539972e6f14c5c71566878d3b7ef56fb082b3e09134f2ebaade562
 # Alpine's configuration for its virt kernel (main/linux-lts/virt.x86.config) at an aports
@@ -164,6 +164,12 @@ printf '{"name": "spindle", "main": "index.js"}\n' > "$root/node_modules/spindle
 versions=$("$work/apk/sbin/apk.static" --root "$root" info -v 2>/dev/null | sort)
 # Manuals and caches are dead weight (the kernel is beside the image, not in it).
 rm -rf "$root/usr/share/man" "$root/usr/share/doc" "$root"/var/cache/apk/* "$root/var/log/apk.log"
+# As is what no command here can use: git's login shell for SSH servers (git-shell), its
+# push to WebDAV servers ("dumb" HTTP, which no forge takes: pushes go through
+# git-remote-http), and Python's turtle graphics (they need tkinter, which the image has
+# not). The wasm Linux leaves the same turtle files out (build-image.sh).
+rm -rf "$root/usr/bin/git-shell" "$root/usr/libexec/git-core/git-http-push" \
+    "$root"/usr/lib/python3.*/turtle.py "$root"/usr/lib/python3.*/__pycache__/turtle.* "$root"/usr/lib/python3.*/turtledemo
 
 echo "v86 filesystem"
 # What this build wrote (not what packages brought) at one fixed time, and one order, so

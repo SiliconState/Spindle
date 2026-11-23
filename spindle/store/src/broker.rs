@@ -7,6 +7,8 @@ use dext_core::model::{ModelWait, Phase};
 use dext_transcript::Block;
 use dext_transcript::checkpoint::NativeResponse;
 use dext_transcript::turn::Effect;
+#[cfg(feature = "driver")]
+use dext_transcript::whole_number;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1049,7 +1051,7 @@ fn strict_tool(effect: &Effect) -> Result<StrictTool<'_>> {
     // Any non-negative size is accepted; receipts clamp it into the 4096-32768 window.
     if input
         .get("max_output")
-        .is_some_and(|size| size.as_u64().is_none())
+        .is_some_and(|size| whole_number(size).is_none())
     {
         return Err(Error::Invalid);
     }
@@ -1075,7 +1077,7 @@ fn strict_tool(effect: &Effect) -> Result<StrictTool<'_>> {
                 .ok_or(Error::Invalid)?;
             let timeout = match input.get("timeout") {
                 None => 30,
-                Some(value) => value.as_u64().ok_or(Error::Invalid)?,
+                Some(value) => whole_number(value).ok_or(Error::Invalid)?,
             };
             if command.is_empty()
                 || command.len() > 16 * 1024
@@ -1103,8 +1105,7 @@ fn strict_tool(effect: &Effect) -> Result<StrictTool<'_>> {
                 .ok_or(Error::Invalid)?;
             let timeout = match input.get("timeout") {
                 None => 60,
-                Some(value) => value
-                    .as_u64()
+                Some(value) => whole_number(value)
                     .filter(|timeout| (1..=dext_native::limits::MAX_RUN_SECS).contains(timeout))
                     .ok_or(Error::Invalid)?,
             };
@@ -1117,8 +1118,7 @@ fn strict_tool(effect: &Effect) -> Result<StrictTool<'_>> {
         "read_file" => {
             let number = |key: &str, default: usize| match input.get(key) {
                 None => Ok(default),
-                Some(value) => value
-                    .as_u64()
+                Some(value) => whole_number(value)
                     .filter(|number| (1..=1_000_000).contains(number))
                     .map(|number| number as usize)
                     .ok_or(Error::Invalid),
@@ -1129,7 +1129,7 @@ fn strict_tool(effect: &Effect) -> Result<StrictTool<'_>> {
                 limit: number("limit", 2000)?,
                 window: input
                     .get("max_output")
-                    .and_then(Value::as_u64)
+                    .and_then(whole_number)
                     .map_or(MAX_TOOL_TEXT, |size| {
                         (size as usize).clamp(4096, MAX_READ_WINDOW)
                     }),
@@ -1139,22 +1139,20 @@ fn strict_tool(effect: &Effect) -> Result<StrictTool<'_>> {
             artifact: text("artifact")?.to_string(),
             offset: match input.get("offset") {
                 None => 0,
-                Some(n) => n
-                    .as_u64()
+                Some(n) => whole_number(n)
                     .filter(|n| *n <= crate::artifact::MAX_OBJECT as u64)
                     .ok_or(Error::Invalid)? as usize,
             },
             limit: match input.get("limit") {
                 None => MAX_TOOL_TEXT,
-                Some(n) => n
-                    .as_u64()
+                Some(n) => whole_number(n)
                     .filter(|n| (1..=MAX_READ_WINDOW as u64).contains(n))
                     .ok_or(Error::Invalid)? as usize,
             },
             tail: match input.get("tail") {
                 None => None,
                 Some(n) => Some(
-                    n.as_u64()
+                    whole_number(n)
                         .filter(|n| (1..=MAX_READ_WINDOW as u64).contains(n))
                         .ok_or(Error::Invalid)? as usize,
                 ),
@@ -1179,7 +1177,7 @@ fn strict_tool(effect: &Effect) -> Result<StrictTool<'_>> {
                 .ok_or(Error::Invalid)?;
             let lifetime = match input.get("timeout") {
                 None => JOB_SECS,
-                Some(value) => value.as_u64().ok_or(Error::Invalid)?,
+                Some(value) => whole_number(value).ok_or(Error::Invalid)?,
             };
             if command.is_empty()
                 || command.len() > 16 * 1024
@@ -1199,19 +1197,17 @@ fn strict_tool(effect: &Effect) -> Result<StrictTool<'_>> {
             },
             offset: match input.get("offset") {
                 None => None,
-                Some(value) => Some(value.as_u64().ok_or(Error::Invalid)?),
+                Some(value) => Some(whole_number(value).ok_or(Error::Invalid)?),
             },
             limit: match input.get("limit") {
                 None => MAX_TOOL_TEXT,
-                Some(value) => value
-                    .as_u64()
+                Some(value) => whole_number(value)
                     .filter(|limit| (1..=MAX_JOB_WINDOW as u64).contains(limit))
                     .ok_or(Error::Invalid)? as usize,
             },
             wait: match input.get("wait") {
                 None => 0,
-                Some(value) => value
-                    .as_u64()
+                Some(value) => whole_number(value)
                     .filter(|wait| *wait <= MAX_JOB_WAIT)
                     .ok_or(Error::Invalid)?,
             },
@@ -1438,7 +1434,7 @@ fn strict_field_issue(name: &str, input: &serde_json::Value) -> Option<String> {
     }
     if object
         .get("max_output")
-        .is_some_and(|v| v.as_u64().is_none())
+        .is_some_and(|v| whole_number(v).is_none())
     {
         let most = if name == "read_file" {
             MAX_READ_WINDOW
@@ -1456,7 +1452,7 @@ fn strict_field_issue(name: &str, input: &serde_json::Value) -> Option<String> {
     };
     if object
         .get("timeout")
-        .is_some_and(|v| !v.as_u64().is_some_and(|n| (1..=max).contains(&n)))
+        .is_some_and(|v| !whole_number(v).is_some_and(|n| (1..=max).contains(&n)))
     {
         return Some(format!("{name}: timeout must be 1-{max} seconds"));
     }
@@ -3703,7 +3699,7 @@ impl Store {
             "read_file" | "read_output" | "read_job"
         ) || crate::turn::HOST_TOOLS.contains(&request.intent.adapter.as_str());
         let requested = app_cap.unwrap_or_else(|| {
-            args["max_output"].as_u64().unwrap_or(MAX_TOOL_TEXT as u64) as usize
+            whole_number(&args["max_output"]).unwrap_or(MAX_TOOL_TEXT as u64) as usize
         });
         // Tool effect ids are `<execution>/m/<n>/t/<position>`.
         let execution = match request.intent.id.rsplit_once("/m/") {

@@ -40,8 +40,8 @@ your key.
   tag until a new release exists. The source/GitHub edition retains ChatGPT (Codex)
   alongside OpenAI's Sign in with ChatGPT; the store edition leaves the Codex client out.
 - **bash, in a Linux inside Chrome:** threads run commands in Alpine Linux (bash,
-  coreutils, Python 3 with pip, Node with npm, git, curl, jq, ripgrep) emulated by v86 in
-  the extension, sealed off from your computer and from Spindle's keys. Commands run as
+  coreutils, Python 3 with pip, Node with npm, git, curl, jq, ripgrep, the time zones)
+  emulated by v86 in the extension, sealed off from your computer and from Spindle's keys. Commands run as
   an unprivileged user, each in namespaces of its own: a fresh /tmp and home each time
   (only the workspace is kept), its own processes (whatever a command leaves running
   ends with it) and, for a thread without network, a network of its own with nothing
@@ -76,8 +76,8 @@ your key.
   emulated Linux): Spindle's wasm Linux is Linux itself compiled to WebAssembly, with
   busybox `sh`, Python 3.14 (the emulated Linux's version, with the same standard
   library files, carried once for both) and ripgrep (the emulated Linux's version, without
-  PCRE2: `rg -P` runs in the emulated Linux), run at the machine's own
-  speed with no emulator: in our measurements it boots in about half a second and runs
+  PCRE2: `rg -P` runs in the emulated Linux) and the same time zones, run at the
+  machine's own speed with no emulator: in our measurements it boots in about half a second and runs
   plain shell commands 2 to 9 times faster than the emulated Linux, Python 3 to 25
   times. No switch: a command that is plain POSIX sh with programs it has runs there
   (each in namespaces of its own, on CPUs of its own, as the same unprivileged user),
@@ -188,11 +188,18 @@ your key.
   once). `read_page` and `page_elements` with `find` (words, or `/a pattern/`) give only
   the lines or parts that match, with a line's neighbours, however long the page. A file
   of the workspace open in Spindle's own tab (a report it made and opened for you) reads
-  with `read_page` as the file's text; Chrome pictures no extension page, so `screenshot`
-  says so for such a tab instead. `screenshot` pictures the tab showing once you have let Spindle picture pages
-  (saved in the workspace, shown in the panel; a script can show it to a vision model
-  with `spindle model --image FILE`). While the switch is off, threads read nothing, not
-  even a provider's site Spindle may reach for its key.
+  with `read_page` as it shows, its scripts run (a page, or a Word, Excel or PowerPoint
+  file drawn as one), and the other page tools work there as on a web page (through
+  Chrome's debugger, so with page actions on; without them `read_page` gives the file's
+  text), so a thread checks what it makes there, not on another site; `read_page` there
+  also says what the page's console said since it loaded (errors, warnings, uncaught
+  errors), or that it said none. `screenshot`
+  pictures the tab showing once you have let Spindle picture pages, and with page actions
+  on any tab, a workspace page in Spindle's tab (that page alone), the whole page
+  (`full_page`) or the page laid out at a set `width` (saved in the workspace, shown in the
+  panel; a script can show it to a vision model with `spindle model --image FILE`). While
+  the switch is off, threads read nothing, not even a provider's site Spindle may reach
+  for its key.
 - **Screenshots of your own:** Capture this tab (the camera under the + in the message
   box) pictures the tab you are on and attaches it to your message (it shows with the
   message; the thread finds it in its workspace). The first time, Chrome asks to let
@@ -229,7 +236,9 @@ your key.
   only once they end), `press` (Enter, Escape, Control+a...), `scroll` (the page, or the pane under the middle of the window),
   `wait_for` (text or a selector), `dialog` (answer an alert, confirm or prompt),
   `close_tab`, `screenshot` of any tab (through the debugger) and `network` (record a
-  tab's requests, list them, read a response). The tabs a thread opens (`navigate`
+  tab's requests, list them, read a response, or the last one a filter matches; the
+  page's own requests carry your sign-in, so a thread reads there the data a site loads
+  for you, which the Linux's requests, sent without it, never get). The tabs a thread opens (`navigate`
   with a new tab, and tabs a page opens on its click, key or choice, such as a link to
   a new tab) close once its turn is done and the thread rests. They stay after a
   stopped or failed turn (Continue or Retry may still need them) and while a message

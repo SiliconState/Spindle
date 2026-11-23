@@ -8,7 +8,8 @@
 # same version, byte for byte, its compiled modules with it: the browser Linux has those
 # very files, so the extension carries them once), ripgrep (the browser Linux's version,
 # built here with build-rust.sh's cargo: without PCRE2, whose JIT needs mmap, so `rg -P`
-# runs on v86; ripgrep/no-mmap.c in place of mmap, which it reads files without),
+# runs on v86; ripgrep/no-mmap.c in place of mmap, which it reads files without), the
+# time zones (Alpine's tzdata, as the browser Linux has them),
 # Spindle's agent and `spindle` command (guest/, built here too), its init and users. Its
 # identity names
 # it as runs record it: the index, the kernel and the runtime that boots it. Nothing
@@ -84,7 +85,7 @@ tar xzf "$work/minirootfs.tar.gz" -C "$alpine" --no-same-owner
 # Packages are checked against the keys the minirootfs carries (the browser Linux has
 # python3 and python3-pyc, its compiled modules).
 "$work/apk/sbin/apk.static" --root "$alpine" --arch x86 --usermode --no-interactive \
-    --update-cache --cache-dir "$work/cache" add python3 python3-pyc ripgrep zstd >/dev/null
+    --update-cache --cache-dir "$work/cache" add python3 python3-pyc ripgrep tzdata zstd >/dev/null
 installed=$("$work/apk/sbin/apk.static" --root "$alpine" info -v 2>/dev/null)
 alpine_python=$(echo "$installed" | sed -n 's/^python3-\([0-9][0-9.]*\)-r[0-9]*$/\1/p')
 [ "$alpine_python" = "$PYTHON" ] || { echo "Alpine's python3 is $alpine_python, build-python.sh's $PYTHON: build $alpine_python (PYTHON there; the two Linuxes run one Python)" >&2; exit 1; }
@@ -144,6 +145,12 @@ mkdir "$lib/lib-dynload"
     esac
 done
 [ ! -s "$work/own-only" ] || echo "  kept from build-python.sh (not in Alpine's package): $(wc -l < "$work/own-only") files, $(head -n 3 "$work/own-only" | tr '\n' ' ')..."
+# Python's turtle graphics need tkinter, which this Python has not (as the browser Linux
+# leaves them out: chrome/linux/build.sh).
+rm -rf "$lib/turtle.py" "$lib"/__pycache__/turtle.* "$lib/turtledemo"
+# The time zones (Python's zoneinfo, `TZ=... date`): Alpine's, the browser Linux's files.
+mkdir -p "$root/usr/share/zoneinfo"
+cp -a "$alpine/usr/share/zoneinfo/." "$root/usr/share/zoneinfo/"
 mkdir -p "$root"/{dev,proc,sys,root,run,etc,workspace,usr/local/bin,var}
 install -m 755 "$here/guest/init" "$root/sbin/init"
 install -m 644 "$here/guest/passwd" "$root/etc/passwd"

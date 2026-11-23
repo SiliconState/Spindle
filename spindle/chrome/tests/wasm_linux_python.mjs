@@ -3,7 +3,7 @@
 // the extension fetches them, zstd decompressed with v86's decoder as the extension
 // does: wasm-linux/zstd.mjs), run as commands through the runner: the version (the
 // browser Linux's, 3.14), the standard library being Alpine's own files, ripgrep (piped
-// input too), its C
+// input too), the time zones, its C
 // modules (zlib, bz2, sqlite3, hashlib, decimal, json, xml), threads, files in the
 // workspace coming back, subprocess (started with posix_spawn: there is no fork), a
 // missing program raising as it should, asyncio, a Unix socket pair, and Spindle's calls
@@ -88,6 +88,9 @@ assert.equal(searched.output, 'a.txt:2:needle one\nd/b.txt:1:x needle\na.txt\nd/
 // at its stdin through a copy of the descriptor, which std makes here as on Linux.
 const piped = await run('printf "a\\nneedle in\\n" > in.txt && printf "x\\nneedle piped\\n" | rg needle && rg -c needle < in.txt');
 assert.equal(piped.output, 'needle piped\n1\n', show(piped));
+// The time zones, read by Python's zoneinfo and by `TZ=... date` (busybox on musl).
+const zones = await run(`python3 -c "import datetime, zoneinfo; z = zoneinfo.ZoneInfo('America/New_York'); print(*(datetime.datetime.fromtimestamp(t, z).strftime('%z %Z') for t in (1783000000, 1795000000)))" && TZ=America/New_York date -d @1795000000 '+%z %Z'`);
+assert.equal(zones.output, '-0400 EDT -0500 EST\n-0500 EST\n', show(zones));
 const pcre = await run('rg -P "needle(?= one)" a.txt');
 assert.equal(pcre.code, 2, show(pcre));
 assert.match(pcre.output, /PCRE2 is not available in this build of ripgrep/, show(pcre));

@@ -726,9 +726,9 @@ assert.match(reread.error, /then failed \(Frame was removed\)/);
   assert.ok(engineFile.includes('prepared(tool.name, numbersIn(tool, input), call)'), 'the engine hands every page tool its numbers as numbers');
   console.log('ok a tab given as a quoted number is taken as that number; any other non-number is refused in words that say how to name one');
 }
-// A workspace file shown in Spindle's own tab (view.html) is read as the file when
-// Chrome keeps scripts out of the tab: `find` gives its matching lines, and a screenshot
-// of such a tab is refused with what to do instead.
+// A workspace file shown in Spindle's own tab (view.html) is read as the file when the
+// debugger cannot reach its page: `find` gives its matching lines; a screenshot of such a
+// tab goes through the debugger too (here refused), never through Chrome's scripting.
 {
   const getTab = pageContext.chrome.tabs.get;
   pageContext.chrome.tabs.get = async (tab) => ({ id: tab, url: `chrome-extension://spindle/view.html?thread=0123456789abcdef&path=notes/page.html`, title: 'page.html' });
@@ -742,11 +742,14 @@ assert.match(reread.error, /then failed \(Frame was removed\)/);
   assert.match(found.content, /Workspace file: notes\/page\.html \(the file itself\)\n\n\[1 matching line, each with its neighbours\]\n%PDF$/, found.content);
   const none = await bg.run('read_page', { tab: 18, find: 'absent' });
   assert.match(none.content, /\[no line matches "absent"\]$/, none.content);
-  const pictured = await bg.run('screenshot', { tab: 18 });
-  assert.match(pictured.error, /does not picture extension pages, so tab 18 \(notes\/page\.html from the workspace\) cannot be pictured; read_page on it gives the file's text/, JSON.stringify(pictured));
+  await assert.rejects(bg.run('screenshot', { tab: 18 }), /would not let Spindle act on tab 18/);
   assert.deepEqual(engineAsked.slice(asked).filter((message) => message.op !== 'ping').map((message) => message.op), ['read', 'read', 'read'], 'the file read once per call, nothing else asked of the engine');
   pageContext.chrome.tabs.get = getTab;
-  console.log('ok a workspace file in Spindle\'s own tab is read as the file, found in with `find`, and never pictured');
+  // An action let go unasked because it was on a workspace page in Spindle's tab (Before
+  // acting) is done only there: on a tab showing a site now, it is refused unsent.
+  await assert.rejects(bg.run('press', { key: 'a', tab: 18 }, undefined, { tab: 18, preview: true }), /tab 18 no longer shows the workspace page this was for, so it was not done/);
+  await assert.rejects(bg.run('select', { ref: 'x1', values: ['a'], tab: 18 }, undefined, { tab: 18, preview: true }), /no longer shows the workspace page/);
+  console.log('ok a workspace file in Spindle\'s own tab is read as the file where the debugger cannot reach it, found in with `find`, and pictured through the debugger; an action let go unasked there is done only there');
 }
 // Moving and closing tabs run through the lines that mark them acting; Chrome refusing a
 // move it was asked for is said plainly (nothing moved).
@@ -1771,6 +1774,21 @@ delete globalThis.chrome;
   assert.match(await denied, /said no[\s\S]*not done/);
   assert.equal(await engine.beforeActing('navigate', { url: 'chrome-extension://id/view.html?thread=t&path=a.html' }, 's'), null,
     'opening a workspace file for the user asks nothing');
+  // Nor does acting on a workspace page in Spindle's own tab (Chrome's side says
+  // `preview`): it is the thread's own making, no site's.
+  const previewing = context.self.postMessage;
+  context.self.postMessage = (message) => {
+    if (message.type === 'page_tool' && message.name === 'tab_of' && message.input?.tab === 9) {
+      queueMicrotask(() => context.self.onmessage({ data: { type: 'page_tool_answer', call: message.call, answer: { content: 'tab 9', details: { tab: 9, host: 'spindle', title: 'a.html · Spindle', preview: true } } } }));
+      return;
+    }
+    previewing(message);
+  };
+  const previewAsked = {};
+  assert.equal(await engine.beforeActing('press', { key: 'Enter', tab: 9 }, 's', undefined, previewAsked), null, 'Enter in a workspace page in Spindle\'s tab asks nothing');
+  assert.equal(JSON.stringify(previewAsked.allowed), JSON.stringify({ tab: 9, preview: true }), 'held to that tab still showing it');
+  assert.equal(waiting().length, 0);
+  context.self.postMessage = previewing;
   const ended = engine.beforeActing('dialog', { accept: true }, 's');
   await settleAsk();
   assert.equal(waiting().length, 1);

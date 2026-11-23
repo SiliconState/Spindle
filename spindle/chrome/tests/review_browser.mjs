@@ -816,9 +816,9 @@ try {
   }
 
   // A model reads a workspace file open in Spindle's own tab (view.html) with read_page
-  // (Chrome keeps scripts out of extension pages: the file itself is read then), finds
-  // lines in it with `find`, and is told a screenshot of such a tab is impossible; `find`
-  // on an ordinary page gives only the matching lines.
+  // (with page actions off, as here, the file itself: Spindle reaches the page there only
+  // through the debugger), finds lines in it with `find`, and is told a screenshot of such
+  // a tab needs page actions; `find` on an ordinary page gives only the matching lines.
   {
     const shown = await open(browser, `chrome-extension://${extension}/view.html?thread=${reportThread.id}&path=plain.html`);
     await shown.until(`/frame /.test(document.querySelector('#view-path').title)`, { what: 'plain.html shown' });
@@ -841,16 +841,16 @@ try {
     await settled(reading.id);
     const read = await page.eval(`(async () => (await rpc('open', { id: ${JSON.stringify(reading.id)} })).history.messages.flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_result').map((b) => typeof b.content === 'string' ? b.content : JSON.stringify(b.content)))()`);
     assert.equal(read.length, 7, `seven tool results: ${read.join(' | ').slice(0, 800)}`);
-    assert.match(read[0], /Workspace file: plain\.html \((as the preview shows it|the file itself)\)/, `the file's text, however read: ${read[0].slice(0, 300)}`);
+    assert.match(read[0], /Workspace file: plain\.html \(the file itself; with page actions on, as it shows\)/, `the file's text, and how to have the page read as it shows: ${read[0].slice(0, 300)}`);
     assert.match(read[0], /\nPlain/, `its text: ${read[0].slice(0, 300)}`);
     assert.doesNotMatch(read[0], /<title>/, 'no markup when the file itself is read');
     assert.match(read[1], /Workspace file: plain\.html[\s\S]*\nPlain/, `the matching line: ${read[1].slice(0, 300)}`);
     assert.match(read[2], /\[no line matches "\/nothing-here\/"\]/, `no match says so: ${read[2].slice(0, 300)}`);
-    assert.match(read[3], /does not picture extension pages[\s\S]*read_page on it gives the file's text/, `a screenshot of Spindle's own tab is refused with what to do instead: ${read[3].slice(0, 300)}`);
+    assert.match(read[3], /a picture of a workspace page in Spindle's tab is taken through Chrome's debugger: it needs page actions on/, `a screenshot of Spindle's own tab says it needs page actions: ${read[3].slice(0, 300)}`);
     assert.equal(read[4], `Address: http://127.0.0.1:${port}/page\nTitle: Review page\n\n[1 matching line, each with its neighbours]\nReview`, 'only the matching line of an ordinary page');
     assert.equal(read[5], read[4], 'the tab id in quotes reads the same tab');
     assert.match(read[6], /tab is a tab's number from list_tabs, such as 2054624637, not "the review page"; nothing was done/, read[6].slice(0, 300));
-    console.log('ok read_page reads a workspace file shown in Spindle\'s own tab and finds lines with `find`; a screenshot of that tab is refused; `find` on an ordinary page gives its matching lines; a tab id in quotes is that tab, any other non-number refused saying how to name one');
+    console.log('ok read_page reads a workspace file shown in Spindle\'s own tab and finds lines with `find`; a screenshot of that tab needs page actions; `find` on an ordinary page gives its matching lines; a tab id in quotes is that tab, any other non-number refused saying how to name one');
     await browser.send('Target.closeTarget', { targetId: shown.targetId }).catch(() => {});
     await plainPage.close();
   }

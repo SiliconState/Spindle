@@ -308,8 +308,9 @@ async function run(job) {
     // Its machine stopped answering (or its agent started again): every command on it
     // ended, the share with them.
     if (machine !== mine) return { output, success: false, failure: 'the browser Linux stopped answering; it was restarted' };
-    // This command alone (never sent, or not ended when asked): the others run on.
-    await workspaces.drop(copy);
+    // This command alone (never sent, or not ended when asked): the others run on. It may
+    // still be writing to its copy, packages and all: none of it is kept.
+    await workspaces.drop(copy, { whole: true });
     return {
       output, success: false,
       failure: !job.sent ? `the command did not reach the browser Linux: ${error.message}`

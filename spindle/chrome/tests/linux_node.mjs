@@ -1,6 +1,7 @@
 // The browser Linux (chrome/linux/build.sh's output), booted by v86 in Node: the runner
 // agent answers, a command runs with bash, Python and Node in /workspace over files put
-// on the 9p share, its writes come back, a timeout stops a command, its scripts' Spindle
+// on the 9p share (the time zones there), its writes come back, packages kept when a
+// command's changes are not, a timeout stops a command, its scripts' Spindle
 // calls (the `spindle` command, Python and Node modules) arrive numbered as native code
 // mode numbers them and get their replies, a saved state resumes with the browser's
 // clock, and the network: a command without it reaches nothing; with it, real websites
@@ -103,6 +104,9 @@ assert.equal(first.code, 0, first.output);
 assert.deepEqual(first.output.split('\n'), ['/workspace', 'from the browser', 'i686', '42', 'object']);
 assert.equal(new TextDecoder().decode(await vm.read_file('/runs/a/out.txt')), 'back\n', 'a write comes back');
 assert.equal(vm.fs9p.SearchPath('/runs/a/in.txt').id, -1, 'a delete comes back');
+// The time zones, read by Python's zoneinfo and by `TZ=... date`.
+const zones = await run(vm, listeners, 'runs/a', `python3 -c "import datetime, zoneinfo; z = zoneinfo.ZoneInfo('America/New_York'); print(*(datetime.datetime.fromtimestamp(t, z).strftime('%z %Z') for t in (1783000000, 1795000000)))" && TZ=America/New_York date -d @1795000000 '+%z %Z'`);
+assert.deepEqual(zones.output.split('\n'), ['-0400 EDT -0500 EST', '-0500 EST'], zones.output);
 times.quick = (await run(vm, listeners, 'runs/a', 'true')).ms;
 times.python3 = (await run(vm, listeners, 'runs/a', 'python3 -c pass')).ms;
 times.node = (await run(vm, listeners, 'runs/a', 'node -e 0')).ms;
@@ -348,9 +352,46 @@ assert.equal(w6.result.code, 0, w6.result.output);
 assert.deepEqual(w6.result.output.split('\n'), ['pkg', 'dep', 'pyc', 'from before', 'src', '../pkg/index.js', 'dep'], 'the next command finds the packages and caches as the last one left them, their links too');
 assert.equal(w6.need.size, 0, 'nothing came from Spindle for them');
 assert.deepEqual(names(w6.changes), { writes: [], deletes: [] }, 'nor does a change under them count');
+// A command whose copy is not kept (it left a file over 64 MiB) loses its other changes,
+// but the packages and caches it had and made stay for the next command.
+const input8 = inputOf(thread);
+const plan8 = workspaces.plan('t1', input8);
+const copy8 = await workspaces.build(plan8, input8, new Map([...plan8.need].map((object) => [object, store.get(object)])));
+await run(vm, listeners, copy8.dir, 'echo kept > node_modules/pkg/new.js; echo lost > lost.txt; head -c 67108865 /dev/zero > big.bin', 120);
+await assert.rejects(workspaces.collect(copy8), /big\.bin is over 64 MiB/);
+const w8 = await inWorkspace('t1', thread, 'cat node_modules/pkg/index.js node_modules/pkg/new.js .venv/lib/q.py; ls');
+assert.deepEqual(w8.result.output.split('\n'), ['dep', 'kept', 'more', 'a.txt', 'd', 'hard.sh', 'n.txt', 'node_modules', 'run.sh', 'src'], 'its packages stayed, its other files did not');
+assert.deepEqual(names(w8.changes), { writes: [], deletes: [] });
 const w7 = await inWorkspace('t1', thread, 'rm -r .venv node_modules; ls');
 assert.deepEqual(names(w7.changes), { writes: [], deletes: [] });
 assert.deepEqual(w7.result.output.split('\n'), ['a.txt', 'd', 'hard.sh', 'n.txt', 'run.sh', 'src'], 'removed, they are gone for good');
+// The wasm Linux drops a lingering command's copy once its machine is gone, when the
+// thread may have gone on: a copy kept meanwhile is newer and stays; packages a late drop
+// kept are let go of by the next copy kept. No copy is left behind on the share.
+{
+  const copyOf = async () => {
+    const input = inputOf(thread);
+    const plan = workspaces.plan('t1', input);
+    return workspaces.build(plan, input, new Map([...plan.need].map((object) => [object, store.get(object)])));
+  };
+  const onShare = (copy) => vm.fs9p.SearchPath(`/${copy.dir}`).id >= 0;
+  const late = await copyOf();
+  const next = await copyOf();
+  await workspaces.collect(next);
+  await workspaces.drop(late);
+  assert.equal(workspaces.kept.get('t1').dir, next.dir, 'the copy kept meanwhile stays');
+  assert.ok(!onShare(late), 'the late copy is gone');
+  const late2 = await copyOf();
+  mkdirp(vm, `/${late2.dir}/node_modules/late`);
+  await vm.create_file(`/${late2.dir}/node_modules/late/index.js`, new TextEncoder().encode('late\n'));
+  const next2 = await copyOf();
+  await workspaces.drop(late2);
+  assert.equal(workspaces.kept.get('t1').dir, late2.dir, 'a late drop with nothing newer keeps its packages');
+  await workspaces.collect(next2);
+  assert.equal(workspaces.kept.get('t1').dir, next2.dir, 'the next copy kept takes their place');
+  for (let tries = 0; onShare(late2) && tries < 50; tries++) await new Promise((done) => setTimeout(done, 20));
+  assert.ok(!onShare(late2), 'and the packages a drop left go from the share');
+}
 // A larger workspace: its first command against the next (a quick one each).
 const big = { files: new Map() };
 const filler = 'x'.repeat(16 * 1024);

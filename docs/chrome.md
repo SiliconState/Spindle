@@ -520,17 +520,17 @@ then. A new install starts with both switches off.
 | Tool | Needs | Does |
 | --- | --- | --- |
 | `list_tabs` | reading | Lists tabs (id, title, address) and marks the one the user is looking at. |
-| `read_page` | reading (`scroll` also needs actions) | Visible page text (default 20,000, max 100,000 characters); `find` returns matching lines with neighbours. Reads over 32,000 characters keep full text under `.pages/` in the workspace. `scroll` 1–30 collects new lines as it scrolls. Spindle's own file tabs read as their workspace text. |
+| `read_page` | reading (`scroll` also needs actions) | Visible page text (default 20,000, max 100,000 characters); `find` returns matching lines with neighbours. Reads over 32,000 characters keep full text under `.pages/` in the workspace. `scroll` 1–30 collects new lines as it scrolls. Spindle's own file tabs read as their workspace text; after 0.1.9, with actions on, as the page shows, its scripts run, with what its console said since it loaded (errors, warnings, uncaught errors; the last 20). |
 | `page_elements` | reading | An indented outline with refs such as `kqm12`; `find` filters matching parts with neighbours. |
 | `page_html` | reading | The page's or one part's HTML, without `<script>` unless asked and without password values (default 50,000 characters, at most 200,000). |
-| `screenshot` | reading, plus the `<all_urls>` grant (visible tab) or actions (any tab) | A JPEG of a tab saved to `screenshots/` in the workspace. |
+| `screenshot` | reading, plus the `<all_urls>` grant (visible tab) or actions (any tab) | A JPEG of a tab saved to `screenshots/` in the workspace. After 0.1.9, with actions on: `full_page` (the whole page), `width` (laid out 200-4000 pixels wide) and Spindle's own file tabs (the page alone). |
 | `navigate` | actions (reading for `/workspace/NAME`) | Go to an http(s) address, back, forward or reload, in a tab or a new tab; or open a workspace file in a tab for the user. |
 | `click`, `type`, `press` | actions | Input through Chrome's debugger, so pages receive it as real input. |
 | `select`, `scroll` | actions | Choose `<select>` options, or scroll a part into view or the page, from Spindle's script in the page. |
 | `wait_for` | actions | Wait for text or a CSS selector to appear or disappear (default 10 s, at most 25 s). |
 | `dialog` | actions | Accept or dismiss an alert, confirm or prompt dialog. |
 | `close_tab` | actions | Close a tab showing a web page. |
-| `network` | actions | Record a tab's requests (`start`), list them (`read`, at most 500 kept), read a response body by id, and `stop`. |
+| `network` | actions | Record a tab's requests (`start`), list them (`read`, at most 500 kept), read a response body by id (after 0.1.9 also `body: "last"`: the last finished request `filter` matches), and `stop`. The page's own requests carry the user's sign-in; the browser Linux's never do. |
 
 How the tools run ([`background.js`](../spindle/chrome/background.js)):
 
@@ -568,10 +568,16 @@ How the tools run ([`background.js`](../spindle/chrome/background.js)):
 - **Reruns.** Reading tools, `screenshot` and `wait_for` are declared `rerun: 'safe'`; the other
   acting tools are `rerun: 'no'`, so Spindle never repeats a click by itself (see [tools.md](tools.md)).
 - **Workspace files.** `navigate` to `/workspace/NAME` (or `file:///workspace/NAME`) is rewritten
-  by the engine into `view.html?thread=ID&path=NAME` in a new tab.
+  by the engine into `view.html?thread=ID&path=NAME` in a new tab. After 0.1.9, with page actions
+  on, the page tools work on that tab as on a web page (a page, or a Word, Excel or PowerPoint
+  file drawn as one): the page runs in a sandboxed frame in a
+  process of its own, which Chrome lets no extension script into, so Spindle reaches it through
+  the debugger (the frame's own session, Spindle's isolated world there) and offsets clicks by
+  where the frame sits; `navigate` may reload the tab, to show the file as it is now.
 - **Screenshots.** The visible tab is captured with `chrome.tabs.captureVisibleTab` once the user
   has granted `<all_urls>` (**Capture this tab** under **+** asks for it); any other tab uses
-  `Page.captureScreenshot` through the debugger when page actions are on. The tool returns the
+  `Page.captureScreenshot` through the debugger when page actions are on (after 0.1.9 also the
+  whole page, a set width, and a workspace page in Spindle's tab, clipped to its frame). The tool returns the
   image as a workspace write in `screenshots/`, named by its capture time and tab (the
   panel shows it as "Screenshot" and the time it was taken). The model does not see it
   directly, but a script in the browser Linux can pass it to a vision model with
@@ -590,7 +596,8 @@ Settings, Pages, **Before acting** decides whether a thread asks the user before
 | **Ask** | Every `click`, `type`, `press`, `select`, `navigate` (going back, forward or reloading too), `dialog` (accepting or dismissing) and `close_tab`. |
 
 Reading tools, `scroll`, `wait_for`, `screenshot` and `network` never ask, and neither does
-`navigate` opening a workspace file for the user. If the saved mode cannot be read, Spindle
+`navigate` opening a workspace file for the user, nor (after 0.1.9) any action on a workspace page
+in Spindle's own tab (done only while that tab still shows one). If the saved mode cannot be read, Spindle
 asks (it never acts unasked on a choice it could not see).
 
 The question names what the action lands on. `click`, `type` and `select` name their part and

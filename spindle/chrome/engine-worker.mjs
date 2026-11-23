@@ -1232,6 +1232,12 @@ async function beforeActing(name, input, session, signal, asked = {}) {
     // whatever tab is shown when it runs. Not done; it can be asked about again.
     if (!target && input?.tab == null) return `${BROWSER} did not say which tab this would act on, so it was not done; it can be asked about again`;
   }
+  // A workspace page in Spindle's own tab is the thread's own making, no site's: acting
+  // there asks nothing (as opening it does not), held to that tab still showing it.
+  if (target?.preview) {
+    asked.allowed = { tab: target.tab, preview: true };
+    return null;
+  }
   if (mode === 'auto' && !sends(name, input, target)) return null;
   // Asked about one tab, it acts on that tab, whatever the user looks at when they answer.
   if (target?.tab != null && input && typeof input === 'object') input.tab = target.tab;

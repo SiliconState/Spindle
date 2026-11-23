@@ -33,7 +33,7 @@ journaled by the embedded package, as native code mode journals its calls.
 | --- | --- | --- |
 | What it is | Alpine Linux, 32-bit x86, run by the v86 emulator (compiled to wasm) | Linux for the `wasm` architecture (`arch/wasm`), compiled to WebAssembly; one kernel instance per task, each in a worker, all on one shared memory |
 | Sources | [`chrome/linux/`](../spindle/chrome/linux/), [`linux-worker.mjs`](../spindle/chrome/linux-worker.mjs), [`linux-net.mjs`](../spindle/chrome/linux-net.mjs), [`linux-frames.mjs`](../spindle/chrome/linux-frames.mjs) | [`chrome/wasm-linux/`](../spindle/chrome/wasm-linux/), [`wasm-linux-worker.mjs`](../spindle/chrome/wasm-linux-worker.mjs) |
-| Shell and programs | bash, coreutils, findutils, grep, sed, gawk, diffutils, patch, tar, gzip, xz, Python 3 with pip, Node with npm, git, curl, openssl, jq, ripgrep, file, less | busybox (with hush as `sh`), Python 3.14 after 0.1.8, the v86 Linux's version with Alpine's own standard library files (3.13 with its own library in 0.1.8) (no `ssl`, `ctypes`, `lzma` or pip, and no loadable C extensions: there is no `dlopen`), and after 0.1.8 ripgrep, the v86 Linux's version without PCRE2 (`rg -P` runs on v86); only the programs the image was built with run (see [Programs a command saved](#programs-a-command-saved)) |
+| Shell and programs | bash, coreutils, findutils, grep, sed, gawk, diffutils, patch, tar, gzip, xz, Python 3 with pip, Node with npm, git, curl, openssl, jq, ripgrep, file, less; after 0.1.9 the time zones (Alpine's tzdata, for Python's `zoneinfo` and `TZ=...`), and without what no command here can use: `git-shell` (an SSH login shell), git's WebDAV push (`git-http-push`; pushes over HTTPS go through `git-remote-http`) and Python's `turtle` (it needs tkinter, which neither Linux has) | busybox (with hush as `sh`), Python 3.14 after 0.1.8, the v86 Linux's version with Alpine's own standard library files (3.13 with its own library in 0.1.8) (no `ssl`, `ctypes`, `lzma` or pip, and no loadable C extensions: there is no `dlopen`), and after 0.1.8 ripgrep, the v86 Linux's version without PCRE2 (`rg -P` runs on v86); after 0.1.9 the same time zones; only the programs the image was built with run (see [Programs a command saved](#programs-a-command-saved)) |
 | Network | Through Chrome or a relay, for threads with network on | None |
 | Agent | [`guest/agent.py`](../spindle/chrome/linux/guest/agent.py) with the static [`spindle-sandbox`](../spindle/chrome/linux/command/src/sandbox.rs) | [`guest/src/agent.rs`](../spindle/chrome/wasm-linux/guest/src/agent.rs) (`spindle-agent`, agent and sandbox in one program) |
 | Agent channel | Serial line `/dev/ttyS0`; payloads over 16 KiB go as files on the share | Virtio console `/dev/hvc1` (`hvc0` is the kernel's) |
@@ -278,7 +278,11 @@ Both Linuxes keep a thread's workspace on their 9p share between commands
 
 A command's copy counts only when the package accepts its result. A copy dropped after a stop or
 timeout, or a result that is not taken, leaves nothing stale, because the next plan reuses a kept
-file only when its digest matches what the package lists.
+file only when its digest matches what the package lists. After 0.1.9 a dropped copy (over the
+limits, stopped, timed out, or never run) keeps its package and cache directories (`.venv`,
+`node_modules`, `__pycache__` and the like) as the thread's kept copy, so an `npm install` cut off
+by its time goes on from what it fetched; only a command that may still be running (one the v86
+Linux could not end) loses them too.
 
 ## Network
 
@@ -553,8 +557,16 @@ Ubuntu 23.10 and later restrict them through AppArmor until
    and [`kernel.config`](../spindle/chrome/linux/kernel.config) merged over it: the 9p root, its
    virtio transport, the network card and loop built in (the modules the old boot image loaded),
    no modules at all (the image never carried any), xz compression, no GCC plugins, no debug
-   information, and fixed build user, host and time. The build checks the result has every
-   setting `kernel.config` asks for.
+   information, and fixed build user, host and time. After 0.1.9 it also leaves out what an
+   emulated PC never has or needs: other hypervisors' guest support, disks and RAID (the root
+   is 9p), USB, audit, AppArmor, tracing and debugging aids, suspend, encrypted and verity
+   files, multipath TCP, the firewall, BPF programs, traffic shaping, multicast and policy
+   routing, the kernel's own DHCP, a mouse, crypto hardware, the CPU mitigations (an emulated
+   CPU does not speculate) and all but one CPU (v86 emulates one); commands use namespaces
+   only. `bzImage` is 3.7 MB instead of 5.7 MB, and commands run faster (measured in
+   `linux_node.mjs`: Python and Node start 8-11% sooner, `pip install` 15% and four commands
+   at once about 20% faster, a saved state 9 MiB smaller). The build checks the result has
+   every setting `kernel.config` asks for.
 4. Builds [`command/`](../spindle/chrome/linux/command/) (`spindle` and `spindle-sandbox`) as static
    i686 musl binaries, with build paths remapped out of them.
 5. Installs the guest files: [`inittab`](../spindle/chrome/linux/guest/inittab) (`sysinit`, then

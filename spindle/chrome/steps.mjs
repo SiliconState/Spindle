@@ -94,10 +94,14 @@ function partWords(ref, parts, fallback) {
   return part.name ? `the ${quote(part.name, 24)} ${role}` : `a ${role}`;
 }
 
-/** `url`'s host without www., or null. */
+/** `url`'s host without www., or null; a workspace file (/workspace/NAME, as a file:
+ * address too, or Spindle's own tab showing it), its name. */
 export function domainOf(url) {
+  const file = /^(?:file:\/\/)?\/workspace\/(.+)/.exec(url ?? '')?.[1];
+  if (file) return file;
   try {
-    const { hostname, pathname } = new URL(url);
+    const { hostname, pathname, protocol, searchParams } = new URL(url);
+    if (protocol === 'chrome-extension:' && pathname === '/view.html' && searchParams.get('path')) return searchParams.get('path');
     const host = hostname.replace(/^www\./, '');
     // A site's own pages are told apart by their first path part (x.com/someone).
     const first = pathname.split('/').filter(Boolean)[0];

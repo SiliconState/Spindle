@@ -172,6 +172,18 @@ pub fn unparsed_arguments_refusal(name: &str, input: &serde_json::Value) -> Opti
     ))
 }
 
+/// A whole-number field of a tool call's input: a number, or one in quotes (some models
+/// quote them, `"max_output": "4096"`, and send them so again after a refusal).
+pub fn whole_number(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|text| text.parse().ok())
+    })
+}
+
 pub const DEFAULT_INPUT_USD_PER_MTOK: f64 = 1.0;
 pub const DEFAULT_OUTPUT_USD_PER_MTOK: f64 = 5.0;
 pub const DEFAULT_CACHE_READ_USD_PER_MTOK: f64 = 0.1;

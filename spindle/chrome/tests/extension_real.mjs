@@ -148,6 +148,8 @@ const server = http.createServer(async (request, response) => {
     for await (const part of request) parts.push(part);
     scripted.seen.push({ authorization: request.headers.authorization, body: Buffer.concat(parts).toString() });
     let reply = scripted.replies.shift() ?? { content: '(script ended)' };
+    // A reply made from the request (what an earlier tool answered, such as a tab's id).
+    if (typeof reply === 'function') reply = reply(scripted.seen.at(-1).body);
     if (reply.after) {
       await reply.after;
       reply = reply.then;
@@ -1422,11 +1424,29 @@ try {
   // the user; a file its command makes is in the one workspace card (marked), which sits
   // just above the turn's final answer.
   step = 'files in the conversation';
-  const report = `<!doctype html><title>Report</title><style>h1{color:#3f5b2f}</style><h1>Report</h1><script src="https://cdn.example.invalid/chart.js"></script><script>console.log('spindle-test ran'); fetch('http://127.0.0.1:${port}/rendered?word=leak').then(() => console.log('spindle-test reached'), () => console.log('spindle-test closed'))</script>`;
+  const report = `<!doctype html><title>Report</title><style>h1{color:#3f5b2f}</style><h1>Report</h1><button onclick="this.textContent='Pressed'">Press me</button><input aria-label="Name"><script>console.warn('spindle-test warning'); window.missingFunction();</script><script src="https://cdn.example.invalid/chart.js"></script><script>document.body.insertAdjacentHTML('beforeend', '<p>Drawn by its script</p>'); console.log('spindle-test ran'); fetch('http://127.0.0.1:${port}/rendered?word=leak').then(() => console.log('spindle-test reached'), () => console.log('spindle-test closed'))</script>`;
   const notesCommand = "printf '# Notes\\n\\n- first point\\n' > notes.md";
+  // The page opened in Spindle's tab is read as it shows, acted on and pictured whole at
+  // a phone's width, as a web page would be (its tab's id from navigate's answer); the
+  // picture's size read from its JPEG frame header, in the workspace.
+  const reportTab = (body) => Number(/in a tab for the user \(tab (\d+)/.exec(body)?.[1]);
+  const pictureSize = `python3 - <<'PY'
+import glob
+data = open(sorted(glob.glob('screenshots/*.jpg'))[-1], 'rb').read()
+at = 2
+while data[at + 1] not in (0xC0, 0xC1, 0xC2):
+    at += 2 + int.from_bytes(data[at + 2:at + 4], 'big')
+print('picture', int.from_bytes(data[at + 7:at + 9], 'big'), 'by', int.from_bytes(data[at + 5:at + 7], 'big'))
+PY`;
   scripted.replies.push(
     call('write_file', { path: '/workspace/report.html', content: report }),
     call('navigate', { url: '/workspace/report.html' }),
+    (body) => call('page_elements', { tab: reportTab(body), find: '/Press me|Name/' }),
+    (body) => call('click', { tab: reportTab(body), ref: /button \\"Press me\\" \[(\w+)\]/.exec(body)?.[1] ?? 'none' }),
+    (body) => call('type', { tab: reportTab(body), ref: /textbox \\"Name\\"[^[]*\[(\w+)\]/.exec(body)?.[1] ?? 'none', text: 'Ada' }),
+    (body) => call('read_page', { tab: reportTab(body) }),
+    (body) => call('screenshot', { tab: reportTab(body), full_page: true, width: 390 }),
+    call('bash', { command: pictureSize }),
     call('bash', { command: notesCommand }),
     text('DONE'),
   );
@@ -1460,11 +1480,13 @@ try {
   const cardFolded = await panel.eval(`!document.querySelector('#history .workspace-card').open`);
   // Its summary counts the files once they are listed.
   const workspaceListed = await panel.until(`(() => { const text = document.querySelector('#history .workspace-card summary')?.textContent ?? ''; return /\\d+ files?/.test(text) && text; })()`, { what: 'the workspace card' }).catch((error) => error.message);
+  // What the page tools told the model of the page in Spindle's tab.
+  const told = scripted.seen.map((seen) => seen.body).findLast((body) => /picture \d+ by \d+/.test(body)) ?? '';
   const tabsAfter = await reportTabs();
   for (const tab of tabsAfter) await browser.send('Target.closeTarget', { targetId: tab.targetId }).catch(() => {});
   const saved = fs.readFileSync(await downloadBy(panel, '#history .file-card[data-path="report.html"] button[title="Download report.html"]', /^report\.html$/)).toString();
   await panel.screenshot(join(shots, '03h-files-in-conversation.png'));
-  check('what a thread makes shows in the conversation: a report (written to /workspace/report.html) as a page on its eye, its script running shut off from the network, the web on a click, Download, opened in a tab by navigate; what its commands made in the one workspace card, folded, just above the final answer', () => {
+  check('what a thread makes shows in the conversation: a report (written to /workspace/report.html) as a page on its eye, its script running shut off from the network, the web on a click, Download, opened in a tab by navigate, where the page tools read it as it shows (its console too), click and type in it and picture it whole at a set width; what its commands made in the one workspace card, folded, just above the final answer', () => {
     assert.equal(conversed, 'idle', `state ${conversed}`);
     assert.equal(reportFolded, 'false', `a page's card comes folded: ${reportFolded}`);
     assert.equal(reportCard, true, `the report's card shows its page once asked: ${reportCard}`);
@@ -1474,6 +1496,15 @@ try {
     assert.match(String(webNote), /^It would load from .*\bcdn\.example\.invalid\b.*; previews stay offline\. Load from the web$/, `what it would load from the web is said: ${webNote}`);
     assert.equal(webAllowed, true, `Load from the web shows it again, open to the web: ${webAllowed}`);
     assert.equal(tabsAfter.length, tabsBefore + 1, 'navigate to /workspace/report.html opened it in a tab');
+    assert.match(told, /Address: chrome-extension:\/\/\w+\/view\.html\?thread=[0-9a-f]+&path=report\.html\\nTitle: Report \(tab \d+\)/, 'its parts read under the tab\'s own address');
+    assert.match(told, /Clicked button \\"Press me\\"/, 'a click in the page in Spindle\'s tab');
+    assert.match(told, /Typed into textbox \\"Name\\" \[\w+\]\. It holds \\"Ada\\"/, 'typing there');
+    assert.match(told, /Workspace file: report\.html \(as it shows, its scripts run\)[^"]*Pressed[^"]*Drawn by its script/, 'read_page reads that page as it shows: its script ran, the click took');
+    assert.match(told, /Console since it loaded \(errors and warnings\):\\n  warning: spindle-test warning\\n  uncaught: TypeError: window\.missingFunction is not a function \(line 1\)/, 'and what its console said since it loaded');
+    assert.match(told, /Saved screenshots\/\S+\.jpg: tab \d+, report\.html from the workspace, the whole page, 390 pixels wide/, 'the page pictured whole at a set width');
+    const [, wide, tall] = /picture (\d+) by (\d+)/.exec(told) ?? [];
+    assert.equal(Number(wide), 390, `the picture is 390 pixels wide: ${told.match(/picture \d+ by \d+/)}`);
+    assert.ok(Number(tall) >= 200, `and as tall as the page: ${tall}`);
     assert.equal(notesListed, true, `the command's notes.md is in the workspace card: ${notesListed}`);
     assert.equal(commandLists, 0, 'no separate list of what the commands made');
     assert.equal(cardAboveAnswer, true, 'the workspace card is just above the final answer');
@@ -1678,6 +1709,7 @@ try {
     scripted.replies.push(call('click', { ref: go ?? 'e0' }), call('click', { ref: remove ?? 'e0' }), call('dialog', { accept: true }),
       call('screenshot', {}), call('page_html', {}),
       call('network', { action: 'start' }), call('navigate', { action: 'reload' }), call('network', { action: 'read', filter: 'ping' }),
+      call('network', { action: 'read', filter: 'ping', body: 'last' }),
       call('navigate', { url: `http://127.0.0.1:${port}/second.html` }), text('200'));
     refsKnown.release();
   }
@@ -1689,6 +1721,7 @@ try {
   // The screenshot's picture comes from the workspace a moment after its card.
   await panel.until(`document.querySelector('#history .tool[data-tool="screenshot"] img.shot') && true`, { timeout: 15_000, what: 'the screenshot in the panel' }).catch(() => {});
   const cards = await panel.eval(`Object.fromEntries([...document.querySelectorAll('#history .tool')].map((c) => [c.dataset.tool, { failed: c.classList.contains('failed'), text: c.querySelector('pre.result')?.textContent ?? '', picture: Boolean(c.querySelector('img.shot')), out: c.querySelector('.tool-out')?.textContent ?? '' }]))`);
+  const networkSaid = await panel.eval(`[...document.querySelectorAll('#history .tool[data-tool="network"] pre.result')].map((result) => result.textContent)`);
   const browseFiles = await filesOf(panel);
   await closeFiles(panel);
   const pageNow = await page.eval('location.pathname');
@@ -1711,7 +1744,8 @@ try {
     if (options.scripted) assert.ok(scripted.seen.some((seen) => seen.body.includes(standing)), 'the model was told them');
     if (options.scripted) {
       assert.ok(cards.page_html && cards.page_html.text.includes('<button') && !cards.page_html.text.includes('<script'), 'page_html without scripts');
-      assert.match(cards.network.text, /\/ping/, 'the network log has the page\'s ping');
+      assert.ok(networkSaid.some((said) => / GET 200 .*\/ping$/m.test(said)), `the network log has the page's ping: ${JSON.stringify(networkSaid)}`);
+      assert.ok(scripted.seen.some((seen) => seen.body.includes('{\\"pong\\":true}')), `the last response the filter matches, read in one call: ${JSON.stringify(networkSaid)}`);
     }
   });
 

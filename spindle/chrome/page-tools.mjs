@@ -46,8 +46,10 @@ const READING = [
       'text. Reads the tab the user is looking at unless `tab` names another (an id from list_tabs). For a feed ' +
       'or list that loads as it scrolls (and drops what scrolled away), give `scroll`: one call reads while ' +
       'scrolling down that many screens, each new line once. With `find`, only the lines that match it come ' +
-      'back (each with its neighbours), however long the page. A file of this workspace open in a Spindle tab ' +
-      '(/workspace/NAME) reads as the file shows.',
+      'back (each with its neighbours), however long the page. A page of this workspace open in a Spindle tab ' +
+      '(navigate to /workspace/NAME) reads, with page actions on, as it shows (its scripts run), and says what ' +
+      'its console said since it loaded (errors, warnings, uncaught errors); the other page tools work there as ' +
+      'on a web page: test and check what you make there, never on another site.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -112,10 +114,20 @@ const ACTING = [
     name: 'screenshot',
     description:
       'A picture of what a tab shows, saved in the workspace (screenshots/, JPEG): the tab showing in its ' +
-      'window once the user let Spindle picture pages (the camera beside the message box asks), any tab with ' +
-      'page actions on. The user sees it in the panel; you do not: with bash in the browser Linux, ' +
-      '`spindle model --image FILE "QUESTION"` has a model look at it.',
-    inputSchema: { type: 'object', properties: { tab }, additionalProperties: false },
+      'window once the user let Spindle picture pages (the camera beside the message box asks); with page ' +
+      'actions on, any tab, a page of this workspace in a Spindle tab (that page alone), the whole page ' +
+      '(`full_page`) or the page laid out `width` pixels wide (a phone is about 390). The user sees it in the ' +
+      'panel; you do not: with bash in the browser Linux, `spindle model --image FILE "QUESTION"` has a model ' +
+      'look at it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab,
+        full_page: { type: 'boolean', description: 'The whole page, not only what shows (default false)' },
+        width: { type: 'integer', minimum: 200, maximum: 4000, description: 'Lay the page out this many pixels wide for the picture (default: as its window is)' },
+      },
+      additionalProperties: false,
+    },
     maxOutput: 8 * 1024,
     rerun: 'safe',
   },
@@ -252,15 +264,16 @@ const ACTING = [
     name: 'network',
     description:
       "Watch a tab's network: `start` records its requests from then on, `read` lists them (id, method, status, " +
-      'type, size, address; `filter` keeps those whose address holds it; `body` gives one response by id), ' +
-      '`stop` ends it.',
+      'type, size, address; `filter` keeps those whose address holds it; `body` gives one response by id, or ' +
+      'with "last" the last finished one `filter` matches), `stop` ends it. The page\'s own requests carry the ' +
+      "user's sign-in (a site's data the page loads for them), which the Linux's requests never do.",
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['start', 'read', 'stop'] },
         tab,
         filter: { type: 'string' },
-        body: { type: 'string', description: 'A request id from read: its response body' },
+        body: { type: 'string', description: 'A request id from read, or "last" (the last finished request `filter` matches): its response body' },
       },
       required: ['action'],
       additionalProperties: false,

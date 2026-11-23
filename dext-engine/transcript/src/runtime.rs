@@ -301,9 +301,16 @@ impl TurnRuntimeState {
         if !bulk_network {
             return None;
         }
+        // The machine's own servers are no external source.
+        let loopback = |host: &str| {
+            host == "localhost"
+                || host.ends_with(".localhost")
+                || host.starts_with("127.")
+                || host == "0.0.0.0"
+        };
         let unprobed: Vec<String> = hosts
             .iter()
-            .filter(|h| !self.host_probe_passed.contains(*h))
+            .filter(|h| !self.host_probe_passed.contains(*h) && !loopback(h))
             .cloned()
             .collect();
         if unprobed.is_empty() {
@@ -638,22 +645,24 @@ fn str_array(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The http(s) addresses written in `text`, each without its scheme.
+fn urls(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']')
+    })
+    .filter_map(|token| {
+        let cleaned = token.trim_matches(|c: char| matches!(c, ',' | ';' | '.' | ')' | ']' | '}'));
+        cleaned
+            .strip_prefix("https://")
+            .or_else(|| cleaned.strip_prefix("http://"))
+    })
+}
+
 pub fn extract_url_hosts(text: &str) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
 
-    for token in text.split(|c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']')
-    }) {
-        let cleaned = token.trim_matches(|c: char| matches!(c, ',' | ';' | '.' | ')' | ']' | '}'));
-        let rest = if let Some(r) = cleaned.strip_prefix("https://") {
-            r
-        } else if let Some(r) = cleaned.strip_prefix("http://") {
-            r
-        } else {
-            continue;
-        };
-
+    for rest in urls(text) {
         let host = rest
             .split('/')
             .next()
@@ -722,12 +731,69 @@ fn small_literal_loop(lower: &str) -> bool {
     found && !lower.contains("while ")
 }
 
+/// The most items a request may ask for and still be the single-item probe the
+/// feasibility gate asks for (`limit=1`, `symbols=MMM,AOS`), not a bulk collection.
+const HANDFUL: usize = 5;
+
+/// Whether a command (lowercased) makes requests itself: an address a script only writes
+/// into a file is none.
+fn fetches(lower: &str) -> bool {
+    [
+        "curl",
+        "wget",
+        "urlopen",
+        "urllib",
+        "requests.",
+        "httpx",
+        "aiohttp",
+        "fetch(",
+        "http.client",
+        "spindle http",
+    ]
+    .iter()
+    .any(|verb| lower.contains(verb))
+}
+
+/// Whether an address (lowercased, without its scheme) asks for many items at once: a
+/// `batch` or `bulk` endpoint, or a count, page or list parameter beyond a handful (one
+/// made at run time, such as `limit=$n` or `symbols=' + ','.join(...)`, counts as many).
+fn bulk_query(url: &str) -> bool {
+    if url.contains("batch") || url.contains("bulk") {
+        return true;
+    }
+    ["size=", "limit=", "offset=", "symbols=", "ids="]
+        .iter()
+        .any(|marker| {
+            url.match_indices(marker).any(|(at, _)| {
+                let value = url[at + marker.len()..]
+                    .split(['&', '#'])
+                    .next()
+                    .unwrap_or("")
+                    .replace("%2c", ",");
+                let items: Vec<&str> = value.split(',').collect();
+                let literal = items.iter().all(|item| {
+                    !item.is_empty()
+                        && item.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '^' | '%')
+                        })
+                });
+                !literal
+                    || value
+                        .parse::<usize>()
+                        .map_or(items.len() > HANDFUL, |count| count > HANDFUL)
+            })
+        })
+}
+
 pub fn looks_like_bulk_network_call(name: &str, input: &Value) -> bool {
     match name {
         "bash" => {
             let command = input["command"].as_str().unwrap_or("");
             let lower = command.to_ascii_lowercase();
-            let has_url = lower.contains("http://") || lower.contains("https://");
+            if !fetches(&lower) {
+                return false;
+            }
+            let has_url = urls(&lower).next().is_some();
             let shell_loop = (lower.contains("for ") || lower.contains("while "))
                 && (lower.contains("; do")
                     || lower.lines().any(|line| {
@@ -737,26 +803,9 @@ pub fn looks_like_bulk_network_call(name: &str, input: &Value) -> bool {
             let loopish = has_url
                 && (shell_loop || lower.contains("xargs") || lower.contains("parallel"))
                 && !small_literal_loop(&lower);
-            let bulk_query = lower.contains("size=")
-                || lower.contains("limit=")
-                || lower.contains("offset=")
-                || lower.contains("symbols=")
-                || lower.contains("ids=")
-                || lower.contains("batch")
-                || lower.contains("bulk");
-            loopish || (has_url && bulk_query)
+            loopish || urls(&lower).any(bulk_query)
         }
-        "http" => {
-            let joined = str_array(&input["args"]).join(" ");
-            let lower = joined.to_ascii_lowercase();
-            lower.contains("size=")
-                || lower.contains("limit=")
-                || lower.contains("offset=")
-                || lower.contains("symbols=")
-                || lower.contains("ids=")
-                || lower.contains("batch")
-                || lower.contains("bulk")
-        }
+        "http" => urls(&str_array(&input["args"]).join(" ").to_ascii_lowercase()).any(bulk_query),
         _ => false,
     }
 }
@@ -3634,5 +3683,52 @@ mod bulk_tests {
         assert!(bash("cat urls | xargs -n1 curl -s https://site.example/"));
         // "before " is not "for ".
         assert!(!bash("curl -s https://site.example/before; echo done"));
+    }
+
+    #[test]
+    fn a_probe_is_no_bulk_collection_and_a_script_that_fetches_nothing_is_no_request() {
+        // The single-item probe the gate asks for passes it, a handful of items too.
+        assert!(!bash(
+            "curl -s 'https://remotive.com/api/remote-jobs?search=fde&limit=1'"
+        ));
+        assert!(!bash(
+            "curl -s 'https://www.reddit.com/r/merida/search.json?q=black&limit=5'"
+        ));
+        assert!(!bash(
+            "curl -s 'https://query1.finance.yahoo.com/v8/finance/spark?symbols=MMM,AOS,ABT&range=1y'"
+        ));
+        // More than a handful, a batch endpoint, or a value made at run time still sweeps.
+        assert!(bash(
+            "curl -s 'https://www.reddit.com/r/merida/search.json?q=black&limit=15'"
+        ));
+        assert!(bash(
+            "curl -s 'https://q.example/spark?symbols=A,B,C,D,E,F&range=1y'"
+        ));
+        assert!(bash("curl -s https://api.example.com/v1/batch"));
+        assert!(bash(
+            "python3 - <<'PY'\nimport urllib.request\nfor i in range(0, 500, 20):\n    urllib.request.urlopen('https://q.example/spark?symbols=' + ','.join(syms[i:i+20]))\nPY"
+        ));
+        // Addresses and gate words in text a script writes into a file are no request.
+        assert!(!bash(
+            "python3 - <<'PY'\nfrom pathlib import Path\np = Path('index.html')\np.write_text(p.read_text().replace('x', '<a href=\"https://jobs.example/openai?limit=50\">batch</a>'))\nPY"
+        ));
+        assert!(!bash(
+            "cat > serve.mjs <<'EOF'\nconst url = 'http://localhost:8080/items?limit=100';\nEOF"
+        ));
+    }
+
+    #[test]
+    fn the_machines_own_servers_need_no_probe() {
+        let state = super::TurnRuntimeState::new();
+        assert!(
+            state
+                .feasibility_guard(&["localhost".into(), "127.0.0.1".into()], true)
+                .is_none()
+        );
+        assert!(
+            state
+                .feasibility_guard(&["127.0.0.1".into(), "api.example.com".into()], true)
+                .is_some_and(|guard| guard.contains("host(s) api.example.com have"))
+        );
     }
 }
