@@ -47,7 +47,7 @@
           with you. Research across pages. Run Python and JavaScript. Build reports, datasets and small
           applications in a Linux environment inside your browser.</p>
         <div class="actions">
-          <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/download/browser-v0.1.8/spindle-browser-0.1.8.zip">Download <small>0.1.8 · 74.5 MiB zip</small></a>
+          <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/download/browser-v0.1.10/spindle-browser-0.1.10.zip">Download <small>0.1.10 · 64.0 MiB zip</small></a>
           <a class="button" href="#install">Install guide</a>
         </div>
         <p class="trust">Open source. Bring your own model. No required desktop app or backend.</p>
@@ -86,7 +86,7 @@
           <p>Threads run in an offscreen worker, not in the panel. Close it, switch tabs, and come back to
             the answer.</p></div>
         <div class="card"><span class="tag">Linux</span><h3>A real shell, inside the browser.</h3>
-          <p>bash, coreutils, Python 3 with pip, Node with npm, git, curl, jq and ripgrep in Alpine Linux.
+          <p>bash, coreutils, Python 3 with pip and Pillow, Node with npm, git, curl, jq and ripgrep in Alpine Linux.
             Each command runs in namespaces of its own, over a copy of the thread's workspace.</p></div>
         <div class="card"><span class="tag">Tabs</span><h3>Reads and works your pages.</h3>
           <p>With page reading on: list, read and outline tabs. With page actions on: click, type, select,
@@ -140,8 +140,9 @@
           and chart it with Python, without copying a cell by hand.</p></div>
         <div class="card"><h3>Do the clicking for you.</h3><p>Fill in a long form or walk a settings page, one action
           at a time, on the page you are looking at.</p></div>
-        <div class="card"><h3>Build a small app and see it.</h3><p>Write HTML and JavaScript, open it in a preview,
-          change it, and download the folder when it works.</p></div>
+        <div class="card"><h3>Build a small app and test it.</h3><p>Write HTML and JavaScript, open it in a preview,
+          click through it, read its console, picture it at a phone's width, and download the folder when it
+          works.</p></div>
         <div class="card"><h3>Make sense of a file.</h3><p>Drop in a log, a spreadsheet export or a JSON dump and ask
           what is in it. Python does the counting; you get the answer and the script.</p></div>
         <div class="card"><h3>See what a page loads.</h3><p>Record a tab's requests and read the responses, to find
@@ -249,7 +250,7 @@
         <li>Local llama.cpp <small>no key</small></li>
         <li>Your own <small>providers.json</small></li>
       </ul>
-      <p class="note" style="margin-top:16px">Version 0.1.8 offers OpenAI's Sign in with ChatGPT and, in the
+      <p class="note" style="margin-top:16px">Version 0.1.10 offers OpenAI's Sign in with ChatGPT and, in the
         source/GitHub edition, ChatGPT (Codex). The store edition omits the Codex client. Both use your plan;
         account eligibility and limits are set by OpenAI. Anthropic models take an
         API key; a Claude subscription sign-in is not offered. Any OpenAI-compatible endpoint can be added with a
@@ -263,9 +264,9 @@
         <span class="num">07 &mdash; INSTALL</span>
         <h2 id="install-h">Download, load, sign in.</h2>
         <p>Spindle for Browser is not in the Chrome Web Store yet. Each release is a zip built and
-          checked by the repository's own workflow; you load it as an unpacked extension. Version 0.1.8 includes
-          OpenAI's Sign in with ChatGPT, keeps ChatGPT (Codex) in this standard zip, and adds the Auto default
-          plus reviewed credential-refresh, task-file and restart/storage fixes.</p>
+          checked by the repository's own workflow; you load it as an unpacked extension. Version 0.1.10 carries
+          both Linuxes, boots the emulated one in the background as it installs, and, with page actions on, lets a
+          thread test the pages it makes; this standard zip keeps ChatGPT (Codex) beside OpenAI's Sign in with ChatGPT.</p>
       </div>
       <ol class="steps">
         <li><div><h3>Download the zip.</h3>
@@ -301,8 +302,10 @@ git clone https://github.com/SiliconState/Spindle.git
 cd Spindle/spindle
 chrome/linux/build.sh   <span class="c"># the browser Linux, into chrome/linux/dist</span>
 chrome/build.sh         <span class="c"># the extension, into chrome/dist</span></code></pre>
-      <p class="note">For the faster wasm Linux (<a href="#speed">below</a>), build it and pass
-        <code>SPINDLE_WASM_LINUX</code>
+      <p class="note">That build runs every command on the v86 Linux. To carry the faster wasm Linux as releases
+        do (<a href="#speed">below</a>), fetch the image the source pins with
+        <code class="long">chrome/wasm-linux/fetch-image.sh ../wasm-linux</code> and build with
+        <code class="long">SPINDLE_WASM_LINUX=../wasm-linux chrome/build.sh</code>, or build the image from source
         (<a href="https://github.com/SiliconState/Spindle/blob/main/docs/browser-linux.md#building-the-images">how</a>).
         <a href="https://github.com/SiliconState/Spindle/blob/main/docs/chrome.md">How it is built</a>.</p>
     </div>
@@ -312,29 +315,30 @@ chrome/build.sh         <span class="c"># the extension, into chrome/dist</span>
     <div class="wrap">
       <div class="head">
         <span class="num">08 &mdash; SPEED</span>
-        <h2 id="speed-h">Faster still, built from source.</h2>
-        <p>Release zips carry the v86 Linux, an emulated PC. Built from source with its optional wasm Linux, the
-          extension runs the commands it can there, at close to the machine's own speed, with no emulator in between: plain
-          <code>sh</code> commands run 2.2 to 8.6 times faster, and Python up to 26 times. What the wasm Linux
-          cannot run (bash itself, Node, git, the network) stays on the v86 Linux.</p>
+        <h2 id="speed-h">Two Linuxes, the fast one first.</h2>
+        <p>Every release carries both. Commands the wasm Linux can run (plain <code>sh</code>, Python, ripgrep)
+          run there at close to the machine's own speed, with no emulator in between: shell commands 1.9 to 9.2
+          times faster than on the v86 Linux, an emulated PC, and Python up to 25 times. The rest (bash itself,
+          Node, git, pip, the network) runs on v86, whose one boot happens in the background as the extension
+          installs.</p>
       </div>
       <figure class="diagram">
         <ul class="bars" aria-label="How many times faster each command ran on the wasm Linux than on the v86 Linux">
-          <li class="bar"><span>First command after install<br><small>21 s &rarr; 0.54 s</small></span>
-            <span class="scale"><span class="fill" style="--x:1"></span><b>39&times;</b></span></li>
-          <li class="bar"><span>Python summing 3 million squares<br><small>8,353 &rarr; 326 ms</small></span>
-            <span class="scale"><span class="fill" style="--x:.659"></span><b>25.6&times;</b></span></li>
-          <li class="bar"><span>Python importing six modules<br><small>1,299 &rarr; 171 ms</small></span>
-            <span class="scale"><span class="fill" style="--x:.195"></span><b>7.6&times;</b></span></li>
-          <li class="bar"><span><code>python3 -c pass</code><br><small>418 &rarr; 102 ms</small></span>
-            <span class="scale"><span class="fill" style="--x:.105"></span><b>4.1&times;</b></span></li>
-          <li class="bar"><span>Python writing 200 files<br><small>894 &rarr; 300 ms</small></span>
-            <span class="scale"><span class="fill" style="--x:.077"></span><b>3.0&times;</b></span></li>
+          <li class="bar"><span>Python summing 3 million squares<br><small>8,391 &rarr; 336 ms</small></span>
+            <span class="scale"><span class="fill" style="--x:1"></span><b>25.0&times;</b></span></li>
+          <li class="bar"><span>An <code>awk</code> loop<br><small>6,997 &rarr; 763 ms</small></span>
+            <span class="scale"><span class="fill" style="--x:.367"></span><b>9.2&times;</b></span></li>
+          <li class="bar"><span>Python importing six modules<br><small>1,288 &rarr; 189 ms</small></span>
+            <span class="scale"><span class="fill" style="--x:.272"></span><b>6.8&times;</b></span></li>
+          <li class="bar"><span><code>python3 -c pass</code><br><small>447 &rarr; 121 ms</small></span>
+            <span class="scale"><span class="fill" style="--x:.148"></span><b>3.7&times;</b></span></li>
+          <li class="bar"><span>Python writing 200 files<br><small>840 &rarr; 343 ms</small></span>
+            <span class="scale"><span class="fill" style="--x:.096"></span><b>2.4&times;</b></span></li>
         </ul>
         <figcaption>Times faster on the wasm Linux than on the v86 Linux, with both times under each name: the
-          median of five runs in headless Chrome 153, the same commands on both Linuxes
-          (<a href="https://github.com/SiliconState/Spindle/blob/main/docs/browser-linux.md#measured-speed">the full table</a>).
-          The first command is a one-time cost: v86 resumes its saved state on later starts.</figcaption>
+          median of five runs of Spindle for Browser 0.1.10 in headless Chrome 153, the same commands on both
+          Linuxes (<a href="https://github.com/SiliconState/Spindle/blob/main/docs/browser-linux.md#measured-speed">the full table</a>).
+          v86 boots once per image, in the background, and resumes its saved state after that.</figcaption>
       </figure>
     </div>
   </section>
@@ -383,10 +387,10 @@ chrome/build.sh         <span class="c"># the extension, into chrome/dist</span>
 
   <section class="block closing" aria-labelledby="get-h">
     <div class="wrap">
-      <p class="eyebrow">Spindle for Browser 0.1.8</p>
+      <p class="eyebrow">Spindle for Browser 0.1.10</p>
       <h2 id="get-h">Put it beside your next tab.</h2>
       <div class="actions">
-        <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/download/browser-v0.1.8/spindle-browser-0.1.8.zip">Download <small>0.1.8 · 74.5 MiB zip</small></a>
+        <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/download/browser-v0.1.10/spindle-browser-0.1.10.zip">Download <small>0.1.10 · 64.0 MiB zip</small></a>
         <a class="button" href="#install">Install guide</a>
         <a class="button" href="https://github.com/SiliconState/Spindle">Source on GitHub</a>
       </div>

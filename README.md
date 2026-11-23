@@ -97,7 +97,7 @@ flowchart TB
   With `spindle-embed`, the program around it does; Spindle for Browser is such a program.
 - **Where commands run.** A bubblewrap sandbox or the host itself, a runner the program
   supplies, or in Spindle for Browser a Linux inside the browser (v86, plus a faster wasm
-  Linux when built from source) or the sandbox of a Spindle host you connect, which can
+  Linux for plain `sh`, Python and ripgrep) or the sandbox of a Spindle host you connect, which can
   also take whole threads and hand them back.
 - **Tools.** Only Spindle for Browser has page tools for reading and acting on tabs.
   Only the native binary mounts your Rust toolchain read-only for commands
@@ -146,13 +146,16 @@ Interrupted? `spindle --dir ../demo continue`. The web UI:
 [docs/host.md](docs/host.md#remote-access-through-a-reverse-proxy)). Full walkthrough:
 [docs/getting-started.md](docs/getting-started.md).
 
-**Spindle for Browser 0.1.8.** The standard/GitHub zip includes OpenAI's Sign in
-with ChatGPT and keeps **ChatGPT (Codex)**. The store-edition zip omits the legacy
-Codex client. This release also includes reviewed credential-refresh,
-background-task file delivery and restart/storage fixes.
+**Spindle for Browser 0.1.10.** Both zips carry the two browser Linuxes: the wasm
+Linux runs plain `sh`, Python 3.14 and ripgrep at the machine's own speed, and the v86
+Linux, on its own trimmed kernel and prepared in the background as the extension
+installs, runs the rest. With page actions on, a thread reads, clicks, types into and
+pictures the pages it makes, and reads what their console said. The standard/GitHub zip
+includes OpenAI's Sign in with ChatGPT and keeps **ChatGPT (Codex)**; the store-edition
+zip omits the legacy Codex client.
 
-Download `spindle-browser-0.1.8.zip` from the
-[0.1.8 release](https://github.com/SiliconState/Spindle/releases/tag/browser-v0.1.8), unzip it, and load
+Download `spindle-browser-0.1.10.zip` from the
+[0.1.10 release](https://github.com/SiliconState/Spindle/releases/tag/browser-v0.1.10), unzip it, and load
 the folder with **Load unpacked** in `chrome://extensions`, `edge://extensions` or `brave://extensions`
 ([docs/chrome.md](docs/chrome.md#install-a-release)). Its single-box composer,
 grouped threads, compact steps and task cards share the web UI's design. Workspace
