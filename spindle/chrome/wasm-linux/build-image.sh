@@ -11,10 +11,9 @@
 # runs on v86; ripgrep/no-mmap.c in place of mmap, which it reads files without), the
 # time zones (Alpine's tzdata, as the browser Linux has them),
 # Spindle's agent and `spindle` command (guest/, built here too), its init and users. Its
-# identity names
-# it as runs record it: the index, the kernel and the runtime that boots it. Nothing
-# needs root: Alpine's packages install as a normal user, and the files are compressed
-# in that Alpine root in a user namespace.
+# identity names it as runs record it: the index, the kernel and the runtime that boots
+# it. Nothing needs root: Alpine's packages install as a normal user, and the files are
+# compressed in that Alpine root in a user namespace.
 #
 # usage: chrome/wasm-linux/build-image.sh VMLINUX_WASM USERLAND_DIR RUST_DIR PYTHON_DIR [OUT_DIR]
 #   USERLAND_DIR, RUST_DIR, PYTHON_DIR: build-userland.sh's, build-rust.sh's and

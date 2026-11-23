@@ -1267,7 +1267,7 @@ content}` with content blocks:
 | `redacted_thinking` | none. |
 | `reasoning` | none (provider-specific reasoning items are opaque). |
 | `tool_use` | `id`, `name`, `input`. |
-| `tool_result` | `tool_use_id`, `content`, `is_error`, `exit_code`, `duration_ms`; on a successful `show` result also `display` (its cards). `exit_code` is set for a native command run (`bash` or `run_code`) recorded by a build after 0.1.8, and `duration_ms` for one that ran 10 s or more; both are null for other tools, older results, a run a signal ended (no exit code) and a shorter run's time. A failed run's `content` ends with `[exit status N]` too ([tools.md](tools.md#results-the-turns-output-budget-and-read_output)). |
+| `tool_result` | `tool_use_id`, `content`, `is_error`, `exit_code`, `duration_ms`; on a successful `show` result also `display` (its cards). `exit_code` is set for a native command run (`bash` or `run_code`) recorded by a build since 0.1.10, and `duration_ms` for one that ran 10 s or more; both are null for other tools, older results, a run a signal ended (no exit code) and a shorter run's time. A failed run's `content` ends with `[exit status N]` too ([tools.md](tools.md#results-the-turns-output-budget-and-read_output)). |
 | `image` | `path`, `media_type`, `width`, `height`, `sha256`. |
 | `image_artifact` | `digest`, `size`, `width`, `height`. |
 | `partial` | `text`. |

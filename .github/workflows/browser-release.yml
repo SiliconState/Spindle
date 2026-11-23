@@ -142,9 +142,9 @@ jobs:
           cat > "$RUNNER_TEMP/notes.md" <<EOF
           Spindle for Browser $VERSION, for Chrome, Edge and Brave, built from this tag by the browser release workflow.
 
-          **New in 0.1.8:** OpenAI's Sign in with ChatGPT, with ChatGPT (Codex) retained in the standard zip; credential refreshes respect sign-out and replacement; background task reports adopt their files together; file-merge warnings survive long answers; Stop keeps priority between tool steps. This release also carries the reviewed restart/storage and task-budget fixes.
+          **New in 0.1.10:** the wasm Linux is in every release, this one's Chrome Web Store build included: plain \`sh\`, Python 3.14 and ripgrep run there at the machine's own speed, and the v86 Linux runs the rest. The v86 Linux boots its own trimmed kernel straight onto its files, now compressed, and makes its saved state in the background right after an install or update; both Linuxes have the time zones. With page actions on, a thread reads, clicks, types into and pictures the pages it makes, in Spindle's own tab, and reads what the page's console said; screenshots take the whole page (\`full_page\`) or a set \`width\`. A command cut off by its limits keeps the thread's package and cache folders. The zip carries both Linuxes and is still smaller than 0.1.8's.
 
-          **Compatibility:** stores remain schema 20 until a step needs more than eight intents, when they widen to schema 21 (up to 256). Older builds refuse widened stores and the new ChatGPT request contract. Keep a verified backup before updating if rollback matters.
+          **Compatibility:** as in 0.1.8, stores stay schema 20 until a step needs more than eight intents, when they widen to schema 21 (up to 256), which 0.1.7 and older refuse. The browser Linux's new image is booted once, in the background, after the update. Keep a verified backup before updating if rollback matters.
 
           **Verify** it before you unzip it: \`sha256sum -c $ASSET.sha256\` (on macOS, \`shasum -a 256 -c $ASSET.sha256\`; on Windows, compare \`Get-FileHash $ASSET\` with the \`.sha256\` file), or \`gh attestation verify $ASSET -R $GITHUB_REPOSITORY\`.
 

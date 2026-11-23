@@ -53,7 +53,7 @@ and theme switch as the native UI.
 | [`engine.html`](../spindle/chrome/engine.html), [`engine.mjs`](../spindle/chrome/engine.mjs) | Offscreen document (one per profile, reason `WORKERS`) | Starts the engine worker and relays its page-tool calls to the service worker (a worker has no `chrome.runtime`). |
 | [`engine-worker.mjs`](../spindle/chrome/engine-worker.mjs) | Dedicated worker of the offscreen document | The engine. Holds an `EmbeddedClient` over the OPFS pool, the thread index, every thread's turns and the command runners; opens the provider's sealed credential for each request. Drives threads that live on a connected host through a `RemoteClient`. |
 | [`linux-runner.mjs`](../spindle/chrome/linux-runner.mjs), [`linux-route.mjs`](../spindle/chrome/linux-route.mjs) | Engine worker | The `app` command runner: picks a Linux for each command and talks to the Linux workers. |
-| [`linux-worker.mjs`](../spindle/chrome/linux-worker.mjs), [`wasm-linux-worker.mjs`](../spindle/chrome/wasm-linux-worker.mjs) | Nested workers started by the engine | The two browser Linuxes (the wasm Linux only in builds that carry it). See [browser-linux.md](browser-linux.md). |
+| [`linux-worker.mjs`](../spindle/chrome/linux-worker.mjs), [`wasm-linux-worker.mjs`](../spindle/chrome/wasm-linux-worker.mjs) | Nested workers started by the engine | The two browser Linuxes (the wasm Linux in builds that carry it: every release since 0.1.10). See [browser-linux.md](browser-linux.md). |
 | [`panel.html`](../spindle/chrome/panel.html), [`panel.mjs`](../spindle/chrome/panel.mjs), [`panel.css`](../spindle/chrome/panel.css) | Side panel (also opens in a tab) | The UI. It holds no session: it sends requests to the engine and renders the events the engine broadcasts. |
 | [`steps.mjs`](../spindle/chrome/steps.mjs) | Panel, file tab | Pure functions that label tool steps in plain words with the right tense, name the page and element a browser step acted on, find failed steps that a later step redid, and pick out scratch files. |
 | [`markdown.mjs`](../spindle/chrome/markdown.mjs) | Panel, file tab | Renders `text.js` Markdown blocks as DOM nodes. |
@@ -153,7 +153,7 @@ The engine's operations (`ops` in [`engine-worker.mjs`](../spindle/chrome/engine
 | `tasks`, `taskStop` | List child tasks and stop one, including while the parent only waits for reports. |
 | `storage`, `compact`, `dropAside`, `freeSealed`, `reclaimLost` | Per-thread disk use (and, since 0.1.7, the bytes no file name leads to), return free database pages, remove set-aside first attempts, remove a moved thread's sealed copy after checking its bundle, or (since 0.1.7) free those unreadable bytes. |
 | `open` | A thread's status and history (optionally from a message index), from one read of its head (`status` with `history`). For a thread whose commands run in the browser it also warms the wasm Linux (when the build carries it), and v86 only if the thread ran a command there in the last 24 hours. |
-| `rewindTo` | Takes the thread back to just before one of the user's messages, searching the last 8192 rewind targets, and returns that message and its attachments. After 0.1.8 it first narrows the targets to the histories that begin as the thread's does through that message (a history only grows until a compaction starts it again), and reads every target only when that misses; the panel waits up to ten minutes for it. |
+| `rewindTo` | Takes the thread back to just before one of the user's messages, searching the last 8192 rewind targets, and returns that message and its attachments. Since 0.1.10 it first narrows the targets to the histories that begin as the thread's does through that message (a history only grows until a compaction starts it again), and reads every target only when that misses; the panel waits up to ten minutes for it. |
 | `earlier` | The history before a compaction summary. |
 | `restart` | Starts an unfinished turn over, optionally with other settings, or hands its message back. |
 | `settings`, `efforts`, `rename` | Change a thread's settings; list a model's efforts; rename. |
@@ -520,17 +520,17 @@ then. A new install starts with both switches off.
 | Tool | Needs | Does |
 | --- | --- | --- |
 | `list_tabs` | reading | Lists tabs (id, title, address) and marks the one the user is looking at. |
-| `read_page` | reading (`scroll` also needs actions) | Visible page text (default 20,000, max 100,000 characters); `find` returns matching lines with neighbours. Reads over 32,000 characters keep full text under `.pages/` in the workspace. `scroll` 1–30 collects new lines as it scrolls. Spindle's own file tabs read as their workspace text; after 0.1.9, with actions on, as the page shows, its scripts run, with what its console said since it loaded (errors, warnings, uncaught errors; the last 20). |
+| `read_page` | reading (`scroll` also needs actions) | Visible page text (default 20,000, max 100,000 characters); `find` returns matching lines with neighbours. Reads over 32,000 characters keep full text under `.pages/` in the workspace. `scroll` 1–30 collects new lines as it scrolls. Spindle's own file tabs read as their workspace text; since 0.1.10, with actions on, as the page shows, its scripts run, with what its console said since it loaded (errors, warnings, uncaught errors; the last 20). |
 | `page_elements` | reading | An indented outline with refs such as `kqm12`; `find` filters matching parts with neighbours. |
 | `page_html` | reading | The page's or one part's HTML, without `<script>` unless asked and without password values (default 50,000 characters, at most 200,000). |
-| `screenshot` | reading, plus the `<all_urls>` grant (visible tab) or actions (any tab) | A JPEG of a tab saved to `screenshots/` in the workspace. After 0.1.9, with actions on: `full_page` (the whole page), `width` (laid out 200-4000 pixels wide) and Spindle's own file tabs (the page alone). |
+| `screenshot` | reading, plus the `<all_urls>` grant (visible tab) or actions (any tab) | A JPEG of a tab saved to `screenshots/` in the workspace. Since 0.1.10, with actions on: `full_page` (the whole page), `width` (laid out 200-4000 pixels wide) and Spindle's own file tabs (the page alone). |
 | `navigate` | actions (reading for `/workspace/NAME`) | Go to an http(s) address, back, forward or reload, in a tab or a new tab; or open a workspace file in a tab for the user. |
 | `click`, `type`, `press` | actions | Input through Chrome's debugger, so pages receive it as real input. |
 | `select`, `scroll` | actions | Choose `<select>` options, or scroll a part into view or the page, from Spindle's script in the page. |
 | `wait_for` | actions | Wait for text or a CSS selector to appear or disappear (default 10 s, at most 25 s). |
 | `dialog` | actions | Accept or dismiss an alert, confirm or prompt dialog. |
 | `close_tab` | actions | Close a tab showing a web page. |
-| `network` | actions | Record a tab's requests (`start`), list them (`read`, at most 500 kept), read a response body by id (after 0.1.9 also `body: "last"`: the last finished request `filter` matches), and `stop`. The page's own requests carry the user's sign-in; the browser Linux's never do. |
+| `network` | actions | Record a tab's requests (`start`), list them (`read`, at most 500 kept), read a response body by id (since 0.1.10 also `body: "last"`: the last finished request `filter` matches), and `stop`. The page's own requests carry the user's sign-in; the browser Linux's never do. |
 
 How the tools run ([`background.js`](../spindle/chrome/background.js)):
 
@@ -568,7 +568,7 @@ How the tools run ([`background.js`](../spindle/chrome/background.js)):
 - **Reruns.** Reading tools, `screenshot` and `wait_for` are declared `rerun: 'safe'`; the other
   acting tools are `rerun: 'no'`, so Spindle never repeats a click by itself (see [tools.md](tools.md)).
 - **Workspace files.** `navigate` to `/workspace/NAME` (or `file:///workspace/NAME`) is rewritten
-  by the engine into `view.html?thread=ID&path=NAME` in a new tab. After 0.1.9, with page actions
+  by the engine into `view.html?thread=ID&path=NAME` in a new tab. Since 0.1.10, with page actions
   on, the page tools work on that tab as on a web page (a page, or a Word, Excel or PowerPoint
   file drawn as one): the page runs in a sandboxed frame in a
   process of its own, which Chrome lets no extension script into, so Spindle reaches it through
@@ -576,7 +576,7 @@ How the tools run ([`background.js`](../spindle/chrome/background.js)):
   where the frame sits; `navigate` may reload the tab, to show the file as it is now.
 - **Screenshots.** The visible tab is captured with `chrome.tabs.captureVisibleTab` once the user
   has granted `<all_urls>` (**Capture this tab** under **+** asks for it); any other tab uses
-  `Page.captureScreenshot` through the debugger when page actions are on (after 0.1.9 also the
+  `Page.captureScreenshot` through the debugger when page actions are on (since 0.1.10 also the
   whole page, a set width, and a workspace page in Spindle's tab, clipped to its frame). The tool returns the
   image as a workspace write in `screenshots/`, named by its capture time and tab (the
   panel shows it as "Screenshot" and the time it was taken). The model does not see it
@@ -596,7 +596,7 @@ Settings, Pages, **Before acting** decides whether a thread asks the user before
 | **Ask** | Every `click`, `type`, `press`, `select`, `navigate` (going back, forward or reloading too), `dialog` (accepting or dismissing) and `close_tab`. |
 
 Reading tools, `scroll`, `wait_for`, `screenshot` and `network` never ask, and neither does
-`navigate` opening a workspace file for the user, nor (after 0.1.9) any action on a workspace page
+`navigate` opening a workspace file for the user, nor (since 0.1.10) any action on a workspace page
 in Spindle's own tab (done only while that tab still shows one). If the saved mode cannot be read, Spindle
 asks (it never acts unasked on a choice it could not see).
 
@@ -675,7 +675,7 @@ or edited (`turnFiles` compares digests
 with the workspace before the turn), whether a file tool or a command made them. Finding
 the point before the turn (`pointBefore`) read the history at every recent rewind target
 until one matched, which on a long thread whose last turn compacted held the engine for
-over a minute ("Spindle's engine is not answering"); after 0.1.8 it narrows the targets
+over a minute ("Spindle's engine is not answering"); since 0.1.10 it narrows the targets
 the same way as `rewindTo` (a few reads), and long searches let the engine answer other
 asks between reads. Scratch files (`isScratch`:
 `.txt`, `.py`, `.pyc`, `.log`, `.tmp`, and anything under `test/`, `tests/`, `__pycache__/` or
@@ -901,7 +901,7 @@ defaults for new threads are kept in the panel's `localStorage` (`spindle-new`).
 
 For a stopped, failed or interrupted thread, saving this page restarts from its
 newest safe before-model or settled target, keeping earlier history; only a true
-first turn starts afresh, with its old copy retained. After 0.1.8, the turn then goes on
+first turn starts afresh, with its old copy retained. Since 0.1.10, the turn then goes on
 with the new model even when it is another provider's that speaks another wire contract
 (the OpenAI API to ChatGPT, say, after running out of credits): 0.1.8 refused that step
 ("turn state rejected the step (Binding)"), and Retry after such a restart could say "the
@@ -1169,24 +1169,24 @@ chrome/build.sh /path/to/wasm-bindgen OUT     # or into another folder
 ```
 
 `chrome/build.sh [WASM_BINDGEN_CLI] [OUT_DIR]` builds `spindle-embed` for `wasm32-unknown-unknown`
-(after 0.1.8 with the workspace's `browser` profile, `cargo build --locked --profile browser`:
+(since 0.1.10 with the workspace's `browser` profile, `cargo build --locked --profile browser`:
 the release profile with fat link-time optimization and one codegen unit; 0.1.8 used
 `--release`), generates its web glue into `OUT/web`, optimizes the wasm with Binaryen's
-`wasm-opt -O3` when one is found (after 0.1.8), and copies the extension files, the JS
+`wasm-opt -O3` when one is found (since 0.1.10), and copies the extension files, the JS
 clients (into `OUT/clients`), the native UI's `text.js` and `theme.js`, the icons,
 `THIRD-PARTY.md`, the browser Linux (`OUT/linux`) and, with `SPINDLE_WASM_LINUX`, the wasm
-Linux (`OUT/wasm-linux`; after 0.1.8 its files go into `OUT/linux/flat/` beside the v86
+Linux (`OUT/wasm-linux`; since 0.1.10 its files go into `OUT/linux/flat/` beside the v86
 Linux's, where the files the two share are carried once, and its identity is worked out
 again by `chrome/wasm-linux/identity.sh`). It writes `build.json`: the version, the sources'
-commits (marked when they had changes), the tool versions (after 0.1.8 also `wasm_opt`,
+commits (marked when they had changes), the tool versions (since 0.1.10 also `wasm_opt`,
 null when none ran), the wasm's digest and each Linux image's identity, which Settings, About
 shows. Environment variables:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SPINDLE_LINUX` | `chrome/linux/dist` | The v86 Linux to carry (must contain `identity`). |
-| `SPINDLE_WASM_LINUX` | unset | The wasm Linux to carry (`build-image.sh` output, or `chrome/wasm-linux/fetch-image.sh`'s: the image `image.json` pins, which releases after 0.1.8 carry). Without it, every command runs on v86. A wasm Linux whose Python differs from the v86 Linux's python3 is carried with a warning (they then share fewer files). |
-| `SPINDLE_WASM_OPT` | `wasm-opt` on `PATH` | Binaryen's `wasm-opt` for the engine wasm (after 0.1.8; releases pin version 133). Without one the build says so and leaves the wasm unoptimized. |
+| `SPINDLE_WASM_LINUX` | unset | The wasm Linux to carry (`build-image.sh` output, or `chrome/wasm-linux/fetch-image.sh`'s: the image `image.json` pins, which releases since 0.1.10 carry). Without it, every command runs on v86. A wasm Linux whose Python differs from the v86 Linux's python3 is carried with a warning (they then share fewer files). |
+| `SPINDLE_WASM_OPT` | `wasm-opt` on `PATH` | Binaryen's `wasm-opt` for the engine wasm (since 0.1.10; releases pin version 133). Without one the build says so and leaves the wasm unoptimized. |
 | `SPINDLE_STORE` | unset | A nonempty value builds without `codex-signin`, checks the output contains no legacy Codex client/options, and sets `build.json.edition` to `store`; otherwise `source`. |
 
 To load it:

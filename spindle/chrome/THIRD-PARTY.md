@@ -22,6 +22,7 @@ kernel and index in `wasm-linux/`, its files in `linux/flat/` with the browser L
 | busybox | GPL-2.0 | <https://github.com/tombl/busybox>, at the commit pinned in `chrome/wasm-linux/build-userland.sh` |
 | musl and compiler-rt's builtins, linked into its programs | MIT; Apache-2.0 with LLVM exceptions | <https://github.com/tombl/musl> and <https://github.com/tombl/llvm-project>, at the commits pinned in `chrome/wasm-linux/build-toolchain.sh` |
 | Python with zlib, bzip2 and SQLite | PSF-2.0; Zlib; bzip2's BSD-style license; public domain | The releases pinned in `chrome/wasm-linux/build-python.sh`; its standard library is the one in Alpine's `python3` package of the same version (above) |
+| Time zone data (`/usr/share/zoneinfo`) | Public domain | Alpine's `tzdata` package, the one the browser Linux has (above); the IANA time zone database, <https://www.iana.org/time-zones> |
 | ripgrep (`rg`) and the crates it is built from | ripgrep: MIT or Unlicense; its crates: their own, MIT, Apache-2.0 or Unlicense | The release pinned in `chrome/wasm-linux/build-image.sh` (<https://github.com/BurntSushi/ripgrep>), crates at the versions in its `Cargo.lock`, `libc` replaced by the patched copy below |
 | Rust's standard library, in its programs | MIT or Apache-2.0 | The nightly pinned in `chrome/wasm-linux/build-rust.sh`, with the patches in `chrome/wasm-linux/rust/patches/` |
 

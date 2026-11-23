@@ -33,14 +33,14 @@ journaled by the embedded package, as native code mode journals its calls.
 | --- | --- | --- |
 | What it is | Alpine Linux, 32-bit x86, run by the v86 emulator (compiled to wasm) | Linux for the `wasm` architecture (`arch/wasm`), compiled to WebAssembly; one kernel instance per task, each in a worker, all on one shared memory |
 | Sources | [`chrome/linux/`](../spindle/chrome/linux/), [`linux-worker.mjs`](../spindle/chrome/linux-worker.mjs), [`linux-net.mjs`](../spindle/chrome/linux-net.mjs), [`linux-frames.mjs`](../spindle/chrome/linux-frames.mjs) | [`chrome/wasm-linux/`](../spindle/chrome/wasm-linux/), [`wasm-linux-worker.mjs`](../spindle/chrome/wasm-linux-worker.mjs) |
-| Shell and programs | bash, coreutils, findutils, grep, sed, gawk, diffutils, patch, tar, gzip, xz, Python 3 with pip, Node with npm, git, curl, openssl, jq, ripgrep, file, less; after 0.1.9 the time zones (Alpine's tzdata, for Python's `zoneinfo` and `TZ=...`), and without what no command here can use: `git-shell` (an SSH login shell), git's WebDAV push (`git-http-push`; pushes over HTTPS go through `git-remote-http`) and Python's `turtle` (it needs tkinter, which neither Linux has) | busybox (with hush as `sh`), Python 3.14 after 0.1.8, the v86 Linux's version with Alpine's own standard library files (3.13 with its own library in 0.1.8) (no `ssl`, `ctypes`, `lzma` or pip, and no loadable C extensions: there is no `dlopen`), and after 0.1.8 ripgrep, the v86 Linux's version without PCRE2 (`rg -P` runs on v86); after 0.1.9 the same time zones; only the programs the image was built with run (see [Programs a command saved](#programs-a-command-saved)) |
+| Shell and programs | bash, coreutils, findutils, grep, sed, gawk, diffutils, patch, tar, gzip, xz, Python 3 with pip, Node with npm, git, curl, openssl, jq, ripgrep, file, less; since 0.1.10 the time zones (Alpine's tzdata, for Python's `zoneinfo` and `TZ=...`), and without what no command here can use: `git-shell` (an SSH login shell), git's WebDAV push (`git-http-push`; pushes over HTTPS go through `git-remote-http`) and Python's `turtle` (it needs tkinter, which neither Linux has) | busybox (with hush as `sh`), Python 3.14 since 0.1.10, the v86 Linux's version with Alpine's own standard library files (3.13 with its own library in 0.1.8) (no `ssl`, `ctypes`, `lzma` or pip, and no loadable C extensions: there is no `dlopen`), and since 0.1.10 ripgrep, the v86 Linux's version without PCRE2 (`rg -P` runs on v86); since 0.1.10 the same time zones; only the programs the image was built with run (see [Programs a command saved](#programs-a-command-saved)) |
 | Network | Through Chrome or a relay, for threads with network on | None |
 | Agent | [`guest/agent.py`](../spindle/chrome/linux/guest/agent.py) with the static [`spindle-sandbox`](../spindle/chrome/linux/command/src/sandbox.rs) | [`guest/src/agent.rs`](../spindle/chrome/wasm-linux/guest/src/agent.rs) (`spindle-agent`, agent and sandbox in one program) |
 | Agent channel | Serial line `/dev/ttyS0`; payloads over 16 KiB go as files on the share | Virtio console `/dev/hvc1` (`hvc0` is the kernel's) |
-| Files | `linux/fs.json` (the index); the files in `linux/flat/`, named by digest, each compressed with zstd after 0.1.8 | `wasm-linux/fs.json`; after 0.1.8 its files in the same `linux/flat/` (what it shares with v86 is carried once) and its kernel as `wasm-linux/vmlinux.wasm.zst`, decompressed with v86's own zstd decoder ([`zstd.mjs`](../spindle/chrome/wasm-linux/zstd.mjs)) |
-| Start | First start boots and saves the machine state to OPFS (after 0.1.8, in the background right after an install, or an update that brings a new image); later starts resume it | Boots every time; nothing is saved |
+| Files | `linux/fs.json` (the index); the files in `linux/flat/`, named by digest, each compressed with zstd since 0.1.10 | `wasm-linux/fs.json`; since 0.1.10 its files in the same `linux/flat/` (what it shares with v86 is carried once) and its kernel as `wasm-linux/vmlinux.wasm.zst`, decompressed with v86's own zstd decoder ([`zstd.mjs`](../spindle/chrome/wasm-linux/zstd.mjs)) |
+| Start | First start boots and saves the machine state to OPFS (since 0.1.10, in the background right after an install, or an update that brings a new image); later starts resume it | Boots every time; nothing is saved |
 | Concurrency | Up to 4 commands, one per thread, one with network | Up to 4 commands, one per thread, each pinned to two CPUs of its own (9 CPUs in all) |
-| Carried | Always (`chrome/build.sh` refuses to build without it) | When built with `SPINDLE_WASM_LINUX`: in releases after 0.1.8, the image [`image.json`](../spindle/chrome/wasm-linux/image.json) pins (see [Building the images](#building-the-images)); 0.1.8 and earlier releases did not carry it |
+| Carried | Always (`chrome/build.sh` refuses to build without it) | When built with `SPINDLE_WASM_LINUX`: in releases since 0.1.10, the image [`image.json`](../spindle/chrome/wasm-linux/image.json) pins (see [Building the images](#building-the-images)); 0.1.8 and earlier releases did not carry it |
 
 Both Linuxes use the same workspace code ([`linux-workspace.mjs`](../spindle/chrome/linux-workspace.mjs))
 over a v86 9p filesystem, and both agents speak the same frame protocol and the same code-bridge
@@ -55,19 +55,19 @@ returns (`linuxRunner`). The engine connects it to its `EmbeddedClient` as the r
 The wasm Linux runs at the machine's own speed with no emulator in between, which is why
 routing sends it every command it can run. [`linux_bench.mjs`](../spindle/chrome/tests/linux_bench.mjs)
 runs the same commands on both Linuxes through `linuxRunner` with a forced route, in headless
-Chrome 153, and keeps the median of five runs (the first command is timed once). Measured on a
-build after 0.1.8 (v86 on its own kernel with no boot image, Python 3.14 on both):
+Chrome 153, and keeps the median of five runs (the first command is timed once). Measured on
+0.1.10 (v86 on its own trimmed kernel with no boot image, Python 3.14 on both):
 
 | Workload | v86 Linux | wasm Linux | Faster by |
 | --- | ---: | ---: | ---: |
-| Shell: `true`, a file write and read, a directory listing piped to `wc`, a sort pipeline, 30 program starts, 200 files, an `awk` loop | varies by command | varies by command | 2.4x to 8.6x |
-| `python3 -c pass` | 431 ms | 110 ms | 3.9x |
-| Python importing `json`, `re`, `collections`, `datetime`, `pathlib`, `subprocess` | 1,362 ms | 171 ms | 8.0x |
-| Python summing 3 million squares | 8,503 ms | 326 ms | 26.1x |
-| Python writing 200 files | 958 ms | 325 ms | 2.9x |
-| First start (v86 boots and saves its state once per image) | 16.7 s (21 s in 0.1.8) | 0.59 s | about 28x |
+| Shell: `true`, a file write and read, a directory listing piped to `wc`, a sort pipeline, 30 program starts, 200 files, an `awk` loop | varies by command | varies by command | 1.9x to 9.2x |
+| `python3 -c pass` | 447 ms | 121 ms | 3.7x |
+| Python importing `json`, `re`, `collections`, `datetime`, `pathlib`, `subprocess` | 1,288 ms | 189 ms | 6.8x |
+| Python summing 3 million squares | 8,391 ms | 336 ms | 25.0x |
+| Python writing 200 files | 840 ms | 343 ms | 2.4x |
+| First start (v86 boots and saves its state once per image) | 15.3 s (21 s in 0.1.8) | 0.65 s | about 24x |
 
-v86 resumes its saved state on later starts, so the last row is a one-time cost, and after 0.1.8
+v86 resumes its saved state on later starts, so the last row is a one-time cost, and since 0.1.10
 it is paid in the background right after an install or an update that brings a new image (see
 [Boot, resume and idle](#boot-resume-and-idle)). What the wasm Linux cannot run (bash, Node,
 git, the network, C extensions, programs a command saved) stays on v86.
@@ -135,10 +135,10 @@ when:
 | `unrecognized option`, `invalid option`, or a BusyBox usage text | `grep -P`, `find -printf` |
 | `date: invalid date` | `date -d yesterday` |
 | `ModuleNotFoundError: No module named` | a module only v86's Python has, or one pip would install there |
-| `python3: No module named` (after 0.1.8) | `python3 -m pip`, `python3 -m pytest`: pip and what it installs are v86's |
-| `Error: Command '[...'-m', 'ensurepip'...` (after 0.1.8) | `python3 -m venv .venv`: a venv's pip can only come on v86, which makes the venv afresh |
-| `PCRE2 is not available in this build of ripgrep` (after 0.1.8) | `rg -P`, or `rg --engine auto` with a pattern only PCRE2 takes |
-| `MemoryError`, `memory allocation of N bytes failed`, or `...: out of memory` (after 0.1.8) | a program that needed more than the 256 MiB each wasm Linux program may have; v86's machine has 512 MiB |
+| `python3: No module named` (since 0.1.10) | `python3 -m pip`, `python3 -m pytest`: pip and what it installs are v86's |
+| `Error: Command '[...'-m', 'ensurepip'...` (since 0.1.10) | `python3 -m venv .venv`: a venv's pip can only come on v86, which makes the venv afresh |
+| `PCRE2 is not available in this build of ripgrep` (since 0.1.10) | `rg -P`, or `rg --engine auto` with a pattern only PCRE2 takes |
+| `MemoryError`, `memory allocation of N bytes failed`, or `...: out of memory` (since 0.1.10) | a program that needed more than the 256 MiB each wasm Linux program may have; v86's machine has 512 MiB |
 | Python `subprocess` raising `FileNotFoundError` or `PermissionError` | a program Python tried to start that the image lacks or may not run |
 
 A rerun is safe because each command works on a copy of its thread's workspace, and that copy
@@ -278,7 +278,7 @@ Both Linuxes keep a thread's workspace on their 9p share between commands
 
 A command's copy counts only when the package accepts its result. A copy dropped after a stop or
 timeout, or a result that is not taken, leaves nothing stale, because the next plan reuses a kept
-file only when its digest matches what the package lists. After 0.1.9 a dropped copy (over the
+file only when its digest matches what the package lists. Since 0.1.10 a dropped copy (over the
 limits, stopped, timed out, or never run) keeps its package and cache directories (`.venv`,
 `node_modules`, `__pycache__` and the like) as the thread's kept copy, so an `npm install` cut off
 by its time goes on from what it fetched; only a command that may still be running (one the v86
@@ -445,9 +445,10 @@ start. The Python module talks to the socket directly.
 
 ## Boot, resume and idle
 
-The engine warms the optional wasm Linux when a browser-runner thread is opened or
-created. It warms v86 then only if that thread used v86 in the last day; a chat-only
-thread leaves v86 and its 512 MiB unstarted. A command that needs v86 starts it then.
+The engine warms the wasm Linux (in every release since 0.1.10) when a browser-runner
+thread is opened or created. It warms v86 then only if that thread used v86 in the last
+day; a chat-only thread leaves v86 and its 512 MiB unstarted. A command that needs v86
+starts it then.
 Choosing This browser as a thread's runner explicitly warms both (`warm()`;
 `warm({v86: false})` skips v86). The engine's `onRan` callback notes on the thread when it
 last ran a command on v86. A Linux worker that has run nothing for 10 minutes is terminated
@@ -457,13 +458,13 @@ last ran a command on v86. A Linux worker that has run nothing for 10 minutes is
 
 **v86** ([`linux-worker.mjs`](../spindle/chrome/linux-worker.mjs)):
 
-- **Prepared ahead** (after 0.1.8). On an install or update, the background service worker
+- **Prepared ahead** (since 0.1.10). On an install or update, the background service worker
   looks in OPFS for this image's saved state (`linuxStateName` in
   [`shared.mjs`](../spindle/chrome/shared.mjs)); when there is none it asks the engine for
   `prepareLinux` (starting the engine's document), and the runner's `prepare()` has a v86
   worker make the state (a first start, below), then ends the worker and its memory unless a
   command or a warm-up came for it meanwhile. An update that kept the image starts nothing.
-- **First start.** v86 boots its kernel (after 0.1.8 `linux/bzImage`, Spindle's own build with
+- **First start.** v86 boots its kernel (since 0.1.10 `linux/bzImage`, Spindle's own build with
   the 9p root and virtio built in, straight onto the 9p root with no boot image; in 0.1.8 the
   kernel and initramfs it found in the 9p root's `/boot`) (512 MiB of memory). Once
   the agent reports `READY 0` (within 180 s), the worker saves the machine state to OPFS as
@@ -537,10 +538,10 @@ SPINDLE_WASM_LINUX=chrome/wasm-linux/dist chrome/build.sh /path/to/wasm-bindgen
 ### v86 Linux
 
 [`chrome/linux/build.sh [OUT_DIR]`](../spindle/chrome/linux/build.sh) (default `chrome/linux/dist`)
-needs curl, npm, xz (0.1.8: python3, not xz), user namespaces (`unshare -r` and, after 0.1.8, `unshare -r -m`;
+needs curl, npm, xz (0.1.8: python3, not xz), user namespaces (`unshare -r` and, since 0.1.10, `unshare -r -m`;
 Ubuntu 23.10 and later restrict them through AppArmor until
 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`), and Rust with the
-`i686-unknown-linux-musl` target. As it is after 0.1.8, it:
+`i686-unknown-linux-musl` target. As it is since 0.1.10, it:
 
 1. Fetches the v86 npm package at a pinned version, checks its SHA-256, and checks that it was
    built from the pinned v86 commit. It also fetches the SeaBIOS and VGA BIOS images and v86's
@@ -557,7 +558,7 @@ Ubuntu 23.10 and later restrict them through AppArmor until
    and [`kernel.config`](../spindle/chrome/linux/kernel.config) merged over it: the 9p root, its
    virtio transport, the network card and loop built in (the modules the old boot image loaded),
    no modules at all (the image never carried any), xz compression, no GCC plugins, no debug
-   information, and fixed build user, host and time. After 0.1.9 it also leaves out what an
+   information, and fixed build user, host and time. Since 0.1.10 it also leaves out what an
    emulated PC never has or needs: other hypervisors' guest support, disks and RAID (the root
    is 9p), USB, audit, AppArmor, tracing and debugging aids, suspend, encrypted and verity
    files, multipath TCP, the firewall, BPF programs, traffic shaping, multicast and policy
@@ -599,19 +600,19 @@ chrome/wasm-linux/build-image.sh    $W/kernel/vmlinux.wasm $W/userland $W/rust $
 
 | Script | Builds | Notes |
 | --- | --- | --- |
-| [`build-kernel.sh`](../spindle/chrome/wasm-linux/build-kernel.sh) | `vmlinux.wasm` | The `arch/wasm` Linux port at a pinned commit, plus Spindle's patches ([`kernel/`](../spindle/chrome/wasm-linux/kernel/): context tracking for `NO_HZ_FULL`, an `rcu_barrier` fix for offloaded CPUs, a netfs remote-size fix), configured with its defconfig plus [`spindle.config`](../spindle/chrome/wasm-linux/spindle.config) (9p over virtio, namespaces, System V IPC, `NO_HZ_FULL`). The build stops if the kernel drops any of these options. Needs clang, an LLD `wasm-ld` (LLVM's or rustup's) and `wasm2wat`; builds m4, bison and flex if missing. After 0.1.8, `KERNEL_LLVM=DIR` compiles the kernel with another LLVM (such as `build-toolchain.sh`'s `llvm/bin`, where the machine's clang is older than 21), host programs still with the machine's clang. |
+| [`build-kernel.sh`](../spindle/chrome/wasm-linux/build-kernel.sh) | `vmlinux.wasm` | The `arch/wasm` Linux port at a pinned commit, plus Spindle's patches ([`kernel/`](../spindle/chrome/wasm-linux/kernel/): context tracking for `NO_HZ_FULL`, an `rcu_barrier` fix for offloaded CPUs, a netfs remote-size fix), configured with its defconfig plus [`spindle.config`](../spindle/chrome/wasm-linux/spindle.config) (9p over virtio, namespaces, System V IPC, `NO_HZ_FULL`). The build stops if the kernel drops any of these options. Needs clang, an LLD `wasm-ld` (LLVM's or rustup's) and `wasm2wat`; builds m4, bison and flex if missing. Since 0.1.10, `KERNEL_LLVM=DIR` compiles the kernel with another LLVM (such as `build-toolchain.sh`'s `llvm/bin`, where the machine's clang is older than 21), host programs still with the machine's clang. |
 | [`build-toolchain.sh`](../spindle/chrome/wasm-linux/build-toolchain.sh) | clang, LLD, and a `wasm32-unknown-linux-musl` sysroot | From source at pinned commits: an LLVM with a wasm Linux target, a musl port, the kernel's userspace headers, and compiler-rt builtins. Programs are built with atomics, bulk memory and LLVM-lowered setjmp/longjmp. Fetches ninja if missing. |
 | [`build-userland.sh`](../spindle/chrome/wasm-linux/build-userland.sh) | busybox | A busybox 1.37 port for machines without an MMU, static, with hush as `sh`. |
-| [`build-rust.sh`](../spindle/chrome/wasm-linux/build-rust.sh) | Rust for `wasm32-spindle-linux-musl` | A pinned nightly from rustup, checked by its rustc commit, with `core`, `std` and `libc` patched ([`rust/patches/`](../spindle/chrome/wasm-linux/rust/patches/)) for this ABI: 32-bit `long`, asm-generic syscall numbers, spawning by `posix_spawn` only, and (after 0.1.8) file descriptors duplicated with `fcntl` and `dup2` as on Linux (std assumes no wasm32 target can, so ripgrep could not tell that input was piped to it). Adds the target spec [`rust/wasm32-spindle-linux-musl.json`](../spindle/chrome/wasm-linux/rust/wasm32-spindle-linux-musl.json), a stub libunwind (programs abort on panic), and `bin/cargo-wasm-linux`. |
+| [`build-rust.sh`](../spindle/chrome/wasm-linux/build-rust.sh) | Rust for `wasm32-spindle-linux-musl` | A pinned nightly from rustup, checked by its rustc commit, with `core`, `std` and `libc` patched ([`rust/patches/`](../spindle/chrome/wasm-linux/rust/patches/)) for this ABI: 32-bit `long`, asm-generic syscall numbers, spawning by `posix_spawn` only, and (since 0.1.10) file descriptors duplicated with `fcntl` and `dup2` as on Linux (std assumes no wasm32 target can, so ripgrep could not tell that input was piped to it). Adds the target spec [`rust/wasm32-spindle-linux-musl.json`](../spindle/chrome/wasm-linux/rust/wasm32-spindle-linux-musl.json), a stub libunwind (programs abort on panic), and `bin/cargo-wasm-linux`. |
 | [`build-python.sh`](../spindle/chrome/wasm-linux/build-python.sh) | CPython 3.14 (3.13 in 0.1.8), and `VERSION` | The version of Alpine's python3 in the v86 Linux. Cross-compiled with zlib, bzip2 and SQLite (release tarballs pinned by SHA-256), all C modules linked into one program (there is no `dlopen`), `_posixsubprocess` patched to start children with `posix_spawn` ([`python/subprocess-spawn.patch`](../spindle/chrome/wasm-linux/python/subprocess-spawn.patch)), pymalloc, no remote debugging (3.14's, which maps other processes' memory), no `ctypes`, `ssl`, `readline` or `curses`. |
-| [`build-image.sh`](../spindle/chrome/wasm-linux/build-image.sh) | `dist/`: `vmlinux.wasm.zst`, `fs.json`, `flat/`, `python-version`, `identity` | Builds [`guest/`](../spindle/chrome/wasm-linux/guest/) (`spindle-agent`, allowed up to 1 GiB of memory, and `spindle` from `chrome/linux/command`) with `cargo-wasm-linux`, and after 0.1.8 ripgrep at the version of Alpine's `ripgrep` (it refuses another; the release tarball pinned by SHA-256, its lock moved to `build-rust.sh`'s patched `libc`, its `release-lto` profile, without PCRE2, whose JIT needs `mmap`, and with [`ripgrep/no-mmap.c`](../spindle/chrome/wasm-linux/ripgrep/no-mmap.c) failing `mmap` so it reads files instead), adds `init`, `passwd`, `group`, `spindle.py` (precompiled), sets owners, modes and a fixed time, and converts the tree with v86's tools (same pinned commit as the v86 build). After 0.1.8 it installs Alpine's `python3` and `python3-pyc` (the Alpine release `chrome/linux/build.sh` pins; it refuses another) into a root of their own and takes the standard library from there, byte for byte and with its files' times (its compiled modules check them), keeping only this Python's own build description (`_sysconfigdata`, `_sysconfig_vars`, `build-details.json`) and an empty `lib-dynload`; it refuses when Alpine's python3 is not `build-python.sh`'s version. Files and kernel are compressed with zstd in that root. |
-| [`identity.sh`](../spindle/chrome/wasm-linux/identity.sh) | the identity | After 0.1.8: the SHA-256 of the image as carried (`fs.json`, `vmlinux.wasm.zst`) and the runtime (this directory's modules and v86's vendored files). `build-image.sh` writes it; `chrome/build.sh` works it out again. |
-| [`pack-image.sh`](../spindle/chrome/wasm-linux/pack-image.sh), [`fetch-image.sh`](../spindle/chrome/wasm-linux/fetch-image.sh) | a release asset, and back | After 0.1.8: `pack-image.sh DIST TAR` packs an image into one tar with no owners or times (the same image, the same tar) and prints its SHA-256; `fetch-image.sh DIR` downloads the tar [`image.json`](../spindle/chrome/wasm-linux/image.json) names, checks its SHA-256 and unpacks it for `SPINDLE_WASM_LINUX`. The `wasm Linux image` workflow (`.github/workflows/wasm-linux.yml`, run by hand) builds every stage above on GitHub's runner, checks Python on the image, publishes the tar as a prerelease asset `wasm-linux-SHA12` with an attestation, and prints the `image.json` to commit; the browser release fetches that image for both zips. |
+| [`build-image.sh`](../spindle/chrome/wasm-linux/build-image.sh) | `dist/`: `vmlinux.wasm.zst`, `fs.json`, `flat/`, `python-version`, `identity` | Builds [`guest/`](../spindle/chrome/wasm-linux/guest/) (`spindle-agent`, allowed up to 1 GiB of memory, and `spindle` from `chrome/linux/command`) with `cargo-wasm-linux`, and since 0.1.10 ripgrep at the version of Alpine's `ripgrep` (it refuses another; the release tarball pinned by SHA-256, its lock moved to `build-rust.sh`'s patched `libc`, its `release-lto` profile, without PCRE2, whose JIT needs `mmap`, and with [`ripgrep/no-mmap.c`](../spindle/chrome/wasm-linux/ripgrep/no-mmap.c) failing `mmap` so it reads files instead), adds `init`, `passwd`, `group`, `spindle.py` (precompiled), sets owners, modes and a fixed time, and converts the tree with v86's tools (same pinned commit as the v86 build). Since 0.1.10 it installs Alpine's `python3` and `python3-pyc` (the Alpine release `chrome/linux/build.sh` pins; it refuses another) into a root of their own and takes the standard library from there, byte for byte and with its files' times (its compiled modules check them), keeping only this Python's own build description (`_sysconfigdata`, `_sysconfig_vars`, `build-details.json`) and an empty `lib-dynload`; it refuses when Alpine's python3 is not `build-python.sh`'s version. Files and kernel are compressed with zstd in that root. |
+| [`identity.sh`](../spindle/chrome/wasm-linux/identity.sh) | the identity | Since 0.1.10: the SHA-256 of the image as carried (`fs.json`, `vmlinux.wasm.zst`) and the runtime (this directory's modules and v86's vendored files). `build-image.sh` writes it; `chrome/build.sh` works it out again. |
+| [`pack-image.sh`](../spindle/chrome/wasm-linux/pack-image.sh), [`fetch-image.sh`](../spindle/chrome/wasm-linux/fetch-image.sh) | a release asset, and back | Since 0.1.10: `pack-image.sh DIST TAR` packs an image into one tar with no owners or times (the same image, the same tar) and prints its SHA-256; `fetch-image.sh DIR` downloads the tar [`image.json`](../spindle/chrome/wasm-linux/image.json) names, checks its SHA-256 and unpacks it for `SPINDLE_WASM_LINUX`. The `wasm Linux image` workflow (`.github/workflows/wasm-linux.yml`, run by hand) builds every stage above on GitHub's runner, checks Python on the image, publishes the tar as a prerelease asset `wasm-linux-SHA12` with an attestation, and prints the `image.json` to commit; the browser release fetches that image for both zips. |
 
 `chrome/build.sh` copies the runtime (`console.mjs`, `devicetree.mjs`, `entropy.mjs`,
 `imports.mjs`, `machine.mjs`, `ninep.mjs`, `runner.mjs`, `task.mjs`, `user.mjs`,
-`virtio.mjs` and, after 0.1.8, `zstd.mjs`), the vendored `v86/` directory, and the image's
-index and kernel into the extension's `wasm-linux/` folder; after 0.1.8 the image's files go
+`virtio.mjs` and, since 0.1.10, `zstd.mjs`), the vendored `v86/` directory, and the image's
+index and kernel into the extension's `wasm-linux/` folder; since 0.1.10 the image's files go
 into `linux/flat/` beside the v86 Linux's (both name files by digest, so a file both have is
 carried once: all of Python's standard library), and it warns when the two Pythons'
 versions differ.
@@ -620,7 +621,7 @@ versions differ.
 offer for each binary is the pinned commit in its build script, plus, for the kernel, Spindle's
 patches in [`kernel/`](../spindle/chrome/wasm-linux/kernel/). The LLVM toolchain is Apache-2.0
 with LLVM exceptions, musl is MIT, and Python is under the PSF license (its standard library,
-after 0.1.8, being the files of Alpine's python3 package). zlib, bzip2 and SQLite
+since 0.1.10, being the files of Alpine's python3 package). zlib, bzip2 and SQLite
 (in Python) are under the Zlib license, a BSD-style license and public domain; Rust's standard
 library is MIT or Apache-2.0. [`chrome/THIRD-PARTY.md`](../spindle/chrome/THIRD-PARTY.md) lists
 everything a build carries.
@@ -646,10 +647,10 @@ but `linux_bench.mjs` run in Node alone; none needs a provider; all but `linux_r
 | --- | --- | --- |
 | [`linux_node.mjs`](../spindle/chrome/tests/linux_node.mjs) | `node --max-old-space-size=4096 --wasm-num-compilation-tasks=2 chrome/tests/linux_node.mjs [LINUX_DIST]` | The v86 Linux in Node: commands with bash, Python and Node over a 9p workspace, writes coming back, timeouts, commands side by side in their own namespaces, the workspace kept between commands, the code bridge from all three interfaces, resuming with the browser's clock, and the network: none without it; HTTP and HTTPS through the gateway from curl, Python, Node, pip and git; never a local address; a test WISP relay. The network checks need the internet. |
 | [`linux_route.mjs`](../spindle/chrome/tests/linux_route.mjs) | `node chrome/tests/linux_route.mjs` | `wasmCanRun` and `wantsV86`, including the results a saved program refused on the wasm Linux gives. |
-| [`linux_warm.mjs`](../spindle/chrome/tests/linux_warm.mjs) | `node chrome/tests/linux_warm.mjs` | Which Linux starts ahead of a command, with stand-in workers: `warm()` starts both, `warm({ v86: false })` the wasm Linux alone, nothing without a wasm Linux; v86 starts with the first command that needs it; `onRan` says which Linux ran each command; after 0.1.8, `prepare()` makes v86's state and lets the machine go, unless a command came meanwhile. |
+| [`linux_warm.mjs`](../spindle/chrome/tests/linux_warm.mjs) | `node chrome/tests/linux_warm.mjs` | Which Linux starts ahead of a command, with stand-in workers: `warm()` starts both, `warm({ v86: false })` the wasm Linux alone, nothing without a wasm Linux; v86 starts with the first command that needs it; `onRan` says which Linux ran each command; since 0.1.10, `prepare()` makes v86's state and lets the machine go, unless a command came meanwhile. |
 | [`wasm_linux_runner.mjs`](../spindle/chrome/tests/wasm_linux_runner.mjs) | `node chrome/tests/wasm_linux_runner.mjs VMLINUX_WASM USERLAND_ROOT GUEST_BIN [CPUS]` | `WasmLinux` as a runner: workspaces, exit statuses, threads side by side, Spindle calls, timeouts, Stop, isolation (no program a command saved in its workspace, `/tmp` or home runs, `/run` takes nothing, a script run through `sh` does), and a runaway loop that only a restart ends. |
-| [`wasm_linux_python.mjs`](../spindle/chrome/tests/wasm_linux_python.mjs) | `node chrome/tests/wasm_linux_python.mjs [DIST [V86_WASM]]` | Python from the built image (after 0.1.8 its files zstd-decompressed with `V86_WASM`'s decoder, default `chrome/linux/dist/v86.wasm`): the version, Alpine's compiled modules used as they are, C modules, threads, files, `subprocess` via `posix_spawn`, asyncio, Unix sockets, the `spindle` module; after 0.1.8 also ripgrep (searching what is piped to it too), and `rg -P` refused as v86's rerun expects. |
-| [`find_paths.mjs`](../spindle/chrome/tests/find_paths.mjs) | `node chrome/tests/find_paths.mjs DIR STRING...` | After 0.1.8: no file under `DIR`, a `.zst` one as it decompresses, holds any `STRING` (the release workflows give their machine's directories). Needs Node 22.15 or later. |
+| [`wasm_linux_python.mjs`](../spindle/chrome/tests/wasm_linux_python.mjs) | `node chrome/tests/wasm_linux_python.mjs [DIST [V86_WASM]]` | Python from the built image (since 0.1.10 its files zstd-decompressed with `V86_WASM`'s decoder, default `chrome/linux/dist/v86.wasm`): the version, Alpine's compiled modules used as they are, C modules, threads, files, `subprocess` via `posix_spawn`, asyncio, Unix sockets, the `spindle` module; since 0.1.10 also ripgrep (searching what is piped to it too), and `rg -P` refused as v86's rerun expects. |
+| [`find_paths.mjs`](../spindle/chrome/tests/find_paths.mjs) | `node chrome/tests/find_paths.mjs DIR STRING...` | Since 0.1.10: no file under `DIR`, a `.zst` one as it decompresses, holds any `STRING` (the release workflows give their machine's directories). Needs Node 22.15 or later. |
 | [`wasm_linux_rust.mjs`](../spindle/chrome/tests/wasm_linux_rust.mjs) | `node chrome/tests/wasm_linux_rust.mjs VMLINUX_WASM STD_CHECK LAYOUT_C LAYOUT_RUST [CPUS]` | Rust `std` on the target, and C and Rust struct layouts agreeing ([`wasm-linux/tests/`](../spindle/chrome/wasm-linux/tests/)). |
 | [`wasm_linux_shares.mjs`](../spindle/chrome/tests/wasm_linux_shares.mjs) | `node chrome/tests/wasm_linux_shares.mjs VMLINUX_WASM USERLAND_ROOT [CPUS]` | A 9p root and a second share at `/workspace`; the entropy device. |
 | [`wasm_linux_busybox.mjs`](../spindle/chrome/tests/wasm_linux_busybox.mjs) | `node chrome/tests/wasm_linux_busybox.mjs VMLINUX_WASM USERLAND_ROOT [CPUS]` | busybox `sh` from an initramfs on the console. |

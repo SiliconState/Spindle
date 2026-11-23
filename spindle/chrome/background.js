@@ -357,7 +357,7 @@ async function page(tabId, op, args = {}, control) {
     throw new Error(result.error);
   }
   // Where a part of the preview is in the tab, whose page has Spindle's bar above it.
-  if (preview && op === 'point' && result.value?.x != null) {
+  if (preview && op === 'point' && result?.value?.x != null) {
     const frame = await previewBox(tabId);
     if (!frame) throw new Error(`tab ${tabId}'s page went while it was measured: read its parts again`);
     result.value.x += frame.x;
