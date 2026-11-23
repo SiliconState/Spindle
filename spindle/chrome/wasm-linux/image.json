@@ -1,5 +1,5 @@
 {
-  "url": "https://github.com/SiliconState/Spindle/releases/download/wasm-linux-IMAGE/wasm-linux-IMAGE.tar",
-  "sha256": "set by the wasm Linux workflow's run (its summary prints this file)",
+  "url": "https://github.com/SiliconState/Spindle/releases/download/wasm-linux-27e0932d25bf/wasm-linux-27e0932d25bf.tar",
+  "sha256": "27e0932d25bf5df72a1674ed67bfb2d0434db79faf262909761273ea16523378",
   "python": "3.14.10"
 }
