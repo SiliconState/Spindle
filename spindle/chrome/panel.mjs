@@ -4138,7 +4138,10 @@ function onLinux(state) {
   if (engine) engine.linux = { state: state.state, detail: state.detail, wasm: state.wasm ?? null };
   if ($('settings-dialog').open) renderCommands();
   const thread = current ? threads.get(current) : null;
-  if (thread?.state === 'running' && ['booting', 'saving', 'resuming'].includes(state.state)) {
+  // Said while the open thread waits on a command: a Linux started for another thread, or
+  // prepared ahead after an install or update, is not this turn's.
+  const command = document.querySelector('#history .tool.running:is([data-tool="bash"], [data-tool="run_code"], [data-tool="start_job"])');
+  if (thread?.state === 'running' && command && ['booting', 'saving', 'resuming'].includes(state.state)) {
     phase(state.state === 'resuming' ? 'Resuming the Linux…' : `Starting the Linux${state.detail ? ` (${state.detail})` : ''}…`, 'busy');
   }
 }

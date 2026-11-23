@@ -550,6 +550,8 @@ async function readScrolling(tab, limit, screens, control, find = null) {
   let quiet = 0;
   let scrolled = 0;
   let last = null;
+  // Looking for lines: what scrolls by is all kept (the matches alone are answered).
+  const most = find ? 4 * 1024 * 1024 : limit;
   for (;;) {
     // Reading an already-dispatched page response can finish, but no further action
     // from this call is admitted after the switches change.
@@ -561,8 +563,6 @@ async function readScrolling(tab, limit, screens, control, find = null) {
     }), DEADLINE_MS, `tab ${tab.id}`);
     last = result;
     let added = 0;
-    // Looking for lines: what scrolls by is all kept (the matches alone are answered).
-    const most = find ? 4 * 1024 * 1024 : limit;
     for (const line of result.text.split('\n')) {
       const key = line.trim();
       if (!key || seen.has(key) || chars >= most) continue;
@@ -679,8 +679,12 @@ async function pictured(tabId, view, full, wide, control) {
         box = await previewBox(tabId);
       }
       if (!box) throw new Error(`tab ${tabId}'s page went while it was pictured: try again`);
+      if (wide || full) await redrawn(tabId, box, control);
       clip = { x: box.x, y: box.y, width: box.width, height: Math.min(box.height, TALLEST), scale: 1 };
-    } else if (full) {
+    } else if (wide) {
+      await redrawn(tabId, null, control);
+    }
+    if (!view && full) {
       const { cssContentSize: size } = await cdp(tabId, 'Page.getLayoutMetrics', {}, control);
       cut = size.height > TALLEST;
       clip = { x: 0, y: 0, width: size.width, height: Math.min(size.height, TALLEST), scale: 1 };
@@ -692,6 +696,34 @@ async function pictured(tabId, view, full, wide, control) {
     if (wide || (view && full)) await chrome.debugger.sendCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride').catch(() => {});
   }
 }
+
+/** Waits, after tab `tabId` was laid out at another size, until it is drawn at that size:
+ * a frame in a process of its own (a workspace page's, `box`) learns its new size a moment
+ * later, and until it draws again a picture repeats its old picture across the new size
+ * (seen in Edge: a page tiled four times). Its size is watched from here, then two of its
+ * frames and two of the tab's are waited for; a tab not showing draws no frames, so a
+ * hidden page is given a moment instead (a web page's own frames, which it could hold
+ * back, at most 1 s each). */
+async function redrawn(tabId, box, control) {
+  const frames = 'Promise.race([new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))), new Promise((done) => setTimeout(done, 1000))])';
+  if (box) {
+    let shown;
+    for (const until = Date.now() + 5_000; ; await pause(50)) {
+      shown = await inPreview(tabId, () => [innerWidth, innerHeight, document.visibilityState], [], control);
+      if ((Math.abs(shown[0] - box.width) <= 1 && Math.abs(shown[1] - box.height) <= 1) || Date.now() > until) break;
+    }
+    if (shown[2] !== 'visible') return pause(HIDDEN_REDRAW_MS);
+    await inPreview(tabId, () => Promise.race([
+      new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))),
+      new Promise((done) => setTimeout(done, 1000)),
+    ]), [], control);
+  }
+  await deadline(cdp(tabId, 'Runtime.evaluate', { expression: frames, awaitPromise: true }, control), 2000, `tab ${tabId}`).catch(() => {});
+}
+
+/** How long a page in a tab not showing is given to take a new size before it is
+ * pictured (it draws no frames to wait for; 400 ms was enough in tests). */
+const HIDDEN_REDRAW_MS = 800;
 
 // ---- Acting ------------------------------------------------------------------------
 

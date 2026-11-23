@@ -615,14 +615,24 @@ from. They land in the parent's workspace as the call's new root, so rewinding t
 parent past the call undoes them. Before recording,
 [`refuse_conflicts`](../spindle/store/src/task_tool.rs) compares each task's changes
 with what has changed in the parent since the base, including earlier tasks of the same
-step. If any path overlaps, none of the task's changes are adopted, the answer gains
-`[task file conflict: ...]`, and it is marked failed.
+step. Where paths overlap, since 0.1.10
+[`settle_conflicts`](../spindle/store/src/task_tool.rs) settles each one: a text file
+(up to 1 MiB) both changed on separate lines, or both only added lines to its end,
+is merged by lines (the parent's added lines first), and the answer gains
+`[task files merged with what the session changed in them since the task began: ...]`;
+a file both made the same is left alone. Any other overlap keeps the parent's version, and a file the task wrote over one the
+parent has is kept beside it as `NAME.task-XXXXXXXX.EXT` (named by its bytes'
+SHA-256), so nothing the task made is lost. The answer then gains
+`[task file conflict, changed here too since the task began: ...]`, naming what was
+kept and where, and is marked failed; the task's other changes are adopted. (Before
+0.1.10, any overlap discarded all of the task's changes.)
 
 A background task's call is answered at once, saying the task started and will
 report as a queued update. On a finished task's report, both hosts offer its changes
-against its original base and commit mergeable files with that report. A stopped task,
-`files: "discard"`, overlapping parent changes, or more than 64 MiB / 8192 changed paths
-leaves the files in the child, with the reason in the report. The driver waits for the
+against its original base and commit them with that report, overlaps settled as above
+(since 0.1.10; before, overlapping parent changes left all of them in the child). A
+stopped task, `files: "discard"`, or more than 64 MiB / 8192 changed paths leaves the
+files in the child, with the reason in the report. The driver waits for the
 host's explicit file offer (even an empty offer) before consuming a finished report,
 so a task finishing between two host polls cannot lose its files.
 When it ends, its retained answer, or a stopped report with the reason when it

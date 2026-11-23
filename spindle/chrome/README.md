@@ -40,8 +40,8 @@ your key.
   tag until a new release exists. The source/GitHub edition retains ChatGPT (Codex)
   alongside OpenAI's Sign in with ChatGPT; the store edition leaves the Codex client out.
 - **bash, in a Linux inside Chrome:** threads run commands in Alpine Linux (bash,
-  coreutils, Python 3 with pip, Node with npm, git, curl, jq, ripgrep, the time zones)
-  emulated by v86 in the extension, sealed off from your computer and from Spindle's keys. Commands run as
+  coreutils, Python 3 with pip and Pillow, Node with npm, git, curl, jq, ripgrep, the time
+  zones) emulated by v86 in the extension, sealed off from your computer and from Spindle's keys. Commands run as
   an unprivileged user, each in namespaces of its own: a fresh /tmp and home each time
   (only the workspace is kept), its own processes (whatever a command leaves running
   ends with it) and, for a thread without network, a network of its own with nothing

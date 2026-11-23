@@ -107,6 +107,9 @@ assert.equal(vm.fs9p.SearchPath('/runs/a/in.txt').id, -1, 'a delete comes back')
 // The time zones, read by Python's zoneinfo and by `TZ=... date`.
 const zones = await run(vm, listeners, 'runs/a', `python3 -c "import datetime, zoneinfo; z = zoneinfo.ZoneInfo('America/New_York'); print(*(datetime.datetime.fromtimestamp(t, z).strftime('%z %Z') for t in (1783000000, 1795000000)))" && TZ=America/New_York date -d @1795000000 '+%z %Z'`);
 assert.deepEqual(zones.output.split('\n'), ['-0400 EDT -0500 EST', '-0500 EST'], zones.output);
+// Pillow (Alpine's py3-pillow): a picture made, saved as PNG and JPEG, and read back.
+const pillow = await run(vm, listeners, 'runs/a', `python3 -c "from PIL import Image; Image.new('RGB', (40, 30), 'red').save('p.png'); Image.open('p.png').save('p.jpg'); print(Image.open('p.jpg').size)" && rm p.png p.jpg`);
+assert.equal(pillow.output, '(40, 30)', pillow.output);
 times.quick = (await run(vm, listeners, 'runs/a', 'true')).ms;
 times.python3 = (await run(vm, listeners, 'runs/a', 'python3 -c pass')).ms;
 times.node = (await run(vm, listeners, 'runs/a', 'node -e 0')).ms;
@@ -158,6 +161,18 @@ assert.deepEqual(bridged.output.split('\n'), [
 ].flat());
 assert.deepEqual(asked.map((request) => [request.method, request.id ?? null]),
   [['limits', null], ['model', 0], ['tool', 1], ['search', null], ['batch', 2]], 'children numbered in order; a batch takes one per call');
+
+// `spindle model --help` says how, an option it does not take is refused, and neither
+// asks a model (each would have been a prompt, and paid for).
+const helped = await run(vm, listeners, 'runs/a', 'spindle model --help | head -1; spindle model --temperature 0 hi; echo "exit $?"; spindle model; echo "exit $?"', 60, (request) => {
+  asked.push(request);
+  return { ok: true, data: { text: 'asked' } };
+});
+assert.deepEqual(helped.output.split('\n'), [
+  "spindle: Spindle's calls from bash (and any program), journaled by Spindle.", 'spindle: model takes no --temperature (spindle --help lists what it takes; after --, a prompt may start with --)', 'exit 1',
+  'spindle: model needs a PROMPT (- reads it from standard input)', 'exit 1',
+], helped.output);
+assert.equal(asked.length, 5, 'no call for help or a refused option');
 
 // TypeScript runs (Node strips the types) and imports the module as ESM; `spindle http`
 // prints a site's body (JSON pretty) and fails on HTTP 400 and up.

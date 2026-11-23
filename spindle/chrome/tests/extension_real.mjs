@@ -1424,7 +1424,7 @@ try {
   // the user; a file its command makes is in the one workspace card (marked), which sits
   // just above the turn's final answer.
   step = 'files in the conversation';
-  const report = `<!doctype html><title>Report</title><style>h1{color:#3f5b2f}</style><h1>Report</h1><button onclick="this.textContent='Pressed'">Press me</button><input aria-label="Name"><script>console.warn('spindle-test warning'); window.missingFunction();</script><script src="https://cdn.example.invalid/chart.js"></script><script>document.body.insertAdjacentHTML('beforeend', '<p>Drawn by its script</p>'); console.log('spindle-test ran'); fetch('http://127.0.0.1:${port}/rendered?word=leak').then(() => console.log('spindle-test reached'), () => console.log('spindle-test closed'))</script>`;
+  const report = `<!doctype html><title>Report</title><style>h1{color:#3f5b2f}</style><h1>Report</h1><button onclick="this.textContent='Pressed'">Press me</button><input aria-label="Name"><div style="height:1400px"></div><div style="height:240px;background:#c0392b"></div><script>console.warn('spindle-test warning'); window.missingFunction();</script><script src="https://cdn.example.invalid/chart.js"></script><script>document.body.insertAdjacentHTML('beforeend', '<p>Drawn by its script</p>'); console.log('spindle-test ran'); fetch('http://127.0.0.1:${port}/rendered?word=leak').then(() => console.log('spindle-test reached'), () => console.log('spindle-test closed'))</script>`;
   const notesCommand = "printf '# Notes\\n\\n- first point\\n' > notes.md";
   // The page opened in Spindle's tab is read as it shows, acted on and pictured whole at
   // a phone's width, as a web page would be (its tab's id from navigate's answer); the
@@ -1482,6 +1482,18 @@ PY`;
   const workspaceListed = await panel.until(`(() => { const text = document.querySelector('#history .workspace-card summary')?.textContent ?? ''; return /\\d+ files?/.test(text) && text; })()`, { what: 'the workspace card' }).catch((error) => error.message);
   // What the page tools told the model of the page in Spindle's tab.
   const told = scripted.seen.map((seen) => seen.body).findLast((body) => /picture \d+ by \d+/.test(body)) ?? '';
+  // The picture as the panel shows it: the page is taller than this window, so its red
+  // end band is at its foot only if the page was drawn whole (Edge once tiled the part in
+  // view down the picture instead).
+  const pictureColours = await panel.until(`(async () => {
+    const shot = [...document.querySelectorAll('#history .tool[data-tool="screenshot"] img.shot')].at(-1);
+    if (!shot?.naturalHeight) return null;
+    const canvas = new OffscreenCanvas(shot.naturalWidth, shot.naturalHeight);
+    const draw = canvas.getContext('2d');
+    draw.drawImage(shot, 0, 0);
+    const at = (y) => Array.from(draw.getImageData(Math.floor(shot.naturalWidth / 2), y, 1, 1).data.slice(0, 3));
+    return { top: at(10), foot: at(shot.naturalHeight - 60), height: shot.naturalHeight };
+  })()`, { timeout: 15_000, what: 'the picture in its card' }).catch((error) => ({ error: error.message }));
   const tabsAfter = await reportTabs();
   for (const tab of tabsAfter) await browser.send('Target.closeTarget', { targetId: tab.targetId }).catch(() => {});
   const saved = fs.readFileSync(await downloadBy(panel, '#history .file-card[data-path="report.html"] button[title="Download report.html"]', /^report\.html$/)).toString();
@@ -1504,7 +1516,9 @@ PY`;
     assert.match(told, /Saved screenshots\/\S+\.jpg: tab \d+, report\.html from the workspace, the whole page, 390 pixels wide/, 'the page pictured whole at a set width');
     const [, wide, tall] = /picture (\d+) by (\d+)/.exec(told) ?? [];
     assert.equal(Number(wide), 390, `the picture is 390 pixels wide: ${told.match(/picture \d+ by \d+/)}`);
-    assert.ok(Number(tall) >= 200, `and as tall as the page: ${tall}`);
+    assert.ok(Number(tall) >= 1700, `and as tall as the page: ${tall}`);
+    const red = ([r, g, b] = []) => r > 150 && g < 110 && b < 110;
+    assert.ok(red(pictureColours.foot) && !red(pictureColours.top), `the whole page drawn, its red end at its foot: ${JSON.stringify(pictureColours)}`);
     assert.equal(notesListed, true, `the command's notes.md is in the workspace card: ${notesListed}`);
     assert.equal(commandLists, 0, 'no separate list of what the commands made');
     assert.equal(cardAboveAnswer, true, 'the workspace card is just above the final answer');
@@ -1691,7 +1705,7 @@ PY`;
   await panel.click('#standing-form button.primary');
   await panel.until(`spindlePanel.engine.standing === ${JSON.stringify(standing)}`, { what: 'the instructions to be kept' });
   await panel.click('#settings-dialog [data-close]');
-  const browsePrompt = 'On the page I am looking at, use your page tools: read its parts with page_elements, type violet into the Search field and click Go, click Delete and accept the confirmation it asks for, take a screenshot, read its HTML with page_html, start watching the network, reload the page with navigate, read the network log filtered by ping, then navigate to the address the Second page link goes to. Reply with only the status code of the ping request.';
+  const browsePrompt = 'On the page I am looking at, use your page tools: read its parts with page_elements, type violet into the Search field and click Go, click Delete and accept the confirmation it asks for, take a screenshot, read its HTML with page_html, read its text while scrolling down two screens with read_page, start watching the network, reload the page with navigate, read the network log filtered by ping, then navigate to the address the Second page link goes to. Reply with only the status code of the ping request.';
   const refsKnown = {};
   if (options.scripted) {
     const next = { after: new Promise((done) => { refsKnown.release = done; }) };
@@ -1707,7 +1721,7 @@ PY`;
     const remove = /button "Delete"[^\n]*\[([a-z]{3}\d+)\]/.exec(parts)?.[1];
     refsKnown.next.then = call('type', { ref: field ?? 'e0', text: 'violet' });
     scripted.replies.push(call('click', { ref: go ?? 'e0' }), call('click', { ref: remove ?? 'e0' }), call('dialog', { accept: true }),
-      call('screenshot', {}), call('page_html', {}),
+      call('screenshot', {}), call('page_html', {}), call('read_page', { scroll: 2 }),
       call('network', { action: 'start' }), call('navigate', { action: 'reload' }), call('network', { action: 'read', filter: 'ping' }),
       call('network', { action: 'read', filter: 'ping', body: 'last' }),
       call('navigate', { url: `http://127.0.0.1:${port}/second.html` }), text('200'));
@@ -1728,10 +1742,12 @@ PY`;
   await panel.screenshot(join(shots, '03e-browsing.png'));
   check('a thread browses (reads the parts of a page, types and clicks there, answers its dialog, pictures it, reads its HTML, watches its network, navigates), keeping to the standing instructions', () => {
     assert.equal(browsed, 'idle', `state ${browsed}`);
-    for (const name of ['page_elements', 'type', 'click', 'dialog', 'screenshot', 'navigate', 'network']) {
+    for (const name of ['page_elements', 'type', 'click', 'dialog', 'screenshot', 'read_page', 'navigate', 'network']) {
       assert.ok(cards[name] && !cards[name].failed, `${name}: ${JSON.stringify(cards[name])}`);
     }
     assert.match(cards.page_elements.text, /textbox "Search"[\s\S]*button "Go"[\s\S]*link "Second page"/);
+    // Read while scrolling, to its end (0.1.8 to 0.1.10 failed there: "most is not defined").
+    assert.match(cards.read_page.text, /^Read while scrolling down \((scrolled \d screens?|the page stopped bringing new text)/m, cards.read_page.text);
     assert.ok(pageClicks.includes('violet'), `the page's Go button searched for: ${JSON.stringify(pageClicks)}`);
     assert.ok(pageClicks.includes('confirmed'), `the confirmation was accepted: ${JSON.stringify(pageClicks)}`);
     assert.ok(browseFiles.some((name) => /^screenshots\/.+\.jpg$/.test(name)), `files: ${browseFiles}`);

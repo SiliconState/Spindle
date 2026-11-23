@@ -126,6 +126,17 @@ fn model(mut rest: &[String]) -> Result<()> {
             "--max-tokens" => "max_tokens",
             "--effort" => "effort",
             "--image" => "images",
+            // Asked how, not a prompt (a model would be asked, and paid, otherwise).
+            "-h" | "--help" => return put(format!("{USAGE}\n").as_bytes()),
+            "--" => {
+                rest = &rest[1..];
+                break;
+            }
+            other if other.starts_with("--") => {
+                return Err(Failure::Said(format!(
+                    "spindle: model takes no {other} (spindle --help lists what it takes; after --, a prompt may start with --)"
+                )));
+            }
             _ => break,
         };
         let Some(value) = rest.get(1) else {
@@ -156,6 +167,11 @@ fn model(mut rest: &[String]) -> Result<()> {
     } else {
         rest.join(" ")
     };
+    if prompt.trim().is_empty() && images.is_empty() {
+        return Err(Failure::Said(
+            "spindle: model needs a PROMPT (- reads it from standard input)".into(),
+        ));
+    }
     let mut input = Map::new();
     input.insert("prompt".into(), json!(prompt));
     input.extend(options);

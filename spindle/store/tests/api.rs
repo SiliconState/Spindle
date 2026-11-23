@@ -142,6 +142,26 @@ fn answer(mut stream: TcpStream) {
         );
         return;
     }
+    // A notes file both sides change: a task adds a line at its end, a while later; the
+    // session edits its first line meanwhile.
+    for (word, command) in [
+        ("NOTESCHILD", "sleep 2; echo task-line >> notes.md"),
+        ("NOTESEDIT", "sed -i 's/^one$/ONE/' notes.md"),
+    ] {
+        if prompt.contains(word) && last["role"] != "tool" {
+            let out = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                chunk(call(command), Value::Null),
+                chunk(json!({}), json!("tool_calls"))
+            );
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                out.len()
+            );
+            return;
+        }
+    }
     if last["role"] == "user" && last["content"].to_string().contains("[task ") {
         let reply = chunk_text(&request, "Background answer received.");
         let _ = write!(
@@ -1592,14 +1612,32 @@ fn parallel_tasks_share_the_base_merge_in_order_and_refuse_conflicts() {
         assert!(result.get("error").is_none(), "{result}");
         let files = api.ok("files", json!({"dir":dir}));
         if conflict {
+            // Both made shared.txt: the first task's stands, the second's is kept beside
+            // it, and the second's other changes are adopted.
             let read = api.ok("read", json!({"dir":dir,"path":"shared.txt"}));
             assert_eq!(read["content"], "one\n");
+            let history = api.ok("history", json!({"dir":dir})).to_string();
+            assert!(history.contains("task file conflict"), "{history}");
             assert!(
-                api.ok("history", json!({"dir":dir}))
-                    .to_string()
-                    .contains("task file conflict")
+                history.contains("the task's other changes were adopted"),
+                "{history}"
             );
-            assert!(!files.to_string().contains("empty-two"));
+            assert!(files.to_string().contains("empty-two"), "{files}");
+            let side = files["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find_map(|file| {
+                    file["path"]
+                        .as_str()
+                        .filter(|path| path.starts_with("shared.task-") && path.ends_with(".txt"))
+                })
+                .unwrap_or_else(|| panic!("the second task's shared.txt beside it: {files}"))
+                .to_string();
+            assert_eq!(
+                api.ok("read", json!({"dir":dir,"path":side}))["content"],
+                "two\n"
+            );
         } else {
             assert!(
                 files.to_string().contains("one.txt") && files.to_string().contains("two.txt"),
@@ -1612,6 +1650,38 @@ fn parallel_tasks_share_the_base_merge_in_order_and_refuse_conflicts() {
             );
         }
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_background_task_and_the_session_changing_one_notes_file_merge() {
+    let port = fake_provider();
+    let root = scratch("notes-merge");
+    let dir = root.join("work");
+    let mut api = Api::start(&root, port);
+    api.ok(
+        "create",
+        json!({"dir":dir,"provider":"local","files":[{"path":"notes.md","text":"one\ntwo\n"}]}),
+    );
+    api.ok("prompt", json!({"dir":dir,"text":"first"}));
+    api.ok(
+        "task_start",
+        json!({"dir":dir,"task":"notes","prompt":"NOTESCHILD","report":"queue"}),
+    );
+    // The session edits the first line while the task adds one at the end.
+    api.ok("prompt", json!({"dir":dir,"text":"NOTESEDIT"}));
+    let waited = api.ok(
+        "task_wait",
+        json!({"dir":dir,"task":"notes","timeout_s":30}),
+    );
+    assert_eq!(waited["state"], "finished", "{waited}");
+    api.ok("continue", json!({"dir":dir}));
+    let history = api.ok("history", json!({"dir":dir})).to_string();
+    assert!(history.contains("[task files merged with what the session changed in them since the task began: notes.md]"), "{history}");
+    assert_eq!(
+        api.ok("read", json!({"dir":dir,"path":"notes.md"}))["content"],
+        "ONE\ntwo\ntask-line\n"
+    );
 }
 
 #[test]

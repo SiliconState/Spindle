@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Builds the Linux that Spindle for Browser runs bash in: Alpine (32-bit x86) with bash,
-# coreutils, Python and pip, Node and npm, git and curl, the time zones, booted by v86 (an
-# x86 emulator in wasm) over its 9p filesystem, with Spindle's runner agent and web proxy
-# as its only services (guest/), its `spindle` command and `spindle-sandbox` (which puts
-# each command in namespaces of its own), static Rust programs (command/) built for the
-# image with Rust's i686-unknown-linux-musl target. The kernel is built here: Alpine's virt
+# coreutils, Python with pip and Pillow, Node and npm, git and curl, the time zones,
+# booted by v86 (an x86 emulator in wasm) over its 9p filesystem, with Spindle's runner
+# agent and web proxy as its only services (guest/), its `spindle` command and
+# `spindle-sandbox` (which puts each command in namespaces of its own), static Rust
+# programs (command/) built for the image with Rust's i686-unknown-linux-musl target.
+# The kernel is built here: Alpine's virt
 # configuration with kernel.config's changes (no modules, no boot image: v86 boots it
 # straight onto the 9p root), compressed with xz. The image's files are compressed with
 # zstd (v86 reads them so). Nothing needs root: Alpine's static apk installs as a normal
@@ -37,7 +38,9 @@ V86_FILES="bios/seabios.bin:73e3f359102e3a9982c35fce98eb7cd08f18303ac7f1ba6ebfbe
 bios/vgabios.bin:a4bc0d80cc3ca028c73dafa8fee396b8d054ce87ebd8abfbd31b06b437607880
 tools/fs2json.py:546b0ce7d0b172fa855587209318a8d473bce6de23fa327ceeb5b6c115fda23f
 tools/copy-to-sha256.py:7bfb94736afbb9753b6deea922184eec2f9b205be0214bc5f9866cf990bfa77c"
-PACKAGES="bash coreutils findutils grep sed gawk diffutils patch tar gzip xz python3 py3-pip nodejs npm git curl openssl jq ripgrep file less tzdata"
+# Pillow (py3-pillow): threads that look at pictures (their own screenshots too) asked
+# for it most of all, and pip cannot build it here (no compiler, no 32-bit musl wheel).
+PACKAGES="bash coreutils findutils grep sed gawk diffutils patch tar gzip xz python3 py3-pip py3-pillow nodejs npm git curl openssl jq ripgrep file less tzdata"
 KERNEL=6.18.64
 KERNEL_SHA256=020d45510c539972e6f14c5c71566878d3b7ef56fb082b3e09134f2ebaade562
 # Alpine's configuration for its virt kernel (main/linux-lts/virt.x86.config) at an aports
@@ -99,7 +102,8 @@ tools=$work/tools
 echo "Linux $KERNEL (Alpine's virt configuration, aports ${APORTS_COMMIT:0:10}, with kernel.config)"
 fetch "https://cdn.kernel.org/pub/linux/kernel/v${KERNEL%%.*}.x/linux-$KERNEL.tar.xz" "$work/linux.tar.xz"
 check "$work/linux.tar.xz" "$KERNEL_SHA256"
-fetch "https://gitlab.alpinelinux.org/alpine/aports/-/raw/$APORTS_COMMIT/main/linux-lts/virt.x86.config" "$work/virt.x86.config"
+# From aports' GitHub mirror, Alpine's own (its GitLab turns CI runners away with 418).
+fetch "https://raw.githubusercontent.com/alpinelinux/aports/$APORTS_COMMIT/main/linux-lts/virt.x86.config" "$work/virt.x86.config"
 check "$work/virt.x86.config" "$KERNEL_CONFIG_SHA256"
 mkdir -p "$tools/build"
 tar xJf "$work/linux.tar.xz" -C "$tools/build"

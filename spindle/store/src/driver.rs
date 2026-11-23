@@ -1418,13 +1418,14 @@ impl Step<'_> {
             && run.state == "finished"
             && !matches!(&offered, Ok(changes) if changes.is_empty())
         {
-            let staged = match offered {
+            let (staged, note) = match offered {
                 Ok(changes) => self.task_files_root(&run, changes)?,
-                Err(note) => Err(note),
+                Err(note) => (None, Some(note)),
             };
-            match staged {
-                Ok(staged) => root = Some(staged),
-                Err(note) => {
+            root = staged;
+            match note {
+                None => {}
+                Some(note) => {
                     if !retained_report {
                         self.store
                             .amend_task_answer(&run.task, &note)
@@ -1463,33 +1464,53 @@ impl Step<'_> {
     }
 
     /// The root of the head's tree with a finished task's `changes` staged over it, for
-    /// its report to commit; or why they are not merged (a note for the task's answer).
+    /// its report to commit (none when nothing is staged), and a note for the task's
+    /// answer: what merged or stayed the session's where both changed a path
+    /// (`task_tool::settle_conflicts`), or why nothing merged.
     fn task_files_root(
         &mut self,
         run: &crate::meta::TaskRun,
         changes: crate::broker::Changes,
-    ) -> Result<std::result::Result<String, String>> {
+    ) -> Result<(Option<String>, Option<String>)> {
+        // (An empty why: nothing was left to stage, the note says what became of it.)
+        Ok(match self.task_files_staged(run, changes)? {
+            (Ok(root), note) => (Some(root), note),
+            (Err(why), None) => (None, Some(why)),
+            (Err(why), Some(note)) if why.is_empty() => (None, Some(note)),
+            (Err(why), Some(note)) => (None, Some(format!("{note}\n{why}"))),
+        })
+    }
+
+    fn task_files_staged(
+        &mut self,
+        run: &crate::meta::TaskRun,
+        mut changes: crate::broker::Changes,
+    ) -> Result<(std::result::Result<String, String>, Option<String>)> {
         let (bytes, count) = (changes.bytes(), changes.count());
         if bytes > MAX_TASK_MERGE_BYTES || count > MAX_TASK_MERGE_PATHS {
-            return Ok(Err(format!(
-                "[task files not merged: {count} paths, {} MiB, over the merge limit ({} paths, {} MiB); they stay in the task's own session]",
-                bytes / (1024 * 1024),
-                MAX_TASK_MERGE_PATHS,
-                MAX_TASK_MERGE_BYTES / (1024 * 1024)
-            )));
+            return Ok((
+                Err(format!(
+                    "[task files not merged: {count} paths, {} MiB, over the merge limit ({} paths, {} MiB); they stay in the task's own session]",
+                    bytes / (1024 * 1024),
+                    MAX_TASK_MERGE_PATHS,
+                    MAX_TASK_MERGE_BYTES / (1024 * 1024)
+                )),
+                None,
+            ));
         }
         let (_, head_root) = self.store.head_root().map_err(store_error)?;
         let Some(head_root) = head_root else {
-            return Ok(Err(
-                "[task files not merged: the session has no workspace]".into()
+            return Ok((
+                Err("[task files not merged: the session has no workspace]".into()),
+                None,
             ));
         };
         // The tree the task began from (its row's base): one no longer kept leaves the
         // files in the task, said; the report still goes.
         let Ok(base) = self.store.tree_map(SCOPE, &run.base) else {
-            return Ok(Err(
-                "[task files not merged: the files the task began from are no longer kept here]"
-                    .into(),
+            return Ok((
+                Err("[task files not merged: the files the task began from are no longer kept here]".into()),
+                None,
             ));
         };
         let head = self
@@ -1497,17 +1518,60 @@ impl Step<'_> {
             .tree_map(SCOPE, &head_root)
             .map_err(store_error)?;
         let conflicts = task_conflicts(&base, &head, &changes);
+        let mut note = None;
         if !conflicts.is_empty() {
-            return Ok(Err(format!(
-                "[task file conflict: {}; none of this task's changes were adopted]",
-                conflicts.join(", ")
-            )));
+            let file = |tree: &Tree, path: &str| {
+                tree.files
+                    .iter()
+                    .find(|entry| entry.path == path)
+                    .map(|entry| (entry.object.clone(), entry.executable))
+            };
+            let taken: std::collections::HashSet<&str> = head
+                .files
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .chain(head.links.iter().map(|link| link.path.as_str()))
+                .chain(head.directories.iter().map(String::as_str))
+                .collect();
+            let store = &mut *self.store;
+            let crate::broker::Changes {
+                writes,
+                deletes,
+                links,
+                directories,
+            } = &mut changes;
+            let settled = task_tool::settle_conflicts(
+                &conflicts,
+                writes,
+                deletes,
+                links,
+                directories,
+                |path| {
+                    let Some((now, now_x)) = file(&head, path) else {
+                        return Ok(None);
+                    };
+                    let then = match file(&base, path) {
+                        Some((then, then_x)) => Some((store.read_object(SCOPE, &then)?, then_x)),
+                        None => None,
+                    };
+                    Ok(Some((then, (store.read_object(SCOPE, &now)?, now_x))))
+                },
+                |path| taken.contains(path),
+            )
+            .map_err(store_error)?;
+            note = Some(settled.note);
+            if changes.is_empty() {
+                return Ok((Err(String::new()), note));
+            }
         }
         if !self.store.make_app_room().map_err(store_error)? {
-            return Ok(Err(format!(
-                "[task files not merged: {}]",
-                crate::broker::STORE_FULL
-            )));
+            return Ok((
+                Err(format!(
+                    "[task files not merged: {}]",
+                    crate::broker::STORE_FULL
+                )),
+                note,
+            ));
         }
         // The stage is named by a digest of the task's key (a key is any text an app
         // chose; a stage's label is bounded ASCII).
@@ -1524,18 +1588,23 @@ impl Step<'_> {
             Ok(()) => {}
             // No room for a stage: the files stay in the task, the report goes.
             Err(Error::Exhausted) => {
-                return Ok(Err(format!(
-                    "[task files not merged: {}]",
-                    crate::broker::STORE_FULL
-                )));
+                return Ok((
+                    Err(format!(
+                        "[task files not merged: {}]",
+                        crate::broker::STORE_FULL
+                    )),
+                    note,
+                ));
             }
             Err(error) => return Err(store_error(error)),
         }
-        Ok(self
-            .store
-            .stage_task_changes(&stage, &head_root, changes)
-            .map_err(store_error)?
-            .map_err(|why| format!("[task files not merged: {why}]")))
+        Ok((
+            self.store
+                .stage_task_changes(&stage, &head_root, changes)
+                .map_err(store_error)?
+                .map_err(|why| format!("[task files not merged: {why}]")),
+            note,
+        ))
     }
 
     /// The command a task's next report goes as: a task started again after it reported

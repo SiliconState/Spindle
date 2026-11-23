@@ -45,16 +45,20 @@ deps=$build/deps
 root=$out/root
 mkdir -p "$src" "$build" "$deps/include" "$deps/lib"
 
+# fetch URL SHA256 [MIRROR]: the mirror when the first address refuses (the same file,
+# checked by its sha256 all the same).
 fetch() {
-    local url=$1 file=$src/$(basename "$1") sha=$2
-    [ -f "$file" ] || curl -fsSL --retry 3 -o "$file" "$url"
+    local url=$1 file=$src/$(basename "$1") sha=$2 mirror=${3:-}
+    [ -f "$file" ] || curl -fsSL --retry 3 -o "$file" "$url" || { [ -n "$mirror" ] && curl -fsSL --retry 3 -o "$file" "$mirror"; }
     echo "$sha  $file" | sha256sum -c --quiet -
 }
 unpack() { rm -rf "$build/$2" && mkdir -p "$build/$2" && tar xf "$src/$1" -C "$build/$2" --strip-components=1; }
 
 fetch "https://www.python.org/ftp/python/$PYTHON/Python-$PYTHON.tar.xz" "$PYTHON_SHA256"
-fetch "https://zlib.net/zlib-$ZLIB.tar.gz" "$ZLIB_SHA256"
-fetch "https://sourceware.org/pub/bzip2/bzip2-$BZIP2.tar.gz" "$BZIP2_SHA256"
+# zlib.net keeps only its newest release where the others were; its author's GitHub
+# releases keep every one. Sourceware's files are mirrored by kernel.org.
+fetch "https://github.com/madler/zlib/releases/download/v$ZLIB/zlib-$ZLIB.tar.gz" "$ZLIB_SHA256"
+fetch "https://sourceware.org/pub/bzip2/bzip2-$BZIP2.tar.gz" "$BZIP2_SHA256" "https://mirrors.kernel.org/sourceware/bzip2/bzip2-$BZIP2.tar.gz"
 fetch "https://www.sqlite.org/$SQLITE_YEAR/sqlite-autoconf-$SQLITE.tar.gz" "$SQLITE_SHA256"
 
 echo "zlib $ZLIB"
