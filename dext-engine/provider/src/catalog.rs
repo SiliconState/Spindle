@@ -370,6 +370,11 @@ pub fn canonical_provider_id(raw: &str) -> String {
 
 pub(crate) const RETIRED_BUNDLED_PROVIDER_IDS: &[&str] = &["openrouter", "ollama"];
 
+/// The price `builtin_model_pricing` gives a GLM model Z.ai publishes none for.
+fn glm_generic_pricing() -> ModelPricing {
+    model_pricing(1.0, 5.0, 0.1, 1.25)
+}
+
 pub(crate) fn model_pricing(
     input: f64,
     output: f64,
@@ -549,6 +554,22 @@ pub fn is_glm_5_3_model(model: &str) -> bool {
     )
 }
 
+pub fn is_glm_5_4_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().trim_end_matches("[1m]") == "glm-5.4"
+}
+
+/// GLM models Z.ai serves under their own names only: a `[1m]` context hint in the name
+/// is refused as an unknown model (code 1211), so the catalog maps each hinted name to
+/// its model (whose 1M window the catalog declares).
+const GLM_CONTEXT_HINTS: [&str; 6] = [
+    "glm-5.4",
+    "glm-5.3",
+    "glm-5.3-flash",
+    "glm-5.3-flashx",
+    "glm-5.3-flashx-legal",
+    "glm-5.2",
+];
+
 pub(crate) fn canonical_deepseek_model(model: &str) -> Option<&'static str> {
     match model.trim().to_ascii_lowercase().as_str() {
         "deepseek-chat"
@@ -574,6 +595,9 @@ pub(crate) fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<Mo
     let model = model.to_ascii_lowercase();
     match canonical_provider_id(provider_id).as_str() {
         "local" | "kimi" => Some(model_pricing(0.0, 0.0, 0.0, 0.0)),
+        // GLM-5.4 is served on GLM Coding Plans only so far: Z.ai has published no API
+        // price for it, so none is guessed.
+        "glm" if is_glm_5_4_model(&model) => None,
         "glm" if model.trim_end_matches("[1m]") == "glm-5.3-flash" => {
             Some(model_pricing(0.15, 0.5, 0.03, 0.0))
         }
@@ -588,7 +612,17 @@ pub(crate) fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<Mo
         {
             Some(model_pricing(0.37, 1.25, 0.075, 0.0))
         }
-        "glm" => Some(model_pricing(1.0, 5.0, 0.1, 1.25)),
+        // Z.ai's published rates (docs.z.ai pricing, 2026-11-23; cached-input storage free).
+        "glm" if matches!(model.trim_end_matches("[1m]"), "glm-5.2" | "glm-5.1") => {
+            Some(model_pricing(1.4, 4.4, 0.26, 0.0))
+        }
+        "glm" if matches!(model.as_str(), "glm-5" | "glm-5.0") => {
+            Some(model_pricing(1.0, 3.2, 0.2, 0.0))
+        }
+        "glm" if matches!(model.as_str(), "glm-4.6" | "glm-4.7") => {
+            Some(model_pricing(0.6, 2.2, 0.11, 0.0))
+        }
+        "glm" => Some(glm_generic_pricing()),
         "deepseek" => deepseek_model_pricing(&model),
         "anthropic" if is_claude_fable_5_2_model(&model) => {
             Some(model_pricing(8.0, 40.0, 0.2, 10.0))
@@ -714,7 +748,7 @@ fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
             if provider_id == "glm" {
                 spec.capabilities.image_input = Some(matches!(
                     normalized.trim_end_matches("[1m]"),
-                    "glm-5.3-flash" | "glm-5.3-flashx"
+                    "glm-5.4" | "glm-5.3-flash" | "glm-5.3-flashx"
                 ));
             }
             if matches!(provider_id.as_str(), "openai" | "chatgpt")
@@ -815,13 +849,13 @@ fn chatgpt_plan_models() -> Vec<String> {
 }
 
 pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
-    let glm_flash_spec = ModelSpec {
+    // GLM-5.2 to 5.4, as Z.ai documents them: a 1M context, up to 131,072 output tokens
+    // (`max_tokens` above that is refused, code 1210) and an effort. The older models'
+    // 200K windows are left their earlier output requests, so a turn keeps its history.
+    let glm_spec = |efforts: &[&str]| ModelSpec {
         context_window: Some(1_000_000),
         max_output_tokens: Some(131_072),
-        effort_levels: ["low", "high", "max"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        effort_levels: efforts.iter().map(|level| level.to_string()).collect(),
         reasoning_modes: Vec::new(),
         capabilities: ModelCapabilities {
             tools: Some(true),
@@ -831,6 +865,7 @@ pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
         },
         pricing: None,
     };
+    let glm_effort_spec = glm_spec(&["low", "high", "max"]);
     let kimi_spec = |context_window| ModelSpec {
         context_window: Some(context_window),
         max_output_tokens: Some(131_072),
@@ -868,68 +903,46 @@ pub fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             display_name: "ZAI GLM".to_string(),
             api_provider: ApiProvider::Anthropic,
             base_url: "https://api.z.ai/api/anthropic".to_string(),
-            default_model: "glm-5.2[1m]".to_string(),
+            // GLM-5.3 is served both on GLM Coding Plans and on Z.ai's API; GLM-5.4 so
+            // far on Coding Plans only.
+            default_model: "glm-5.3".to_string(),
             models: vec![
-                "glm-5.3-flash".to_string(),
-                "glm-5.3-flash[1m]".to_string(),
+                "glm-5.4".to_string(),
                 "glm-5.3".to_string(),
-                "glm-5.3[1m]".to_string(),
+                "glm-5.3-flash".to_string(),
                 "glm-5.3-flashx".to_string(),
-                "glm-5.3-flashx[1m]".to_string(),
                 "glm-5.3-flashx-legal".to_string(),
-                "glm-5.3-flashx-legal[1m]".to_string(),
-                "glm-5.2[1m]".to_string(),
                 "glm-5.2".to_string(),
                 "glm-5.1".to_string(),
-                "glm-5.0".to_string(),
+                // Z.ai's name for GLM-5 (it refuses `glm-5.0`, an alias here).
+                "glm-5".to_string(),
                 "glm-4.6".to_string(),
             ],
             env_vars: vec!["ZAI_API_KEY".to_string()],
             requires_api_key: true,
-            login_url: Some("https://open.bigmodel.cn/usercenter/apikeys".to_string()),
+            login_url: Some("https://z.ai/manage-apikey/apikey-list".to_string()),
             oauth_flow: None,
             notes: Some(
-                "Use your ZAI key. The catalog includes GLM-5.3-Flash with 1M context, 131,072-token output, and low/high/max effort; model-name context hints such as [1m] are honored, and other entitled models can be set directly in settings."
+                "Use your ZAI key. A GLM Coding Plan covers GLM-5.4, GLM-5.3 and GLM-5.3-Flash; the catalog's GLM-5.4, GLM-5.3 and GLM-5.2 models have a 1M context and 131,072-token output, GLM-5.2 on take an effort, and other entitled models can be set directly in settings."
                     .to_string(),
             ),
             context_window: Some(200_000),
-            model_context_windows: {
-                let mut m = HashMap::new();
-                m.insert("glm-5.3-flash".to_string(), 1_000_000);
-                m.insert("glm-5.3-flash[1m]".to_string(), 1_000_000);
-                m.insert("glm-5.2".to_string(), 1_000_000);
-                m.insert("glm-5.2[1m]".to_string(), 1_000_000);
-                m
-            },
-            model_effort_levels: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "glm-5.3-flash".to_string(),
-                    vec!["low".to_string(), "high".to_string(), "max".to_string()],
-                );
-                m.insert(
-                    "glm-5.3-flash[1m]".to_string(),
-                    vec!["low".to_string(), "high".to_string(), "max".to_string()],
-                );
-                m.insert("glm-5.2".to_string(), vec!["high".to_string(), "max".to_string()]);
-                m.insert(
-                    "glm-5.2[1m]".to_string(),
-                    vec!["high".to_string(), "max".to_string()],
-                );
-                m
-            },
+            model_context_windows: HashMap::new(),
+            model_effort_levels: HashMap::new(),
             request_contract: Some(RequestContract::AnthropicMessages),
-            model_aliases: HashMap::new(),
+            model_aliases: GLM_CONTEXT_HINTS
+                .into_iter()
+                .map(|model| (format!("{model}[1m]"), model.to_string()))
+                .chain([("glm-5.0".to_string(), "glm-5".to_string())])
+                .collect(),
             model_defaults: ModelSpec::default(),
             model_specs: HashMap::from([
-                ("glm-5.3-flash".to_string(), glm_flash_spec.clone()),
-                ("glm-5.3-flash[1m]".to_string(), glm_flash_spec.clone()),
-                ("glm-5.3".to_string(), glm_flash_spec.clone()),
-                ("glm-5.3[1m]".to_string(), glm_flash_spec.clone()),
-                ("glm-5.3-flashx".to_string(), glm_flash_spec.clone()),
-                ("glm-5.3-flashx[1m]".to_string(), glm_flash_spec.clone()),
-                ("glm-5.3-flashx-legal".to_string(), glm_flash_spec.clone()),
-                ("glm-5.3-flashx-legal[1m]".to_string(), glm_flash_spec),
+                ("glm-5.4".to_string(), glm_effort_spec.clone()),
+                ("glm-5.3".to_string(), glm_effort_spec.clone()),
+                ("glm-5.3-flash".to_string(), glm_effort_spec.clone()),
+                ("glm-5.3-flashx".to_string(), glm_effort_spec.clone()),
+                ("glm-5.3-flashx-legal".to_string(), glm_effort_spec),
+                ("glm-5.2".to_string(), glm_spec(&["high", "max"])),
             ]),
         },
         // Sign in with ChatGPT (OpenAI's flow for open-source apps that run locally): the
@@ -1423,7 +1436,7 @@ pub fn normalize_provider_profile(mut profile: ProviderProfile) -> Option<Provid
         {
             (RequestContract::ChatGptResponses, _) => CODEX_DEFAULT_MODEL,
             (_, "local") => DEFAULT_LOCAL_MODEL,
-            _ => "glm-5.2[1m]",
+            _ => "glm-5.3",
         }
         .to_string();
     }
@@ -1607,6 +1620,14 @@ pub(crate) fn merge_provider_profile_with_migrations(
         if refresh_retired_generated_prices {
             refresh_retired_builtin_pricing(&builtin_id, &model, &mut spec);
         }
+        // A save made before a GLM model had its published price (or, for GLM-5.4,
+        // none) wrote GLM's generic one: the catalog's own stands instead.
+        if builtin_id == "glm"
+            && spec.pricing == Some(glm_generic_pricing())
+            && builtin_model_pricing(&builtin_id, &model) != spec.pricing
+        {
+            spec.pricing = None;
+        }
         let model = if builtin_id == "deepseek" {
             normalize_provider_model_value(&builtin, &model).to_ascii_lowercase()
         } else {
@@ -1672,7 +1693,14 @@ pub(crate) fn merge_provider_profile_with_migrations(
             } else if builtin_id == "deepseek" {
                 normalize_provider_model_value(&builtin, &model)
             } else {
-                model.trim().to_string()
+                // A name the built-in profile aliases (GLM's `[1m]` hints) is that
+                // model, not another one to list.
+                let model = model.trim();
+                builtin
+                    .model_aliases
+                    .get(&normalize_model_alias_key(model))
+                    .cloned()
+                    .unwrap_or_else(|| model.to_string())
             }
         })
         .filter(|model| !model.is_empty())
@@ -2710,43 +2738,18 @@ pub fn provider_headers_with_context(
             if extended_anthropic_cache {
                 put("anthropic-beta", "extended-cache-ttl-2025-04-11".into())?;
             }
-            if official_kimi {
+            // Kimi Code's device headers, from a host that knows the device (a native
+            // one). A host without those facts (the browser) sends the key alone, as Kimi
+            // documents for third-party coding agents.
+            if official_kimi && let Some(kimi) = context.kimi {
                 let version = crate::CLIENT_VERSION;
                 put("user-agent", format!("dext/{version}"))?;
                 put("x-msh-platform", "kimi_code_cli".into())?;
                 put("x-msh-version", version.into())?;
-                put(
-                    "x-msh-device-name",
-                    context
-                        .kimi
-                        .context("Kimi header facts required")?
-                        .device_name
-                        .to_string(),
-                )?;
-                put(
-                    "x-msh-device-model",
-                    context
-                        .kimi
-                        .context("Kimi header facts required")?
-                        .device_model
-                        .to_string(),
-                )?;
-                put(
-                    "x-msh-os-version",
-                    context
-                        .kimi
-                        .context("Kimi header facts required")?
-                        .os_version
-                        .to_string(),
-                )?;
-                put(
-                    "x-msh-device-id",
-                    context
-                        .kimi
-                        .context("Kimi header facts required")?
-                        .device_id
-                        .to_string(),
-                )?;
+                put("x-msh-device-name", kimi.device_name.to_string())?;
+                put("x-msh-device-model", kimi.device_model.to_string())?;
+                put("x-msh-os-version", kimi.os_version.to_string())?;
+                put("x-msh-device-id", kimi.device_id.to_string())?;
             }
             if !api_key.trim().is_empty() {
                 put("x-api-key", api_key.into())?;

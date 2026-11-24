@@ -843,10 +843,11 @@ mod tests {
             ),
             (1000.0 * 4.0 + 2000.0 * 5.0 + 30000.0 * 0.2 + 500.0 * 20.0) / 1e6,
         );
-        // GLM speaks the same contract: the same buckets at its own rates.
+        // GLM speaks the same contract: the same buckets at its own rates (GLM-5.1, as
+        // Z.ai publishes them: 1.4 in, 4.4 out, 0.26 cache read, cache writes free).
         close(
             priced("glm", "glm-5.1", RequestContract::AnthropicMessages, &usage),
-            (1000.0 * 1.0 + 2000.0 * 1.25 + 30000.0 * 0.1 + 500.0 * 5.0) / 1e6,
+            (1000.0 * 1.4 + 2000.0 * 0.0 + 30000.0 * 0.26 + 500.0 * 4.4) / 1e6,
         );
     }
 

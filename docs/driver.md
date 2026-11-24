@@ -424,6 +424,7 @@ When a send does not produce a reply, `deliver` classifies it:
 | Failure | Classified as | Policy |
 | --- | --- | --- |
 | `chatgpt-plan` usage limit, ineligible account, unsupported route or permission refusal | Final plan refusal | No automatic retry; review usage at chatgpt.com/settings/usage. A genuinely unavailable 503 remains transient. |
+| Z.ai's account and GLM Coding Plan refusals, sent as HTTP 429 with code 1113 (no balance and no plan for the key), 1308, 1310 or 1316-1321 (the plan's usage limit), 1309 (plan expired), 1311 (the plan lacks the model), 1313 (fair-use limit), 1314 (an enterprise package expired) or 1315 (a key for the enterprise coding package only) (`driver::zai_refusal`), before the reply or streamed in it | Final refusal | No automatic retry; the message says what the account or plan lacks, then Z.ai's own words. Z.ai's 1302 (rate limit) and 1305 (overloaded) stay transient. |
 | HTTP 408, 409, 425, 429, 500, 502, 503, 504, 529 | Transient refusal (recorded) | Sent again after `Retry-After`, or `2 << attempt` seconds (4, 8, 16, 32, 64, 64), at most 300 seconds, up to 6 automatic retries. |
 | HTTP 400, 413 or 422 whose body says the input is too long | Context overflow (recorded) | Sent again at once after compacting (`compacting: true`). |
 | HTTP 400 or 422 that states a lower output-token limit | Output limit (recorded) | The limit is remembered per provider and model in the `output_limits` metadata and the request is sent again at once asking for less. |

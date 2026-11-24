@@ -17,6 +17,65 @@ fn context() -> HeaderContext<'static> {
 }
 
 #[test]
+fn a_saved_glm_profile_lists_each_context_hinted_model_once() {
+    // A catalog saved before the `[1m]` names became aliases (Z.ai refuses them): its
+    // hinted default and models are their models, listed once; its own models stay.
+    let mut saved = default_provider_catalog();
+    let glm = saved
+        .providers
+        .iter_mut()
+        .find(|profile| profile.id == "glm")
+        .unwrap();
+    glm.default_model = "glm-5.2[1m]".into();
+    glm.models = ["glm-5.3-flash[1m]", "glm-5.4[1m]", "glm-4.7"]
+        .map(String::from)
+        .to_vec();
+    glm.model_aliases.clear();
+    // Written by a save when GLM-5.2 had only GLM's generic price.
+    glm.model_specs.entry("glm-5.2".into()).or_default().pricing = Some(ModelPricing {
+        input_usd_per_mtok: 1.0,
+        output_usd_per_mtok: 5.0,
+        cache_read_usd_per_mtok: 0.1,
+        cache_create_usd_per_mtok: 1.25,
+    });
+    let merged = normalize_provider_catalog(saved).unwrap();
+    let glm = find_provider_profile(&merged, "glm").unwrap();
+    assert_eq!(glm.default_model, "glm-5.2");
+    assert!(
+        glm.models.iter().all(|model| !model.contains('[')),
+        "{:?}",
+        glm.models
+    );
+    assert!(glm.models.iter().any(|model| model == "glm-4.7"));
+    for model in ["glm-5.3-flash", "glm-5.4", "glm-5.2"] {
+        assert_eq!(
+            glm.models.iter().filter(|listed| *listed == model).count(),
+            1,
+            "{model}"
+        );
+    }
+    assert_eq!(
+        normalize_provider_model_value(&glm, "glm-5.3[1m]"),
+        "glm-5.3"
+    );
+    // Z.ai's published prices, the stale generic one given way.
+    for (model, input, output) in [
+        ("glm-5.2", 1.4, 4.4),
+        ("glm-5.1", 1.4, 4.4),
+        ("glm-5", 1.0, 3.2),
+        ("glm-4.6", 0.6, 2.2),
+    ] {
+        let price = resolve_model_spec(&glm, model).pricing.expect(model);
+        assert_eq!(
+            (price.input_usd_per_mtok, price.output_usd_per_mtok),
+            (input, output),
+            "{model}"
+        );
+    }
+    assert!(resolve_model_spec(&glm, "glm-5.4").pricing.is_none());
+}
+
+#[test]
 fn pure_catalog_normalization_and_wire_encoding_need_no_native_host() {
     let catalog = default_provider_catalog();
     let roundtrip = normalize_provider_catalog(
@@ -145,6 +204,29 @@ fn headers_use_supplied_facts_and_keep_credentials_sensitive() {
     assert_eq!(kimi["x-msh-device-name"], "fixture");
     assert_eq!(kimi["x-msh-device-model"], "test wasm32");
     assert_eq!(kimi["x-msh-os-version"], "test");
+    // A host that does not know the device (the browser) sends the key alone, as Kimi
+    // documents for third-party coding agents.
+    let browser = provider_headers_with_context(
+        RequestContract::AnthropicMessages,
+        "fixture",
+        true,
+        false,
+        false,
+        None,
+        &HeaderContext {
+            kimi: None,
+            ..context()
+        },
+    )
+    .unwrap();
+    assert_eq!(browser["x-api-key"], "fixture");
+    assert!(
+        browser
+            .keys()
+            .all(|name| !name.as_str().starts_with("x-msh-")),
+        "{browser:?}"
+    );
+    assert!(!browser.contains_key("user-agent"));
     let payload = base64::Engine::encode(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
         json!({"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}).to_string(),
@@ -183,19 +265,8 @@ fn missing_header_facts_and_header_injection_fail_closed() {
         )
         .is_err()
     );
+    // Kimi's device facts are not among them: without them the key goes alone (above).
     ctx.kimi = None;
-    assert!(
-        provider_headers_with_context(
-            RequestContract::AnthropicMessages,
-            "fixture",
-            true,
-            false,
-            false,
-            None,
-            &ctx
-        )
-        .is_err()
-    );
     assert!(
         provider_headers_with_context(
             RequestContract::OpenAiResponses,

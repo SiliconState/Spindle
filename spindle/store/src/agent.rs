@@ -4505,7 +4505,9 @@ mod tests {
         defaulted.profile.model_specs.clear();
         defaulted.profile.model_defaults.max_output_tokens = Some(8_192);
         let body = request_body(&defaulted, "s", false, false, Effort::Max, &prompt).unwrap();
-        assert_eq!(body["thinking"]["budget_tokens"], 65536);
+        // (GLM takes no budget: without a declared limit it gets the answer and the
+        // level's allowance.)
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
         assert_eq!(body["max_tokens"], MAX_OUTPUT_TOKENS + 65536);
     }
 
@@ -4579,6 +4581,136 @@ mod tests {
             serde_json::from_slice(&subscription_body(high.clone(), "go", "s").unwrap()).unwrap();
         assert!(shaped["thinking"].get("block_binding").is_none());
         assert_eq!(shaped["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn glm_thinks_by_effort_with_the_whole_output_limit_and_no_budget() {
+        let prompt = TranscriptCheckpoint {
+            route_binding: ROUTE.into(),
+            messages: vec![text("user", "go")],
+        };
+        let sent = |route: &Route, effort| {
+            request_body(route, "s", false, false, effort, &prompt).unwrap()
+        };
+        // GLM-5.4 (Coding Plans): effort levels, 131,072 output tokens, images, no price.
+        // Low thinks briefly and keeps the answer plus its small allowance, so a budget
+        // sets less aside; the deeper levels get the whole output.
+        let glm54 = builtin("glm", "glm-5.4");
+        for (effort, level, most) in [
+            (Effort::Low, "low", MAX_OUTPUT_TOKENS + 2048),
+            (Effort::Medium, "high", 131_072),
+            (Effort::High, "high", 131_072),
+            (Effort::XHigh, "max", 131_072),
+            (Effort::Max, "max", 131_072),
+        ] {
+            let body = sent(&glm54, effort);
+            assert_eq!(body["thinking"], json!({"type": "enabled"}), "{effort:?}");
+            assert_eq!(body["output_config"]["effort"], level, "{effort:?}");
+            assert_eq!(body["max_tokens"], most, "{effort:?}");
+        }
+        let max = reasoning(&glm54, Effort::Max).unwrap();
+        assert_eq!(
+            (max.short.as_str(), max.answer + max.allowance),
+            ("think max", 131_072)
+        );
+        assert!(
+            !max.label.contains("budget") && !max.short.contains('K'),
+            "{}",
+            max.label
+        );
+        // It thinks only when asked: off, and off by Spindle's default.
+        for effort in [Effort::Default, Effort::Off] {
+            let body = sent(&glm54, effort);
+            assert_eq!(body["thinking"], json!({"type": "disabled"}));
+            assert!(body.get("output_config").is_none());
+        }
+        let spec = provider::resolve_model_spec(&glm54.profile, &glm54.model);
+        assert_eq!(
+            (
+                spec.context_window,
+                spec.max_output_tokens,
+                spec.image_input
+            ),
+            (Some(1_000_000), Some(131_072), true)
+        );
+        assert!(
+            spec.pricing.is_none(),
+            "Z.ai has published no API price for GLM-5.4"
+        );
+        // GLM-5.3 always thinks: its default and off are effort low.
+        let glm53 = builtin("glm", "glm-5.3");
+        assert_eq!(glm53.profile.default_model, "glm-5.3");
+        for effort in [Effort::Default, Effort::Off] {
+            let body = sent(&glm53, effort);
+            assert_eq!(body["thinking"]["type"], "enabled");
+            assert_eq!(body["output_config"]["effort"], "low");
+            assert_eq!(body["max_tokens"], MAX_OUTPUT_TOKENS + 2048);
+        }
+        // GLM-5.2 takes high and max; an effort it lacks is the nearest it has.
+        let glm52 = builtin("glm", "glm-5.2");
+        // (High is what it thinks at, so it gets the whole output, as high does.)
+        let low = sent(&glm52, Effort::Low);
+        assert_eq!(
+            (&low["output_config"]["effort"], &low["max_tokens"]),
+            (&json!("high"), &json!(131_072))
+        );
+        assert_eq!(sent(&glm52, Effort::Max)["max_tokens"], 131_072);
+        assert_eq!(
+            sent(&glm52, Effort::Default)["thinking"]["type"],
+            "disabled"
+        );
+        // Older models take thinking on or off only, and (their windows being 200K) the
+        // answer and the level's allowance, as before, without a budget.
+        let glm51 = builtin("glm", "glm-5.1");
+        let body = sent(&glm51, Effort::Max);
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
+        assert!(body.get("output_config").is_none());
+        assert_eq!(body["max_tokens"], MAX_OUTPUT_TOKENS + 65536);
+        assert_eq!(reasoning(&glm51, Effort::Max).unwrap().short, "think on");
+        // No GLM request carries a token budget.
+        for model in [
+            "glm-5.4",
+            "glm-5.3",
+            "glm-5.3-flash",
+            "glm-5.2",
+            "glm-5.1",
+            "glm-5",
+            "glm-4.6",
+        ] {
+            for effort in Effort::ALL {
+                let body = sent(&builtin("glm", model), effort);
+                assert!(
+                    body["thinking"].get("budget_tokens").is_none(),
+                    "{model} {effort:?}"
+                );
+            }
+        }
+        // A limit the provider stated is what is asked for.
+        let mut learned = builtin("glm", "glm-5.4");
+        learned.learned_limit = Some(65_536);
+        assert_eq!(sent(&learned, Effort::Max)["max_tokens"], 65_536);
+        // Z.ai refuses `[1m]` in a name, and `glm-5.0`, as unknown models: those names
+        // are the models themselves (threads saved with one go on), and the picker lists
+        // each once.
+        for (hinted, model) in [
+            ("glm-5.4[1m]", "glm-5.4"),
+            ("glm-5.3[1m]", "glm-5.3"),
+            ("glm-5.3-flash[1m]", "glm-5.3-flash"),
+            ("glm-5.2[1m]", "glm-5.2"),
+            ("glm-5.0", "glm-5"),
+        ] {
+            let route = builtin("glm", hinted);
+            assert_eq!(route.model, model);
+            assert_eq!(sent(&route, Effort::High)["model"], model);
+        }
+        let listed = catalog::models_of(&glm54.profile);
+        assert!(
+            listed
+                .iter()
+                .all(|model| !model.contains('[') && model != "glm-5.0")
+                && listed.iter().any(|model| model == "glm-5"),
+            "{listed:?}"
+        );
     }
 
     #[test]
@@ -5038,7 +5170,8 @@ mod tests {
     fn a_max_effort_step_fits_beside_the_largest_history_kept() {
         // Worst case: the whole max allowance is visible reasoning, kept in a history
         // already at its budget and replayed by the next request. The adopting step
-        // holds history, request and reply twice; the reserve must cover it.
+        // holds history, request and reply twice; the reserve must cover it. GLM asks
+        // for its whole 131,072-token output at max, the largest reply of any route.
         let deepseek = builtin("deepseek", "deepseek-flash");
         let budget = history_budget(&deepseek, Effort::Max).unwrap();
         assert!(
@@ -5047,43 +5180,48 @@ mod tests {
         );
         let glm = builtin("glm", "glm-5.3");
         assert!(history_budget(&glm, Effort::Max).unwrap() >= HISTORY_MIN);
-        let reasoning = "x\n".repeat((MAX_OUTPUT_TOKENS + 65536) as usize * 2);
-        let mut messages = vec![text("user", "go")];
-        while transcript_bytes(&TranscriptCheckpoint {
-            route_binding: ROUTE.into(),
-            messages: messages.clone(),
-        })
-        .unwrap()
-        .len()
-            < budget
-        {
-            messages.extend(step(messages.len()));
+        for route in [deepseek, builtin("glm", "glm-5.4")] {
+            let budget = history_budget(&route, Effort::Max).unwrap();
+            let most = reasoning(&route, Effort::Max).unwrap();
+            let reasoning = "x\n".repeat((most.answer + most.allowance) as usize * 2);
+            let mut messages = vec![text("user", "go")];
+            while transcript_bytes(&TranscriptCheckpoint {
+                route_binding: ROUTE.into(),
+                messages: messages.clone(),
+            })
+            .unwrap()
+            .len()
+                < budget
+            {
+                messages.extend(step(messages.len()));
+            }
+            messages.push(Message {
+                role: "assistant".into(),
+                content: vec![
+                    Block::Thinking {
+                        text: reasoning,
+                        signature: None,
+                    },
+                    Block::ToolUse {
+                        id: "c".into(),
+                        name: "bash".into(),
+                        input: json!({"command": "ls"}),
+                    },
+                ],
+            });
+            let history = TranscriptCheckpoint {
+                route_binding: ROUTE.into(),
+                messages,
+            };
+            let next = request_body(&route, "s", false, false, Effort::Max, &history).unwrap();
+            let held = 2 * transcript_bytes(&history).unwrap().len()
+                + 2 * serde_json::to_vec(&next).unwrap().len();
+            assert!(
+                held + reply_reserve(&route, Effort::Max).unwrap() < crate::MAX_PAYLOAD,
+                "{}: {held}",
+                route.model
+            );
         }
-        messages.push(Message {
-            role: "assistant".into(),
-            content: vec![
-                Block::Thinking {
-                    text: reasoning,
-                    signature: None,
-                },
-                Block::ToolUse {
-                    id: "c".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "ls"}),
-                },
-            ],
-        });
-        let history = TranscriptCheckpoint {
-            route_binding: ROUTE.into(),
-            messages,
-        };
-        let next = request_body(&deepseek, "s", false, false, Effort::Max, &history).unwrap();
-        let held = 2 * transcript_bytes(&history).unwrap().len()
-            + 2 * serde_json::to_vec(&next).unwrap().len();
-        assert!(
-            held + reply_reserve(&deepseek, Effort::Max).unwrap() < crate::MAX_PAYLOAD,
-            "{held}"
-        );
     }
 
     #[test]

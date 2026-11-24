@@ -763,7 +763,7 @@ provider is `glm`):
 
 | id | Display name | Contract | Default model | Credentials |
 |---|---|---|---|---|
-| `glm` | ZAI GLM | `anthropic-messages` | `glm-5.2[1m]` | API key, `ZAI_API_KEY` |
+| `glm` | ZAI GLM | `anthropic-messages` | `glm-5.3` | API key, `ZAI_API_KEY` |
 | `chatgpt-plan` | ChatGPT | `chatgpt-plan` | `gpt-6.1-sol` | OpenAI's issued-client Sign in with ChatGPT; browser only, absent from native load/save |
 | `chatgpt` | ChatGPT (Codex) | `chatgpt-responses` | `gpt-6.2-sol` | Legacy OAuth (PKCE), or `CHATGPT_ACCESS_TOKEN`; feature `codex-signin` |
 | `openai` | OpenAI API | `openai-chat-completions`; `openai-responses` for the gpt-5.6 and gpt-6 models on the official API host | `gpt-5` | API key, `OPENAI_API_KEY` |
@@ -784,11 +784,18 @@ and `gpt-5.4-mini` to `gpt-6-luna`; these mappings do not apply to Platform. The
 separate Sign in with ChatGPT (`chatgpt-plan`) catalog is unchanged. A catalog entry
 does not establish account entitlement.
 
-Claude Fable 5.2 uses adaptive thinking even at Off. Haiku 5.5 has a higher pricing
-tier above 100K total input tokens (including cache reads and writes) unless pricing
-is overridden. GLM 5.3 variants and Kimi Code K3.1 Pro, Highspeed, and K3-256k have
-low/high/max thinking metadata. Unsigned thinking replay is limited to official
-Kimi Code tool turns. A model whose spec says it does not reason
+Claude Fable 5.2 uses adaptive thinking even at Off. Haiku 5.5 has a higher pricing tier
+above 100K total input tokens (including cache reads and writes) unless pricing is
+overridden. GLM-5.4 (served on GLM Coding Plans only so far, so it has no API price),
+the GLM 5.3 variants and Kimi Code K3.1 Pro, Highspeed, and K3-256k have low/high/max
+thinking metadata, GLM-5.2 high/max; GLM-5.4, 5.3 and 5.2 have a 1M context and answer
+up to 131,072 tokens. GLM prices are Z.ai's published ones (GLM-5.2 and 5.1, 5 and 4.6
+included); a saved catalog's GLM generic price gives way to them. Z.ai refuses a `[1m]`
+context hint in a model name as an unknown model, so the GLM profile maps each hinted
+name (`glm-5.2[1m]`, say) to its model, and `glm-5.0`, which it refuses too, to `glm-5`.
+Unsigned thinking replay is limited to official Kimi Code tool turns, and Kimi Code's
+device headers are sent only by native hosts: the browser sends the key alone, as Kimi
+documents for third-party coding agents. A model whose spec says it does not reason
 (`capabilities.reasoning` false, as for GPT-4.1 and GPT-4o) takes only the default
 effort. A Responses model whose effort list contains `none` sends `none` at Off.
 
@@ -1021,7 +1028,8 @@ Spindle chooses the wire fields for an effort in `shape::reasoning`
 | Route | Fields sent for a level |
 |---|---|
 | Anthropic Messages, Claude models with adaptive thinking | `thinking: {type: adaptive}`, `output_config.effort`, `max_tokens` raised by the level's reasoning allowance; `off` sends `thinking: {type: disabled}`, or effort `low` for models that always think |
-| Anthropic Messages, other models | `thinking: {type: enabled, budget_tokens}` (at least 1024) with `max_tokens` = answer + budget; `off` disables thinking; GLM's default is thinking off |
+| Anthropic Messages, GLM on Z.ai's endpoint | `thinking: {type: enabled}`, `output_config.effort` (`low`, `high` or `max`, the nearest the model declares) where the model takes one, and no token budget: `max_tokens` is the model's whole output limit at high and max (131,072 for GLM-5.2 to 5.4), and otherwise (low, or the older models) the answer plus the level's allowance; default and `off` send `thinking: {type: disabled}`, except GLM-5.3, which always thinks (effort `low`) |
+| Anthropic Messages, other models | `thinking: {type: enabled, budget_tokens}` (at least 1024) with `max_tokens` = answer + budget; `off` disables thinking; GLM's default (on other endpoints) is thinking off |
 | Chat Completions, DeepSeek | `thinking: {type: enabled}`, `reasoning_effort` (`low`, `high` or `max`) and `max_tokens`; default and `off` disable thinking |
 | Chat Completions, others | `reasoning_effort` at the nearest level the model declares (at most `high` when it declares none); local llama.cpp servers also get `chat_template_kwargs.enable_thinking`, which is how `off` works there; elsewhere `off` is refused |
 | OpenAI Responses, ChatGPT | `reasoning.effort`; only ordinary OpenAI Responses sets `max_output_tokens`; both ChatGPT subscription routes omit it. `chatgpt-plan` additionally nests function tools under the `spindle` namespace and names it on replayed calls. |

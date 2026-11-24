@@ -334,8 +334,10 @@ impl Step<'_> {
             return self.backoff_drop(rejection, attempts);
         }
         let overflow = context_overflow(status, &rejection.body);
-        // A ChatGPT plan's refusal (its usage limit among them, a 429) is final.
-        let plan_refused = dext_core::recovery::chatgpt_plan_refusal(&rejection.body).is_some();
+        // A ChatGPT plan's refusal (its usage limit among them, a 429) is final, as are
+        // Z.ai's balance and Coding Plan refusals (also 429s).
+        let plan_refused = dext_core::recovery::chatgpt_plan_refusal(&rejection.body).is_some()
+            || zai_refusal(&rejection.body).is_some();
         let unreached = status == UNREACHED;
         let transient = !plan_refused
             && matches!(
@@ -3185,6 +3187,10 @@ pub(crate) fn unreadable(why: Option<&str>) -> String {
 #[cfg(any(feature = "agent", feature = "embedded"))]
 pub(crate) fn protocol_failure(why: Option<&str>) -> ModelFailure {
     let said = unreadable(why);
+    // Z.ai's plan and balance refusals name a rate limit but do not pass.
+    if let Some(refused) = why.and_then(zai_refusal) {
+        return ModelFailure::Failed(format!("{refused}: {said}"));
+    }
     let passing = why.is_some_and(|why| {
         let why = why.to_ascii_lowercase();
         why.starts_with("provider stream error [")
@@ -3769,13 +3775,58 @@ fn display_of(content: &str) -> Option<Value> {
         .then_some(value)
 }
 /// What a refusal says when it is a ChatGPT plan's usage limit (the plan's, or the one
-/// the user set for this app in ChatGPT's settings).
+/// the user set for this app in ChatGPT's settings), or Z.ai's word on the key's
+/// balance or GLM Coding Plan (`zai_refusal`).
 fn plan_limit(body: &str) -> Option<String> {
     let lower = body.to_ascii_lowercase();
-    (lower.contains("subscription_sharing_") && lower.contains("usage_limit_exceeded")).then(|| {
-        format!(
+    if lower.contains("subscription_sharing_") && lower.contains("usage_limit_exceeded") {
+        return Some(format!(
             "your ChatGPT plan's usage limit is reached (the plan's, or the one set for this app): review it at {CHATGPT_USAGE}"
-        )
+        ));
+    }
+    zai_refusal(body)
+}
+
+/// Z.ai's code in an error it sent (`{"error":{"code":"1113","message":...}}`).
+fn zai_code(body: &str) -> Option<u32> {
+    let at = body.find("\"code\":")? + "\"code\":".len();
+    let rest = body[at..].trim_start().trim_start_matches('"');
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// A refusal of Z.ai's that waiting does not end, said plainly: Z.ai sends its account,
+/// balance and GLM Coding Plan refusals as HTTP 429, the status of a rate limit, so
+/// without this they read as one and are sent again. Its passing ones (1302, a rate
+/// limit; 1305, overloaded) are not among them.
+pub(crate) fn zai_refusal(body: &str) -> Option<String> {
+    let code = zai_code(body)?;
+    Some(match code {
+        1113 => "Z.ai found no balance and no plan for this request (Z.ai code 1113): a \
+                 GLM Coding Plan serves its models (GLM-5.4, GLM-5.3 and GLM-5.3-Flash, \
+                 Z.ai says) to a key of the account that holds it; for another model, or \
+                 a key of an account without a plan, add balance to that account at z.ai"
+            .into(),
+        1308 | 1310 | 1316..=1321 => format!(
+            "your GLM Coding Plan's usage limit is reached (Z.ai code {code}); Z.ai's message \
+             says when it resets"
+        ),
+        1309 => "your GLM Coding Plan has expired (Z.ai code 1309): renew it at \
+                 https://z.ai/subscribe"
+            .into(),
+        1311 => "your GLM Coding Plan does not include this model (Z.ai code 1311; the \
+                 plan serves GLM-5.4, GLM-5.3 and GLM-5.3-Flash, Z.ai says)"
+            .into(),
+        1313 => "Z.ai has limited this account's requests under its fair usage policy \
+                 (Z.ai code 1313); Z.ai's message says how to ask for them back"
+            .into(),
+        1314 => "the Z.ai enterprise package of this key has expired (Z.ai code 1314): \
+                 your enterprise's administrator can renew it"
+            .into(),
+        1315 => "this key serves only Z.ai's enterprise coding package (Z.ai code 1315): \
+                 use a key made for what this request calls"
+            .into(),
+        _ => return None,
     })
 }
 
@@ -4013,6 +4064,39 @@ mod plan_tests {
             dext_core::recovery::chatgpt_plan_refusal(limit).is_some(),
             "and backoff gives up on it at once"
         );
+    }
+
+    #[test]
+    fn zai_plan_and_balance_refusals_are_said_and_final() {
+        // As Z.ai sent it to a key without a plan (HTTP 429, a rate limit's type).
+        let balance = r#"{"type":"error","error":{"type":"rate_limit_error","code":"1113","message":"[1113][Insufficient balance or no resource package. Please recharge.][2026]"},"request_id":"2026"}"#;
+        let said = plan_limit(balance).unwrap();
+        assert!(
+            said.contains("no balance and no plan")
+                && said.contains("a key of the account that holds it"),
+            "{said}"
+        );
+        let used = r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-24 10:00:00"}}"#;
+        assert!(plan_limit(used).unwrap().contains("usage limit is reached"));
+        assert!(
+            plan_limit(r#"{"error":{"code":1311,"message":"no access"}}"#)
+                .unwrap()
+                .contains("does not include this model")
+        );
+        // Its passing ones stay rate limits, sent again.
+        for passing in ["1302", "1305"] {
+            let body = format!(r#"{{"error":{{"code":"{passing}","message":"slow down"}}}}"#);
+            assert_eq!(plan_limit(&body), None, "{passing}");
+        }
+        // In a stream, too: the reply fails at once instead of being sent again.
+        #[cfg(any(feature = "agent", feature = "embedded"))]
+        {
+            let streamed = format!("provider stream error [anthropic-messages]: {used}");
+            assert!(matches!(
+                super::protocol_failure(Some(&streamed)),
+                super::ModelFailure::Failed(said) if said.contains("usage limit is reached")
+            ));
+        }
     }
 }
 

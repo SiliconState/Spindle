@@ -501,6 +501,79 @@ fn messages_effort_thinking(
     })
 }
 
+/// Z.ai's own GLM endpoint, as Z.ai documents it: `thinking` is on or off, GLM-5.2 on
+/// also take `output_config.effort` (low, high, max), and there is no token budget.
+/// GLM's thinking spends `max_tokens`, so a request that thinks at high or max asks for
+/// the model's whole declared output limit (131,072 for GLM-5.2 to 5.4), and a long
+/// chain of thought (GLM-5.4's are) still leaves room for an answer; low, and a model
+/// without a declared limit (the older, 200K-window ones), get the answer and the
+/// level's allowance. GLM-5.3 always
+/// thinks: off and the default are its effort low; the other models think only when
+/// asked (Spindle's default is off, as a long chain can spend the whole answer cap with
+/// no text or calls, and three of those halt the turn).
+fn official_glm(route: &Route, effort: Effort) -> Reasoning {
+    let always = provider::is_glm_5_3_model(&route.model);
+    let (answer, _, _) = output_tokens(route, Effort::Default);
+    let off = |label: &str| Reasoning {
+        fields: vec![("thinking", json!({"type": "disabled"}))],
+        answer,
+        allowance: 0,
+        label: label.into(),
+        short: "think off".into(),
+    };
+    match effort {
+        Effort::Default if !always => return off("thinking off (Spindle default for GLM)"),
+        Effort::Off if !always => return off("thinking off"),
+        _ => {}
+    }
+    let levels = provider::resolve_model_spec(&route.profile, &route.model).effort_levels;
+    let level = match effort {
+        Effort::Default | Effort::Off | Effort::Low => Effort::Low,
+        Effort::Medium | Effort::High => Effort::High,
+        Effort::XHigh | Effort::Max => Effort::Max,
+    };
+    let sent = (!levels.is_empty()).then(|| chat_effort(route, level));
+    // Low thinks briefly: the answer and low's allowance, as for any model, keep what a
+    // budget sets aside for each request (its whole output) small. What is sent decides
+    // it: GLM-5.2 takes no low, so its nearest, high, gets the whole output.
+    let brief = match &sent {
+        Some(sent) => sent == "low",
+        None => level == Effort::Low,
+    };
+    let total = match route_output_limit(route) {
+        Some(limit) if !brief => limit,
+        _ => {
+            let (answer, allowance, _) =
+                output_tokens(route, if brief { Effort::Low } else { level });
+            answer + allowance
+        }
+    };
+    let answer = total.min(MAX_OUTPUT_TOKENS);
+    let mut fields = vec![("thinking", json!({"type": "enabled"}))];
+    if let Some(sent) = &sent {
+        fields.push(("output_config", json!({"effort": sent})));
+    }
+    fields.push(("max_tokens", json!(total)));
+    let (label, short) = match &sent {
+        Some(sent) if always && effort == Effort::Off => (
+            format!("this model always thinks: effort {sent}"),
+            format!("think {sent}"),
+        ),
+        Some(sent) => (format!("thinking, effort {sent}"), format!("think {sent}")),
+        None => (
+            "thinking on (this model takes no effort level)".into(),
+            "think on".into(),
+        ),
+    };
+    Reasoning {
+        fields,
+        answer,
+        allowance: total - answer,
+        label: format!("{label}; up to {total} output tokens"),
+        short,
+    }
+}
+
 pub(crate) fn reasoning(route: &Route, effort: Effort) -> Result<Reasoning> {
     let glm = route.profile.id == "glm" || route.endpoint.contains("z.ai");
     let deepseek = provider::is_deepseek_provider(
@@ -527,10 +600,9 @@ pub(crate) fn reasoning(route: &Route, effort: Effort) -> Result<Reasoning> {
     match (route.contract, effort) {
         (RequestContract::AnthropicMessages, effort)
             if route.profile.id == "glm"
-                && route.endpoint == "https://api.z.ai/api/anthropic/v1/messages"
-                && provider::is_glm_5_3_model(&route.model) =>
+                && route.endpoint == "https://api.z.ai/api/anthropic/v1/messages" =>
         {
-            messages_effort_thinking(route, effort, "enabled", "low", "max")
+            Ok(official_glm(route, effort))
         }
         (RequestContract::AnthropicMessages, effort)
             if official_kimi(route) && provider::is_kimi_adaptive_model(&route.model) =>
