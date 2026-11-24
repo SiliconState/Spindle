@@ -146,7 +146,9 @@ Interrupted? `spindle --dir ../demo continue`. The web UI:
 [docs/host.md](docs/host.md#remote-access-through-a-reverse-proxy)). Full walkthrough:
 [docs/getting-started.md](docs/getting-started.md).
 
-**Spindle for Browser 0.1.10.** Both zips carry the two browser Linuxes: the wasm
+**Spindle for Browser 0.1.11.** GLM works again (Z.ai refused the old default model and every
+`[1m]` name), with GLM-5.4 and effort levels that think without a 64K budget, and Kimi Code
+keys work in the browser. Both zips carry the two browser Linuxes: the wasm
 Linux runs plain `sh`, Python 3.14 and ripgrep at the machine's own speed, and the v86
 Linux, on its own trimmed kernel and prepared in the background as the extension
 installs, runs the rest. With page actions on, a thread reads, clicks, types into and
@@ -154,8 +156,8 @@ pictures the pages it makes, and reads what their console said. The standard/Git
 includes OpenAI's Sign in with ChatGPT and keeps **ChatGPT (Codex)**; the store-edition
 zip omits the legacy Codex client.
 
-Download `spindle-browser-0.1.10.zip` from the
-[0.1.10 release](https://github.com/SiliconState/Spindle/releases/tag/browser-v0.1.10), unzip it, and load
+Download `spindle-browser-0.1.11.zip` from the
+[0.1.11 release](https://github.com/SiliconState/Spindle/releases/tag/browser-v0.1.11), unzip it, and load
 the folder with **Load unpacked** in `chrome://extensions`, `edge://extensions` or `brave://extensions`
 ([docs/chrome.md](docs/chrome.md#install-a-release)). Its single-box composer,
 grouped threads, compact steps and task cards share the web UI's design. Workspace
