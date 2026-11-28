@@ -47,7 +47,7 @@
           with you. Research across pages. Run Python and JavaScript. Build reports, datasets and small
           applications in a Linux environment inside your browser.</p>
         <div class="actions">
-          <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/download/browser-v0.1.11/spindle-browser-0.1.11.zip">Download <small>0.1.11 · 64.3 MiB zip</small></a>
+          <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/download/browser-v0.1.12/spindle-browser-0.1.12.zip">Download <small>0.1.12 · 64.2 MiB zip</small></a>
           <a class="button" href="#install">Install guide</a>
         </div>
         <p class="trust">Open source. Bring your own model. No required desktop app or backend.</p>
@@ -250,7 +250,7 @@
         <li>Local llama.cpp <small>no key</small></li>
         <li>Your own <small>providers.json</small></li>
       </ul>
-      <p class="note" style="margin-top:16px">Version 0.1.11 offers OpenAI's Sign in with ChatGPT and, in the
+      <p class="note" style="margin-top:16px">Version 0.1.12 offers OpenAI's Sign in with ChatGPT and, in the
         source/GitHub edition, ChatGPT (Codex). The store edition omits the Codex client. Both use your plan;
         account eligibility and limits are set by OpenAI. Anthropic models take an
         API key; a Claude subscription sign-in is not offered. Any OpenAI-compatible endpoint can be added with a
@@ -264,8 +264,9 @@
         <span class="num">07 &mdash; INSTALL</span>
         <h2 id="install-h">Download, load, sign in.</h2>
         <p>Spindle for Browser is not in the Chrome Web Store yet. Each release is a zip built and
-          checked by the repository's own workflow; you load it as an unpacked extension. Version 0.1.11 carries
-          both Linuxes, boots the emulated one in the background as it installs, and, with page actions on, lets a
+          checked by the repository's own workflow; you load it as an unpacked extension. Version 0.1.12 carries
+          both Linuxes and runs every command it can on the fast one, network on or off; it boots the emulated one
+          in the background as it installs, and, with page actions on, lets a
           thread test the pages it makes; this standard zip keeps ChatGPT (Codex) beside OpenAI's Sign in with ChatGPT.</p>
       </div>
       <ol class="steps">
@@ -320,7 +321,7 @@ chrome/build.sh         <span class="c"># the extension, into chrome/dist</span>
           run there at close to the machine's own speed, with no emulator in between: shell commands 1.9 to 9.2
           times faster than on the v86 Linux, an emulated PC, and Python up to 25 times. The rest (bash itself,
           Node, git, pip, the network) runs on v86, whose one boot happens in the background as the extension
-          installs.</p>
+          installs. Since 0.1.12 a thread with network on also runs its other commands on the wasm Linux.</p>
       </div>
       <figure class="diagram">
         <ul class="bars" aria-label="How many times faster each command ran on the wasm Linux than on the v86 Linux">
@@ -387,10 +388,10 @@ chrome/build.sh         <span class="c"># the extension, into chrome/dist</span>
 
   <section class="block closing" aria-labelledby="get-h">
     <div class="wrap">
-      <p class="eyebrow">Spindle for Browser 0.1.11</p>
+      <p class="eyebrow">Spindle for Browser 0.1.12</p>
       <h2 id="get-h">Put it beside your next tab.</h2>
       <div class="actions">
-        <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/download/browser-v0.1.11/spindle-browser-0.1.11.zip">Download <small>0.1.11 · 64.3 MiB zip</small></a>
+        <a class="button primary" href="https://github.com/SiliconState/Spindle/releases/download/browser-v0.1.12/spindle-browser-0.1.12.zip">Download <small>0.1.12 · 64.2 MiB zip</small></a>
         <a class="button" href="#install">Install guide</a>
         <a class="button" href="https://github.com/SiliconState/Spindle">Source on GitHub</a>
       </div>
