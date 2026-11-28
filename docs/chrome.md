@@ -1221,7 +1221,7 @@ whole.
 | [`panel_steps.mjs`](../spindle/chrome/tests/panel_steps.mjs) | Node only | `steps.mjs` labels, tenses, retried failures, durations, a group's time on the clock (steps run at once counted once), scratch files. |
 | [`panel_tree.mjs`](../spindle/chrome/tests/panel_tree.mjs) | a build, `SPINDLE_BROWSER` | Large workspace trees: closed folders draw no descendants, single-child folder chains, counts and change marks, open state across redraws, filtering and next/previous navigation; draw timing and Light/Dim screenshots. |
 | [`engine_renew.mjs`](../spindle/chrome/tests/engine_renew.mjs) | build's `web/`, Node `--expose-gc` | Fresh wasm instance from one compiled module; old glue drops references, resident memory falls, fresh sessions work. |
-| [`linux_warm.mjs`](../spindle/chrome/tests/linux_warm.mjs) | Node only | Stand-in workers: wasm-only warming leaves v86 unstarted, commands start the Linux they need, and `onRan` identifies it. |
+| [`linux_warm.mjs`](../spindle/chrome/tests/linux_warm.mjs) | Node only | Stand-in workers: wasm-only warming leaves v86 unstarted, commands start the Linux they need, and `onRan` identifies it; since 0.1.12, a plain command of a thread with network runs on the wasm Linux, and a compiled module reruns on v86 only in a workspace holding compiled code. |
 | [`vault_host.mjs`](../spindle/chrome/tests/vault_host.mjs) | Node only | Host token sealed apart, lock/unlock and reset, strict refresh writes, and a pending refresh racing sign-out, replacement (even with the same refresh token), lock or reset. |
 
 **Scripted or real provider.** `extension_real.mjs --scripted` serves a scripted provider from

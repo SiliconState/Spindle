@@ -3,7 +3,12 @@
 // when it can, v86 otherwise,
 // and v86 again when the wasm Linux turns out not to have what the command needs. No
 // switch for the user: the decision is the command's. The parser is cautious: a command it
-// cannot tell to be plain POSIX sh with programs the wasm Linux has goes to v86.
+// cannot tell to be plain POSIX sh with programs the wasm Linux has goes to v86. So does
+// one that uses the packages and caches each Linux keeps for itself, and, in a thread
+// with network on, one that may use the network (`needsV86`) or that the wasm Linux's
+// missing network turns out to fail.
+
+import { ignored } from './linux-workspace.mjs';
 
 /** Shell words that start or join commands (the next word is a command), and hush's
  * builtins (POSIX's and its own: they run without a program). */
@@ -383,16 +388,195 @@ function substitutions(inner) {
   return found;
 }
 
+/** The wasm Linux's programs (busybox applets) that reach the network. The wasm Linux has
+ * none (no card, no name server: they fail), so in a thread with network on a command
+ * naming one goes to v86. */
+export const NETWORK_PROGRAMS = new Set([
+  'wget', 'nc', 'telnet', 'ftpget', 'ftpput', 'ping', 'ping6', 'nslookup', 'traceroute', 'traceroute6',
+  'tftp', 'whois', 'ntpd', 'udhcpc', 'httpd', 'ssl_client', 'sendmail', 'fetchmail', 'popmaildir', 'arping',
+]);
+
+/** Python (in a command, a heredoc or a script it runs) that may open a connection: a
+ * module that connects, imported as such (`NETWORK_IMPORTS`); a call that does; a program
+ * that does, named in quotes (for subprocess or os.system); pip. What reaches the network
+ * otherwise fails loudly in the wasm Linux and runs again on v86 (`wantsV86`); these keep
+ * a script that would catch that failure and carry on from running where its connections
+ * cannot work. */
+const NETWORK_IMPORTS = [
+  /(^|[\n;"'])[ \t]*(import|from)[ \t]+(socket|ssl|socketserver|selectors|requests|httpx|aiohttp|urllib3|httplib2|websockets?|websocket|ftplib|smtplib|imaplib|poplib|nntplib|telnetlib|xmlrpc|http\.client|http\.server|urllib\.request|urllib\.error|urllib\.robotparser|paramiko|pycurl|grpc|boto3|botocore|openai|anthropic|yfinance|feedparser|tweepy|praw)\b/,
+  /(^|[\n;"'])[ \t]*import[ \t]+[^\n#]*,[ \t]*(socket|ssl|requests|httpx|urllib3|ftplib|smtplib)\b/,
+  /\bfrom[ \t]+urllib[ \t]+import[ \t]+[^\n#]*\b(request|error|robotparser)\b/,
+  /\bfrom[ \t]+http[ \t]+import[ \t]+[^\n#]*\b(client|server)\b/,
+  /\b(__import__|import_module)[ \t]*\([ \t]*['"](socket|ssl|urllib\.request|http\.client|requests|httpx|urllib3)\b/,
+];
+const NETWORK_CODE = [
+  ...NETWORK_IMPORTS,
+  /\b(urlopen|urlretrieve|open_connection|start_server|create_connection|sock_connect|getaddrinfo|gethostbyname)[ \t]*\(/,
+  /['"](curl|wget|git|pip3?|npm|npx|yarn|pnpm|ssh|scp|sftp|rsync|nc|ncat|nslookup|dig|apk|ping|ftp|telnet)['"\s]/,
+  /(^|\s)-m[ \t]+(pip|ensurepip)\b/,
+];
+
+/** At most this many workspace files, and bytes in all, are read to tell whether a
+ * command needs v86 (`needsV86`); a command whose Python reaches further goes there. */
+const SCAN_FILES = 256;
+const SCAN_BYTES = 16 * 1024 * 1024;
+
+/** Caches only the programs that made them read (Python's, pytest's, mypy's...), each in
+ * the Linux it runs in: naming one does not tie a command to v86. */
+const OWN_CACHES = /^(__pycache__|\.\w+_cache)$/;
+
+/** Whether `text` names a directory of packages or caches a later command may use
+ * (`.venv`, `node_modules`, `.cache`...: linux-workspace.mjs `ignored`), whose files are
+ * never workspace files: each Linux keeps its own between commands. */
+function namesKept(text) {
+  return (text.match(/[\w.@+-]+(?:\/[\w.@+-]+)*/g) ?? [])
+    .some((word) => word.split('/').some((part) => ignored(part) && !OWN_CACHES.test(part)));
+}
+
+/** Whether a command the wasm Linux could run must run on v86 all the same: it uses the
+ * packages and caches each Linux keeps for itself (pip, npm and curl, which run on v86,
+ * fill v86's: the wasm Linux's would not hold them, and removing or looking for them there
+ * would not touch v86's), or, with `network` (its thread's on), it may use the network the
+ * wasm Linux lacks. Told from its text (heredocs included) and the workspace's Python it
+ * reaches (the scripts and modules it names, and what they import from the workspace,
+ * matched by name wherever they are): a package or cache directory named, or
+ * `NETWORK_CODE` (in what pip installed there, `NETWORK_IMPORTS` alone). `files`: the
+ * workspace's ({path, size, object}); `read(object)`: a file's bytes. What cannot be read
+ * or reaches too far counts. `cache` (object -> what a file holds) spares reading a file
+ * again. */
+export function needsV86(command, files, read, { network = true, cache = new Map() } = {}) {
+  const connects = (text) => NETWORK_CODE.some((pattern) => pattern.test(text));
+  if (namesKept(command) || (network && connects(command))) return true;
+  const roots = [...scripts(command)];
+  const own = imports(command).filter((one) => !one.dots);
+  if (!roots.length && !own.length) return false;
+  // The workspace's Python by path, and by file name; the directories pip installed
+  // packages into (each holds a package's `*.dist-info`).
+  const at = new Map();
+  const byName = new Map();
+  const installed = new Set();
+  for (const file of files ?? []) {
+    const info = /^(.+\/)[^/]+\.dist-info\//.exec(file.path);
+    if (info) installed.add(info[1]);
+    if (!file.path.endsWith('.py')) continue;
+    at.set(file.path, file);
+    const name = file.path.slice(file.path.lastIndexOf('/') + 1);
+    if (!byName.has(name)) byName.set(name, []);
+    byName.get(name).push(file);
+  }
+  /** The workspace's files a name (`a/b.py`, `b.py`) may mean. */
+  const named = (name) => {
+    const clean = name.replace(/^(\.\.?\/|\/workspace\/)+/, '');
+    const found = byName.get(clean.slice(clean.lastIndexOf('/') + 1)) ?? [];
+    return found.filter((file) => file.path === clean || file.path.endsWith(`/${clean}`));
+  };
+  /** The workspace's files a module imported from `dir` may be (relative: `dots`). */
+  const modules = (dir, { dots, path }) => {
+    const candidates = [`${path}.py`, `${path}/__init__.py`];
+    if (!dots) return candidates.flatMap(named);
+    let base = dir;
+    for (let up = 1; up < dots; up++) base = base.replace(/[^/]*\/$/, '');
+    return candidates.flatMap((candidate) => at.get(`${base}${candidate}`) ?? []);
+  };
+  const decoder = new TextDecoder();
+  const seen = new Set();
+  let bytes = 0;
+  // The scripts it names, and the modules its own Python (`python3 - <<EOF`, `-c`) imports.
+  const queue = [...roots.flatMap(named), ...own.flatMap((one) => modules('', one))];
+  while (queue.length) {
+    const file = queue.shift();
+    if (seen.has(file.path)) continue;
+    seen.add(file.path);
+    bytes += file.size ?? 0;
+    if (seen.size > SCAN_FILES || bytes > SCAN_BYTES) return true;
+    let held = cache.get(file.object);
+    if (!held) {
+      let text;
+      try {
+        text = decoder.decode(read(file.object));
+      } catch {
+        return true;
+      }
+      held = {
+        kept: namesKept(text),
+        connects: connects(text),
+        importsNetwork: NETWORK_IMPORTS.some((pattern) => pattern.test(text)),
+        imports: imports(text),
+      };
+      if (cache.size >= 4096) cache.clear();
+      cache.set(file.object, held);
+    }
+    // A package pip installed counts only for the modules it imports: its text names
+    // programs, calls and directories in data and documentation too (html5lib's sanitizer
+    // lists the `ping` attribute, pypdf's messages say `pip install`).
+    const library = [...installed].some((dir) => file.path.startsWith(dir));
+    if (library ? network && held.importsNetwork : held.kept || (network && held.connects)) return true;
+    const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/') + 1) : '';
+    for (const one of held.imports) queue.push(...modules(dir, one));
+  }
+  return false;
+}
+
+/** The Python files and modules a command names: `x.py` words (`./x.py`, `/workspace/x.py`
+ * too), and `-m module`. */
+function scripts(command) {
+  const found = new Set();
+  for (const match of command.matchAll(/(?:^|[\s'"=(])(\/?(?:[\w.-]+\/)*[\w.-]+\.py)(?=$|[\s'";|&)<>])/g)) found.add(match[1]);
+  for (const match of command.matchAll(/(?:^|\s)-m[ \t]+([\w.]+)/g)) {
+    const path = match[1].replace(/\./g, '/');
+    found.add(`${path}.py`).add(`${path}/__init__.py`).add(`${path}/__main__.py`);
+  }
+  return found;
+}
+
+/** What a Python file imports, as paths (`a/b`), with the dots of a relative import. */
+function imports(text) {
+  const found = [];
+  const add = (dots, module) => {
+    const parts = module.split('.').filter(Boolean);
+    // `import a.b` runs a/__init__.py too.
+    for (let end = 1; end <= parts.length; end++) found.push({ dots, path: parts.slice(0, end).join('/') });
+  };
+  // At a line's start, after `;`, or a quote's (`python3 -c "import x"`); `from a import
+  // (b, c)` over lines too.
+  for (const match of text.matchAll(/(?:^|[;"'])[ \t]*(?:from[ \t]+(\.*)([\w.]*)[ \t]+import[ \t]+(\([^)]*\)|[^\n#;"']+)|import[ \t]+([^\n#;"']+))/gm)) {
+    if (match[4] !== undefined) {
+      for (const part of match[4].split(',')) add(0, part.trim().split(/\s+/)[0] ?? '');
+      continue;
+    }
+    const dots = match[1].length;
+    const module = match[2];
+    if (module) add(dots, module);
+    // `from pkg import mod`: mod may be a module of the package.
+    for (const part of match[3].replace(/#[^\n]*/g, '').replace(/[()\\]/g, ' ').split(',')) {
+      const name = part.trim().split(/\s+/)[0];
+      if (/^\w+$/.test(name)) add(dots, module ? `${module}.${name}` : name);
+    }
+  }
+  return found;
+}
+
+/** What the wasm Linux prints when a command reaches for the network it lacks (checked
+ * on the image): a name it cannot look up, an address it cannot reach, HTTPS without its
+ * Python's ssl. */
+const NETWORK_FAILED = /\[Errno -3\] Try again|\[Errno 101\] Network unreachable|unknown url type: https|SSL module is not available|(^|\n)(wget|nc|telnet|ftpget|ftpput|whois|tftp|traceroute6?|ping6?): bad address |no servers could be reached/;
+
 /** Whether a wasm Linux result says the command needs what it lacks (a program it does
  * not have, syntax its sh does not take, an option only GNU's tools take, ripgrep's
- * PCRE2, a Python module, pip, a program Python asked for, or more memory):
- * run again on v86, unless it made a Spindle call (journaled, maybe billed) or was
- * stopped or timed out (its result stands). */
-export function wantsV86(result) {
+ * PCRE2, a Python module, pip, a program Python asked for, more memory, the network when
+ * its thread has `network` on, or a module of the `compiled` code its workspace holds:
+ * `.so` files, as pip puts in a directory of it, which its Python cannot load): run again
+ * on v86, unless it made a Spindle call (journaled, maybe billed) or was stopped or timed
+ * out (its result stands). */
+export function wantsV86(result, { network = false, compiled = false } = {}) {
   if (result.called || result.success) return false;
   if (result.unavailable) return true;
   if (result.failure) return false;
   const output = result.output ?? '';
+  if (network && NETWORK_FAILED.test(output)) return true;
+  // `from . import _speedups` of a package whose module is compiled: ImportError (a
+  // module imported by its full name says ModuleNotFoundError, below).
+  if (compiled && /(^|\n)ImportError: /.test(output)) return true;
   if (result.code === 127 && /(^|\n)(sh: )?[^\n]*: (not found|applet not found)\s*(\n|$)/.test(output)) return true;
   // How busybox's sh and its applets (env, timeout, xargs…) say a program is not there.
   if (result.code === 127 && /can't execute '[^'\n]+': No such file or directory|(^|\n)xargs: [^:\n]+: No such file or directory/.test(output)) return true;

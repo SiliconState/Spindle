@@ -6,12 +6,12 @@
 // puts the wasm Linux's there beside v86's, so what they have in common is carried once),
 // its kernel wasm-linux/vmlinux.wasm.zst. Files and kernel are compressed with zstd and
 // decompressed with v86's own decoder (wasm-linux/zstd.mjs). It boots in under a second,
-// so it is not saved. Several commands run at once (one per thread at a time, each on CPUs of its
-// own); none has network (linux-runner.mjs sends those to v86). It checks first that this
-// browser lets a worker share memory with the workers it starts, and says `unavailable`
-// when it does not (or the image is missing): commands then go to v86. A boot that fails
-// otherwise says `failed`, and the next command tries again (linux-runner.mjs stops
-// sending commands after a few such failures in a row).
+// so it is not saved. Several commands run at once (one per thread at a time, each on CPUs
+// of its own); none has network (linux-runner.mjs sends a command that may use it to v86).
+// It checks first that this browser lets a worker share memory with the workers it
+// starts, and says `unavailable` when it does not (or the image is missing): commands then
+// go to v86. A boot that fails otherwise says `failed`, and the next command tries again
+// (linux-runner.mjs stops sending commands after a few such failures in a row).
 //
 // engine -> worker  { type: 'run', id, session, command, timeoutS, files, links, directories }
 //                   { type: 'files', id, files | error } | { type: 'stop', id }

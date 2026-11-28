@@ -17,8 +17,12 @@ class StandIn {
   postMessage(message) {
     this.got.push(message.type);
     if (message.type !== 'run') return;
-    // Answer the command as the Linux would.
-    queueMicrotask(() => this.onmessage({ data: { type: 'ran', id: message.id, result: { output: 'ok', success: true } } }));
+    // Answer the command as the Linux would (the wasm Linux's Python loads no compiled
+    // module).
+    const result = this.kind === 'wasm' && message.command.includes('import fast')
+      ? { output: "ImportError: cannot import name '_speed' from partially initialized module 'fast'\n", success: false, code: 1 }
+      : { output: 'ok', success: true };
+    queueMicrotask(() => this.onmessage({ data: { type: 'ran', id: message.id, result } }));
   }
   terminate() {
     this.terminated = true;
@@ -30,7 +34,7 @@ globalThis.fetch = async (url) => {
   const path = String(url);
   if (path.endsWith('wasm-linux/identity')) return new Response(carriesWasm ? 'wasm-digest' : null, { status: carriesWasm ? 200 : 404 });
   if (path.endsWith('wasm-linux/fs.json')) {
-    const index = { fsroot: [['bin', 0, 0, 0o040755, 0, 0, [['sh', 0, 0, 0o100755, 0, 0, null], ['echo', 0, 0, 0o100755, 0, 0, null]]]] };
+    const index = { fsroot: [['bin', 0, 0, 0o040755, 0, 0, [['sh', 0, 0, 0o100755, 0, 0, null], ['echo', 0, 0, 0o100755, 0, 0, null], ['python3', 0, 0, 0o100755, 0, 0, null]]]] };
     return new Response(carriesWasm ? JSON.stringify(index) : null, { status: carriesWasm ? 200 : 404 });
   }
   if (path.endsWith('linux/identity')) return new Response('v86-digest');
@@ -47,13 +51,26 @@ let runner = linuxRunner({ onRan: (session, kind) => ran.push([session, kind]) }
 runner.warm({ v86: false });
 await settle();
 assert.deepEqual(kinds(), ['wasm'], 'v86 stays unstarted');
-// A command the wasm Linux runs, then one only v86 can (network): v86 starts then.
+// Commands the wasm Linux runs (in a thread with network on too, using none of it), then
+// one only v86 can (a cache v86 keeps for a thread with network): v86 starts then.
 const job = { session: '/threads/0123456789abcdef', timeoutS: 5, files: [], links: [], directories: [], read: () => new Uint8Array() };
 assert.equal((await runner.run({ ...job, command: 'echo hi', network: false })).success, true);
-assert.deepEqual(kinds(), ['wasm']);
 assert.equal((await runner.run({ ...job, command: 'echo hi', network: true })).success, true);
+assert.deepEqual(kinds(), ['wasm']);
+assert.equal((await runner.run({ ...job, command: 'echo hi > .cache/page.html', network: true })).success, true);
 assert.deepEqual(kinds(), ['v86', 'wasm'], 'v86 starts with the command that needs it');
-assert.deepEqual(ran, [[job.session, 'wasm'], [job.session, 'v86']]);
+assert.deepEqual(ran, [[job.session, 'wasm'], [job.session, 'wasm'], [job.session, 'v86']]);
+// A compiled module the wasm Linux cannot load: v86 runs the command again, but only in a
+// workspace that holds compiled code (otherwise the import error is the script's).
+ran = [];
+const fast = { path: 'pylib/fast/__init__.py', size: 1, executable: false, object: 'o1' };
+const speed = { path: 'pylib/fast/_speed.cpython-314-i386-linux-musl.so', size: 1, executable: false, object: 'o2' };
+const compiledRun = await runner.run({ ...job, command: 'PYTHONPATH=pylib python3 -c "import fast"', files: [fast, speed], read: () => new Uint8Array(1) });
+assert.equal(compiledRun.success, true);
+assert.deepEqual(ran.map(([, kind]) => kind), ['wasm', 'v86']);
+ran = [];
+assert.equal((await runner.run({ ...job, command: 'PYTHONPATH=pylib python3 -c "import fast"', files: [fast], read: () => new Uint8Array(1) })).success, false);
+assert.deepEqual(ran.map(([, kind]) => kind), ['wasm']);
 
 // A thread that used v86 lately, or the user asking: both.
 started.length = 0;
@@ -112,5 +129,5 @@ await settle();
 assert.equal(v86.got.length, asked);
 assert.equal(started.length, 1);
 
-console.log('linux-warm passed: v86 starts only when asked or with a command that needs it; the wasm Linux on open; which ran each command told; prepare() makes v86\'s state and lets it go');
+console.log('linux-warm passed: v86 starts only when asked or with a command that needs it; the wasm Linux on open; which ran each command told; a compiled module reruns on v86; prepare() makes v86\'s state and lets it go');
 process.exit(0);

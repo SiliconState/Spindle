@@ -77,27 +77,30 @@ git, the network, C extensions, programs a command saved) stays on v86.
 `linuxRunner().run` decides where each command runs. The user has no switch for it.
 
 1. If the extension carries the wasm Linux (its `wasm-linux/identity` and `wasm-linux/fs.json`
-   load), the thread has no network, and `wasmCanRun(command, programs)` accepts the command, it
-   runs on the wasm Linux. `programs` is the set of names in the image's `bin`, `sbin`,
-   `usr/bin`, `usr/sbin` and `usr/local/bin`, read from `fs.json`.
+   load), `wasmCanRun(command, programs)` accepts the command, and `needsV86` finds no reason to
+   keep it on v86 (see [What keeps a command on v86](#what-keeps-a-command-on-v86)), it runs on
+   the wasm Linux. `programs` is the set of names in the image's `bin`, `sbin`, `usr/bin`,
+   `usr/sbin` and `usr/local/bin`, read from `fs.json`; for a thread with network on, busybox's
+   applets that reach the network (`wget`, `nc`, `nslookup` and the rest of `NETWORK_PROGRAMS`)
+   are left out. Through 0.1.11, every command of a thread with network ran on v86.
 2. Otherwise it runs on v86.
-3. After a wasm run, `wantsV86(result)` decides whether to run the command again on v86. A
-   command the user stopped is never rerun.
+3. After a wasm run, `wantsV86(result, {network, compiled})` decides whether to run the command
+   again on v86. A command the user stopped is never rerun.
 
 ```mermaid
 flowchart TD
   cmd(["A bash command of a runner: app thread"]) --> carried{"wasm Linux carried<br/>and not disabled?"}
   carried -- no --> v86["Run on v86"]
-  carried -- yes --> net{"Thread has network?"}
-  net -- yes --> v86
-  net -- no --> parse{"wasmCanRun: plain POSIX sh<br/>and every program in the image?"}
+  carried -- yes --> parse{"wasmCanRun: plain POSIX sh<br/>and every program in the image?"}
   parse -- no --> v86
-  parse -- yes --> wasm["Run on the wasm Linux"]
+  parse -- yes --> needs{"needsV86: a kept directory named,<br/>or network use when the thread has network?"}
+  needs -- yes --> v86
+  needs -- no --> wasm["Run on the wasm Linux"]
   wasm --> stopped{"Stopped by the user?"}
   stopped -- yes --> result(["Result to the package"])
   stopped -- no --> wants{"wantsV86 on the result"}
   wants -->|"no: success, a Spindle call was made,<br/>timeout or other failure"| result
-  wants -->|"yes: wasm Linux unavailable, program not found or saved,<br/>sh syntax error, GNU-only option, missing Python module"| v86
+  wants -->|"yes: wasm Linux unavailable, program not found or saved,<br/>sh syntax error, GNU-only option, missing Python module,<br/>missing network, compiled module"| v86
   v86 --> result
 ```
 
@@ -118,6 +121,37 @@ sends the command to v86 if any of the following holds:
 - a wrapped command is unknown. `env`, `nice`, `nohup`, `time`, `exec`, `stdbuf`, `timeout`,
   `xargs`, `find -exec`/`-execdir`/`-ok`/`-okdir`, `busybox APPLET`, `command`, and `sh -c SCRIPT`
   (also `ash`, `hush`, `dash`) are looked through to the command they run.
+
+### What keeps a command on v86
+
+`needsV86(command, files, read, {network})` (since 0.1.12) keeps a command on v86 that the wasm
+Linux could run. It reads the command (heredoc bodies and `python3 -c` included) and the
+workspace's Python the command reaches: the scripts it names (`x.py`, `./x.py`,
+`/workspace/x.py`, `python3 -m pkg.mod`), the modules its own Python imports, and what those
+import in turn from the workspace, found by name anywhere in it (relative imports by their
+place). It reads at most 256 files and 16 MiB, each file once per object digest, and a command
+that reaches further, or a file it cannot read, stays on v86. It returns true when:
+
+- the command or a script it reaches names a package or cache directory that a later command
+  may use (`.venv`, `venv` or `*-venv`, `node_modules`, `.cache`, `.npm`, `.tox`, `.nox`,
+  `.ipynb_checkpoints`: what `ignored` in
+  [`linux-workspace.mjs`](../spindle/chrome/linux-workspace.mjs) leaves out of the workspace). Each Linux
+  keeps its own copy of these between commands and none of them is a workspace file, so what
+  pip, npm or curl put there on v86 is not in the wasm Linux's copy. Python's and its tools' own
+  caches (`__pycache__`, `.pytest_cache`, `.mypy_cache`) do not count, since only the program
+  that made one reads it;
+- the thread has network on and the command or a script it reaches may use it
+  (`NETWORK_CODE`): it imports a module that connects (`socket`, `ssl`, `urllib.request`,
+  `http.client`, `requests`, `httpx`, `urllib3` and others), calls `urlopen`,
+  `create_connection`, `getaddrinfo` or the like, names a program that connects in quotes (for
+  `subprocess` or `os.system`: `curl`, `wget`, `git`, `pip`, `ssh` and others), or runs
+  `-m pip`. In a package pip installed into the workspace (a directory holding its
+  `*.dist-info`, as `pip install --target .packages` makes), only the modules it imports count
+  (`NETWORK_IMPORTS`), since its text names programs and calls in data and documentation.
+
+The static check matters for a script that would catch the wasm Linux's failed connection and
+carry on with a fallback. A network use it does not see fails loudly on the wasm Linux and
+runs again on v86 (next section), after the wasm Linux's name lookup gives up (about 5 s).
 
 ### When a wasm result is run again on v86
 
@@ -140,6 +174,8 @@ when:
 | `PCRE2 is not available in this build of ripgrep` (since 0.1.10) | `rg -P`, or `rg --engine auto` with a pattern only PCRE2 takes |
 | `MemoryError`, `memory allocation of N bytes failed`, or `...: out of memory` (since 0.1.10) | a program that needed more than the 256 MiB each wasm Linux program may have; v86's machine has 512 MiB |
 | Python `subprocess` raising `FileNotFoundError` or `PermissionError` | a program Python tried to start that the image lacks or may not run |
+| with network on (since 0.1.12): `[Errno -3] Try again`, `[Errno 101] Network unreachable`, `unknown url type: https`, `SSL module is not available`, or a busybox network applet's `bad address` | a connection the wasm Linux, which has no network, could not make; nothing was sent, so the rerun is safe |
+| in a workspace holding `.so` files (since 0.1.12): `ImportError` | a compiled module pip put in the workspace, which the wasm Linux's Python cannot load (`from . import _speedups` says `ImportError`; a module imported by its full name says `ModuleNotFoundError`, above) |
 
 A rerun is safe because each command works on a copy of its thread's workspace, and that copy
 counts only when its result is returned to the package (see [Workspace sync](#workspace-sync)).
@@ -287,7 +323,9 @@ Linux could not end) loses them too.
 ## Network
 
 A thread's network is off until the user turns it on (the thread's model page; see
-[chrome.md](chrome.md#settings)). Network commands always run on v86. The v86 worker runs one
+[chrome.md](chrome.md#settings)). Only v86 has a network: a command of such a thread that may
+use it runs there, and since 0.1.12 the thread's other commands run on the wasm Linux when it
+can run them (see [Routing a command](#routing-a-command)). The v86 worker runs one
 command with network at a time, and its network card passes traffic only while that command runs
 (`allowed()` in `wireNetwork`). When the command ends, its connections are cut. A command without
 network is in a network namespace with only loopback, so it cannot reach even the Linux's own
@@ -646,8 +684,8 @@ but `linux_bench.mjs` run in Node alone; none needs a provider; all but `linux_r
 | Test | Usage | Checks |
 | --- | --- | --- |
 | [`linux_node.mjs`](../spindle/chrome/tests/linux_node.mjs) | `node --max-old-space-size=4096 --wasm-num-compilation-tasks=2 chrome/tests/linux_node.mjs [LINUX_DIST]` | The v86 Linux in Node: commands with bash, Python and Node over a 9p workspace, writes coming back, timeouts, commands side by side in their own namespaces, the workspace kept between commands, the code bridge from all three interfaces, resuming with the browser's clock, and the network: none without it; HTTP and HTTPS through the gateway from curl, Python, Node, pip and git; never a local address; a test WISP relay. The network checks need the internet. |
-| [`linux_route.mjs`](../spindle/chrome/tests/linux_route.mjs) | `node chrome/tests/linux_route.mjs` | `wasmCanRun` and `wantsV86`, including the results a saved program refused on the wasm Linux gives. |
-| [`linux_warm.mjs`](../spindle/chrome/tests/linux_warm.mjs) | `node chrome/tests/linux_warm.mjs` | Which Linux starts ahead of a command, with stand-in workers: `warm()` starts both, `warm({ v86: false })` the wasm Linux alone, nothing without a wasm Linux; v86 starts with the first command that needs it; `onRan` says which Linux ran each command; since 0.1.10, `prepare()` makes v86's state and lets the machine go, unless a command came meanwhile. |
+| [`linux_route.mjs`](../spindle/chrome/tests/linux_route.mjs) | `node chrome/tests/linux_route.mjs` | `wasmCanRun` and `wantsV86`, including the results a saved program refused on the wasm Linux gives; since 0.1.12, `needsV86` (kept directories with network on and off, network use in a command and in the workspace scripts and modules it reaches, a pip-installed package) and the reruns for a missing network and a compiled module. |
+| [`linux_warm.mjs`](../spindle/chrome/tests/linux_warm.mjs) | `node chrome/tests/linux_warm.mjs` | Which Linux starts ahead of a command, with stand-in workers: `warm()` starts both, `warm({ v86: false })` the wasm Linux alone, nothing without a wasm Linux; v86 starts with the first command that needs it; `onRan` says which Linux ran each command; since 0.1.10, `prepare()` makes v86's state and lets the machine go, unless a command came meanwhile; since 0.1.12, a plain command of a thread with network runs on the wasm Linux, and a compiled module reruns on v86 only in a workspace holding compiled code. |
 | [`wasm_linux_runner.mjs`](../spindle/chrome/tests/wasm_linux_runner.mjs) | `node chrome/tests/wasm_linux_runner.mjs VMLINUX_WASM USERLAND_ROOT GUEST_BIN [CPUS]` | `WasmLinux` as a runner: workspaces, exit statuses, threads side by side, Spindle calls, timeouts, Stop, isolation (no program a command saved in its workspace, `/tmp` or home runs, `/run` takes nothing, a script run through `sh` does), and a runaway loop that only a restart ends. |
 | [`wasm_linux_python.mjs`](../spindle/chrome/tests/wasm_linux_python.mjs) | `node chrome/tests/wasm_linux_python.mjs [DIST [V86_WASM]]` | Python from the built image (since 0.1.10 its files zstd-decompressed with `V86_WASM`'s decoder, default `chrome/linux/dist/v86.wasm`): the version, Alpine's compiled modules used as they are, C modules, threads, files, `subprocess` via `posix_spawn`, asyncio, Unix sockets, the `spindle` module; since 0.1.10 also ripgrep (searching what is piped to it too), and `rg -P` refused as v86's rerun expects. |
 | [`find_paths.mjs`](../spindle/chrome/tests/find_paths.mjs) | `node chrome/tests/find_paths.mjs DIR STRING...` | Since 0.1.10: no file under `DIR`, a `.zst` one as it decompresses, holds any `STRING` (the release workflows give their machine's directories). Needs Node 22.15 or later. |

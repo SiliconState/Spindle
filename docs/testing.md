@@ -191,7 +191,8 @@ attaches both zips and their SHA-256 files to the release (see
 
 The extension's focused suites are linked in [chrome.md](chrome.md#tests):
 `panel_tree.mjs` checks closed-folder rendering, change counts, filter/redraw state
-and navigation through large trees; `linux_warm.mjs` checks lazy v86 starts;
+and navigation through large trees; `linux_warm.mjs` checks lazy v86 starts and which
+Linux runs a command; `linux_route.mjs` checks how a command is routed and when it runs again;
 `vault_host.mjs` checks sealing and passphrase handling for the host token;
 `engine_renew.mjs` checks old wasm memory is released and fresh sessions work.
 `review_browser.mjs` covers contained/static previews and version choices,

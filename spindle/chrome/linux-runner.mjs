@@ -4,18 +4,19 @@
 // carries it, the wasm Linux (wasm-linux-worker.mjs: Linux compiled to WebAssembly with
 // busybox `sh`; it boots in under a second and runs at the machine's own speed, several
 // threads' commands at once on CPUs of their own). linux-route.mjs decides which runs a
-// command: plain POSIX sh with programs the wasm Linux has goes there, anything else to
-// v86, and v86 runs again what the wasm Linux turns out to lack, unless the command made
-// a Spindle call (journaled, maybe billed). A rerun is safe: a command works on a copy of
-// its workspace that counts only when its result is taken. Each worker starts with its
-// first command and stops after a while unused, giving its memory back. A command goes
-// with its workspace's list of files; a worker asks for the bytes of those its share does
-// not already hold. Its identity marks its runs as sandboxed (commands reach neither this
-// machine nor the extension's keys, and the web only when their thread has network,
-// through Chrome or the user's relay): v86's image digest, or with the wasm Linux both
-// images' together, as one runner made of the two.
+// command: plain POSIX sh with programs the wasm Linux has goes there (unless it uses the
+// packages and caches v86 keeps or, in a thread with network on, the network, which the
+// wasm Linux lacks), anything else to v86, and v86 runs again what the wasm Linux turns
+// out to lack, unless the command made a Spindle call (journaled, maybe billed). A rerun
+// is safe: a command works on a copy of its workspace that counts only when its result is
+// taken. Each worker starts with its first command and stops after a while unused, giving
+// its memory back. A command goes with its workspace's list of files; a worker asks for
+// the bytes of those its share does not already hold. Its identity marks its runs as
+// sandboxed (commands reach neither this machine nor the extension's keys, and the web
+// only when their thread has network, through Chrome or the user's relay): v86's image
+// digest, or with the wasm Linux both images' together, as one runner made of the two.
 
-import { wantsV86, wasmCanRun } from './linux-route.mjs';
+import { NETWORK_PROGRAMS, needsV86, wantsV86, wasmCanRun } from './linux-route.mjs';
 
 /** How long an idle Linux keeps its memory. */
 const IDLE_MS = 10 * 60_000;
@@ -47,11 +48,14 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
   /** Run id -> the session its command is for, a signal that ends with it, how its files
    * are read, and whether its scripts made a Spindle call. */
   const sessions = new Map();
-  /** The wasm Linux as found: {identity, programs} when the extension carries it, null
-   * when it does not; false once it cannot run here (it said so, or failed
-   * WASM_FAILURES times in a row). */
+  /** The wasm Linux as found: {identity, programs, offline (those that do not reach the
+   * network)} when the extension carries it, null when it does not; false once it cannot
+   * run here (it said so, or failed WASM_FAILURES times in a row). */
   let wasm;
   let wasmFailures = 0;
+  /** What the workspace files read to tell whether a command needs v86 hold (by object),
+   * so each is read once. */
+  const scanned = new Map();
   const wasmFailed = () => {
     if (++wasmFailures >= WASM_FAILURES && wasm) {
       wasm = false;
@@ -64,7 +68,8 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
         fetch(new URL('wasm-linux/identity', import.meta.url)).then((response) => (response.ok ? response.text() : null)),
         fetch(new URL('wasm-linux/fs.json', import.meta.url)).then((response) => (response.ok ? response.json() : null)),
       ]);
-      wasm = digest && index ? { identity: digest.trim(), programs: programsOf(index) } : null;
+      const programs = digest && index ? programsOf(index) : null;
+      wasm = programs ? { identity: digest.trim(), programs, offline: new Set([...programs].filter((name) => !NETWORK_PROGRAMS.has(name))) } : null;
     } catch {
       wasm = null;
     }
@@ -188,7 +193,11 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
       // A Stop while the image was looked for (runOn takes those from here).
       if (signal?.aborted) return { output: '', success: false, failure: 'the command was stopped before it ran' };
       if (route === 'wasm' && !(found && wasm)) return { output: '', success: false, failure: 'the wasm Linux is unavailable here' };
-      const toWasm = route === 'wasm' || (route === 'auto' && !network && wasmCanRun(command, found?.programs ?? new Set()));
+      // A command that uses the packages and caches v86 keeps goes to v86, and so, in a
+      // thread with network on (the wasm Linux has none), does one that may use it (a
+      // program that connects, Python that does).
+      const toWasm = route === 'wasm' || (route === 'auto' && found && wasm && wasmCanRun(command, network ? found.offline : found.programs)
+        && !needsV86(command, files, read, { network: Boolean(network), cache: scanned }));
       if (found && wasm && toWasm) {
         const id = ++next;
         sessions.set(id, { session, ended: new AbortController(), read, called: false });
@@ -200,7 +209,8 @@ export function linuxRunner({ onStatus = () => {}, onCode = async () => ({ ok: f
           sessions.delete(id);
         }
         onRan(session, 'wasm');
-        if (route === 'wasm' || signal?.aborted || !wantsV86(result)) return told(result);
+        const compiled = files.some((file) => file.path.endsWith('.so'));
+        if (route === 'wasm' || signal?.aborted || !wantsV86(result, { network: Boolean(network), compiled })) return told(result);
       }
       const id = ++next;
       sessions.set(id, { session, ended: new AbortController(), read, called: false });

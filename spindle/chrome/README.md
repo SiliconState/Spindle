@@ -82,8 +82,15 @@ your key.
   times. No switch: a command that is plain POSIX sh with programs it has runs there
   (each in namespaces of its own, on CPUs of its own, as the same unprivileged user),
   anything else runs in the emulated Linux, which also runs again a command the wasm
-  Linux turns out to lack something for (unless it made a Spindle call). Commands of
-  threads with network always run in the emulated Linux.
+  Linux turns out to lack something for (unless it made a Spindle call). A command that
+  names a package or cache directory (`.venv`, `node_modules`, `.cache`...: each Linux
+  keeps its own, and pip, npm and curl fill the emulated Linux's) runs in the emulated
+  Linux. The wasm Linux has no network: in a thread with network on, so does a command
+  that may use it (a program that connects, such as wget, curl or git, or Python that
+  does, in the command or in the workspace's scripts and modules it runs), and one the
+  wasm Linux's missing network fails (a name it cannot look up, an address it cannot
+  reach) runs again there. So does one that needs a compiled module pip put in the
+  workspace, which the wasm Linux's Python cannot load.
 - **Code mode through bash:** scripts in that Linux can ask Spindle for calls, each
   journaled as native `run_code` journals them (a call cut off is never sent again by
   itself; its error says `[may_have_run]`): from bash `spindle model PROMPT` (a model's

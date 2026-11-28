@@ -229,20 +229,31 @@ const GUIDE_START_BEFORE_NOTES = [
   'need over many separate tool calls.',
   'What you make for the user (pages, apps, reports, pictures) goes in the workspace as files: each shows in the',
 ];
+/** What the guide says of where commands run and how fast; `SPEED_BEFORE`, what it said
+ * before it told the browser's two Linuxes apart (every command of a thread with network
+ * on ran in the emulated one then). */
+const SPEED_NOW = 'Each command runs in one of two Linuxes, chosen for it: plain POSIX sh using busybox tools, ' +
+  "Python 3 and ripgrep runs at the machine's own speed; one that needs more (bash-only syntax, Node, npm, git, curl, " +
+  'pip or a venv, Python that uses the network) runs whole in an emulated Linux, many times slower, so keep heavy ' +
+  'Python apart from such commands. Give a command that runs long, or makes Spindle calls, a timeout of a few minutes.';
+const SPEED_BEFORE = 'The Linux is emulated and slow: give a command that runs long, or makes Spindle calls, a timeout of a few minutes.';
+/** Where package and cache directories stay between commands; `PACKAGES_BEFORE`, as it
+ * read when there was one Linux to say. */
+const PACKAGES_NOW = 'stay between commands only in the Linux that made them (pip, npm and curl run in the emulated one, below), ' +
+  "and are not workspace files (not in its history, not in tasks' copies):";
+const PACKAGES_BEFORE = "stay on the Linux between commands but are not workspace files (not in its history, not in tasks' copies):";
 const GUIDE_START = [
   "Your commands run in a small Linux inside the user's browser (Alpine: bash, coreutils, Python 3 with pip, Node with",
   'npm, git, curl, jq, ripgrep). Each command starts afresh but for the workspace, so install packages into it',
   '(`npm install`, `python3 -m venv .venv`). Package and cache directories (.venv, node_modules, __pycache__, .cache)',
-  'stay on the Linux between commands but are not workspace files (not in its history, not in tasks\' copies): after',
-  'a long pause they may be gone, so check before using them, and keep what you make outside them.',
+  PACKAGES_NOW, 'after a long pause they may be gone, so check before using them, and keep what you make outside them.',
   'Keep NOTES.md in the workspace: what the user wants, decisions, where things are and what is left; its start is',
   'carried into the summary when the history is compacted, so you go on knowing it.',
   'With network on (the bash tool says whether), commands reach websites over',
   'HTTP and HTTPS, which Chrome fetches through the proxy their environment names (without the user\'s cookies; the',
   "user's computer and local network addresses and names are refused); if the user set a relay, they reach any address through it. Without",
   "network, connections are refused: ask the user to turn the thread's network on (its model menu) rather than",
-  'working around it. The Linux is emulated and slow: give a command that runs long, or makes Spindle calls, a',
-  'timeout of a few minutes.',
+  'working around it.', SPEED_NOW,
   'Scripts there can ask Spindle for calls, each journaled so a call that was cut off is never sent twice:',
   "from bash, `spindle model PROMPT` prints a model's answer, `spindle tool NAME '{\"json\": \"args\"}'` calls a tool",
   '(such as read_page or list_tabs), `spindle search` lists the tools, `spindle http URL` calls a site the user',
@@ -323,6 +334,8 @@ const EARLIER_GUIDES = [[
   'Prefer one script that loops, filters and aggregates (asking models or tools as it goes) and prints only what you',
   'need over many separate tool calls.',
 ].join(' ')];
+// The current guide as it read before it told the two Linuxes apart.
+EARLIER_GUIDES.push(LINUX_GUIDE.replace(SPEED_NOW, SPEED_BEFORE).replace(PACKAGES_NOW, PACKAGES_BEFORE));
 // Every guide as it read before it said Spindle adds a site's secret header.
 const SITES_NOW = 'allowed (any other is refused, naming those allowed; a site the user saved with a secret header, such as a token, ' +
   'gets it from Spindle: never set that header or ask for its value); in Python';
